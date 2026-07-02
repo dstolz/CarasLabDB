@@ -1,0 +1,1537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ephys Metadata Explorer — Caras Lab</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+<style>
+  :root{
+    --bg-primary:#eef1f6;
+    --bg-card:#ffffff;
+    --bg-header:#141b2d;
+    --bg-header-2:#1e2a44;
+    --text-primary:#1b2432;
+    --text-secondary:#6b7688;
+    --text-on-dark:#eaf0fb;
+    --border:#e3e8f0;
+    --border-strong:#cfd6e2;
+
+    /* event-type palette (shared by badges + charts) */
+    --ev-birth:#55A868;
+    --ev-surgery:#C44E52;
+    --ev-recording:#4C72B0;
+    --ev-behavior:#DD8452;
+    --ev-husbandry:#8172B3;
+    --ev-endpoint:#937860;
+    --ev-histology:#DA8BC3;
+    --ev-analysis:#3FA7B7;
+
+    --positive:#1f9d55;
+    --negative:#dc3545;
+    --warn:#d98c00;
+    --accent:#4C72B0;
+
+    --gap:16px;
+    --radius:10px;
+    --shadow:0 1px 3px rgba(20,27,45,.08), 0 1px 2px rgba(20,27,45,.04);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg-primary);color:var(--text-primary);line-height:1.5;font-size:14px;
+  }
+  .app{max-width:1440px;margin:0 auto;padding:var(--gap);}
+
+  /* Header */
+  .app-header{
+    background:linear-gradient(135deg,var(--bg-header),var(--bg-header-2));
+    color:var(--text-on-dark);border-radius:var(--radius);padding:18px 22px;margin-bottom:var(--gap);
+    box-shadow:var(--shadow);
+  }
+  .app-header .top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;}
+  .brand{display:flex;align-items:center;gap:12px;}
+  .brand .logo{
+    width:40px;height:40px;border-radius:9px;background:rgba(255,255,255,.08);
+    display:grid;place-items:center;flex:none;border:1px solid rgba(255,255,255,.12);
+  }
+  .brand h1{font-size:19px;font-weight:650;letter-spacing:.2px;}
+  .brand .sub{font-size:12.5px;color:rgba(234,240,251,.62);margin-top:1px;}
+  .sample-badge{
+    display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;
+    text-transform:uppercase;letter-spacing:.6px;color:#ffd479;background:rgba(217,140,0,.14);
+    border:1px solid rgba(217,140,0,.35);padding:5px 10px;border-radius:20px;white-space:nowrap;
+  }
+  .sample-badge .dot{width:7px;height:7px;border-radius:50%;background:#ffbb33;box-shadow:0 0 0 3px rgba(255,187,51,.18);}
+
+  /* Filters */
+  .filters{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;}
+  .filter-group{display:flex;flex-direction:column;gap:4px;}
+  .filter-group label{font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:rgba(234,240,251,.55);font-weight:600;}
+  .filter-group select,.filter-group input[type="date"]{
+    padding:7px 10px;border:1px solid rgba(255,255,255,.16);border-radius:7px;
+    background:rgba(255,255,255,.06);color:var(--text-on-dark);font-size:13px;min-width:150px;
+    font-family:inherit;
+  }
+  .filter-group input[type="date"]{color-scheme:dark;min-width:135px;}
+  .filter-group select option{background:var(--bg-header);color:var(--text-on-dark);}
+  .filter-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:rgba(234,240,251,.8);cursor:pointer;user-select:none;padding-bottom:7px;}
+  .filter-toggle input{accent-color:var(--accent);width:15px;height:15px;}
+  .btn-reset{
+    padding:7px 13px;border-radius:7px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);
+    color:var(--text-on-dark);font-size:12.5px;cursor:pointer;font-family:inherit;font-weight:500;
+  }
+  .btn-reset:hover{background:rgba(255,255,255,.13);}
+
+  /* Tabs */
+  .tabs{display:flex;gap:4px;margin-bottom:var(--gap);flex-wrap:wrap;background:var(--bg-card);padding:6px;border-radius:var(--radius);box-shadow:var(--shadow);width:fit-content;}
+  .tab{
+    padding:9px 16px;border-radius:7px;font-size:13.5px;font-weight:550;color:var(--text-secondary);
+    cursor:pointer;border:none;background:none;font-family:inherit;display:flex;align-items:center;gap:7px;
+  }
+  .tab:hover{background:var(--bg-primary);color:var(--text-primary);}
+  .tab.active{background:var(--bg-header);color:#fff;}
+  .tab .count{font-size:11px;background:rgba(0,0,0,.12);padding:1px 7px;border-radius:10px;font-weight:600;}
+  .tab.active .count{background:rgba(255,255,255,.18);}
+
+  .view{display:none;}
+  .view.active{display:block;animation:fade .18s ease;}
+  @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+
+  /* KPI cards */
+  .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:var(--gap);margin-bottom:var(--gap);}
+  .kpi-card{background:var(--bg-card);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);border:1px solid var(--border);position:relative;overflow:hidden;}
+  .kpi-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent);}
+  .kpi-card.c1::before{background:var(--ev-recording)}
+  .kpi-card.c2::before{background:var(--ev-behavior)}
+  .kpi-card.c3::before{background:var(--ev-analysis)}
+  .kpi-card.c4::before{background:var(--ev-surgery)}
+  .kpi-card.c5::before{background:var(--ev-husbandry)}
+  .kpi-card.c6::before{background:var(--ev-birth)}
+  .kpi-label{font-size:11.5px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:6px;}
+  .kpi-value{font-size:26px;font-weight:720;letter-spacing:-.5px;line-height:1.1;}
+  .kpi-sub{font-size:12px;color:var(--text-secondary);margin-top:3px;}
+
+  /* Charts */
+  .chart-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--gap);margin-bottom:var(--gap);}
+  .card{background:var(--bg-card);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);border:1px solid var(--border);}
+  .card h3{font-size:13.5px;font-weight:650;margin-bottom:2px;}
+  .card .card-sub{font-size:12px;color:var(--text-secondary);margin-bottom:14px;}
+  .chart-wrap{position:relative;height:270px;}
+
+  /* Section / table */
+  .section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;}
+  .section-head h2{font-size:16px;font-weight:650;}
+  .section-head .meta{font-size:12.5px;color:var(--text-secondary);}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+  .toolbar input[type="search"],.toolbar select{
+    padding:7px 11px;border:1px solid var(--border-strong);border-radius:7px;font-size:13px;background:#fff;
+    font-family:inherit;color:var(--text-primary);
+  }
+  .toolbar input[type="search"]{min-width:210px;}
+
+  .table-wrap{background:var(--bg-card);border-radius:var(--radius);box-shadow:var(--shadow);border:1px solid var(--border);overflow:auto;max-height:none;}
+  table.data{width:100%;border-collapse:collapse;font-size:13px;}
+  table.data thead th{
+    text-align:left;padding:11px 14px;background:#f7f9fc;border-bottom:2px solid var(--border-strong);
+    color:var(--text-secondary);font-weight:650;font-size:11px;text-transform:uppercase;letter-spacing:.5px;
+    white-space:nowrap;user-select:none;position:sticky;top:0;z-index:2;
+  }
+  table.data thead th.sortable{cursor:pointer;}
+  table.data thead th.sortable:hover{color:var(--text-primary);background:#eef2f8;}
+  table.data tbody td{padding:10px 14px;border-bottom:1px solid #f0f3f8;white-space:nowrap;}
+  table.data tbody tr:last-child td{border-bottom:none;}
+  table.data tbody tr.clickable{cursor:pointer;}
+  table.data tbody tr.clickable:hover{background:#f5f8fd;}
+  .num{text-align:right;font-variant-numeric:tabular-nums;}
+  .mono{font-family:'SF Mono',ui-monospace,'Cascadia Mono',Menlo,Consolas,monospace;font-size:12px;}
+  .muted{color:var(--text-secondary);}
+  .truncate{max-width:280px;overflow:hidden;text-overflow:ellipsis;}
+  .empty{padding:44px;text-align:center;color:var(--text-secondary);font-size:14px;}
+
+  /* Badges */
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:20px;font-size:11.5px;font-weight:600;white-space:nowrap;}
+  .badge .dot{width:7px;height:7px;border-radius:50%;}
+  .ev-birth{background:rgba(85,168,104,.13);color:#357a49;}
+  .ev-surgery{background:rgba(196,78,82,.13);color:#a3373b;}
+  .ev-recording{background:rgba(76,114,176,.13);color:#3a5c94;}
+  .ev-behavior{background:rgba(221,132,82,.15);color:#b5642e;}
+  .ev-husbandry{background:rgba(129,114,179,.15);color:#5f5296;}
+  .ev-endpoint{background:rgba(147,120,96,.16);color:#6e5842;}
+  .ev-histology{background:rgba(218,139,195,.16);color:#a6539a;}
+  .ev-analysis{background:rgba(63,167,183,.15);color:#2b7d8b;}
+  .dot-birth{background:var(--ev-birth)}.dot-surgery{background:var(--ev-surgery)}
+  .dot-recording{background:var(--ev-recording)}.dot-behavior{background:var(--ev-behavior)}
+  .dot-husbandry{background:var(--ev-husbandry)}.dot-endpoint{background:var(--ev-endpoint)}
+  .dot-histology{background:var(--ev-histology)}.dot-analysis{background:var(--ev-analysis)}
+
+  .pill{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11.5px;font-weight:600;background:#eef2f8;color:#54617a;}
+  .pill.ok{background:rgba(31,157,85,.13);color:#187a41;}
+  .pill.missing{background:rgba(220,53,69,.13);color:#b02a37;}
+  .pill.mismatch{background:rgba(217,140,0,.15);color:#a06400;}
+  .pill.superseded{background:rgba(107,118,136,.15);color:#5b6577;}
+  .pill.active{background:rgba(31,157,85,.13);color:#187a41;}
+  .pill.succeeded{background:rgba(31,157,85,.13);color:#187a41;}
+  .pill.failed{background:rgba(220,53,69,.13);color:#b02a37;}
+  .pill.running{background:rgba(76,114,176,.14);color:#3a5c94;}
+
+  .link{color:var(--accent);cursor:pointer;font-weight:550;}
+  .link:hover{text-decoration:underline;}
+
+  /* Modal */
+  .modal-overlay{position:fixed;inset:0;background:rgba(15,20,35,.55);backdrop-filter:blur(2px);display:none;align-items:flex-start;justify-content:center;padding:40px 20px;z-index:100;overflow:auto;}
+  .modal-overlay.open{display:flex;}
+  .modal{background:var(--bg-card);border-radius:14px;max-width:920px;width:100%;box-shadow:0 24px 60px rgba(0,0,0,.35);animation:pop .18s ease;}
+  @keyframes pop{from{opacity:0;transform:translateY(8px) scale(.99)}to{opacity:1;transform:none}}
+  .modal-head{display:flex;justify-content:space-between;align-items:flex-start;padding:20px 24px;border-bottom:1px solid var(--border);gap:14px;position:sticky;top:0;background:var(--bg-card);border-radius:14px 14px 0 0;}
+  .modal-head h2{font-size:18px;font-weight:680;}
+  .modal-head .sub{font-size:13px;color:var(--text-secondary);margin-top:2px;}
+  .modal-close{border:none;background:#f0f3f8;width:32px;height:32px;border-radius:8px;font-size:18px;cursor:pointer;color:var(--text-secondary);flex:none;line-height:1;}
+  .modal-close:hover{background:#e3e8f0;color:var(--text-primary);}
+  .modal-body{padding:20px 24px 26px;}
+
+  .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px 22px;margin-bottom:18px;}
+  .kv .k{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);font-weight:600;}
+  .kv .v{font-size:14px;margin-top:1px;word-break:break-word;}
+  .modal h4{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-secondary);margin:20px 0 10px;font-weight:700;}
+
+  /* Timeline */
+  .timeline{position:relative;margin-left:6px;padding-left:22px;border-left:2px solid var(--border-strong);}
+  .tl-item{position:relative;padding:9px 0 9px 2px;}
+  .tl-item::before{content:"";position:absolute;left:-29px;top:14px;width:12px;height:12px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px var(--border-strong);}
+  .tl-item.t-birth::before{background:var(--ev-birth)}.tl-item.t-surgery::before{background:var(--ev-surgery)}
+  .tl-item.t-recording::before{background:var(--ev-recording)}.tl-item.t-behavior::before{background:var(--ev-behavior)}
+  .tl-item.t-husbandry::before{background:var(--ev-husbandry)}.tl-item.t-endpoint::before{background:var(--ev-endpoint)}
+  .tl-item.t-histology::before{background:var(--ev-histology)}.tl-item.t-analysis::before{background:var(--ev-analysis)}
+  .tl-item.superseded{opacity:.5;}
+  .tl-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+  .tl-date{font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums;min-width:96px;}
+  .tl-summary{font-size:13.5px;}
+  .tl-note{font-size:12.5px;color:var(--text-secondary);margin-top:2px;margin-left:106px;}
+
+  .lineage-col{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
+  .lineage-node{display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-size:12.5px;background:#fafbfe;}
+  .lineage-node .depth{font-size:10px;color:var(--text-secondary);background:#eef2f8;border-radius:5px;padding:1px 6px;font-weight:600;flex:none;}
+  .lineage-empty{font-size:13px;color:var(--text-secondary);padding:12px;background:#fafbfe;border-radius:8px;border:1px dashed var(--border-strong);}
+
+  /* Info banner */
+  .banner{
+    background:linear-gradient(90deg,rgba(76,114,176,.08),rgba(63,167,183,.05));
+    border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;margin-bottom:var(--gap);
+    font-size:13px;color:var(--text-secondary);display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;
+  }
+  .banner b{color:var(--text-primary);}
+  .banner .link{white-space:nowrap;}
+
+  details.howto{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:0;margin-bottom:var(--gap);box-shadow:var(--shadow);}
+  details.howto summary{padding:14px 18px;cursor:pointer;font-weight:600;font-size:13.5px;list-style:none;display:flex;align-items:center;gap:8px;}
+  details.howto summary::-webkit-details-marker{display:none}
+  details.howto summary .chev{transition:transform .18s;color:var(--text-secondary);}
+  details.howto[open] summary .chev{transform:rotate(90deg);}
+  details.howto .howto-body{padding:0 18px 18px;font-size:13px;color:var(--text-secondary);line-height:1.65;}
+  details.howto code{background:#f0f3f8;padding:1px 6px;border-radius:5px;font-size:12px;font-family:ui-monospace,monospace;color:#3a5c94;}
+  details.howto pre{background:#141b2d;color:#dbe4f5;padding:14px 16px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.6;margin:10px 0;}
+
+  footer.app-footer{text-align:center;color:var(--text-secondary);font-size:12px;padding:18px 0 8px;}
+
+  @media (max-width:920px){
+    .chart-grid{grid-template-columns:1fr;}
+    .kpi-row{grid-template-columns:repeat(2,1fr);}
+    .lineage-col{grid-template-columns:1fr;}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="app-header">
+    <div class="top">
+      <div class="brand">
+        <div class="logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#8db4ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12h3l2-7 4 14 2-7h3"/><circle cx="20" cy="12" r="1.6" fill="#8db4ff"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Ephys Metadata Explorer</h1>
+          <div class="sub">Append-only event log · artifacts &amp; provenance · <span id="asof"></span></div>
+        </div>
+      </div>
+      <div class="sample-badge"><span class="dot"></span> Synthetic sample data</div>
+    </div>
+
+    <div class="filters">
+      <div class="filter-group">
+        <label for="f-species">Species</label>
+        <select id="f-species"><option value="all">All species</option></select>
+      </div>
+      <div class="filter-group">
+        <label for="f-subject">Subject</label>
+        <select id="f-subject"><option value="all">All subjects</option></select>
+      </div>
+      <div class="filter-group">
+        <label for="f-event">Event type</label>
+        <select id="f-event"><option value="all">All event types</option></select>
+      </div>
+      <div class="filter-group">
+        <label for="f-from">From (occurred)</label>
+        <input type="date" id="f-from">
+      </div>
+      <div class="filter-group">
+        <label for="f-to">To (occurred)</label>
+        <input type="date" id="f-to">
+      </div>
+      <label class="filter-toggle"><input type="checkbox" id="f-active" checked> Active only</label>
+      <button class="btn-reset" id="f-clear">Reset filters</button>
+    </div>
+  </header>
+
+  <div class="banner">
+    <span><b>Note:</b> this file is populated with a deterministic synthetic dataset that matches <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">design_docs/schema.sql</code>. No real animal or subject records are shown.</span>
+    <span class="link" id="open-howto">How do I load real data? →</span>
+  </div>
+
+  <details class="howto" id="howto">
+    <summary><span class="chev">▶</span> Loading a real database export</summary>
+    <div class="howto-body">
+      <p>The interface reads a single global object, <code>window.EPHYS_DATA</code>, with one array per table. To use live data, export the tables to JSON (server-side) and replace the generated dataset — everything else re-renders automatically.</p>
+      <p>A one-shot export from PostgreSQL:</p>
+      <pre>-- run per table, e.g. subjects:
+\copy (SELECT json_agg(t) FROM ephys.subject t) TO 'subject.json'
+-- events joined with their active-version flag, artifacts, event_input, sessions, verifications ...
+</pre>
+      <p>Then set, before the app script runs:</p>
+      <pre>window.EPHYS_DATA = {
+  people:[], probes:[], pipelines:[], storageRoots:[], species:[],
+  projects:[ /* {project_id,name,description,started_on,is_active,created_by} */ ],
+  projectMembers:[ /* {project_id, person_id, role} */ ],
+  projectArtifacts:[ /* {project_artifact_id,project_id,title,kind,content_type,
+                        uri,storage_root_id,relative_path} */ ],
+  subjects:[ /* {subject_id, project_id, species_code, ...} */ ], sessions:[],
+  events:[ /* {event_id,event_type,subject_id,session_id,occurred_at,
+               recorded_at,recorded_by,supersedes,notes,detail:{...}} */ ],
+  artifacts:[ /* {artifact_id,produced_by_event_id,storage_root_id,relative_path,
+                 checksum,size_bytes,role,format,subject_id,session_id,supersedes,
+                 verification:{status,verified_at}} */ ],
+  eventInputs:[ /* {event_id, artifact_id, role} */ ]
+};</pre>
+      <p>Field names mirror the schema columns. <code>detail</code> holds the class-table-inheritance columns for that event type (e.g. <code>recording_event.sample_rate_hz</code>). Superseded rows are detected via the <code>supersedes</code> links, exactly like the <code>event_active</code> / <code>artifact_active</code> views.</p>
+    </div>
+  </details>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="overview">Overview</button>
+    <button class="tab" data-view="projects">Projects <span class="count" id="tc-projects">0</span></button>
+    <button class="tab" data-view="subjects">Subjects <span class="count" id="tc-subjects">0</span></button>
+    <button class="tab" data-view="sessions">Sessions <span class="count" id="tc-sessions">0</span></button>
+    <button class="tab" data-view="events">Event log <span class="count" id="tc-events">0</span></button>
+    <button class="tab" data-view="artifacts">Artifacts <span class="count" id="tc-artifacts">0</span></button>
+  </nav>
+
+  <!-- OVERVIEW -->
+  <section class="view active" id="view-overview">
+    <div class="kpi-row" id="kpi-row"></div>
+    <div class="chart-grid">
+      <div class="card">
+        <h3>Events by type</h3>
+        <div class="card-sub">Active events in the current selection</div>
+        <div class="chart-wrap"><canvas id="chart-events"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Lab activity over time</h3>
+        <div class="card-sub">Events per month, with recordings highlighted</div>
+        <div class="chart-wrap"><canvas id="chart-time"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Subjects by species</h3>
+        <div class="card-sub">Cohort composition</div>
+        <div class="chart-wrap"><canvas id="chart-species"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Storage by artifact role</h3>
+        <div class="card-sub">Registered bytes on the NAS</div>
+        <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROJECTS -->
+  <section class="view" id="view-projects">
+    <div class="section-head">
+      <div><h2>Projects</h2><div class="meta" id="projects-meta"></div></div>
+      <div class="toolbar">
+        <input type="search" id="projects-search" placeholder="Search name, description, member…">
+      </div>
+    </div>
+    <div class="table-wrap" id="projects-table"></div>
+  </section>
+
+  <!-- SUBJECTS -->
+  <section class="view" id="view-subjects">
+    <div class="section-head">
+      <div><h2>Subjects</h2><div class="meta" id="subjects-meta"></div></div>
+      <div class="toolbar">
+        <input type="search" id="subjects-search" placeholder="Search ID, strain, genotype…">
+      </div>
+    </div>
+    <div class="table-wrap" id="subjects-table"></div>
+  </section>
+
+  <!-- SESSIONS -->
+  <section class="view" id="view-sessions">
+    <div class="section-head">
+      <div><h2>Sessions</h2><div class="meta" id="sessions-meta"></div></div>
+      <div class="toolbar">
+        <input type="search" id="sessions-search" placeholder="Search label, rig, path…">
+      </div>
+    </div>
+    <div class="table-wrap" id="sessions-table"></div>
+  </section>
+
+  <!-- EVENT LOG -->
+  <section class="view" id="view-events">
+    <div class="section-head">
+      <div><h2>Event log</h2><div class="meta" id="events-meta"></div></div>
+      <div class="toolbar">
+        <input type="search" id="events-search" placeholder="Search subject, notes, detail…">
+      </div>
+    </div>
+    <div class="table-wrap" id="events-table"></div>
+  </section>
+
+  <!-- ARTIFACTS -->
+  <section class="view" id="view-artifacts">
+    <div class="section-head">
+      <div><h2>Artifacts</h2><div class="meta" id="artifacts-meta"></div></div>
+      <div class="toolbar">
+        <select id="artifacts-role"><option value="all">All roles</option></select>
+        <select id="artifacts-verif">
+          <option value="all">Any verification</option>
+          <option value="ok">Verified ok</option>
+          <option value="missing">Missing</option>
+          <option value="mismatch">Mismatch</option>
+        </select>
+        <input type="search" id="artifacts-search" placeholder="Search path, format, checksum…">
+      </div>
+    </div>
+    <div class="table-wrap" id="artifacts-table"></div>
+  </section>
+
+  <footer class="app-footer">
+    Ephys Metadata Explorer · self-contained &amp; offline · data as of <span id="asof2"></span> ·
+    generated to match <code style="font-family:ui-monospace,monospace">design_docs/schema.sql</code>
+  </footer>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div><h2 id="modal-title"></h2><div class="sub" id="modal-sub"></div></div>
+      <button class="modal-close" id="modal-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   Synthetic data generator — matches design_docs/schema.sql
+   Deterministic (seeded PRNG) so the dataset is stable across reloads.
+   ============================================================================ */
+(function(){
+  "use strict";
+
+  const NOW = Date.parse('2026-07-02T12:00:00Z');
+  const DAY = 86400000;
+
+  // -- seeded PRNG (mulberry32) --------------------------------------------
+  let _s = 0x9e3779b9 ^ 20260702;
+  function rnd(){
+    _s |= 0; _s = _s + 0x6D2B79F5 | 0;
+    let t = Math.imul(_s ^ _s >>> 15, 1 | _s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+  const ri = (a,b)=> a + Math.floor(rnd()*(b-a+1));
+  const rf = (a,b)=> a + rnd()*(b-a);
+  const pick = a => a[Math.floor(rnd()*a.length)];
+  const chance = p => rnd() < p;
+  function pickW(pairs){ let r=rnd(); for(const [v,w] of pairs){ if((r-=w)<=0) return v; } return pairs[pairs.length-1][0]; }
+  const HEX='0123456789abcdef';
+  function hex(n){ let s=''; for(let i=0;i<n;i++) s+=HEX[Math.floor(rnd()*16)]; return s; }
+  function uuid(){ return `${hex(8)}-${hex(4)}-4${hex(3)}-${'89ab'[ri(0,3)]}${hex(3)}-${hex(12)}`; }
+  const iso = t => new Date(t).toISOString();
+  const gitsha = ()=> hex(7);
+
+  // -- reference / lookup tables -------------------------------------------
+  const species = [
+    {code:'meriones_unguiculatus', common_name:'Mongolian gerbil'},
+    {code:'mus_musculus', common_name:'House mouse'},
+    {code:'rattus_norvegicus', common_name:'Norway rat'}
+  ];
+
+  const people = [
+    {person_id:uuid(), full_name:'M. Caras',        email:'caras@example.edu',   role:'PI',                    is_active:true},
+    {person_id:uuid(), full_name:'Priya Nadkarni',  email:'pnadkarni@example.edu',role:'Postdoc',              is_active:true},
+    {person_id:uuid(), full_name:'Daniel Owusu',    email:'dowusu@example.edu',  role:'Graduate student',      is_active:true},
+    {person_id:uuid(), full_name:'Elena Rossi',     email:'erossi@example.edu',  role:'Graduate student',      is_active:true},
+    {person_id:uuid(), full_name:'Marcus Bui',      email:'mbui@example.edu',    role:'Research technician',   is_active:true},
+    {person_id:uuid(), full_name:'Hana Farouk',     email:null,                  role:'Undergraduate',         is_active:false}
+  ];
+  const PI=people[0], surgeons=[people[0],people[1],people[2]];
+
+  // -- projects (unique names; every subject belongs to one) ----------------
+  const projects = [
+    {project_id:uuid(), name:'Gerbil AC plasticity',       description:'Auditory-cortex plasticity during perceptual learning in gerbils', started_on:'2025-02-03', is_active:true,  created_by:PI.person_id},
+    {project_id:uuid(), name:'Cortical AM coding',          description:'Amplitude-modulation coding across cortical depth',                started_on:'2025-06-17', is_active:true,  created_by:PI.person_id},
+    {project_id:uuid(), name:'Thalamocortical development', description:'Developmental refinement of thalamocortical circuits',             started_on:'2024-09-10', is_active:true,  created_by:PI.person_id},
+    {project_id:uuid(), name:'Behavioral training pilots',  description:'Method development for go/nogo appetitive training',               started_on:'2026-01-20', is_active:false, created_by:PI.person_id}
+  ];
+
+  // membership is many-to-many; the PI is on every project, plus a rotating subset.
+  const projectMembers = [];
+  projects.forEach((pr,i)=>{
+    projectMembers.push({project_id:pr.project_id, person_id:PI.person_id, role:'PI'});
+    people.slice(1).forEach((p,j)=>{
+      if((i+j)%2===0 || chance(0.35))
+        projectMembers.push({project_id:pr.project_id, person_id:p.person_id,
+          role: p.role==='Postdoc' ? 'lead' : 'member'});
+    });
+  });
+
+  // project-level documents: NAS files of varied types plus Google Docs/Sheets & links.
+  const projectArtifacts = [];
+  function addProjArt(pr,o){
+    projectArtifacts.push(Object.assign({
+      project_artifact_id:uuid(), project_id:pr.project_id,
+      content_type:null, uri:null, storage_root_id:null, relative_path:null,
+      description:'', created_at:iso(Date.parse(pr.started_on)+ri(1,60)*DAY),
+      created_by:pick(people).person_id
+    }, o));
+  }
+  projects.forEach(pr=>{
+    const slug = pr.name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+    addProjArt(pr,{title:'Project aims & hypotheses', kind:'google_doc',   content_type:'application/vnd.google-apps.document',    uri:`https://docs.google.com/document/d/${hex(16)}/edit`});
+    addProjArt(pr,{title:'Animal & session roster',   kind:'google_sheet',  content_type:'application/vnd.google-apps.spreadsheet', uri:`https://docs.google.com/spreadsheets/d/${hex(16)}/edit`});
+    if(chance(0.8)) addProjArt(pr,{title:'Surgery protocol', kind:'file', content_type:'pdf',  storage_root_id:1, relative_path:`projects/${slug}/protocol.pdf`});
+    if(chance(0.6)) addProjArt(pr,{title:'Analysis notes',   kind:'file', content_type:'md',   storage_root_id:1, relative_path:`projects/${slug}/analysis-notes.md`});
+    if(chance(0.5)) addProjArt(pr,{title:'Grant narrative',  kind:'file', content_type:'docx', storage_root_id:2, relative_path:`projects/${slug}/grant.docx`});
+    if(chance(0.4)) addProjArt(pr,{title:'Preregistration',  kind:'url',   content_type:null,   uri:`https://osf.io/${hex(5)}/`});
+  });
+
+  const probes = [
+    {probe_id:uuid(), manufacturer:'Cambridge NeuroTech', model:'ASSY-236 H5', n_channels:64,  description:'64-ch acute silicon probe'},
+    {probe_id:uuid(), manufacturer:'NeuroNexus',          model:'A1x32-Poly2', n_channels:32,  description:'32-ch linear array'},
+    {probe_id:uuid(), manufacturer:'IMEC',                model:'Neuropixels 1.0', n_channels:384, description:'High-density CMOS probe'},
+    {probe_id:uuid(), manufacturer:'Cambridge NeuroTech', model:'ASSY-158 H3', n_channels:64,  description:'64-ch chronic probe'}
+  ];
+
+  const pipelines = [
+    {pipeline_id:uuid(), name:'kilosort4',        description:'Spike sorting',              repo_url:'https://github.com/MouseLand/Kilosort'},
+    {pipeline_id:uuid(), name:'spikeinterface',   description:'Sorting + QC wrapper',       repo_url:'https://github.com/SpikeInterface/spikeinterface'},
+    {pipeline_id:uuid(), name:'am-detection',     description:'AM detection neurometrics',  repo_url:'https://github.com/caraslab/am-detection'},
+    {pipeline_id:uuid(), name:'lfp-bandpower',    description:'LFP spectral analysis',      repo_url:'https://github.com/caraslab/lfp-bandpower'}
+  ];
+
+  const storageRoots = [
+    {root_id:1, name:'nas-main',    description:'Primary acquisition NAS'},
+    {root_id:2, name:'nas-archive', description:'Cold archive'}
+  ];
+
+  const eventTypeMeta = [
+    {code:'birth',     label:'Birth'},
+    {code:'surgery',   label:'Surgery'},
+    {code:'recording', label:'Recording'},
+    {code:'behavior',  label:'Behavior / training'},
+    {code:'husbandry', label:'Husbandry / health'},
+    {code:'endpoint',  label:'Endpoint / euthanasia'},
+    {code:'histology', label:'Histology'},
+    {code:'analysis',  label:'Analysis run'}
+  ];
+  const roleMeta = ['raw','spikes','lfp','waveforms','video','figure','report','derived','other'];
+
+  // -- output collections ---------------------------------------------------
+  const subjects=[], sessions=[], events=[], artifacts=[], eventInputs=[];
+
+  function addEvent(type, o){
+    const id = uuid();
+    const rec = o.occurred_at + ri(0,4)*DAY + ri(0,8)*3600000;
+    events.push({
+      event_id:id, event_type:type,
+      subject_id:o.subject_id||null, session_id:o.session_id||null,
+      occurred_at:iso(o.occurred_at), recorded_at:iso(Math.min(rec,NOW)),
+      recorded_by:(o.recorded_by||PI).person_id,
+      supersedes:o.supersedes||null, notes:o.notes||'',
+      detail:o.detail||{}
+    });
+    return id;
+  }
+  function addArtifact(o){
+    const id = uuid();
+    const vstat = pickW([['ok',0.86],['missing',0.07],['mismatch',0.07]]);
+    artifacts.push({
+      artifact_id:id, produced_by_event_id:o.event_id,
+      storage_root_id:o.root||1, relative_path:o.path,
+      checksum:hex(64), checksum_algo:'sha256',
+      size_bytes:o.size, role:o.role, format:o.format,
+      subject_id:o.subject_id||null, session_id:o.session_id||null,
+      supersedes:o.supersedes||null, created_at:iso(o.created_at),
+      created_by:(o.created_by||PI).person_id,
+      verification:{status:vstat, verified_at:iso(Math.min(o.created_at+ri(5,120)*DAY,NOW))}
+    });
+    return id;
+  }
+  const addInput=(event_id,artifact_id,role)=> eventInputs.push({event_id,artifact_id,role});
+
+  // -- subject roster -------------------------------------------------------
+  const strains = {
+    meriones_unguiculatus:[null,'wild-type'],
+    mus_musculus:['C57BL/6J','CBA/CaJ','Thy1-GCaMP6s'],
+    rattus_norvegicus:['Long-Evans','Sprague-Dawley']
+  };
+  const sources = ['bred_in_house','bred_in_house','bred_in_house','vendor:Charles River','vendor:Envigo'];
+  const targets = ['A1 (primary auditory cortex)','AAF','MGB (medial geniculate)','IC (inferior colliculus)'];
+  const stagesSeq = ['naive','training','psychometric','expert'];
+
+  const roster = [];
+  for(let i=0;i<18;i++) roster.push({sp:'meriones_unguiculatus', pre:'GERB'});
+  for(let i=0;i<4;i++)  roster.push({sp:'mus_musculus', pre:'MOUSE'});
+  for(let i=0;i<2;i++)  roster.push({sp:'rattus_norvegicus', pre:'RAT'});
+
+  let gerbN=40, mouseN=200, ratN=15;
+  roster.forEach(r=>{
+    const n = r.sp==='meriones_unguiculatus' ? gerbN++ : r.sp==='mus_musculus' ? mouseN++ : ratN++;
+    const sid = `${r.pre}${String(n).padStart(3,'0')}`;
+    const inHouse = chance(0.7);
+    const ageDays = ri(120, 620);
+    const dob = NOW - ageDays*DAY;
+    const project = r.sp==='meriones_unguiculatus' ? pick([projects[0],projects[1]])
+                  : r.sp==='mus_musculus'          ? projects[2]
+                  :                                  pick([projects[1],projects[3]]);
+    subjects.push({
+      subject_id:sid, project_id:project.project_id, species_code:r.sp,
+      sex: pickW([['M',0.46],['F',0.46],['U',0.08]]),
+      strain: pick(strains[r.sp]),
+      genotype: r.sp==='mus_musculus' ? pick(['+/+','GCaMP6s/+','Thy1+/-']) : null,
+      source: inHouse ? 'bred_in_house' : pick(sources.filter(s=>s!=='bred_in_house')),
+      date_of_birth: inHouse ? iso(dob).slice(0,10) : null,
+      notes: chance(0.2) ? pick(['Docile handler.','Fast learner.','Re-derived cohort.','Backup animal.']) : '',
+      created_at: iso(dob + 3*DAY),
+      created_by: PI.person_id,
+      _dob: dob, _inHouse: inHouse, _pre:r.pre
+    });
+  });
+
+  // -- per-subject lifecycle ------------------------------------------------
+  subjects.forEach(subj=>{
+    const sid = subj.subject_id;
+    const dob = subj._dob;
+    const probe = pick(probes);
+    const target = pick(targets);
+    const hemi = pick(['L','R','bilateral']);
+
+    // birth event (in-house only)
+    if(subj._inHouse){
+      addEvent('birth', {subject_id:sid, occurred_at:dob, recorded_by:pick([people[4],people[2]]),
+        detail:{ litter_id:`L${new Date(dob).getUTCFullYear()}-${String(new Date(dob).getUTCMonth()+1).padStart(2,'0')}`,
+                 birth_weight_g: subj.species_code==='meriones_unguiculatus' ? +rf(2.5,4).toFixed(2) : +rf(1.2,1.8).toFixed(2) },
+        notes:'' });
+    }
+
+    // husbandry weights from weaning to ~surgery
+    let t = dob + 24*DAY;
+    let w = subj.species_code==='meriones_unguiculatus' ? rf(28,34) : subj.species_code==='mus_musculus' ? rf(9,12) : rf(45,60);
+    const adult = subj.species_code==='meriones_unguiculatus' ? rf(62,78) : subj.species_code==='mus_musculus' ? rf(24,30) : rf(320,420);
+    const surgeryAt = dob + ri(58, 96)*DAY;
+    let waterRestricted=false;
+    while(t < Math.min(surgeryAt, NOW)){
+      w = Math.min(adult, w + rf(1.2, 3.4));
+      addEvent('husbandry', {subject_id:sid, occurred_at:t, recorded_by:pick([people[4],people[2],people[3]]),
+        detail:{measure:'weight', weight_g:+w.toFixed(1), health_status:pickW([['normal',0.9],['monitor',0.1]])}});
+      // begin water restriction ~2 wks before surgery
+      if(!waterRestricted && t > surgeryAt - 18*DAY){
+        waterRestricted=true;
+        addEvent('husbandry', {subject_id:sid, occurred_at:t+2*DAY, recorded_by:pick([people[3],people[4]]),
+          detail:{measure:'water_restriction', water_ml:+rf(1.0,2.5).toFixed(1), health_status:'normal'},
+          notes:'Started scheduled water access for behavior.'});
+      }
+      t += ri(11,17)*DAY;
+    }
+
+    // surgery
+    if(surgeryAt < NOW){
+      addEvent('surgery', {subject_id:sid, occurred_at:surgeryAt, recorded_by:pick(surgeons),
+        detail:{ procedure:pick(['Headpost + craniotomy','Chronic probe implant','Headpost implant']),
+                 surgeon_id:pick(surgeons).person_id, anesthesia:pick(['isoflurane','ketamine/xylazine']),
+                 target_region:target, hemisphere:hemi,
+                 stereotax_ap_mm:+rf(-4.8,-2.2).toFixed(2), stereotax_ml_mm:+rf(3.2,5.6).toFixed(2),
+                 stereotax_dv_mm:+rf(0.8,3.4).toFixed(2), probe_id:probe.probe_id,
+                 outcome:pickW([['recovered',0.9],['complication',0.1]]) },
+        notes:pick(['Clean craniotomy.','Good probe insertion.','Minor bleeding, controlled.',''])});
+    }
+
+    // recording sessions
+    const nSessions = surgeryAt < NOW ? ri(2,5) : 0;
+    let st = surgeryAt + ri(8,16)*DAY;
+    for(let s=0; s<nSessions && st<NOW; s++){
+      const label = `${iso(st).slice(0,10)}_am-detection`;
+      const session_id = uuid();
+      const relPath = `${sid}/${label}`;
+      const durS = ri(1500, 5400);
+      const startedAt = st + 10*3600000;
+      sessions.push({
+        session_id, subject_id:sid, label,
+        storage_root_id:1, relative_path:relPath,
+        started_at:iso(startedAt), ended_at:iso(startedAt + durS*1000),
+        rig:pick(['rig-A','rig-B']),
+        notes: chance(0.25) ? pick(['Quiet session.','Some motion artifact early on.','Excellent unit yield.']) : '',
+        created_by:PI.person_id
+      });
+
+      const stage = stagesSeq[Math.min(s, stagesSeq.length-1)];
+      const perf = stage==='naive'?rf(0.5,0.7):stage==='training'?rf(0.65,0.82):stage==='psychometric'?rf(0.78,0.9):rf(0.88,0.97);
+      // behavior
+      addEvent('behavior', {subject_id:sid, session_id, occurred_at:startedAt, recorded_by:pick([people[2],people[3]]),
+        detail:{ task:'AM detection', paradigm:'go/nogo appetitive', stage,
+                 trials_completed:ri(180,620), performance:+perf.toFixed(3), reward:'water' }});
+
+      // recording (occasionally superseded to demo corrections)
+      const modality = pickW([['ephys',0.72],['multimodal',0.2],['behavior',0.08]]);
+      const acq = pick(['intan_rhx','open_ephys']);
+      const recDetailBase = ()=>({ acquisition_system_code:acq, probe_id:probe.probe_id, modality,
+        sample_rate_hz:30000, n_channels:probe.n_channels, duration_s:durS,
+        stimulus_protocol:'AM_broadband_noise_0-100pct_depth', hardware_config:{gain:'x1000', ref:'tip'} });
+
+      let recId;
+      if(chance(0.12)){
+        // wrong sample rate first, then corrected
+        const wrong = addEvent('recording', {subject_id:sid, session_id, occurred_at:startedAt, recorded_by:pick([people[2],people[4]]),
+          detail:Object.assign(recDetailBase(),{sample_rate_hz:20000}), notes:'Logged during acquisition.'});
+        recId = addEvent('recording', {subject_id:sid, session_id, occurred_at:startedAt, recorded_by:pick([people[1],people[2]]),
+          detail:recDetailBase(), supersedes:wrong, notes:'Corrected sample rate (30 kHz).'});
+      } else {
+        recId = addEvent('recording', {subject_id:sid, session_id, occurred_at:startedAt, recorded_by:pick([people[2],people[3],people[4]]),
+          detail:recDetailBase(), notes:''});
+      }
+
+      // raw artifact (size ~ channels * fs * dur * 2 bytes)
+      const rawSize = Math.round(probe.n_channels * 30000 * durS * 2);
+      const rawId = addArtifact({event_id:recId, path:`${relPath}/raw/continuous.dat`, format:'dat', role:'raw',
+        size:rawSize, subject_id:sid, session_id, created_at:startedAt+durS*1000, created_by:pick([people[4],people[2]])});
+      if(modality==='multimodal'||modality==='behavior'){
+        addArtifact({event_id:recId, path:`${relPath}/video/session.mp4`, format:'mp4', role:'video',
+          size:ri(4e8,2.4e9), subject_id:sid, session_id, created_at:startedAt+durS*1000, created_by:people[4]});
+      }
+
+      // analysis: spike sorting consumes raw -> spikes/waveforms/lfp
+      const sortAt = startedAt + ri(1,6)*DAY;
+      const ksStatus = pickW([['succeeded',0.85],['failed',0.08],['running',0.07]]);
+      const sortId = addEvent('analysis', {subject_id:sid, session_id, occurred_at:sortAt, recorded_by:pick([people[1],people[2],people[3]]),
+        detail:{ pipeline_id:pipelines[0].pipeline_id, pipeline_name:'kilosort4', code_version:gitsha(),
+                 parameters:{Th:[9,3], nblocks:5, spkTh:-6}, environment:{os:'Ubuntu 22.04', gpu:'RTX 4090', python:'3.11'},
+                 started_at:iso(sortAt), finished_at:iso(sortAt+ri(1,6)*3600000), status:ksStatus },
+        notes: ksStatus==='failed' ? 'Drift correction diverged; rerun queued.' : ''});
+      addInput(sortId, rawId, 'raw');
+      if(ksStatus==='succeeded'){
+        const spikesId = addArtifact({event_id:sortId, path:`${relPath}/ks4/spike_times.npy`, format:'npy', role:'spikes',
+          size:ri(8e6,7e7), subject_id:sid, session_id, created_at:sortAt+3*3600000, created_by:pick([people[1],people[2]])});
+        addArtifact({event_id:sortId, path:`${relPath}/ks4/templates.npy`, format:'npy', role:'waveforms',
+          size:ri(2e7,1.2e8), subject_id:sid, session_id, created_at:sortAt+3*3600000, created_by:pick([people[1],people[2]])});
+        if(chance(0.7)){
+          addArtifact({event_id:sortId, path:`${relPath}/lfp/lfp_1kHz.npy`, format:'npy', role:'lfp',
+            size:ri(3e8,1.4e9), subject_id:sid, session_id, created_at:sortAt+3*3600000, created_by:pick([people[1],people[3]])});
+        }
+        // downstream neurometric analysis consumes spikes -> figure + report
+        if(chance(0.75)){
+          const figAt = sortAt + ri(1,10)*DAY;
+          const figEvt = addEvent('analysis', {subject_id:sid, session_id, occurred_at:figAt, recorded_by:pick([people[1],people[3]]),
+            detail:{ pipeline_id:pipelines[2].pipeline_id, pipeline_name:'am-detection', code_version:gitsha(),
+                     parameters:{window_ms:[0,1000], smoothing:'gaussian', bootstrap:1000},
+                     environment:{os:'macOS 14', matlab:'R2025a'}, started_at:iso(figAt),
+                     finished_at:iso(figAt+ri(1,3)*3600000), status:'succeeded' }});
+          addInput(figEvt, spikesId, 'spikes');
+          addArtifact({event_id:figEvt, path:`${relPath}/figures/neurometric_${stage}.png`, format:'png', role:'figure',
+            size:ri(2e5,1.8e6), subject_id:sid, session_id, created_at:figAt+3600000, created_by:pick([people[1],people[3]])});
+          if(chance(0.4)){
+            addArtifact({event_id:figEvt, path:`${relPath}/reports/session_report.html`, format:'html', role:'report',
+              size:ri(4e4,4e5), subject_id:sid, session_id, created_at:figAt+3600000, created_by:pick([people[1],people[3]])});
+          }
+        }
+      }
+
+      st += ri(6,15)*DAY;
+    }
+
+    // endpoint + histology for a subset (older, in-house-heavy)
+    const endpointAt = st + ri(3,20)*DAY;
+    const doEndpoint = nSessions>0 && chance(0.55) && endpointAt < NOW;
+    if(doEndpoint){
+      addEvent('endpoint', {subject_id:sid, occurred_at:endpointAt, recorded_by:pick(surgeons),
+        detail:{ method:pick(['transcardial perfusion','anesthetic overdose']),
+                 perfusion_fixative:'4% PFA', tissue_collected:true,
+                 disposition:'brain collected for histology' },
+        notes:pick(['Perfusion clean.','Probe track visible on dissection.',''])});
+
+      if(chance(0.85)){
+        const histAt = endpointAt + ri(5,40)*DAY;
+        if(histAt < NOW){
+          const histId = addEvent('histology', {subject_id:sid, occurred_at:histAt, recorded_by:pick([people[3],people[4]]),
+            detail:{ technique:pick(['cryosection 40µm','vibratome 100µm']), target_region:target,
+                     stain:pick(['DiI + DAPI','NeuN + DAPI','Nissl']), microscope:pick(['confocal','epifluorescence']) }});
+          addArtifact({event_id:histId, path:`${sid}/histology/track_reconstruction.png`, format:'png', role:'figure',
+            size:ri(1e6,9e6), subject_id:sid, created_at:histAt+2*DAY, created_by:pick([people[3],people[4]])});
+        }
+      }
+    }
+  });
+
+  // expose
+  window.EPHYS_DATA = {
+    people, probes, pipelines, storageRoots, species,
+    projects, projectMembers, projectArtifacts,
+    eventTypeMeta, roleMeta, subjects, sessions, events, artifacts, eventInputs, NOW
+  };
+})();
+</script>
+
+<script>
+/* ============================================================================
+   Application — rendering, filtering, charts, drill-downs
+   ============================================================================ */
+(function(){
+  "use strict";
+  const D = window.EPHYS_DATA;
+  const NOW = D.NOW;
+
+  // ---- lookups ----
+  const personById = new Map(D.people.map(p=>[p.person_id,p]));
+  const probeById  = new Map(D.probes.map(p=>[p.probe_id,p]));
+  const subjectById= new Map(D.subjects.map(s=>[s.subject_id,s]));
+  const sessionById= new Map(D.sessions.map(s=>[s.session_id,s]));
+  const rootById   = new Map(D.storageRoots.map(r=>[r.root_id,r]));
+  const speciesByCode = new Map(D.species.map(s=>[s.code,s]));
+  const eventById  = new Map(D.events.map(e=>[e.event_id,e]));
+  const artifactById = new Map(D.artifacts.map(a=>[a.artifact_id,a]));
+  const etLabel = new Map(D.eventTypeMeta.map(e=>[e.code,e.label]));
+  const projectById = new Map((D.projects||[]).map(p=>[p.project_id,p]));
+
+  // project membership + documents, grouped for quick lookup
+  const membersByProject = new Map();   // project_id -> [person_id]
+  (D.projectMembers||[]).forEach(m=>{
+    if(!membersByProject.has(m.project_id)) membersByProject.set(m.project_id,[]);
+    membersByProject.get(m.project_id).push(m);
+  });
+  const docsByProject = new Map();      // project_id -> [projectArtifact]
+  (D.projectArtifacts||[]).forEach(a=>{
+    if(!docsByProject.has(a.project_id)) docsByProject.set(a.project_id,[]);
+    docsByProject.get(a.project_id).push(a);
+  });
+  const subjectCountByProject = new Map();
+  D.subjects.forEach(s=>{ if(s.project_id) subjectCountByProject.set(s.project_id,(subjectCountByProject.get(s.project_id)||0)+1); });
+  const projectName = id => (projectById.get(id)||{}).name || '—';
+
+  // superseded sets
+  const supersededEvents = new Set(D.events.filter(e=>e.supersedes).map(e=>e.supersedes));
+  const supersededArtifacts = new Set(D.artifacts.filter(a=>a.supersedes).map(a=>a.supersedes));
+  const isEventActive = e => !supersededEvents.has(e.event_id);
+  const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
+
+  // provenance edges (produces + consumes), like ephys.provenance_edge
+  const inputsByEvent = new Map();      // event_id -> [artifact_id]
+  const consumersByArtifact = new Map();// artifact_id -> [event_id]
+  D.eventInputs.forEach(ei=>{
+    if(!inputsByEvent.has(ei.event_id)) inputsByEvent.set(ei.event_id,[]);
+    inputsByEvent.get(ei.event_id).push(ei.artifact_id);
+    if(!consumersByArtifact.has(ei.artifact_id)) consumersByArtifact.set(ei.artifact_id,[]);
+    consumersByArtifact.get(ei.artifact_id).push(ei.event_id);
+  });
+  const artifactsByEvent = new Map();
+  D.artifacts.forEach(a=>{
+    if(!artifactsByEvent.has(a.produced_by_event_id)) artifactsByEvent.set(a.produced_by_event_id,[]);
+    artifactsByEvent.get(a.produced_by_event_id).push(a);
+  });
+
+  // subject_current: latest active weight + endpoint status
+  const subjectCurrent = new Map();
+  D.subjects.forEach(s=> subjectCurrent.set(s.subject_id, {latest_weight_g:null, latest_weight_at:null, is_endpointed:false, endpoint_at:null}));
+  D.events.forEach(e=>{
+    if(!isEventActive(e) || !e.subject_id) return;
+    const sc = subjectCurrent.get(e.subject_id); if(!sc) return;
+    if(e.event_type==='husbandry' && e.detail && e.detail.weight_g!=null){
+      if(!sc.latest_weight_at || e.occurred_at > sc.latest_weight_at){ sc.latest_weight_g=e.detail.weight_g; sc.latest_weight_at=e.occurred_at; }
+    }
+    if(e.event_type==='endpoint'){
+      if(!sc.endpoint_at || e.occurred_at > sc.endpoint_at){ sc.is_endpointed=true; sc.endpoint_at=e.occurred_at; }
+    }
+  });
+  // event / artifact counts per subject & session
+  const eventCountBySubject = new Map(), sessionCountBySubject = new Map();
+  D.events.forEach(e=>{ if(e.subject_id && isEventActive(e)) eventCountBySubject.set(e.subject_id,(eventCountBySubject.get(e.subject_id)||0)+1); });
+  D.sessions.forEach(s=> sessionCountBySubject.set(s.subject_id,(sessionCountBySubject.get(s.subject_id)||0)+1));
+  const eventCountBySession = new Map(), artifactCountBySession = new Map();
+  D.events.forEach(e=>{ if(e.session_id && isEventActive(e)) eventCountBySession.set(e.session_id,(eventCountBySession.get(e.session_id)||0)+1); });
+  D.artifacts.forEach(a=>{ if(a.session_id) artifactCountBySession.set(a.session_id,(artifactCountBySession.get(a.session_id)||0)+1); });
+
+  // ---- formatting ----
+  const ETYPES = ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis'];
+  const CSSVAR = getComputedStyle(document.documentElement);
+  const etColor = t => CSSVAR.getPropertyValue('--ev-'+t).trim();
+  function fmtBytes(n){
+    if(n==null) return '—';
+    const u=['B','KB','MB','GB','TB','PB']; let i=0,v=n;
+    while(v>=1024&&i<u.length-1){v/=1024;i++;}
+    return (v>=100||i===0?v.toFixed(0):v.toFixed(1))+' '+u[i];
+  }
+  function fmtNum(n){ return n==null?'—':n.toLocaleString(); }
+  const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const fmtDate = iso => iso ? iso.slice(0,10) : '—';
+  const fmtDateTime = iso => iso ? iso.slice(0,10)+' '+iso.slice(11,16) : '—';
+  const personName = id => { const p=personById.get(id); return p?p.full_name:'—'; };
+  const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
+  function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
+  function fmtDur(s){ if(s==null) return '—'; const h=Math.floor(s/3600), m=Math.round((s%3600)/60); return h?`${h}h ${m}m`:`${m}m`; }
+
+  function eventSummary(e){
+    const d=e.detail||{};
+    switch(e.event_type){
+      case 'birth': return `Litter ${esc(d.litter_id||'—')}${d.birth_weight_g?`, ${d.birth_weight_g} g`:''}`;
+      case 'surgery': return `${esc(d.procedure||'Surgery')} · ${esc(d.target_region||'')} ${d.hemisphere?'('+d.hemisphere+')':''}`;
+      case 'recording': return `${esc((d.modality||'ephys'))} · ${d.n_channels||'?'} ch @ ${d.sample_rate_hz? (d.sample_rate_hz/1000)+' kHz':'?'} · ${fmtDur(d.duration_s)}`;
+      case 'behavior': return `${esc(d.task||'')} · ${esc(d.stage||'')} · ${d.trials_completed||0} trials${d.performance!=null?` · perf ${d.performance}`:''}`;
+      case 'husbandry': return d.measure==='weight' ? `Weight ${d.weight_g} g` : `${esc(d.measure)}${d.water_ml?` · ${d.water_ml} mL`:''}`;
+      case 'endpoint': return `${esc(d.method||'')}${d.perfusion_fixative?` · ${esc(d.perfusion_fixative)}`:''}`;
+      case 'histology': return `${esc(d.technique||'')} · ${esc(d.stain||'')} · ${esc(d.target_region||'')}`;
+      case 'analysis': return `${esc(d.pipeline_name||'pipeline')} · <span class="pill ${d.status||''}">${esc(d.status||'—')}</span>`;
+      default: return '';
+    }
+  }
+
+  // ---- filters / state ----
+  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true };
+  let currentView='overview';
+
+  function passSpecies(subjectId){
+    if(F.species==='all') return true;
+    const s=subjectById.get(subjectId); return s && s.species_code===F.species;
+  }
+  function withinDate(iso){
+    if(!iso) return (!F.from && !F.to);
+    const d=iso.slice(0,10);
+    if(F.from && d<F.from) return false;
+    if(F.to && d>F.to) return false;
+    return true;
+  }
+
+  function filteredEvents(){
+    return D.events.filter(e=>{
+      if(F.activeOnly && !isEventActive(e)) return false;
+      if(F.event!=='all' && e.event_type!==F.event) return false;
+      if(F.subject!=='all' && e.subject_id!==F.subject) return false;
+      if(!passSpecies(e.subject_id)) return false;
+      if((F.from||F.to) && !withinDate(e.occurred_at)) return false;
+      return true;
+    });
+  }
+  function filteredSubjects(){
+    return D.subjects.filter(s=>{
+      if(F.species!=='all' && s.species_code!==F.species) return false;
+      if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      return true;
+    });
+  }
+  function filteredSessions(){
+    return D.sessions.filter(s=>{
+      if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      if(!passSpecies(s.subject_id)) return false;
+      if((F.from||F.to) && !withinDate(s.started_at)) return false;
+      return true;
+    });
+  }
+  function filteredArtifacts(){
+    return D.artifacts.filter(a=>{
+      if(F.activeOnly && !isArtifactActive(a)) return false;
+      if(F.subject!=='all' && a.subject_id!==F.subject) return false;
+      if(!passSpecies(a.subject_id)) return false;
+      if((F.from||F.to) && !withinDate(a.created_at)) return false;
+      return true;
+    });
+  }
+
+  /* ------------------------------------------------------------------ KPIs */
+  function renderKPIs(){
+    const evs = filteredEvents();
+    const subs = filteredSubjects();
+    const sess = filteredSessions();
+    const arts = filteredArtifacts();
+    const recs = evs.filter(e=>e.event_type==='recording');
+    const recHours = recs.reduce((a,e)=> a + ((e.detail&&e.detail.duration_s)||0)/3600, 0);
+    const activeSubs = subs.filter(s=>!subjectCurrent.get(s.subject_id).is_endpointed).length;
+    const bytes = arts.reduce((a,x)=>a+(x.size_bytes||0),0);
+    const analyses = evs.filter(e=>e.event_type==='analysis').length;
+    const cards = [
+      {c:'c6', label:'Subjects',   value:subs.length,               sub:`${activeSubs} active · ${subs.length-activeSubs} endpointed`},
+      {c:'c1', label:'Sessions',   value:sess.length,               sub:`${recs.length} recording events`},
+      {c:'c2', label:'Events',     value:evs.length,                sub:`${F.activeOnly?'active only':'incl. superseded'}`},
+      {c:'c3', label:'Recording',  value:recHours.toFixed(1)+' h',  sub:`${recs.length} recordings`},
+      {c:'c4', label:'Analyses',   value:analyses,                  sub:`spike-sorting + neurometrics`},
+      {c:'c5', label:'Artifacts',  value:arts.length,               sub:`${fmtBytes(bytes)} on NAS`}
+    ];
+    document.getElementById('kpi-row').innerHTML = cards.map(c=>`
+      <div class="kpi-card ${c.c}">
+        <div class="kpi-label">${c.label}</div>
+        <div class="kpi-value">${typeof c.value==='number'?fmtNum(c.value):c.value}</div>
+        <div class="kpi-sub">${c.sub}</div>
+      </div>`).join('');
+  }
+
+  /* ---------------------------------------------------------------- charts */
+  const charts={};
+  Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+  Chart.defaults.font.size = 12;
+  Chart.defaults.color = '#6b7688';
+
+  function buildCharts(){
+    charts.events = new Chart(document.getElementById('chart-events'),{
+      type:'doughnut',
+      data:{labels:[],datasets:[{data:[],backgroundColor:[],borderColor:'#fff',borderWidth:2}]},
+      options:{responsive:true,maintainAspectRatio:false,cutout:'62%',
+        plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:12,boxWidth:8}},
+          tooltip:{callbacks:{label:c=>{const t=c.dataset.data.reduce((a,b)=>a+b,0);return ` ${c.label}: ${c.parsed} (${t?(c.parsed/t*100).toFixed(0):0}%)`;}}}}}
+    });
+    charts.species = new Chart(document.getElementById('chart-species'),{
+      type:'doughnut',
+      data:{labels:[],datasets:[{data:[],backgroundColor:['#4C72B0','#DD8452','#55A868','#8172B3'],borderColor:'#fff',borderWidth:2}]},
+      options:{responsive:true,maintainAspectRatio:false,cutout:'62%',
+        plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:12,boxWidth:8}},
+          tooltip:{callbacks:{label:c=>` ${c.label}: ${c.parsed}`}}}}
+    });
+    charts.storage = new Chart(document.getElementById('chart-storage'),{
+      type:'bar',
+      data:{labels:[],datasets:[{label:'GB',data:[],backgroundColor:'#4C72B0CC',borderColor:'#4C72B0',borderWidth:1,borderRadius:4}]},
+      options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${fmtBytes(c.raw*1073741824)}`}}},
+        scales:{x:{beginAtZero:true,ticks:{callback:v=>v+' GB'},grid:{color:'#f0f3f8'}},y:{grid:{display:false}}}}
+    });
+    charts.time = new Chart(document.getElementById('chart-time'),{
+      type:'line',
+      data:{labels:[],datasets:[
+        {label:'All events',data:[],borderColor:'#4C72B0',backgroundColor:'#4C72B022',fill:true,tension:.3,pointRadius:2,borderWidth:2},
+        {label:'Recordings',data:[],borderColor:'#DD8452',backgroundColor:'#DD845200',fill:false,tension:.3,pointRadius:2,borderWidth:2}
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+        plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:16,boxWidth:8}}},
+        scales:{x:{grid:{display:false},ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:8}},y:{beginAtZero:true,grid:{color:'#f0f3f8'},ticks:{precision:0}}}}
+    });
+  }
+
+  function updateCharts(){
+    const evs = filteredEvents();
+    const arts = filteredArtifacts();
+
+    // events by type
+    const byType = ETYPES.map(t=>evs.filter(e=>e.event_type===t).length);
+    const idx = ETYPES.map((t,i)=>i).filter(i=>byType[i]>0);
+    charts.events.data.labels = idx.map(i=>etLabel.get(ETYPES[i]));
+    charts.events.data.datasets[0].data = idx.map(i=>byType[i]);
+    charts.events.data.datasets[0].backgroundColor = idx.map(i=>etColor(ETYPES[i]));
+    charts.events.update('none');
+
+    // species (from subjects in selection)
+    const subs = filteredSubjects();
+    const spCounts = D.species.map(sp=>subs.filter(s=>s.species_code===sp.code).length);
+    const spIdx = D.species.map((s,i)=>i).filter(i=>spCounts[i]>0);
+    charts.species.data.labels = spIdx.map(i=>D.species[i].common_name);
+    charts.species.data.datasets[0].data = spIdx.map(i=>spCounts[i]);
+    charts.species.update('none');
+
+    // storage by role
+    const roleBytes={};
+    arts.forEach(a=>{ roleBytes[a.role]=(roleBytes[a.role]||0)+(a.size_bytes||0); });
+    const rolePairs = Object.entries(roleBytes).sort((a,b)=>b[1]-a[1]);
+    charts.storage.data.labels = rolePairs.map(p=>p[0]);
+    charts.storage.data.datasets[0].data = rolePairs.map(p=>+(p[1]/1073741824).toFixed(2));
+    charts.storage.update('none');
+
+    // activity over time (monthly)
+    const months=[]; const key = iso=>iso.slice(0,7);
+    const allK={}, recK={};
+    evs.forEach(e=>{ const k=key(e.occurred_at); allK[k]=(allK[k]||0)+1; if(e.event_type==='recording') recK[k]=(recK[k]||0)+1; });
+    let keys = Object.keys(allK).sort();
+    if(keys.length){
+      // fill gaps
+      const filled=[]; let cur=keys[0]; const last=keys[keys.length-1];
+      while(cur<=last){ filled.push(cur); const[y,m]=cur.split('-').map(Number); const nm=m===12?1:m+1, ny=m===12?y+1:y; cur=`${ny}-${String(nm).padStart(2,'0')}`; if(filled.length>60)break; }
+      keys=filled;
+    }
+    charts.time.data.labels = keys;
+    charts.time.data.datasets[0].data = keys.map(k=>allK[k]||0);
+    charts.time.data.datasets[1].data = keys.map(k=>recK[k]||0);
+    charts.time.update('none');
+  }
+
+  /* ------------------------------------------------------ generic sort table */
+  const sortState={};
+  function sortableTable(containerId, columns, rows, opts){
+    opts=opts||{};
+    const st = sortState[containerId] || (sortState[containerId]={col:opts.defaultSort||null, dir:opts.defaultDir||'desc'});
+    function draw(){
+      let data=rows.slice();
+      if(st.col){
+        const col=columns.find(c=>c.key===st.col);
+        data.sort((a,b)=>{
+          let av=col.sortVal?col.sortVal(a):a[st.col], bv=col.sortVal?col.sortVal(b):b[st.col];
+          if(av==null)av=st.dir==='asc'?Infinity:-Infinity;
+          if(bv==null)bv=st.dir==='asc'?Infinity:-Infinity;
+          const cmp = typeof av==='number'&&typeof bv==='number' ? av-bv : String(av).localeCompare(String(bv));
+          return st.dir==='asc'?cmp:-cmp;
+        });
+      }
+      const cont=document.getElementById(containerId);
+      if(!data.length){ cont.innerHTML=`<div class="empty">No matching rows for the current filters.</div>`; return; }
+      const limit = opts.limit||400;
+      const shown = data.slice(0,limit);
+      let html='<table class="data"><thead><tr>';
+      columns.forEach(c=>{
+        const arrow = st.col===c.key ? (st.dir==='asc'?' ▲':' ▼') : '';
+        html+=`<th class="${c.sortable!==false?'sortable':''} ${c.cls||''}" data-col="${c.key}">${c.label}${arrow}</th>`;
+      });
+      html+='</tr></thead><tbody>';
+      shown.forEach(r=>{
+        const attrs = opts.rowAttrs?opts.rowAttrs(r):'';
+        html+=`<tr class="${opts.clickable?'clickable':''}" ${attrs}>`;
+        columns.forEach(c=>{ html+=`<td class="${c.cls||''}">${c.render?c.render(r):esc(r[c.key])}</td>`; });
+        html+='</tr>';
+      });
+      html+='</tbody></table>';
+      if(data.length>limit) html+=`<div class="empty" style="padding:12px">Showing first ${limit} of ${data.length} rows — narrow the filters to see more.</div>`;
+      cont.innerHTML=html;
+      cont.querySelectorAll('th.sortable').forEach(th=>{
+        th.onclick=()=>{ const c=th.dataset.col; if(st.col===c) st.dir=st.dir==='asc'?'desc':'asc'; else {st.col=c;st.dir='desc';} draw(); };
+      });
+      if(opts.onClick){
+        cont.querySelectorAll('tbody tr.clickable').forEach(tr=> tr.onclick=()=>opts.onClick(tr.dataset));
+      }
+    }
+    draw();
+  }
+
+  /* ------------------------------------------------------------- projects tab */
+  const projKindPill = k => `<span class="pill">${esc(k||'file')}</span>`;
+  function renderProjects(){
+    const q=(document.getElementById('projects-search').value||'').toLowerCase();
+    let rows=(D.projects||[]).slice();
+    if(q) rows=rows.filter(p=>{
+      const mem=(membersByProject.get(p.project_id)||[]).map(m=>personName(m.person_id)).join(' ');
+      return (p.name+' '+(p.description||'')+' '+mem).toLowerCase().includes(q);
+    });
+    document.getElementById('projects-meta').textContent = `${rows.length} project${rows.length!==1?'s':''}`;
+    const cols=[
+      {key:'name',label:'Project',render:p=>`<span style="font-weight:600">${esc(p.name)}</span>`},
+      {key:'description',label:'Description',sortable:false,render:p=>`<span class="truncate" style="max-width:320px;display:inline-block;vertical-align:bottom" title="${esc(p.description||'')}">${esc(p.description||'—')}</span>`},
+      {key:'_members',label:'Members',cls:'num',sortVal:p=>(membersByProject.get(p.project_id)||[]).length,render:p=>(membersByProject.get(p.project_id)||[]).length},
+      {key:'_subjects',label:'Subjects',cls:'num',sortVal:p=>subjectCountByProject.get(p.project_id)||0,render:p=>subjectCountByProject.get(p.project_id)||0},
+      {key:'_docs',label:'Documents',cls:'num',sortVal:p=>(docsByProject.get(p.project_id)||[]).length,render:p=>(docsByProject.get(p.project_id)||[]).length},
+      {key:'started_on',label:'Started',sortVal:p=>p.started_on,render:p=>fmtDate(p.started_on)},
+      {key:'_status',label:'Status',sortVal:p=>p.is_active?0:1,
+        render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`}
+    ];
+    sortableTable('projects-table',cols,rows,{clickable:true,defaultSort:'name',defaultDir:'asc',
+      rowAttrs:p=>`data-project="${esc(p.project_id)}"`, onClick:d=>openProject(d.project)});
+  }
+
+  function openProject(pid){
+    const p=projectById.get(pid); if(!p) return;
+    const mem=membersByProject.get(pid)||[];
+    const docs=docsByProject.get(pid)||[];
+    const subs=D.subjects.filter(s=>s.project_id===pid);
+
+    let body = kv([
+      ['Name',esc(p.name)],
+      ['Description',esc(p.description||'—')],
+      ['Started',fmtDate(p.started_on)],
+      ['Status', p.is_active?'<span class="pill active">active</span>':'<span class="pill superseded">inactive</span>',true],
+      ['Members',mem.length],
+      ['Subjects',subs.length],
+      ['Documents',docs.length]
+    ]);
+
+    body+=`<h4>Members (${mem.length})</h4><div class="timeline">`;
+    mem.forEach(m=>{ body+=`<div class="tl-row"><span class="pill">${esc(m.role||'member')}</span> <span>${esc(personName(m.person_id))}</span></div>`; });
+    body+=`</div>`;
+
+    body+=`<h4>Documents (${docs.length})</h4><div class="timeline">`;
+    docs.forEach(a=>{
+      const loc = a.uri
+        ? `<a class="link" href="${esc(a.uri)}" target="_blank" rel="noopener">${esc(a.uri)}</a>`
+        : `<span class="mono">${esc((rootById.get(a.storage_root_id)||{}).name||'')}:${esc(a.relative_path||'')}</span>`;
+      body+=`<div class="tl-row">${projKindPill(a.kind)} <span>${esc(a.title)}</span> ${a.content_type?`<span class="muted">${esc(a.content_type)}</span>`:''} · ${loc}</div>`;
+    });
+    body+=`</div>`;
+
+    if(subs.length){
+      body+=`<h4>Subjects (${subs.length})</h4><div class="timeline">`;
+      subs.sort((a,b)=>a.subject_id.localeCompare(b.subject_id)).forEach(s=>{
+        body+=`<div class="tl-row"><span class="link" data-open-subject="${esc(s.subject_id)}"><span class="mono">${esc(s.subject_id)}</span></span> <span class="muted">${esc(speciesName(s.species_code))}</span></div>`;
+      });
+      body+=`</div>`;
+    }
+
+    openModal(esc(p.name), `${p.is_active?'active':'inactive'} project · ${mem.length} member${mem.length!==1?'s':''}`, body);
+  }
+
+  /* ------------------------------------------------------------- subjects tab */
+  function renderSubjects(){
+    const q=(document.getElementById('subjects-search').value||'').toLowerCase();
+    let rows=filteredSubjects();
+    if(q) rows=rows.filter(s=> (s.subject_id+' '+projectName(s.project_id)+' '+(s.strain||'')+' '+(s.genotype||'')+' '+(s.source||'')).toLowerCase().includes(q));
+    document.getElementById('subjects-meta').textContent = `${rows.length} subject${rows.length!==1?'s':''}`;
+    const cols=[
+      {key:'subject_id',label:'Subject ID',render:s=>`<span class="mono" style="font-weight:600">${esc(s.subject_id)}</span>`},
+      {key:'_project',label:'Project',sortVal:s=>projectName(s.project_id),render:s=>esc(projectName(s.project_id))},
+      {key:'species_code',label:'Species',render:s=>esc(speciesName(s.species_code))},
+      {key:'sex',label:'Sex',render:s=>`<span class="pill">${s.sex}</span>`},
+      {key:'strain',label:'Strain / genotype',render:s=>esc([s.strain,s.genotype].filter(Boolean).join(' · ')||'—')},
+      {key:'source',label:'Source',render:s=>esc(s.source||'—')},
+      {key:'_age',label:'Age (d)',cls:'num',sortVal:s=>s.date_of_birth?Math.round((NOW-Date.parse(s.date_of_birth))/86400000):null,
+        render:s=>s.date_of_birth?Math.round((NOW-Date.parse(s.date_of_birth))/86400000):'—'},
+      {key:'_weight',label:'Latest wt (g)',cls:'num',sortVal:s=>subjectCurrent.get(s.subject_id).latest_weight_g,
+        render:s=>{const w=subjectCurrent.get(s.subject_id).latest_weight_g;return w!=null?w:'—';}},
+      {key:'_sessions',label:'Sessions',cls:'num',sortVal:s=>sessionCountBySubject.get(s.subject_id)||0,render:s=>sessionCountBySubject.get(s.subject_id)||0},
+      {key:'_events',label:'Events',cls:'num',sortVal:s=>eventCountBySubject.get(s.subject_id)||0,render:s=>eventCountBySubject.get(s.subject_id)||0},
+      {key:'_status',label:'Status',sortVal:s=>subjectCurrent.get(s.subject_id).is_endpointed?1:0,
+        render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`}
+    ];
+    sortableTable('subjects-table',cols,rows,{clickable:true,defaultSort:'subject_id',defaultDir:'asc',
+      rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
+  }
+
+  /* ------------------------------------------------------------- sessions tab */
+  function renderSessions(){
+    const q=(document.getElementById('sessions-search').value||'').toLowerCase();
+    let rows=filteredSessions();
+    if(q) rows=rows.filter(s=> (s.label+' '+(s.rig||'')+' '+s.relative_path).toLowerCase().includes(q));
+    document.getElementById('sessions-meta').textContent = `${rows.length} session${rows.length!==1?'s':''}`;
+    const cols=[
+      {key:'label',label:'Session',render:s=>`<span class="mono" style="font-weight:600">${esc(s.label)}</span>`},
+      {key:'subject_id',label:'Subject',render:s=>`<span class="mono">${esc(s.subject_id)}</span>`},
+      {key:'started_at',label:'Started',sortVal:s=>s.started_at,render:s=>fmtDateTime(s.started_at)},
+      {key:'_dur',label:'Duration',cls:'num',sortVal:s=>(Date.parse(s.ended_at)-Date.parse(s.started_at))/1000,
+        render:s=>fmtDur((Date.parse(s.ended_at)-Date.parse(s.started_at))/1000)},
+      {key:'rig',label:'Rig',render:s=>`<span class="pill">${esc(s.rig||'—')}</span>`},
+      {key:'_root',label:'Storage',render:s=>esc((rootById.get(s.storage_root_id)||{}).name||'—')},
+      {key:'relative_path',label:'Path',cls:'mono',render:s=>`<span class="truncate" title="${esc(s.relative_path)}">${esc(s.relative_path)}</span>`},
+      {key:'_ev',label:'Events',cls:'num',sortVal:s=>eventCountBySession.get(s.session_id)||0,render:s=>eventCountBySession.get(s.session_id)||0},
+      {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0}
+    ];
+    sortableTable('sessions-table',cols,rows,{clickable:true,defaultSort:'started_at',defaultDir:'desc',
+      rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
+  }
+
+  /* ------------------------------------------------------------ event log tab */
+  function renderEvents(){
+    const q=(document.getElementById('events-search').value||'').toLowerCase();
+    let rows=filteredEvents();
+    if(q) rows=rows.filter(e=>{
+      const d=JSON.stringify(e.detail||{});
+      return (e.subject_id+' '+e.event_type+' '+(e.notes||'')+' '+d).toLowerCase().includes(q);
+    });
+    document.getElementById('events-meta').textContent = `${rows.length} event${rows.length!==1?'s':''}`;
+    const cols=[
+      {key:'occurred_at',label:'Occurred',sortVal:e=>e.occurred_at,render:e=>fmtDateTime(e.occurred_at)},
+      {key:'event_type',label:'Type',render:e=>typeBadge(e.event_type)},
+      {key:'subject_id',label:'Subject',render:e=>e.subject_id?`<span class="mono">${esc(e.subject_id)}</span>`:'—'},
+      {key:'_summary',label:'Summary',sortable:false,render:e=>`<span class="truncate" style="max-width:360px;display:inline-block;vertical-align:bottom">${eventSummary(e)}</span>`},
+      {key:'_by',label:'Recorded by',render:e=>esc(personName(e.recorded_by))},
+      {key:'_state',label:'State',sortVal:e=>isEventActive(e)?0:1,
+        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`}
+    ];
+    sortableTable('events-table',cols,rows,{clickable:true,defaultSort:'occurred_at',defaultDir:'desc',limit:400,
+      rowAttrs:e=>`data-event="${e.event_id}"`, onClick:d=>openEvent(d.event)});
+  }
+
+  /* ------------------------------------------------------------ artifacts tab */
+  function renderArtifacts(){
+    const q=(document.getElementById('artifacts-search').value||'').toLowerCase();
+    const roleF=document.getElementById('artifacts-role').value;
+    const vF=document.getElementById('artifacts-verif').value;
+    let rows=filteredArtifacts();
+    if(roleF!=='all') rows=rows.filter(a=>a.role===roleF);
+    if(vF!=='all') rows=rows.filter(a=>a.verification.status===vF);
+    if(q) rows=rows.filter(a=>(a.relative_path+' '+(a.format||'')+' '+a.checksum+' '+(a.role||'')).toLowerCase().includes(q));
+    const bytes=rows.reduce((s,a)=>s+(a.size_bytes||0),0);
+    document.getElementById('artifacts-meta').textContent = `${rows.length} artifact${rows.length!==1?'s':''} · ${fmtBytes(bytes)}`;
+    const cols=[
+      {key:'relative_path',label:'Path',render:a=>`<span class="mono truncate" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>`},
+      {key:'role',label:'Role',render:a=>`<span class="pill">${esc(a.role||'—')}</span>`},
+      {key:'format',label:'Fmt',render:a=>esc(a.format||'—')},
+      {key:'size_bytes',label:'Size',cls:'num',sortVal:a=>a.size_bytes||0,render:a=>fmtBytes(a.size_bytes)},
+      {key:'subject_id',label:'Subject',render:a=>a.subject_id?`<span class="mono">${esc(a.subject_id)}</span>`:'—'},
+      {key:'_root',label:'Root',render:a=>esc((rootById.get(a.storage_root_id)||{}).name||'—')},
+      {key:'created_at',label:'Created',sortVal:a=>a.created_at,render:a=>fmtDate(a.created_at)},
+      {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
+        render:a=>`<span class="pill ${a.verification.status}">${a.verification.status}</span>`},
+      {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
+    ];
+    sortableTable('artifacts-table',cols,rows,{clickable:true,defaultSort:'size_bytes',defaultDir:'desc',limit:400,
+      rowAttrs:a=>`data-artifact="${a.artifact_id}"`, onClick:d=>openArtifact(d.artifact)});
+  }
+
+  /* --------------------------------------------------------------- modals */
+  const overlay=document.getElementById('modal-overlay');
+  function openModal(title,sub,bodyHtml){
+    document.getElementById('modal-title').innerHTML=title;
+    document.getElementById('modal-sub').innerHTML=sub||'';
+    document.getElementById('modal-body').innerHTML=bodyHtml;
+    overlay.classList.add('open');
+    // wire internal links
+    document.getElementById('modal-body').querySelectorAll('[data-open-artifact]').forEach(el=>el.onclick=()=>openArtifact(el.dataset.openArtifact));
+    document.getElementById('modal-body').querySelectorAll('[data-open-event]').forEach(el=>el.onclick=()=>openEvent(el.dataset.openEvent));
+    document.getElementById('modal-body').querySelectorAll('[data-open-subject]').forEach(el=>el.onclick=()=>openSubject(el.dataset.openSubject));
+    document.getElementById('modal-body').querySelectorAll('[data-open-project]').forEach(el=>el.onclick=()=>openProject(el.dataset.openProject));
+  }
+  function closeModal(){ overlay.classList.remove('open'); }
+  document.getElementById('modal-close').onclick=closeModal;
+  overlay.onclick=e=>{ if(e.target===overlay) closeModal(); };
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
+
+  function kv(pairs){
+    return `<div class="kv">`+pairs.filter(p=>p&&p[1]!=null&&p[1]!=='').map(p=>`<div><div class="k">${esc(p[0])}</div><div class="v">${p[2]?p[1]:esc(p[1])}</div></div>`).join('')+`</div>`;
+  }
+
+  function openSubject(sid){
+    const s=subjectById.get(sid); if(!s) return;
+    const sc=subjectCurrent.get(sid);
+    const evs=D.events.filter(e=>e.subject_id===sid).sort((a,b)=>a.occurred_at<b.occurred_at?-1:1);
+    const activeEvs=evs.filter(isEventActive);
+    const arts=D.artifacts.filter(a=>a.subject_id===sid);
+    const subSessions=D.sessions.filter(x=>x.subject_id===sid);
+
+    let body = kv([
+      ['Project', s.project_id?`<span class="link" data-open-project="${esc(s.project_id)}">${esc(projectName(s.project_id))}</span>`:'—',true],
+      ['Species',speciesName(s.species_code)],
+      ['Sex',s.sex],
+      ['Strain',s.strain||'—'],
+      ['Genotype',s.genotype||'—'],
+      ['Source',s.source||'—'],
+      ['Date of birth',s.date_of_birth||'— (acquired)'],
+      ['Latest weight',sc.latest_weight_g!=null?`${sc.latest_weight_g} g (${fmtDate(sc.latest_weight_at)})`:'—'],
+      ['Status', sc.is_endpointed?`<span class="pill superseded">endpointed ${fmtDate(sc.endpoint_at)}</span>`:'<span class="pill active">active</span>',true],
+      ['Sessions',subSessions.length],
+      ['Artifacts',`${arts.length} · ${fmtBytes(arts.reduce((a,x)=>a+(x.size_bytes||0),0))}`]
+    ]);
+    if(s.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-6px 0 6px">${esc(s.notes)}</div>`;
+
+    body+=`<h4>Event timeline (${activeEvs.length} active${evs.length!==activeEvs.length?`, ${evs.length-activeEvs.length} superseded`:''})</h4>`;
+    body+=`<div class="timeline">`;
+    evs.forEach(e=>{
+      const sup=!isEventActive(e);
+      body+=`<div class="tl-item t-${e.event_type} ${sup?'superseded':''}">
+        <div class="tl-row">
+          <span class="tl-date">${fmtDate(e.occurred_at)}</span>
+          ${typeBadge(e.event_type)}
+          <span class="tl-summary">${eventSummary(e)} <span class="link" data-open-event="${e.event_id}">details</span>${sup?' · <span class="pill superseded">superseded</span>':''}</span>
+        </div>
+        ${e.notes?`<div class="tl-note">${esc(e.notes)}</div>`:''}
+      </div>`;
+    });
+    body+=`</div>`;
+
+    openModal(`<span class="mono">${esc(sid)}</span>`, `${esc(speciesName(s.species_code))} · subject record`, body);
+  }
+
+  function openEvent(eid){
+    const e=eventById.get(eid); if(!e) return;
+    const d=e.detail||{};
+    const base=[
+      ['Event type',etLabel.get(e.event_type)],
+      ['Subject', e.subject_id?`<span class="link mono" data-open-subject="${esc(e.subject_id)}">${esc(e.subject_id)}</span>`:'—',true],
+      ['Session', e.session_id?`<span class="mono">${esc((sessionById.get(e.session_id)||{}).label||e.session_id)}</span>`:'—',true],
+      ['Occurred at',fmtDateTime(e.occurred_at)],
+      ['Recorded at',fmtDateTime(e.recorded_at)],
+      ['Recorded by',personName(e.recorded_by)],
+      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+    ];
+    if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${e.supersedes}">${fmtDate(p.occurred_at)} ${etLabel.get(p.event_type)}</span>`:'(prior row)',true]); }
+    // detail rows per type
+    const detailMap={
+      birth:[['Litter',d.litter_id],['Birth weight',d.birth_weight_g!=null?d.birth_weight_g+' g':null],['Dam',d.dam_subject_id],['Sire',d.sire_subject_id]],
+      surgery:[['Procedure',d.procedure],['Surgeon',personName(d.surgeon_id)],['Anesthesia',d.anesthesia],['Target',d.target_region],['Hemisphere',d.hemisphere],
+        ['Stereotax AP/ML/DV',(d.stereotax_ap_mm!=null)?`${d.stereotax_ap_mm} / ${d.stereotax_ml_mm} / ${d.stereotax_dv_mm} mm`:null],
+        ['Probe',(probeById.get(d.probe_id)||{}).manufacturer?`${probeById.get(d.probe_id).manufacturer} ${probeById.get(d.probe_id).model}`:null],['Outcome',d.outcome]],
+      recording:[['Acquisition',d.acquisition_system_code],['Modality',d.modality],['Sample rate',d.sample_rate_hz?d.sample_rate_hz/1000+' kHz':null],
+        ['Channels',d.n_channels],['Duration',fmtDur(d.duration_s)],['Probe',(probeById.get(d.probe_id)||{}).model||null],['Stimulus',d.stimulus_protocol]],
+      behavior:[['Task',d.task],['Paradigm',d.paradigm],['Stage',d.stage],['Trials',d.trials_completed],['Performance',d.performance],['Reward',d.reward]],
+      husbandry:[['Measure',d.measure],['Weight',d.weight_g!=null?d.weight_g+' g':null],['Water',d.water_ml!=null?d.water_ml+' mL':null],['Health',d.health_status]],
+      endpoint:[['Method',d.method],['Fixative',d.perfusion_fixative],['Tissue collected',d.tissue_collected==null?null:(d.tissue_collected?'yes':'no')],['Disposition',d.disposition]],
+      histology:[['Technique',d.technique],['Target',d.target_region],['Stain',d.stain],['Microscope',d.microscope]],
+      analysis:[['Pipeline',d.pipeline_name],['Code version',d.code_version?`<span class="mono">${esc(d.code_version)}</span>`:null,true],['Status',d.status?`<span class="pill ${d.status}">${d.status}</span>`:null,true],
+        ['Started',fmtDateTime(d.started_at)],['Finished',fmtDateTime(d.finished_at)],
+        ['Parameters',d.parameters?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.parameters))}</span>`:null,true],
+        ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]]
+    };
+    let body = kv(base.concat(detailMap[e.event_type]||[]));
+    if(e.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-4px 0 8px">“${esc(e.notes)}”</div>`;
+
+    // produced / consumed artifacts
+    const produced=artifactsByEvent.get(eid)||[];
+    const consumed=(inputsByEvent.get(eid)||[]).map(id=>artifactById.get(id)).filter(Boolean);
+    if(produced.length){
+      body+=`<h4>Produced artifacts (${produced.length})</h4>`;
+      body+=produced.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span><span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`).join('');
+    }
+    if(consumed.length){
+      body+=`<h4>Consumed inputs (${consumed.length})</h4>`;
+      body+=consumed.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`).join('');
+    }
+    openModal(typeBadge(e.event_type), `Event · ${fmtDate(e.occurred_at)}`, body);
+  }
+
+  // recursive-ish lineage (mirrors fn_artifact_lineage), depth-guarded
+  function lineageUp(startId){
+    const out=[]; const seen=new Set(); let frontier=[{id:startId,depth:0}];
+    while(frontier.length){
+      const next=[];
+      frontier.forEach(({id,depth})=>{
+        if(seen.has(id)||depth>32) return; seen.add(id);
+        const a=artifactById.get(id); if(!a) return;
+        out.push({depth,artifact:a});
+        (inputsByEvent.get(a.produced_by_event_id)||[]).forEach(inpId=> next.push({id:inpId,depth:depth+1}));
+      });
+      frontier=next;
+    }
+    return out;
+  }
+  function lineageDown(startId){
+    const out=[]; const seen=new Set(); let frontier=[{id:startId,depth:0}];
+    while(frontier.length){
+      const next=[];
+      frontier.forEach(({id,depth})=>{
+        if(seen.has(id)||depth>32) return; seen.add(id);
+        const a=artifactById.get(id); if(!a) return;
+        out.push({depth,artifact:a});
+        (consumersByArtifact.get(id)||[]).forEach(evId=> (artifactsByEvent.get(evId)||[]).forEach(prod=> next.push({id:prod.artifact_id,depth:depth+1})));
+      });
+      frontier=next;
+    }
+    return out;
+  }
+  function lineageList(nodes,startId){
+    const items=nodes.filter(n=>n.artifact.artifact_id!==startId);
+    if(!items.length) return `<div class="lineage-empty">None.</div>`;
+    return items.map(n=>{
+      const a=n.artifact, ev=eventById.get(a.produced_by_event_id);
+      return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
+        <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
+        ${ev?typeBadge(ev.event_type):''}<span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`;
+    }).join('');
+  }
+
+  function openArtifact(aid){
+    const a=artifactById.get(aid); if(!a) return;
+    const ev=eventById.get(a.produced_by_event_id);
+    const base=[
+      ['Path',`<span class="mono">${esc(a.relative_path)}</span>`,true],
+      ['Storage root',(rootById.get(a.storage_root_id)||{}).name||'—'],
+      ['Role',`<span class="pill">${esc(a.role||'—')}</span>`,true],
+      ['Format',a.format||'—'],
+      ['Size',fmtBytes(a.size_bytes)],
+      ['Checksum',`<span class="mono" style="font-size:11.5px">${a.checksum_algo}:${esc(a.checksum.slice(0,24))}…</span>`,true],
+      ['Subject', a.subject_id?`<span class="link mono" data-open-subject="${esc(a.subject_id)}">${esc(a.subject_id)}</span>`:'—',true],
+      ['Session',a.session_id?`<span class="mono">${esc((sessionById.get(a.session_id)||{}).label||'')}</span>`:'—',true],
+      ['Created',fmtDateTime(a.created_at)],
+      ['Created by',personName(a.created_by)],
+      ['Verification',`<span class="pill ${a.verification.status}">${a.verification.status}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
+      ['Produced by', ev?`<span class="link" data-open-event="${ev.event_id}">${etLabel.get(ev.event_type)} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
+      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+    ];
+    let body=kv(base);
+    body+=`<div class="lineage-col">
+      <div><h4>Upstream (inputs)</h4>${lineageList(lineageUp(aid),aid)}</div>
+      <div><h4>Downstream (derived)</h4>${lineageList(lineageDown(aid),aid)}</div>
+    </div>`;
+    openModal(`<span class="pill">${esc(a.role||'artifact')}</span> Artifact`, `${esc(a.format||'')} · ${fmtBytes(a.size_bytes)}`, body);
+  }
+
+  /* ---------------------------------------------------------------- render all */
+  function renderAll(){
+    document.getElementById('tc-projects').textContent=(D.projects||[]).length;
+    document.getElementById('tc-subjects').textContent=filteredSubjects().length;
+    document.getElementById('tc-sessions').textContent=filteredSessions().length;
+    document.getElementById('tc-events').textContent=filteredEvents().length;
+    document.getElementById('tc-artifacts').textContent=filteredArtifacts().length;
+    renderKPIs(); updateCharts();
+    renderProjects(); renderSubjects(); renderSessions(); renderEvents(); renderArtifacts();
+  }
+
+  /* ---------------------------------------------------------------- filters UI */
+  function populateFilters(){
+    const spSel=document.getElementById('f-species');
+    D.species.filter(sp=>D.subjects.some(s=>s.species_code===sp.code)).forEach(sp=>{
+      const o=document.createElement('option'); o.value=sp.code; o.textContent=sp.common_name; spSel.appendChild(o);
+    });
+    const etSel=document.getElementById('f-event');
+    D.eventTypeMeta.forEach(et=>{ const o=document.createElement('option'); o.value=et.code; o.textContent=et.label; etSel.appendChild(o); });
+    const roleSel=document.getElementById('artifacts-role');
+    [...new Set(D.artifacts.map(a=>a.role))].sort().forEach(r=>{ const o=document.createElement('option'); o.value=r; o.textContent=r; roleSel.appendChild(o); });
+    refreshSubjectOptions();
+  }
+  function refreshSubjectOptions(){
+    const sel=document.getElementById('f-subject'); const cur=sel.value;
+    sel.innerHTML='<option value="all">All subjects</option>';
+    D.subjects.filter(s=>F.species==='all'||s.species_code===F.species)
+      .sort((a,b)=>a.subject_id.localeCompare(b.subject_id))
+      .forEach(s=>{ const o=document.createElement('option'); o.value=s.subject_id; o.textContent=s.subject_id; sel.appendChild(o); });
+    sel.value=[...sel.options].some(o=>o.value===cur)?cur:'all';
+    if(sel.value==='all') F.subject='all';
+  }
+
+  document.getElementById('f-species').onchange=e=>{ F.species=e.target.value; refreshSubjectOptions(); renderAll(); };
+  document.getElementById('f-subject').onchange=e=>{ F.subject=e.target.value; renderAll(); };
+  document.getElementById('f-event').onchange=e=>{ F.event=e.target.value; renderAll(); };
+  document.getElementById('f-from').onchange=e=>{ F.from=e.target.value; renderAll(); };
+  document.getElementById('f-to').onchange=e=>{ F.to=e.target.value; renderAll(); };
+  document.getElementById('f-active').onchange=e=>{ F.activeOnly=e.target.checked; renderAll(); };
+  document.getElementById('f-clear').onclick=()=>{
+    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;
+    document.getElementById('f-species').value='all';
+    document.getElementById('f-event').value='all';
+    document.getElementById('f-from').value='';document.getElementById('f-to').value='';
+    document.getElementById('f-active').checked=true;
+    refreshSubjectOptions(); renderAll();
+  };
+
+  document.getElementById('projects-search').oninput=renderProjects;
+  ['subjects-search'].forEach(id=>document.getElementById(id).oninput=renderSubjects);
+  document.getElementById('sessions-search').oninput=renderSessions;
+  document.getElementById('events-search').oninput=renderEvents;
+  document.getElementById('artifacts-search').oninput=renderArtifacts;
+  document.getElementById('artifacts-role').onchange=renderArtifacts;
+  document.getElementById('artifacts-verif').onchange=renderArtifacts;
+
+  // tabs
+  document.getElementById('tabs').querySelectorAll('.tab').forEach(tab=>{
+    tab.onclick=()=>{
+      document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+      tab.classList.add('active');
+      currentView=tab.dataset.view;
+      document.getElementById('view-'+currentView).classList.add('active');
+    };
+  });
+  document.getElementById('open-howto').onclick=()=>{ const h=document.getElementById('howto'); h.open=true; h.scrollIntoView({behavior:'smooth',block:'nearest'}); };
+
+  // dates
+  const asof='2 Jul 2026';
+  document.getElementById('asof').textContent='as of '+asof;
+  document.getElementById('asof2').textContent=asof;
+
+  // go
+  populateFilters();
+  buildCharts();
+  renderAll();
+})();
+</script>
+</body>
+</html>

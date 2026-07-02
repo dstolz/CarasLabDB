@@ -1,0 +1,16 @@
+# MATLAB
+*.asv
+*.m~
+slprj/
+*.autosave
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+
+# Local settings
+.claude/settings.local.json
