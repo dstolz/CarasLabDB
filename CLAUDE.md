@@ -7,15 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A metadata/provenance system for the Caras Lab's extracellular electrophysiology
 data. It has three parts:
 
-- **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `ephys`).
+- **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
   redefine it.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
-- **`web/ephys-dashboard.html`** — a standalone, self-contained HTML/JS
+- **`web/lab-dashboard.html`** — a standalone, self-contained HTML/JS
   dashboard (Chart.js via CDN) that visualizes the schema's data model with
-  seeded synthetic data (`window.EPHYS_DATA`, generated in-page by a
+  seeded synthetic data (`window.LAB_DATA`, generated in-page by a
   mulberry32 PRNG). It has no backend/API calls — it does not talk to the
   live Postgres database.
 
@@ -106,12 +106,12 @@ walkthrough script, not an automated test, and assumes a reachable database.
 There is no build/lint/test tooling in this repo (no CI config, no MATLAB
 test suite, no package.json). Practical ways to exercise the code:
 
-- **Database schema**: `createdb ephys && psql -d ephys -f design_docs/schema.sql`
+- **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`
 - **MATLAB class**: add the repo root to the MATLAB path (so `@CarasLabDB` is
   visible as a class folder), then adapt `examples/carasLabDB_demo.m` — it
   needs a real reachable Postgres instance with the schema applied.
 - **Web dashboard**: static file server, e.g. `python -m http.server 8777
-  --directory web` (already configured as the `ephys-web` launch config in
-  `.claude/launch.json`), then open `http://localhost:8777/ephys-dashboard.html`.
+  --directory web` (already configured as the `lab-web` launch config in
+  `.claude/launch.json`), then open `http://localhost:8777/lab-dashboard.html`.
   It renders entirely from in-page synthetic data — no server-side changes
   are needed to iterate on it.

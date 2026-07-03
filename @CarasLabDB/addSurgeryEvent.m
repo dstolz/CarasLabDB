@@ -1,5 +1,5 @@
 function eventId = addSurgeryEvent(obj, opts)
-%ADDSURGERYEVENT Insert a surgery event (base + ephys.surgery_event).
+%ADDSURGERYEVENT Insert a surgery event (base + lab.surgery_event).
 %
 %   eventId = addSurgeryEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                             Procedure="craniotomy", TargetRegion="IC", ...

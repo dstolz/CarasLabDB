@@ -1,5 +1,5 @@
 function eventId = addBirthEvent(obj, opts)
-%ADDBIRTHEVENT Insert a birth event (base + ephys.birth_event) in one transaction.
+%ADDBIRTHEVENT Insert a birth event (base + lab.birth_event) in one transaction.
 %
 %   eventId = addBirthEvent(db, OccurredAt=t, SubjectId="G-0421", ...)
 %

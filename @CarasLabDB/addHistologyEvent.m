@@ -1,5 +1,5 @@
 function eventId = addHistologyEvent(obj, opts)
-%ADDHISTOLOGYEVENT Insert a histology event (base + ephys.histology_event).
+%ADDHISTOLOGYEVENT Insert a histology event (base + lab.histology_event).
 %
 %   eventId = addHistologyEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                   Technique="immunostain", TargetRegion="IC", ...

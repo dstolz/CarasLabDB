@@ -40,9 +40,9 @@ function d = local_defaults()
     d = struct();
     d.Geometry     = [];                 % [x y w h] or [] -> centered default
     d.Connection   = struct("Server","localhost", "Port",5432, ...
-                            "Username","", "DatabaseName","ephys", "PersonEmail","");
+                            "Username","", "DatabaseName","lab", "PersonEmail","");
     d.UseActiveViews = true;
     d.LastTab      = "subjects";
     d.SqlHistory   = strings(0,1);
-    d.LastSql      = "SELECT * FROM ephys.subject_current;";
+    d.LastSql      = "SELECT * FROM lab.subject_current;";
 end

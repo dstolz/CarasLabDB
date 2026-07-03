@@ -1,5 +1,5 @@
 function eventId = addHusbandryEvent(obj, opts)
-%ADDHUSBANDRYEVENT Insert a husbandry/health event (base + ephys.husbandry_event).
+%ADDHUSBANDRYEVENT Insert a husbandry/health event (base + lab.husbandry_event).
 %
 %   eventId = addHusbandryEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                   Measure="weight", WeightG=72.4)

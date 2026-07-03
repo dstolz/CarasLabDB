@@ -17,7 +17,7 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
 %   Name=Value:
 %       OccurredAt      - override the base occurred_at (datetime)
 %       Notes           - override the base notes
-%       EventOverrides  - struct of ephys.event column -> new value
+%       EventOverrides  - struct of lab.event column -> new value
 %       DetailOverrides - struct of detail-table column -> new value
 %
 %   Override struct field names must be actual database column names (e.g.

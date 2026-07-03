@@ -1,5 +1,5 @@
 function eventId = addRecordingEvent(obj, opts)
-%ADDRECORDINGEVENT Insert a recording event (base + ephys.recording_event).
+%ADDRECORDINGEVENT Insert a recording event (base + lab.recording_event).
 %
 %   A recording event MUST reference a session: the database rejects the
 %   insert if event.session_id is null. Pass SessionId=.

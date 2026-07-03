@@ -1,4 +1,4 @@
-# Database Design — Ephys Metadata System
+# Database Design — Lab Metadata System
 
 This document specifies the PostgreSQL schema that implements the append-only
 event log, artifact index, and provenance DAG described in
@@ -6,7 +6,7 @@ event log, artifact index, and provenance DAG described in
 an ER overview, a table-by-table rationale, and the recursive lineage query. The
 complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
-- **Target:** PostgreSQL 14+ (schema named `ephys`).
+- **Target:** PostgreSQL 14+ (schema named `lab`).
 - **Portability:** the schema degrades cleanly to SQLite for single-writer use;
   the deltas are listed in [Portability](#portability-notes).
 
@@ -66,7 +66,7 @@ erDiagram
 ## 2. Conventions
 
 - **Identifiers.** `event` and `artifact` use `uuid` primary keys defaulting to
-  `gen_random_uuid()`. UUIDs are client-generatable, so the MATLAB `EphysDB`
+  `gen_random_uuid()`. UUIDs are client-generatable, so the MATLAB `CarasLabDB`
   layer can mint IDs offline and batch-insert without a round-trip, and two
   workstations never collide. `subject` uses its human-meaningful lab ID as a
   natural text primary key; lookup tables use short `code` primary keys.
@@ -85,7 +85,7 @@ erDiagram
   `probe.geometry` are the JSONB exceptions where the shape is genuinely open).
 - **Timestamps** are `timestamptz`; store UTC. **Text** uses `text`, not
   `varchar(n)`.
-- **Everything is schema-qualified** (`ephys.<table>`) so the DDL is
+- **Everything is schema-qualified** (`lab.<table>`) so the DDL is
   copy-paste-safe regardless of the caller's `search_path`.
 
 ---
@@ -153,7 +153,7 @@ Two rules that need a trigger rather than a constraint:
 **Video.** Behavioral video is not a separate event type; it is an `artifact`
 with `role = 'video'`. A recording that is primarily video sets
 `recording_event.modality = 'video'` (or `'multimodal'` when video accompanies
-ephys), and the `.mp4`/`.avi` files register as artifacts of that event.
+lab), and the `.mp4`/`.avi` files register as artifacts of that event.
 
 ### 3.4 Artifacts & provenance
 
@@ -190,21 +190,21 @@ A row is **active** when nothing supersedes it. The `event_active` and
 
 ```sql
 -- Original (wrong: 20 kHz)
-INSERT INTO ephys.event (event_id, event_type, subject_id, session_id, occurred_at)
+INSERT INTO lab.event (event_id, event_type, subject_id, session_id, occurred_at)
 VALUES ('11111111-1111-1111-1111-111111111111', 'recording', 'GERB042', :sess, now());
-INSERT INTO ephys.recording_event (event_id, acquisition_system_code, sample_rate_hz, n_channels)
+INSERT INTO lab.recording_event (event_id, acquisition_system_code, sample_rate_hz, n_channels)
 VALUES ('11111111-1111-1111-1111-111111111111', 'intan_rhx', 20000, 64);
 
 -- Correction (right: 30 kHz) — supersedes the original, original row is retained
-INSERT INTO ephys.event (event_id, event_type, subject_id, session_id, occurred_at, supersedes)
+INSERT INTO lab.event (event_id, event_type, subject_id, session_id, occurred_at, supersedes)
 VALUES ('22222222-2222-2222-2222-222222222222', 'recording', 'GERB042', :sess, now(),
         '11111111-1111-1111-1111-111111111111');
-INSERT INTO ephys.recording_event (event_id, acquisition_system_code, sample_rate_hz, n_channels)
+INSERT INTO lab.recording_event (event_id, acquisition_system_code, sample_rate_hz, n_channels)
 VALUES ('22222222-2222-2222-2222-222222222222', 'intan_rhx', 30000, 64);
 
 -- event_active now shows only the 30 kHz row; the audit trail keeps both.
 SELECT event_id, sample_rate_hz
-FROM ephys.event_active e JOIN ephys.recording_event r USING (event_id)
+FROM lab.event_active e JOIN lab.recording_event r USING (event_id)
 WHERE e.session_id = :sess;
 ```
 
@@ -223,13 +223,13 @@ artifacts, each of which was produced by an earlier event, and so on.
 ```sql
 WITH RECURSIVE lin AS (
     SELECT 0 AS depth, a.produced_by_event_id AS event_id, a.artifact_id
-    FROM ephys.artifact a
+    FROM lab.artifact a
     WHERE a.artifact_id = :target
   UNION
     SELECT l.depth + 1, ain.produced_by_event_id, ain.artifact_id
     FROM lin l
-    JOIN ephys.event_input ei  ON ei.event_id = l.event_id
-    JOIN ephys.artifact    ain ON ain.artifact_id = ei.artifact_id
+    JOIN lab.event_input ei  ON ei.event_id = l.event_id
+    JOIN lab.artifact    ain ON ain.artifact_id = ei.artifact_id
     WHERE l.depth < 64
 )
 SELECT * FROM lin ORDER BY depth;
@@ -247,10 +247,10 @@ kept as a single source of truth so nothing drifts from a copy. Apply it to a
 fresh database:
 
 ```bash
-createdb ephys && psql -d ephys -f design_docs/schema.sql
+createdb lab && psql -d lab -f design_docs/schema.sql
 ```
 
-`schema.sql` creates everything described above, in dependency order: the `ephys`
+`schema.sql` creates everything described above, in dependency order: the `lab`
 schema; the reference/lookup tables; the `subject` / `session` dimensions; the
 base `event` and its eight detail tables; `artifact` / `event_input` /
 `artifact_verification`; all indexes; the immutability and
@@ -285,4 +285,4 @@ type/idiom substitutions apply.
 - [overview.md](overview.md) — purpose, philosophy, and data flow.
 - [schema.sql](schema.sql) — the canonical, runnable DDL.
 - `for-coders.md` *(planned)* — MATLAB versions, JDBC driver, and connection
-  details for the `EphysDB` class.
+  details for the `CarasLabDB` class.

@@ -1,7 +1,7 @@
 function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %SUPERSEDEARTIFACT Correct an artifact by inserting a superseding copy.
 %
-%   Like SUPERSEDEEVENT, but for ephys.artifact. Reads the old row, carries
+%   Like SUPERSEDEEVENT, but for lab.artifact. Reads the old row, carries
 %   every column forward except artifact_id and created_at (regenerated),
 %   applies your overrides, sets supersedes to the old id and created_by to
 %   the current person, and inserts the new row.
@@ -10,7 +10,7 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %               Overrides=struct("checksum","ff00...", "size_bytes",123))
 %
 %   Name=Value:
-%       Overrides - struct of ephys.artifact column -> new value
+%       Overrides - struct of lab.artifact column -> new value
 %
 %   Override struct field names must be actual database column names. Any
 %   column not overridden is carried forward from the superseded row.

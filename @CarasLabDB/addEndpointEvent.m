@@ -1,5 +1,5 @@
 function eventId = addEndpointEvent(obj, opts)
-%ADDENDPOINTEVENT Insert an endpoint/euthanasia event (base + ephys.endpoint_event).
+%ADDENDPOINTEVENT Insert an endpoint/euthanasia event (base + lab.endpoint_event).
 %
 %   eventId = addEndpointEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                   Method="perfusion", PerfusionFixative="4% PFA", ...

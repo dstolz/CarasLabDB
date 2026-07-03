@@ -8,7 +8,7 @@ classdef CarasLabDBApp < handle
 %   history recall. Window geometry, connection (minus password), the active
 %   view toggle, and SQL history persist between sessions.
 %
-%   Because the ephys schema is append-only, "editing" an event creates a
+%   Because the lab schema is append-only, "editing" an event creates a
 %   *superseding correction* (the original is retained and hidden by the
 %   *_active views). Subjects and sessions are mutable dimensions and are
 %   edited in place.
@@ -189,7 +189,7 @@ classdef CarasLabDBApp < handle
         end
 
         function ref = pQualify(obj, tableName)
-            %PQUALIFY Schema-qualified table reference, e.g. "ephys.subject".
+            %PQUALIFY Schema-qualified table reference, e.g. "lab.subject".
             ref = obj.Db.Schema + "." + string(tableName);
         end
     end
