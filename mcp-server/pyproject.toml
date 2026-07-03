@@ -1,0 +1,22 @@
+[project]
+name = "caraslabdb-mcp"
+version = "0.1.0"
+description = "Read-only MCP server exposing the CarasLabDB lab schema to LLM agents."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+psycopg2 = ["psycopg2-binary>=2.9"]
+
+[project.scripts]
+caraslabdb-mcp = "caraslabdb_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
