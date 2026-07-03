@@ -31,6 +31,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | `@CarasLabDB/` | MATLAB class wrapping the database with typed insert/retrieve helpers for every table |
 | `@CarasLabDBApp/` | MATLAB App Designer GUI for interactive metadata entry and browsing |
 | `web/lab-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
+| `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
 
 ## The data model
 
@@ -109,13 +110,22 @@ recording event → artifact → analysis event → retrieval → supersede walk
 It needs a reachable Postgres instance with the schema applied.
 `examples/carasLabDBApp_demo.m` launches the GUI.
 
-**View the dashboard:** serve the `web/` directory statically and open
-`lab-dashboard.html`. It renders entirely from in-page synthetic data — no
+**View the dashboard (synthetic):** serve the `web/` directory statically and
+open `lab-dashboard.html`. It renders entirely from in-page synthetic data — no
 backend required.
 
 ```sh
 python -m http.server 8777 --directory web
 # then open http://localhost:8777/lab-dashboard.html
+```
+
+**View the dashboard (live):** the same UI backed by the real database. With the
+schema applied to database `lab`, run the bundled server and open the page it
+prints. See `web/live/README.md` for connection settings and details.
+
+```sh
+PGDATABASE=lab python web/live/server.py --port 8778
+# then open http://127.0.0.1:8778/
 ```
 
 See `design_docs/testing-locally.md` for a full local-testing guide and
@@ -133,5 +143,6 @@ design_docs/         Schema DDL and design documentation
 @CarasLabDB/         MATLAB class: typed DB interface
 @CarasLabDBApp/      MATLAB App Designer GUI
 web/                 Standalone dashboard (synthetic data)
+  live/                Live dashboard: /api/data server + query
 examples/            End-to-end demo scripts
 ```
