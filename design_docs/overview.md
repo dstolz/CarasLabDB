@@ -1,4 +1,4 @@
-# Ephys Metadata System — Overview
+# Lab Metadata System — Overview
 
 
 ---
@@ -41,7 +41,7 @@ reading an analysis event rather than reverse-engineering a folder.
 |---|---|
 | PostgreSQL database | Append-only event log, artifact index, provenance graph |
 | NAS storage | Actual data, laid out as `subject/session/...` |
-| MATLAB class (`EphysDB`) | Programmatic push/pull between MATLAB and the database |
+| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database |
 | MATLAB App Designer GUI | Interactive metadata entry and browsing for the lab |
 
 MATLAB target: R2025a or newer, with the Database Toolbox and a PostgreSQL JDBC
@@ -54,7 +54,7 @@ flowchart LR
     subgraph Rig
       A[Acquisition<br/>Intan RHX / Open Ephys] --> R[(NAS<br/>subject/session)]
     end
-    U[MATLAB GUI / EphysDB] -- append events --> DB[(PostgreSQL<br/>event log)]
+    U[MATLAB GUI / CarasLabDB] -- append events --> DB[(PostgreSQL<br/>event log)]
     U -- register artifacts --> DB
     DB -- pull metadata --> U
     R -- paths + checksums --> DB

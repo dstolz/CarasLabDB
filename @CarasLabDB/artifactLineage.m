@@ -1,7 +1,7 @@
 function T = artifactLineage(obj, artifactId, opts)
 %ARTIFACTLINEAGE Walk the provenance DAG from an artifact.
 %
-%   Wraps ephys.fn_artifact_lineage(). Direction "up" returns ancestors
+%   Wraps lab.fn_artifact_lineage(). Direction "up" returns ancestors
 %   (the events and artifacts this one was derived from); "down" returns
 %   descendants (what was derived from it).
 %

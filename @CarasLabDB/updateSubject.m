@@ -2,7 +2,7 @@ function updateSubject(obj, subjectId, opts)
 %UPDATESUBJECT In-place update of a subject dimension row.
 %
 %   updateSubject(db, subjectId, Name=Value) updates the mutable descriptive
-%   columns of ephys.subject for the given natural-key SubjectId. Unlike events
+%   columns of lab.subject for the given natural-key SubjectId. Unlike events
 %   and artifacts, the subject dimension is NOT append-only (no immutability
 %   trigger), so corrections are ordinary UPDATEs.
 %

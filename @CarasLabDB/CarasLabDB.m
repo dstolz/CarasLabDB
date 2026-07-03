@@ -1,8 +1,8 @@
 classdef CarasLabDB < handle
-%CARASLABDB Interface to the Caras Lab ephys metadata PostgreSQL database.
+%CARASLABDB Interface to the Caras Lab lab metadata PostgreSQL database.
 %
 %   CarasLabDB is a thin, opinionated MATLAB wrapper over the append-only
-%   ephys schema defined in design_docs/schema.sql. It connects with the
+%   lab schema defined in design_docs/schema.sql. It connects with the
 %   native Database Toolbox POSTGRESQL interface (no ODBC DSN or JDBC .jar
 %   configuration required) and exposes typed helpers for inserting and
 %   retrieving every table in the schema, including the class-table
@@ -17,8 +17,8 @@ classdef CarasLabDB < handle
 %   full history.
 %
 %   Construction (Name=Value):
-%       db = CarasLabDB(Username="ephys_rw", Password=secret, ...
-%                       Server="nas-main.lab", DatabaseName="ephys", ...
+%       db = CarasLabDB(Username="lab_rw", Password=secret, ...
+%                       Server="nas-main.lab", DatabaseName="lab", ...
 %                       PersonEmail="dstolz@umd.edu");
 %
 %   A "current person" resolved at construction auto-populates the
@@ -56,7 +56,7 @@ classdef CarasLabDB < handle
 
     properties (SetAccess = private)
         Connection                              % Database Toolbox connection object
-        Schema (1,1) string = "ephys"           % Postgres schema that owns the tables
+        Schema (1,1) string = "lab"           % Postgres schema that owns the tables
         CurrentPersonId (1,1) string = string(missing)  % person_id for provenance columns
     end
 
@@ -99,8 +99,8 @@ classdef CarasLabDB < handle
                 opts.Password (1,1) string = string(missing)
                 opts.Server (1,1) string = "localhost"
                 opts.Port (1,1) double {mustBeInteger, mustBePositive} = 5432
-                opts.DatabaseName (1,1) string = "ephys"
-                opts.Schema (1,1) string = "ephys"
+                opts.DatabaseName (1,1) string = "lab"
+                opts.Schema (1,1) string = "lab"
                 opts.PersonId (1,1) string = string(missing)
                 opts.PersonEmail (1,1) string = string(missing)
                 opts.PersonName (1,1) string = string(missing)
@@ -646,7 +646,7 @@ classdef CarasLabDB < handle
 
         function T = getEventDetail(obj, opts)
             %GETEVENTDETAIL Join a base event to its type-specific detail table.
-            %   Returns every ephys.event column plus the detail columns that are
+            %   Returns every lab.event column plus the detail columns that are
             %   not already present on the base row (event_id, event_type are the
             %   join/discriminator columns and are taken from the base only).
             arguments
@@ -759,7 +759,7 @@ classdef CarasLabDB < handle
     % ==================================================================
     methods (Access = private)
         function ref = pT(obj, name)
-            %PT Schema-qualified identifier, e.g. pT("event") -> "ephys.event".
+            %PT Schema-qualified identifier, e.g. pT("event") -> "lab.event".
             ref = obj.Schema + "." + string(name);
         end
 
@@ -833,7 +833,7 @@ classdef CarasLabDB < handle
         end
 
         function base = pEventBase(obj, eventType, opts)
-            %PEVENTBASE Assemble the ephys.event insert struct shared by all event types.
+            %PEVENTBASE Assemble the lab.event insert struct shared by all event types.
             %   opts is the name-value struct of an addXEvent method; it must expose
             %   the common base fields (OccurredAt, SubjectId, SessionId, Notes,
             %   Attributes, RecordedBy, RecordedAt, Supersedes).

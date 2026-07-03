@@ -7,7 +7,7 @@ Windows 11 machine:
    Postgres 14+ server. This is the actual data store.
 2. **The MATLAB interface** (`@CarasLabDB`) and **GUI** (`@CarasLabDBApp`) —
    the tools researchers use to read and write metadata.
-3. **The web dashboard** (`web/ephys-dashboard.html`) — a standalone, static
+3. **The web dashboard** (`web/lab-dashboard.html`) — a standalone, static
    visualization page. It runs on synthetic in-page data and does **not** talk
    to the database, so it can be deployed by itself if that is all you need.
 
@@ -77,11 +77,11 @@ From the repo root (`C:\src\CarasLabDB`):
 
 ```powershell
 # You will be prompted for the 'postgres' password set during install.
-createdb -U postgres ephys
-psql -U postgres -d ephys -f design_docs/schema.sql
+createdb -U postgres lab
+psql -U postgres -d lab -f design_docs/schema.sql
 ```
 
-`schema.sql` creates the `ephys` schema, all tables, triggers, views, and the
+`schema.sql` creates the `lab` schema, all tables, triggers, views, and the
 `fn_artifact_lineage` function. It is safe to re-run against a fresh database.
 On PostgreSQL 13+, `gen_random_uuid()` is built in; only on **older** servers
 would you need to uncomment the `CREATE EXTENSION pgcrypto;` line at the top of
@@ -90,7 +90,7 @@ the file — not relevant if you installed 14+.
 Verify the schema loaded:
 
 ```powershell
-psql -U postgres -d ephys -c "\dt ephys.*"
+psql -U postgres -d lab -c "\dt lab.*"
 ```
 
 You should see the reference tables (`person`, `storage_root`, `species`, …),
@@ -103,10 +103,10 @@ Do not have researchers connect as the `postgres` superuser. Create a
 read/write role for the MATLAB clients:
 
 ```powershell
-psql -U postgres -d ephys -c "CREATE ROLE ephys_rw LOGIN PASSWORD 'CHANGE_ME';"
-psql -U postgres -d ephys -c "GRANT USAGE ON SCHEMA ephys TO ephys_rw;"
-psql -U postgres -d ephys -c "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA ephys TO ephys_rw;"
-psql -U postgres -d ephys -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ephys TO ephys_rw;"
+psql -U postgres -d lab -c "CREATE ROLE lab_rw LOGIN PASSWORD 'CHANGE_ME';"
+psql -U postgres -d lab -c "GRANT USAGE ON SCHEMA lab TO lab_rw;"
+psql -U postgres -d lab -c "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lab TO lab_rw;"
+psql -U postgres -d lab -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;"
 ```
 
 Note the schema is **append-only**: `UPDATE`/`DELETE` are blocked by triggers,
@@ -131,7 +131,7 @@ For a shared server, edit the two config files in the data directory
   e.g.:
 
   ```
-  host    ephys    ephys_rw    192.168.1.0/24    scram-sha-256
+  host    lab    lab_rw    192.168.1.0/24    scram-sha-256
   ```
 
 Then restart the service (elevated PowerShell) and open the firewall port:
@@ -185,11 +185,11 @@ savepath;                        % persist across MATLAB sessions
 
 ```matlab
 db = CarasLabDB( ...
-    Username="ephys_rw", ...
+    Username="lab_rw", ...
     Password="CHANGE_ME", ...
     Server="localhost", ...      % or the DB server hostname/IP
     Port=5432, ...
-    DatabaseName="ephys", ...
+    DatabaseName="lab", ...
     PersonEmail="dstolz@umd.edu");   % must match a person row's email
 ```
 
@@ -218,13 +218,13 @@ user's settings follow their Windows profile.
 
 ## 3. Deploy the web dashboard
 
-The dashboard is a single self-contained file, `web/ephys-dashboard.html`
+The dashboard is a single self-contained file, `web/lab-dashboard.html`
 (Chart.js is loaded from a CDN; all data is generated in-page). It has **no
 backend** and does not connect to Postgres.
 
 ### Option A — open directly
 
-Double-click `web/ephys-dashboard.html`, or open it in any browser. It renders
+Double-click `web/lab-dashboard.html`, or open it in any browser. It renders
 entirely from in-page synthetic data. An internet connection is needed the
 first time so the browser can fetch Chart.js from the CDN.
 
@@ -236,10 +236,10 @@ If you have Python installed:
 python -m http.server 8777 --directory web
 ```
 
-Then browse to <http://localhost:8777/ephys-dashboard.html>. This mirrors the
-`ephys-web` configuration already defined in `.claude/launch.json`.
+Then browse to <http://localhost:8777/lab-dashboard.html>. This mirrors the
+`lab-web` configuration already defined in `.claude/launch.json`.
 
-For a persistent internal deployment, copy `ephys-dashboard.html` to the web
+For a persistent internal deployment, copy `lab-dashboard.html` to the web
 root of any static host (IIS, nginx, a network share opened in a browser,
 etc.) — no server-side runtime is required.
 
@@ -248,14 +248,14 @@ etc.) — no server-side runtime is required.
 ## 4. Quick verification checklist
 
 - [ ] `Get-Service postgresql*` shows the service **Running**.
-- [ ] `psql -U postgres -d ephys -c "\dt ephys.*"` lists the schema tables.
-- [ ] A non-superuser role (`ephys_rw`) can `SELECT`/`INSERT` but not `UPDATE`.
+- [ ] `psql -U postgres -d lab -c "\dt lab.*"` lists the schema tables.
+- [ ] A non-superuser role (`lab_rw`) can `SELECT`/`INSERT` but not `UPDATE`.
 - [ ] MATLAB: `ver`, `license('test','Database_Toolbox')`, and
       `exist('postgresql')` all check out.
 - [ ] `CarasLabDB(...)` constructs without error and
       `examples/carasLabDB_demo.m` runs against the live DB.
 - [ ] `CarasLabDBApp()` opens and connects through its login dialog.
-- [ ] `ephys-dashboard.html` renders charts in the browser.
+- [ ] `lab-dashboard.html` renders charts in the browser.
 
 ---
 
@@ -266,9 +266,9 @@ the whole database rather than individual tables:
 
 ```powershell
 # Nightly logical backup (schedule via Task Scheduler).
-pg_dump -U postgres -Fc ephys -f "D:\backups\ephys_$(Get-Date -Format yyyyMMdd).dump"
+pg_dump -U postgres -Fc lab -f "D:\backups\lab_$(Get-Date -Format yyyyMMdd).dump"
 ```
 
-Restore with `pg_restore -U postgres -d ephys_restored backup.dump` into a
+Restore with `pg_restore -U postgres -d lab_restored backup.dump` into a
 fresh database. Keep backups on separate storage from the live data directory,
 and test a restore periodically.

@@ -27,10 +27,10 @@ reading an analysis event rather than reverse-engineering a folder.
 
 | Component | Role |
 |---|---|
-| `design_docs/schema.sql` | Canonical PostgreSQL 14+ DDL (schema `ephys`) — the single source of truth for the data model |
+| `design_docs/schema.sql` | Canonical PostgreSQL 14+ DDL (schema `lab`) — the single source of truth for the data model |
 | `@CarasLabDB/` | MATLAB class wrapping the database with typed insert/retrieve helpers for every table |
 | `@CarasLabDBApp/` | MATLAB App Designer GUI for interactive metadata entry and browsing |
-| `web/ephys-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
+| `web/lab-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
 
 ## The data model
 
@@ -69,8 +69,8 @@ Read `design_docs/overview.md` first for the conceptual model, then
   `supersedes`, insert as new.
 
 ```matlab
-db  = CarasLabDB(Username="ephys_rw", Password=secret, ...
-                 Server="nas-main.lab", DatabaseName="ephys", ...
+db  = CarasLabDB(Username="lab_rw", Password=secret, ...
+                 Server="nas-main.lab", DatabaseName="lab", ...
                  PersonEmail="dstolz@umd.edu");
 
 db.addSubject(SubjectId="G-0421", SpeciesCode="meriones_unguiculatus", Sex="M");
@@ -99,7 +99,7 @@ event creates a superseding correction rather than mutating in place.
 **Apply the schema:**
 
 ```sh
-createdb ephys && psql -d ephys -f design_docs/schema.sql
+createdb lab && psql -d lab -f design_docs/schema.sql
 ```
 
 **Use the MATLAB class:** add the repo root to the MATLAB path (so `@CarasLabDB`
@@ -110,12 +110,12 @@ It needs a reachable Postgres instance with the schema applied.
 `examples/carasLabDBApp_demo.m` launches the GUI.
 
 **View the dashboard:** serve the `web/` directory statically and open
-`ephys-dashboard.html`. It renders entirely from in-page synthetic data — no
+`lab-dashboard.html`. It renders entirely from in-page synthetic data — no
 backend required.
 
 ```sh
 python -m http.server 8777 --directory web
-# then open http://localhost:8777/ephys-dashboard.html
+# then open http://localhost:8777/lab-dashboard.html
 ```
 
 See `design_docs/testing-locally.md` for a full local-testing guide and
@@ -125,7 +125,7 @@ See `design_docs/testing-locally.md` for a full local-testing guide and
 
 ```
 design_docs/         Schema DDL and design documentation
-  schema.sql           Canonical PostgreSQL DDL (schema `ephys`)
+  schema.sql           Canonical PostgreSQL DDL (schema `lab`)
   overview.md          Conceptual model — read this first
   database-design.md   Table-by-table rationale
   testing-locally.md   Local testing guide

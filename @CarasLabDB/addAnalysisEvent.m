@@ -1,5 +1,5 @@
 function eventId = addAnalysisEvent(obj, opts)
-%ADDANALYSISEVENT Insert an analysis run event (base + ephys.analysis_event).
+%ADDANALYSISEVENT Insert an analysis run event (base + lab.analysis_event).
 %
 %   eventId = addAnalysisEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                   PipelineId=pid, PipelineName="kilosort4", ...

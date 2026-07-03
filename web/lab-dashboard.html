@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ephys Metadata Explorer — Caras Lab</title>
+<title>Lab Metadata Explorer — Caras Lab</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 <style>
   :root{
@@ -254,7 +254,7 @@
           </svg>
         </div>
         <div>
-          <h1>Ephys Metadata Explorer</h1>
+          <h1>Lab Metadata Explorer</h1>
           <div class="sub">Append-only event log · artifacts &amp; provenance · <span id="asof"></span></div>
         </div>
       </div>
@@ -295,14 +295,14 @@
   <details class="howto" id="howto">
     <summary><span class="chev">▶</span> Loading a real database export</summary>
     <div class="howto-body">
-      <p>The interface reads a single global object, <code>window.EPHYS_DATA</code>, with one array per table. To use live data, export the tables to JSON (server-side) and replace the generated dataset — everything else re-renders automatically.</p>
+      <p>The interface reads a single global object, <code>window.LAB_DATA</code>, with one array per table. To use live data, export the tables to JSON (server-side) and replace the generated dataset — everything else re-renders automatically.</p>
       <p>A one-shot export from PostgreSQL:</p>
       <pre>-- run per table, e.g. subjects:
-\copy (SELECT json_agg(t) FROM ephys.subject t) TO 'subject.json'
+\copy (SELECT json_agg(t) FROM lab.subject t) TO 'subject.json'
 -- events joined with their active-version flag, artifacts, event_input, sessions, verifications ...
 </pre>
       <p>Then set, before the app script runs:</p>
-      <pre>window.EPHYS_DATA = {
+      <pre>window.LAB_DATA = {
   people:[], probes:[], pipelines:[], storageRoots:[], species:[],
   projects:[ /* {project_id,name,description,started_on,is_active,created_by} */ ],
   projectMembers:[ /* {project_id, person_id, role} */ ],
@@ -419,7 +419,7 @@
   </section>
 
   <footer class="app-footer">
-    Ephys Metadata Explorer · self-contained &amp; offline · data as of <span id="asof2"></span> ·
+    Lab Metadata Explorer · self-contained &amp; offline · data as of <span id="asof2"></span> ·
     generated to match <code style="font-family:ui-monospace,monospace">design_docs/schema.sql</code>
   </footer>
 </div>
@@ -788,7 +788,7 @@
   });
 
   // expose
-  window.EPHYS_DATA = {
+  window.LAB_DATA = {
     people, probes, pipelines, storageRoots, species,
     projects, projectMembers, projectArtifacts,
     eventTypeMeta, roleMeta, subjects, sessions, events, artifacts, eventInputs, NOW
@@ -802,7 +802,7 @@
    ============================================================================ */
 (function(){
   "use strict";
-  const D = window.EPHYS_DATA;
+  const D = window.LAB_DATA;
   const NOW = D.NOW;
 
   // ---- lookups ----
@@ -838,7 +838,7 @@
   const isEventActive = e => !supersededEvents.has(e.event_id);
   const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
 
-  // provenance edges (produces + consumes), like ephys.provenance_edge
+  // provenance edges (produces + consumes), like lab.provenance_edge
   const inputsByEvent = new Map();      // event_id -> [artifact_id]
   const consumersByArtifact = new Map();// artifact_id -> [event_id]
   D.eventInputs.forEach(ei=>{

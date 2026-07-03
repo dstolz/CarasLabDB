@@ -2,7 +2,7 @@ function updateSession(obj, sessionId, opts)
 %UPDATESESSION In-place update of a session dimension row.
 %
 %   updateSession(db, sessionId, Name=Value) updates the mutable columns of
-%   ephys.session for the given session_id (uuid). Like the subject dimension,
+%   lab.session for the given session_id (uuid). Like the subject dimension,
 %   session is NOT append-only, so corrections are ordinary UPDATEs.
 %
 %   Only the arguments you supply are changed; omitted ones are left untouched.

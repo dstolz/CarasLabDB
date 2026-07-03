@@ -1,5 +1,5 @@
 %% CarasLabDB — usage walkthrough
-% Demonstrates connecting to the ephys metadata database and exercising the
+% Demonstrates connecting to the lab metadata database and exercising the
 % main insert / retrieve / supersede paths. This is a script for reading and
 % adapting, not an automated test — it assumes a reachable database whose
 % schema was created from design_docs/schema.sql.
@@ -11,11 +11,11 @@
 % The current person is resolved by email and used for created_by /
 % recorded_by on every insert below.
 db = CarasLabDB( ...
-    Username      = "ephys_rw", ...
+    Username      = "lab_rw", ...
     Password      = "change-me", ...
     Server        = "nas-main.lab", ...
     Port          = 5432, ...
-    DatabaseName  = "ephys", ...
+    DatabaseName  = "lab", ...
     PersonEmail   = "dstolz@umd.edu");
 
 assert(db.isOpen())
@@ -136,7 +136,7 @@ newWEid = db.supersedeEvent(wEid, ...
 fprintf("weight event %s superseded by %s\n", wEid, newWEid);
 
 %% Ad-hoc SQL escape hatch
-n = db.runQuery("SELECT count(*) AS n FROM ephys.event_active;");
+n = db.runQuery("SELECT count(*) AS n FROM lab.event_active;");
 fprintf("active events: %d\n", n.n(1));
 
 %% Done

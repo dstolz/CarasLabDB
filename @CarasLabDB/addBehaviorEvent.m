@@ -1,5 +1,5 @@
 function eventId = addBehaviorEvent(obj, opts)
-%ADDBEHAVIOREVENT Insert a behavior/training event (base + ephys.behavior_event).
+%ADDBEHAVIOREVENT Insert a behavior/training event (base + lab.behavior_event).
 %
 %   eventId = addBehaviorEvent(db, OccurredAt=t, SubjectId="G-0421", ...
 %                   Task="2AFC", Stage="shaping", TrialsCompleted=240, ...

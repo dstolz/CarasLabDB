@@ -76,7 +76,7 @@ function local_colorEvents(~, d, tbl, T)
 end
 
 function m = local_palette()
-    %LOCAL_PALETTE Event-type colors mirrored from web/ephys-dashboard.html.
+    %LOCAL_PALETTE Event-type colors mirrored from web/lab-dashboard.html.
     m = containers.Map('KeyType', 'char', 'ValueType', 'any');
     m('birth')     = local_hex('55A868');
     m('surgery')   = local_hex('C44E52');
