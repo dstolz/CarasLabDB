@@ -37,6 +37,34 @@ Use a **test-only database name** (`lab_test` below) so you never risk running
 these destructive steps against a real `lab` database. Point MATLAB and the GUI
 at `lab_test` for the whole exercise.
 
+### 0.1 If `createdb` / `psql` aren't recognized
+
+The Windows PostgreSQL installer does **not** add its `bin` folder to `PATH`, so
+a fresh install gives `createdb : The term 'createdb' is not recognized …` even
+though the tools are present (under `C:\Program Files\PostgreSQL\<version>\bin`).
+
+For a single throwaway test session, prepend the `bin` folder to `PATH` and grab
+the superuser password once, so `createdb`/`psql` resolve and don't hang on a
+hidden `Password:` prompt (adjust `16` to your installed major version):
+
+```powershell
+$env:Path += ";C:\Program Files\PostgreSQL\16\bin"
+$env:PGPASSWORD = Read-Host "postgres password" -AsSecureString | ForEach-Object { [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($_)) }
+createdb -U postgres lab_test
+psql -U postgres -d lab_test -f design_docs/schema.sql
+```
+
+Both variables live only in the current PowerShell session — a new terminal
+starts clean. `PGPASSWORD` also lets the later `dropdb`/`psql` steps run without
+re-prompting.
+
+To make `createdb`, `psql`, `pg_dump`, etc. permanently available (new terminals
+included), add the `bin` folder to your user `PATH` once, then open a new shell:
+
+```powershell
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Program Files\PostgreSQL\16\bin", "User")
+```
+
 ---
 
 ## 1. Test the database schema
