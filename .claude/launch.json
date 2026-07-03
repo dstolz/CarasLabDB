@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8777", "--directory", "web"],
       "port": 8777
+    },
+    {
+      "name": "lab-web-live",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["web/live/server.py", "--port", "8778"],
+      "port": 8778
     }
   ]
 }
