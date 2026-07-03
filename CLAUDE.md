@@ -17,7 +17,17 @@ data. It has three parts:
   dashboard (Chart.js via CDN) that visualizes the schema's data model with
   seeded synthetic data (`window.LAB_DATA`, generated in-page by a
   mulberry32 PRNG). It has no backend/API calls — it does not talk to the
-  live Postgres database.
+  live Postgres database. Keep it self-contained/offline.
+- **`web/live/`** — a *live* variant of that dashboard. It reuses the exact
+  markup and render logic from the offline demo, but a loader fetches
+  `/api/data` (served by `web/live/server.py`, which runs `web/live/lab_data.sql`
+  against the `lab` schema) and assigns the result to `window.LAB_DATA` instead
+  of generating it. The SQL emits the whole `LAB_DATA` shape as one JSON object
+  — one array per table, each event with its detail row as `detail`, each
+  artifact with its latest `verification`. `web/live/lab-dashboard-live.html`
+  is *generated* from the offline demo (swap the synthetic `<script>` for the
+  loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
+  offline demo's app logic changes, rather than editing it by hand.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are

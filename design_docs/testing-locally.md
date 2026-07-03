@@ -21,6 +21,11 @@ The three parts and how each is tested:
 
 Commands are **PowerShell** unless the block is labelled `matlab` or `sql`.
 
+> Some steps below — starting/restarting the PostgreSQL service, or setting a
+> **machine-wide** `PATH` — need elevated rights. If a command fails with an
+> "Access is denied" or permission error, re-open PowerShell with **Run as
+> administrator** and retry.
+
 ---
 
 ## 0. Prerequisites for a local test rig
@@ -36,6 +41,42 @@ Everything runs on one Windows 11 box:
 Use a **test-only database name** (`lab_test` below) so you never risk running
 these destructive steps against a real `lab` database. Point MATLAB and the GUI
 at `lab_test` for the whole exercise.
+
+### 0.1 If `createdb` / `psql` aren't recognized
+
+The Windows PostgreSQL installer does **not** add its `bin` folder to `PATH`, so
+a fresh install gives `createdb : The term 'createdb' is not recognized …` even
+though the tools are present (under `C:\Program Files\PostgreSQL\<version>\bin`).
+
+For a single throwaway test session, prepend the `bin` folder to `PATH` and grab
+the superuser password once, so `createdb`/`psql` resolve and don't hang on a
+hidden `Password:` prompt (adjust `16` to your installed major version):
+
+```powershell
+$env:Path += ";C:\Program Files\PostgreSQL\16\bin"
+$env:PGPASSWORD = Read-Host "postgres password" -AsSecureString | ForEach-Object { [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($_)) }
+createdb -U postgres lab_test
+psql -U postgres -d lab_test -f design_docs/schema.sql
+```
+
+Both variables live only in the current PowerShell session — a new terminal
+starts clean. `PGPASSWORD` also lets the later `dropdb`/`psql` steps run without
+re-prompting.
+
+> If you already know the `postgres` password, skip the `Read-Host` prompt and
+> just set it directly: `$env:PGPASSWORD = "yourpassword"`.
+
+To make `createdb`, `psql`, `pg_dump`, etc. permanently available (new terminals
+included), add the `bin` folder to your user `PATH` once, then open a new shell:
+
+```powershell
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Program Files\PostgreSQL\16\bin", "User")
+```
+
+If you'd rather set it for **all users** (`"Machine"` instead of `"User"`) or the
+PostgreSQL service isn't running and needs a `Start-Service`/`Restart-Service`,
+you'll need an elevated PowerShell — see the admin-mode note at the top of this
+document.
 
 ---
 
@@ -71,18 +112,37 @@ psql -U postgres -d lab_test -c "\df lab.*"      # functions (fn_artifact_lineag
 the `event` base table, the eight `*_event` detail tables, `artifact`,
 `event_input`, the `event_active` / `artifact_active` views, and both functions.
 
-### 1.3 Verify the append-only invariant (the most important schema test)
+### 1.3 Seed a person and verify the append-only invariant (the most important schema test)
 
-This is the design's core guarantee, so test it directly. Seed one row, then try
-to mutate it — the triggers must reject `UPDATE` and `DELETE`:
+First seed one `person` row. The MATLAB and GUI tests in §2–§3 connect *as* this
+person (`PersonEmail = "test@local"`), so it has to exist; `ON CONFLICT` keeps the
+step safe to re-run:
+
+```powershell
+psql -U postgres -d lab_test -c @'
+INSERT INTO lab.person (full_name, email, role)
+VALUES ('Test User', 'test@local', 'PI')
+ON CONFLICT (email) DO NOTHING;
+'@
+```
+
+A **successful** test should look like this:
+
+```powershell
+INSERT 0 1
+```
+
+Now test the design's core guarantee directly. Insert one `event` row — the base
+table of the append-only log — then try to mutate it; the triggers must reject
+both `UPDATE` and `DELETE`:
 
 ```powershell
 psql -U postgres -d lab_test -v ON_ERROR_STOP=0 -c @'
-INSERT INTO lab.person (full_name, email, role)
-VALUES ('Test User', 'test@local', 'PI');
+INSERT INTO lab.event (event_type, occurred_at, notes)
+VALUES ('analysis', now(), 'immutability probe');
 -- Both of the next two statements MUST fail with the mutation-forbidden error:
-UPDATE lab.person SET role = 'tech' WHERE email = 'test@local';
-DELETE FROM lab.person WHERE email = 'test@local';
+UPDATE lab.event SET notes = 'changed' WHERE notes = 'immutability probe';
+DELETE FROM lab.event                  WHERE notes = 'immutability probe';
 '@
 ```
 
@@ -90,11 +150,17 @@ DELETE FROM lab.person WHERE email = 'test@local';
 from `fn_forbid_mutation()`. If either mutation *succeeds*, the immutability
 triggers are broken — stop and fix the schema before going further.
 
-> Note: whether `person` itself is trigger-protected depends on the schema; the
-> tables that are guaranteed immutable are `event`, every `*_event` detail table,
-> `artifact`, and `event_input`. If `person` is not protected, run the same
-> UPDATE/DELETE probe against an `event` row you insert instead — that is the row
-> class that must reject mutation.
+A **successful** test should look like this:
+
+```powershell
+ERROR:  UPDATE on lab.event is not allowed: this table is append-only. Insert a superseding row instead.
+CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 3 at RAISE
+```
+
+> Why `event` and not `person`: only the append-only log is trigger-protected —
+> `event`, every `*_event` detail table, `artifact`, and `event_input`. Reference
+> tables like `person` are intentionally mutable, so probing one would report a
+> false failure even on a correct schema.
 
 ### 1.4 Create the application role and confirm least privilege
 
@@ -314,4 +380,5 @@ Re-run the §2.3 connection smoke test and the §2.4 walkthrough (against a
 **scratch** subject you can leave in place or supersede) from a researcher
 workstation to confirm network + `pg_hba.conf` work end-to-end. Then seed the real
 `person` and reference rows and hand it to users.
+
 ```
