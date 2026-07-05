@@ -202,6 +202,41 @@ classdef CarasLabDBApp < handle
             obj.refreshActiveTab();
         end
 
+        function onKeyPress(obj, ~, evt)
+            %ONKEYPRESS Keyboard shortcuts mirroring the toolbar/filter buttons.
+            %   Ctrl+R Refresh · Ctrl+E Export→WS · Ctrl+Shift+E Add Event ·
+            %   Ctrl+Shift+S Add Subject · Ctrl+Shift+N Add Session ·
+            %   Ctrl+D Edit/Supersede · Enter Apply filters (browse tabs) ·
+            %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters.
+            mods  = string(evt.Modifier);
+            ctrl  = any(mods == "control") || any(mods == "command");
+            shift = any(mods == "shift");
+            key   = string(evt.Key);
+
+            sel = obj.UI.TabGroup.SelectedTab;
+            onSqlTab = ~isempty(sel) && string(sel.Tag) == "sql";
+
+            if key == "return" && ctrl
+                if onSqlTab, obj.runCustomSQL(); end
+            elseif key == "return"
+                if ~onSqlTab, obj.onRefresh(); end
+            elseif key == "escape"
+                obj.onClearFilters();
+            elseif key == "e" && ctrl && shift
+                obj.onAddMenu("event");
+            elseif key == "s" && ctrl && shift
+                obj.onAddMenu("subject");
+            elseif key == "n" && ctrl && shift
+                obj.onAddMenu("session");
+            elseif key == "e" && ctrl
+                obj.onExport();
+            elseif key == "d" && ctrl
+                obj.onEditSelected();
+            elseif key == "r" && ctrl
+                obj.onRefresh();
+            end
+        end
+
         function onTabChanged(obj, ~, ~)
             obj.pPopulateFilterColumns();
             obj.refreshActiveTab();

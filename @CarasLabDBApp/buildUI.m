@@ -19,7 +19,8 @@ function buildUI(obj)
         pos = local_center(1180, 720);
     end
     obj.Fig = uifigure("Name", "CarasLabDB Explorer", "Position", pos, ...
-        "CloseRequestFcn", @(s,e) obj.pOnClose(s,e));
+        "CloseRequestFcn", @(s,e) obj.pOnClose(s,e), ...
+        "KeyPressFcn", @(s,e) obj.onKeyPress(s,e));
 
     root = uigridlayout(obj.Fig, [3 1]);
     root.RowHeight = {40, '1x', 24};
@@ -33,12 +34,18 @@ function buildUI(obj)
     tb.ColumnWidth = {90, 120, 100, 110, 110, 150, '1x', 130};
     tb.Padding = [0 0 0 0];
 
-    uibutton(tb, "Text", "Refresh", "ButtonPushedFcn", @(s,e) obj.onRefresh(s,e));
-    uibutton(tb, "Text", "Export → WS", "ButtonPushedFcn", @(s,e) obj.onExport(s,e));
-    uibutton(tb, "Text", "Add Event", "ButtonPushedFcn", @(~,~) obj.onAddMenu("event"));
-    uibutton(tb, "Text", "Add Subject", "ButtonPushedFcn", @(~,~) obj.onAddMenu("subject"));
-    uibutton(tb, "Text", "Add Session", "ButtonPushedFcn", @(~,~) obj.onAddMenu("session"));
-    uibutton(tb, "Text", "Edit / Supersede", "ButtonPushedFcn", @(s,e) obj.onEditSelected(s,e));
+    uibutton(tb, "Text", "Refresh", "Tooltip", "Refresh (Ctrl+R)", ...
+        "ButtonPushedFcn", @(s,e) obj.onRefresh(s,e));
+    uibutton(tb, "Text", "Export → WS", "Tooltip", "Export → Workspace (Ctrl+E)", ...
+        "ButtonPushedFcn", @(s,e) obj.onExport(s,e));
+    uibutton(tb, "Text", "Add Event", "Tooltip", "Add Event (Ctrl+Shift+E)", ...
+        "ButtonPushedFcn", @(~,~) obj.onAddMenu("event"));
+    uibutton(tb, "Text", "Add Subject", "Tooltip", "Add Subject (Ctrl+Shift+S)", ...
+        "ButtonPushedFcn", @(~,~) obj.onAddMenu("subject"));
+    uibutton(tb, "Text", "Add Session", "Tooltip", "Add Session (Ctrl+Shift+N)", ...
+        "ButtonPushedFcn", @(~,~) obj.onAddMenu("session"));
+    uibutton(tb, "Text", "Edit / Supersede", "Tooltip", "Edit / Supersede (Ctrl+D)", ...
+        "ButtonPushedFcn", @(s,e) obj.onEditSelected(s,e));
     uilabel(tb, "Text", "");   % spacer
     obj.UI.ActiveOnly = uicheckbox(tb, "Text", "Active only", ...
         "Value", logical(obj.Prefs.UseActiveViews), ...
@@ -93,8 +100,10 @@ function buildUI(obj)
     brow = uigridlayout(fg, [1 2]);
     brow.ColumnWidth = {'1x', '1x'};
     brow.Padding = [0 0 0 0];
-    uibutton(brow, "Text", "Apply", "ButtonPushedFcn", @(s,e) obj.onRefresh(s,e));
-    uibutton(brow, "Text", "Clear", "ButtonPushedFcn", @(s,e) obj.onClearFilters(s,e));
+    uibutton(brow, "Text", "Apply", "Tooltip", "Apply filters (Enter)", ...
+        "ButtonPushedFcn", @(s,e) obj.onRefresh(s,e));
+    uibutton(brow, "Text", "Clear", "Tooltip", "Clear filters (Esc)", ...
+        "ButtonPushedFcn", @(s,e) obj.onClearFilters(s,e));
 
     % ---- tab group with browse tabs ----------------------------------------
     tg = uitabgroup(body);
@@ -135,7 +144,8 @@ function buildUI(obj)
         "Items", local_historyItems(obj.Prefs.SqlHistory), ...
         "Value", "(history)", ...
         "ValueChangedFcn", @(s,e) obj.pRecallSql(s,e));
-    uibutton(sqlTop, "Text", "Run", "ButtonPushedFcn", @(~,~) obj.runCustomSQL());
+    uibutton(sqlTop, "Text", "Run", "Tooltip", "Run query (Ctrl+Enter)", ...
+        "ButtonPushedFcn", @(~,~) obj.runCustomSQL());
 
     obj.UI.SqlEditor = uitextarea(sg, "Value", cellstr(splitlines(obj.Prefs.LastSql)));
     obj.UI.SqlEditor.FontName = "monospaced";

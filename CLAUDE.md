@@ -110,6 +110,10 @@ walkthrough script, not an automated test, and assumes a reachable database.
   `CarasLabDB.m` itself with large method bodies.
 - Any official MathWorks toolbox may be assumed available (this project
   relies on Database Toolbox).
+- Use `getprefs` and `setprefs` to store user-specific configuration for all GUIs.
+- All GUIs should be efficient and intuitive --- avoid unnecessary clicks.
+- All GUIs should include keyboard shortcuts for common actions (e.g., Ctrl+S to save), including Ctrl+? to display a help dialog with the current keyboard shortcuts. Use similar keyboard shortcuts across all GUIs for consistency.
+- Use `uidatepicker​` entry fields in the Matlab GUI.
 
 ## Running things
 

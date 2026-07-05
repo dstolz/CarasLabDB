@@ -18,11 +18,14 @@ function showSubjectEditor(obj, mode, subjectId)
 
     isEdit = (mode == "edit");
 
-    % Species choices for a friendly dropdown (fall back to free text).
+    % Species choices for a friendly dropdown: "Common name (code)", fall back
+    % to free text if the lookup table can't be read.
     try
         S = obj.Db.getSpecies();
-        speciesChoices = string(S.code);
+        speciesCodes = string(S.code);
+        speciesChoices = string(S.common_name) + " (" + speciesCodes + ")";
     catch
+        speciesCodes = strings(1,0);
         speciesChoices = strings(1,0);
     end
 
@@ -55,7 +58,11 @@ function showSubjectEditor(obj, mode, subjectId)
         vars = string(row.Properties.VariableNames);
         for i = 1:numel(fields)
             if ismember(fields(i).Col, vars)
-                fields(i).Value = local_scalar(row.(char(fields(i).Col)));
+                val = local_scalar(row.(char(fields(i).Col)));
+                if fields(i).Key == "SpeciesCode"
+                    val = local_speciesDisplay(val, speciesCodes, speciesChoices);
+                end
+                fields(i).Value = val;
             end
             if fields(i).Key == "SubjectId"
                 fields(i).Editable = false;   % key is immutable
@@ -63,8 +70,15 @@ function showSubjectEditor(obj, mode, subjectId)
         end
         titleText = "Edit subject " + subjectId;
     else
-        idx = find(strcmp({fields.Key}, "Sex"), 1);
+        idx = find([fields.Key] == "Sex", 1);
         fields(idx).Value = "U";
+        idx = find([fields.Key] == "SubjectId", 1);
+        fields(idx).Value = "SUBJ-ID-";
+        idx = find([fields.Key] == "SpeciesCode", 1);
+        gerbilIdx = find(contains(lower(speciesChoices), "gerbil"), 1);
+        if ~isempty(gerbilIdx)
+            fields(idx).Value = speciesChoices(gerbilIdx);
+        end
         titleText = "Add subject";
     end
 
@@ -119,22 +133,18 @@ end
 function [provided, v] = local_convert(f, raw)
     switch f.Type
         case "datetime"
-            str = strtrim(string(raw));
-            if strlength(str) == 0
-                v = NaT; provided = false; return
-            end
-            try
-                v = datetime(str, "TimeZone", "local");
-            catch
-                v = NaT;
-            end
+            v = raw;
             if isnat(v)
-                error("CarasLabDBApp:badDate", "'%s' is not a valid date.", str);
+                provided = false; return
             end
+            v.TimeZone = "local";
             provided = true;
         otherwise
             v = strtrim(string(raw));
             provided = strlength(v) > 0;
+            if provided && f.Key == "SpeciesCode"
+                v = local_speciesCode(v);
+            end
     end
 end
 
@@ -147,6 +157,25 @@ end
 
 function s = local_espec(key, col, label, type, choices)
     s = local_spec(key, col, label, type, choices);
+end
+
+% ---- species "Common name (code)" display helpers ----------------------------
+function v = local_speciesDisplay(code, codes, choices)
+    idx = find(codes == code, 1);
+    if isempty(idx)
+        v = string(code);
+    else
+        v = choices(idx);
+    end
+end
+
+function code = local_speciesCode(display)
+    tok = regexp(display, "\(([^()]+)\)\s*$", "tokens", "once");
+    if isempty(tok)
+        code = display;
+    else
+        code = string(tok{1});
+    end
 end
 
 function v = local_scalar(colvals)
