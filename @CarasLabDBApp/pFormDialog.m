@@ -15,9 +15,10 @@ function out = pFormDialog(titleText, specs)
 %
 %   Returns a struct with:
 %       out.OK      - true if the user confirmed
-%       out.Values  - struct keyed by Key. Text/enum/datetime -> string
-%                     ("" when blank), number -> double (NaN when blank),
-%                     bool -> logical.
+%       out.Values  - struct keyed by Key. Text/enum -> string ("" when
+%                     blank), number -> double (NaN when blank),
+%                     datetime -> datetime (NaT when blank, time-of-day
+%                     dropped — entry is via uidatepicker), bool -> logical.
 %
 %   See also CARASLABDBAPP/SHOWEVENTEDITOR.
 
@@ -28,10 +29,12 @@ function out = pFormDialog(titleText, specs)
 
     out = struct("OK", false, "Values", struct());
     n = numel(specs);
+    hasTextarea = any(string({specs.Type}) == "textarea");
 
     figH = min(720, 96 + n * 40);
     f = uifigure("Name", titleText, ...
-        "Position", local_center(560, figH), "WindowStyle", "modal");
+        "Position", local_center(560, figH), "WindowStyle", "modal", ...
+        "KeyPressFcn", @(~,e) onKeyPress(e));
     outer = uigridlayout(f, [2 1]);
     outer.RowHeight = {'1x', 44};
     outer.ColumnWidth = {'1x'};
@@ -59,14 +62,28 @@ function out = pFormDialog(titleText, specs)
     brow.ColumnWidth = {'1x', 100, 100};
     brow.Padding = [0 0 0 0];
     uilabel(brow, "Text", "");
-    uibutton(brow, "Text", "Cancel", "ButtonPushedFcn", @(~,~) onCancel());
-    uibutton(brow, "Text", "OK", "ButtonPushedFcn", @(~,~) onOk());
+    uibutton(brow, "Text", "Cancel", "Tooltip", "Cancel (Esc)", ...
+        "ButtonPushedFcn", @(~,~) onCancel());
+    okTip = "OK";
+    if ~hasTextarea, okTip = okTip + " (Enter)"; end
+    uibutton(brow, "Text", "OK", "Tooltip", char(okTip), "ButtonPushedFcn", @(~,~) onOk());
 
     uiwait(f);
     if isvalid(f), delete(f); end
     return
 
     % ---- nested callbacks -----------------------------------------------
+    function onKeyPress(e)
+        %ONKEYPRESS Escape cancels; Enter submits unless a textarea field
+        %   is present (where Enter must insert a newline instead).
+        switch e.Key
+            case "escape"
+                onCancel();
+            case "return"
+                if ~hasTextarea, onOk(); end
+        end
+    end
+
     function onCancel()
         uiresume(f);
     end
@@ -97,8 +114,7 @@ function w = local_makeWidget(parent, s)
         case "bool"
             w = uicheckbox(parent, "Text", "", "Value", local_initBool(s.Value));
         case "datetime"
-            w = uieditfield(parent, "text", "Value", local_initStr(s.Value), ...
-                "Placeholder", "yyyy-MM-dd HH:mm:ss");
+            w = uidatepicker(parent, "Value", local_initDatetime(s.Value));
         otherwise   % "text"
             w = uieditfield(parent, "text", "Value", local_initStr(s.Value));
     end
@@ -113,7 +129,9 @@ function v = local_readWidget(w, type)
             v = str2double(strtrim(string(w.Value)));   % NaN if blank/invalid
         case "bool"
             v = logical(w.Value);
-        otherwise   % text / enum / datetime
+        case "datetime"
+            v = w.Value;   % datetime scalar, NaT when blank
+        otherwise   % text / enum
             v = strtrim(string(w.Value));
     end
 end
@@ -133,6 +151,32 @@ function s = local_initStr(v)
         s = string(v);
     end
     s = char(s);
+end
+
+function v = local_initDatetime(val)
+    %LOCAL_INITDATETIME Coerce a spec's initial Value to a date for uidatepicker.
+    %   Time-of-day and time zone are dropped; uidatepicker only ever
+    %   captures a calendar date. NaT leaves the picker blank.
+    if isempty(val) || (isstring(val) && isscalar(val) && ismissing(val))
+        v = NaT;
+        return
+    end
+    if isdatetime(val)
+        v = val;
+    else
+        try
+            v = datetime(string(val), "TimeZone", "local");
+        catch
+            v = NaT;
+            return
+        end
+    end
+    if isnat(v)
+        v = NaT;
+    else
+        v.TimeZone = "";
+        v = dateshift(v, "start", "day");
+    end
 end
 
 function s = local_initNum(v)

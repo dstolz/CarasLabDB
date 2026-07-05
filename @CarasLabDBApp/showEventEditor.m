@@ -35,7 +35,7 @@ function showEventEditor(obj, mode, eventType, eventId)
         end
         fields = local_fields(eventType, table());          % blank defaults
         % Default OccurredAt to now.
-        idx = find(strcmp({fields.Key}, "OccurredAt"), 1);
+        idx = find([fields.Key] == "OccurredAt", 1);
         fields(idx).Value = datetime("now", "TimeZone", "local");
 
         res = CarasLabDBApp.pFormDialog("Add " + eventType + " event", fields);
@@ -47,7 +47,7 @@ function showEventEditor(obj, mode, eventType, eventId)
             uialert(obj.Fig, string(ME.message), "Invalid input");
             return
         end
-        if ~any(strcmp(args(1:2:end), "OccurredAt"))
+        if ~any(string(args(1:2:end)) == "OccurredAt")
             uialert(obj.Fig, "Occurred at is required.", "Add event");
             return
         end
@@ -188,11 +188,11 @@ function [provided, v] = local_convert(f, raw)
             v = logical(raw);
             provided = true;
         case "datetime"
-            str = strtrim(string(raw));
-            if strlength(str) == 0
-                v = NaT; provided = false; return
+            v = raw;
+            if isnat(v)
+                provided = false; return
             end
-            v = local_parseDateTime(str, f.Label);
+            v.TimeZone = "local";
             provided = true;
         otherwise                    % text / textarea / enum
             v = strtrim(string(raw));
@@ -220,25 +220,6 @@ function v = local_parseJson(str, label)
         v = decoded;
     else
         v = str;   % array/scalar JSON — let the DB cast the text literal
-    end
-end
-
-function dt = local_parseDateTime(str, label)
-    try
-        dt = datetime(str, "InputFormat", "yyyy-MM-dd HH:mm:ss", "TimeZone", "local");
-    catch
-        dt = NaT;
-    end
-    if isnat(dt)
-        try
-            dt = datetime(str, "TimeZone", "local");
-        catch
-            dt = NaT;
-        end
-    end
-    if isnat(dt)
-        error("CarasLabDBApp:badDateTime", ...
-            "'%s' is not a valid date/time for %s (use yyyy-MM-dd HH:mm:ss).", str, label);
     end
 end
 

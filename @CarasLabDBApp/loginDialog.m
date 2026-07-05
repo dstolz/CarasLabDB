@@ -11,7 +11,8 @@ function db = loginDialog(obj)
     c = obj.Prefs.Connection;
 
     f = uifigure("Name", "Connect to CarasLabDB", ...
-        "Position", local_center(420, 320), "WindowStyle", "modal", "Resize", "off");
+        "Position", local_center(420, 320), "WindowStyle", "modal", "Resize", "off", ...
+        "KeyPressFcn", @(~,e) onKeyPress(e));
     g = uigridlayout(f, [7 2]);
     g.RowHeight = repmat({30}, 1, 7);
     g.ColumnWidth = {130, '1x'};
@@ -51,6 +52,14 @@ function db = loginDialog(obj)
     return
 
     % ---- nested callbacks (share workspace with the parent) -------------
+    function onKeyPress(e)
+        %ONKEYPRESS Enter connects, Escape cancels (all fields are single-line).
+        switch e.Key
+            case "return", onConnect();
+            case "escape", onCancel();
+        end
+    end
+
     function onCancel()
         uiresume(f);
     end

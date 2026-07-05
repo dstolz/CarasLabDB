@@ -130,18 +130,11 @@ function [provided, v] = local_convert(f, raw)
             v = raw;
             provided = ~isnan(v);
         case "datetime"
-            str = strtrim(string(raw));
-            if strlength(str) == 0
-                v = NaT; provided = false; return
-            end
-            try
-                v = datetime(str, "TimeZone", "local");
-            catch
-                v = NaT;
-            end
+            v = raw;
             if isnat(v)
-                error("CarasLabDBApp:badDate", "'%s' is not a valid date/time.", str);
+                provided = false; return
             end
+            v.TimeZone = "local";
             provided = true;
         otherwise
             v = strtrim(string(raw));
