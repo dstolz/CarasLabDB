@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Lab Metadata Explorer (Live) — Caras Lab</title>
+<script>
+try{
+  var savedTheme = localStorage.getItem('labdash-theme');
+  var theme = savedTheme || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', theme);
+}catch(e){}
+</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 <style>
   :root{
@@ -32,10 +39,58 @@
     --warn:#d98c00;
     --accent:#4C72B0;
 
+    /* recurring surface tones (table headers, hovers, chips) */
+    --surface-1:#fafbfe;
+    --surface-2:#f7f9fc;
+    --surface-3:#eef2f8;
+    --surface-hover:#f5f8fd;
+    --surface-accent-hover:#e2eaf6;
+    --hairline:#f0f3f8;
+    --chart-grid:#f0f3f8;
+
     --gap:16px;
     --radius:10px;
     --shadow:0 1px 3px rgba(20,27,45,.08), 0 1px 2px rgba(20,27,45,.04);
   }
+
+  html[data-theme="dark"]{
+    --bg-primary:#0f1420;
+    --bg-card:#1a2030;
+    --text-primary:#e4e9f5;
+    --text-secondary:#8b96ac;
+    --border:#2b3245;
+    --border-strong:#3b4358;
+
+    --surface-1:#20273a;
+    --surface-2:#1e2536;
+    --surface-3:#242c40;
+    --surface-hover:#242c40;
+    --surface-accent-hover:#2a3550;
+    --hairline:#262e42;
+    --chart-grid:#262e42;
+
+    --shadow:0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
+  }
+
+  html[data-theme="dark"] .ev-birth{background:rgba(85,168,104,.22);color:#8fd6a0;}
+  html[data-theme="dark"] .ev-surgery{background:rgba(196,78,82,.24);color:#f0a3a6;}
+  html[data-theme="dark"] .ev-recording{background:rgba(76,114,176,.26);color:#a7c1ec;}
+  html[data-theme="dark"] .ev-behavior{background:rgba(221,132,82,.26);color:#f2bb8f;}
+  html[data-theme="dark"] .ev-husbandry{background:rgba(129,114,179,.26);color:#c7bbee;}
+  html[data-theme="dark"] .ev-endpoint{background:rgba(147,120,96,.28);color:#dcc0a3;}
+  html[data-theme="dark"] .ev-histology{background:rgba(218,139,195,.24);color:#f2c0e2;}
+  html[data-theme="dark"] .ev-analysis{background:rgba(63,167,183,.24);color:#8fdcea;}
+  html[data-theme="dark"] .pill{background:var(--surface-3);color:var(--text-secondary);}
+  html[data-theme="dark"] .pill.ok,html[data-theme="dark"] .pill.active,html[data-theme="dark"] .pill.succeeded{background:rgba(31,157,85,.22);color:#8fe6ac;}
+  html[data-theme="dark"] .pill.missing,html[data-theme="dark"] .pill.failed{background:rgba(220,53,69,.22);color:#f4a3a8;}
+  html[data-theme="dark"] .pill.mismatch{background:rgba(217,140,0,.24);color:#ffd28c;}
+  html[data-theme="dark"] .pill.superseded{background:rgba(139,150,172,.22);color:#c7cedb;}
+  html[data-theme="dark"] .pill.running{background:rgba(76,114,176,.26);color:#a7c1ec;}
+  html[data-theme="dark"] .link{color:#8db4ff;}
+  html[data-theme="dark"] .btn-export:hover,html[data-theme="dark"] .btn-tree:hover{color:#8db4ff;}
+  html[data-theme="dark"] table.data thead th.sortable:hover{color:var(--text-primary);}
+  html[data-theme="dark"] #boot-overlay{background:rgba(15,20,32,.85);}
+  html[data-theme="dark"] .boot-hint code,html[data-theme="dark"] details.howto code{background:var(--hairline);color:#a7c1ec;}
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{height:100%}
   body{
@@ -64,6 +119,17 @@
     border:1px solid rgba(217,140,0,.35);padding:5px 10px;border-radius:20px;white-space:nowrap;
   }
   .sample-badge .dot{width:7px;height:7px;border-radius:50%;background:#ffbb33;box-shadow:0 0 0 3px rgba(255,187,51,.18);}
+
+  .header-actions{display:flex;align-items:center;gap:10px;}
+  .btn-theme{
+    display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;
+    border-radius:8px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);
+    color:var(--text-on-dark);cursor:pointer;
+  }
+  .btn-theme:hover{background:rgba(255,255,255,.13);}
+  .btn-theme .icon-moon{display:none;}
+  html[data-theme="dark"] .btn-theme .icon-sun{display:none;}
+  html[data-theme="dark"] .btn-theme .icon-moon{display:inline-block;}
 
   /* Filters */
   .filters{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;}
@@ -126,7 +192,7 @@
   .section-head .meta{font-size:12.5px;color:var(--text-secondary);}
   .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
   .toolbar input[type="search"],.toolbar select{
-    padding:7px 11px;border:1px solid var(--border-strong);border-radius:7px;font-size:13px;background:#fff;
+    padding:7px 11px;border:1px solid var(--border-strong);border-radius:7px;font-size:13px;background:var(--bg-card);
     font-family:inherit;color:var(--text-primary);
   }
   .toolbar input[type="search"]{min-width:210px;}
@@ -134,16 +200,16 @@
   .table-wrap{background:var(--bg-card);border-radius:var(--radius);box-shadow:var(--shadow);border:1px solid var(--border);overflow:auto;max-height:none;}
   table.data{width:100%;border-collapse:collapse;font-size:13px;}
   table.data thead th{
-    text-align:left;padding:11px 14px;background:#f7f9fc;border-bottom:2px solid var(--border-strong);
+    text-align:left;padding:11px 14px;background:var(--surface-2);border-bottom:2px solid var(--border-strong);
     color:var(--text-secondary);font-weight:650;font-size:11px;text-transform:uppercase;letter-spacing:.5px;
     white-space:nowrap;user-select:none;position:sticky;top:0;z-index:2;
   }
   table.data thead th.sortable{cursor:pointer;}
-  table.data thead th.sortable:hover{color:var(--text-primary);background:#eef2f8;}
-  table.data tbody td{padding:10px 14px;border-bottom:1px solid #f0f3f8;white-space:nowrap;}
+  table.data thead th.sortable:hover{color:var(--text-primary);background:var(--surface-3);}
+  table.data tbody td{padding:10px 14px;border-bottom:1px solid var(--hairline);white-space:nowrap;}
   table.data tbody tr:last-child td{border-bottom:none;}
   table.data tbody tr.clickable{cursor:pointer;}
-  table.data tbody tr.clickable:hover{background:#f5f8fd;}
+  table.data tbody tr.clickable:hover{background:var(--surface-hover);}
   .num{text-align:right;font-variant-numeric:tabular-nums;}
   .mono{font-family:'SF Mono',ui-monospace,'Cascadia Mono',Menlo,Consolas,monospace;font-size:12px;}
   .muted{color:var(--text-secondary);}
@@ -166,7 +232,7 @@
   .dot-husbandry{background:var(--ev-husbandry)}.dot-endpoint{background:var(--ev-endpoint)}
   .dot-histology{background:var(--ev-histology)}.dot-analysis{background:var(--ev-analysis)}
 
-  .pill{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11.5px;font-weight:600;background:#eef2f8;color:#54617a;}
+  .pill{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11.5px;font-weight:600;background:var(--surface-3);color:#54617a;}
   .pill.ok{background:rgba(31,157,85,.13);color:#187a41;}
   .pill.missing{background:rgba(220,53,69,.13);color:#b02a37;}
   .pill.mismatch{background:rgba(217,140,0,.15);color:#a06400;}
@@ -187,9 +253,16 @@
   .modal-head{display:flex;justify-content:space-between;align-items:flex-start;padding:20px 24px;border-bottom:1px solid var(--border);gap:14px;position:sticky;top:0;background:var(--bg-card);border-radius:14px 14px 0 0;}
   .modal-head h2{font-size:18px;font-weight:680;}
   .modal-head .sub{font-size:13px;color:var(--text-secondary);margin-top:2px;}
-  .modal-close{border:none;background:#f0f3f8;width:32px;height:32px;border-radius:8px;font-size:18px;cursor:pointer;color:var(--text-secondary);flex:none;line-height:1;}
-  .modal-close:hover{background:#e3e8f0;color:var(--text-primary);}
+  .modal-close{border:none;background:var(--hairline);width:32px;height:32px;border-radius:8px;font-size:18px;cursor:pointer;color:var(--text-secondary);flex:none;line-height:1;}
+  .modal-close:hover{background:var(--border);color:var(--text-primary);}
   .modal-body{padding:20px 24px 26px;}
+
+  /* Export toolbar (project detail modal) */
+  .export-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--border);}
+  .export-bar .export-label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);font-weight:700;margin-right:2px;}
+  .btn-export{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border:1px solid var(--border-strong);border-radius:7px;background:var(--bg-card);font-family:inherit;font-size:12.5px;font-weight:600;color:var(--text-primary);cursor:pointer;}
+  .btn-export:hover{background:var(--surface-hover);border-color:var(--accent);color:var(--accent);}
+  .btn-export svg{width:14px;height:14px;flex:none;}
 
   .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px 22px;margin-bottom:18px;}
   .kv .k{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);font-weight:600;}
@@ -199,7 +272,7 @@
   /* Timeline */
   .timeline{position:relative;margin-left:6px;padding-left:22px;border-left:2px solid var(--border-strong);}
   .tl-item{position:relative;padding:9px 0 9px 2px;}
-  .tl-item::before{content:"";position:absolute;left:-29px;top:14px;width:12px;height:12px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px var(--border-strong);}
+  .tl-item::before{content:"";position:absolute;left:-29px;top:14px;width:12px;height:12px;border-radius:50%;border:2px solid var(--bg-card);box-shadow:0 0 0 1px var(--border-strong);}
   .tl-item.t-birth::before{background:var(--ev-birth)}.tl-item.t-surgery::before{background:var(--ev-surgery)}
   .tl-item.t-recording::before{background:var(--ev-recording)}.tl-item.t-behavior::before{background:var(--ev-behavior)}
   .tl-item.t-husbandry::before{background:var(--ev-husbandry)}.tl-item.t-endpoint::before{background:var(--ev-endpoint)}
@@ -211,9 +284,9 @@
   .tl-note{font-size:12.5px;color:var(--text-secondary);margin-top:2px;margin-left:106px;}
 
   .lineage-col{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
-  .lineage-node{display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-size:12.5px;background:#fafbfe;}
-  .lineage-node .depth{font-size:10px;color:var(--text-secondary);background:#eef2f8;border-radius:5px;padding:1px 6px;font-weight:600;flex:none;}
-  .lineage-empty{font-size:13px;color:var(--text-secondary);padding:12px;background:#fafbfe;border-radius:8px;border:1px dashed var(--border-strong);}
+  .lineage-node{display:flex;align-items:center;gap:9px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;font-size:12.5px;background:var(--surface-1);}
+  .lineage-node .depth{font-size:10px;color:var(--text-secondary);background:var(--surface-3);border-radius:5px;padding:1px 6px;font-weight:600;flex:none;}
+  .lineage-empty{font-size:13px;color:var(--text-secondary);padding:12px;background:var(--surface-1);border-radius:8px;border:1px dashed var(--border-strong);}
 
   /* Info banner */
   .banner{
@@ -230,7 +303,7 @@
   details.howto summary .chev{transition:transform .18s;color:var(--text-secondary);}
   details.howto[open] summary .chev{transform:rotate(90deg);}
   details.howto .howto-body{padding:0 18px 18px;font-size:13px;color:var(--text-secondary);line-height:1.65;}
-  details.howto code{background:#f0f3f8;padding:1px 6px;border-radius:5px;font-size:12px;font-family:ui-monospace,monospace;color:#3a5c94;}
+  details.howto code{background:var(--hairline);padding:1px 6px;border-radius:5px;font-size:12px;font-family:ui-monospace,monospace;color:#3a5c94;}
   details.howto pre{background:#141b2d;color:#dbe4f5;padding:14px 16px;border-radius:8px;overflow:auto;font-size:12px;line-height:1.6;margin:10px 0;}
 
   footer.app-footer{text-align:center;color:var(--text-secondary);font-size:12px;padding:18px 0 8px;}
@@ -240,6 +313,35 @@
     .kpi-row{grid-template-columns:repeat(2,1fr);}
     .lineage-col{grid-template-columns:1fr;}
   }
+
+  /* Table ⇄ Tree toggle + hierarchical tree (Projects view) */
+  .seg{display:inline-flex;border:1px solid var(--border-strong);border-radius:7px;overflow:hidden;flex:none;}
+  .seg-btn{padding:7px 14px;border:none;background:var(--bg-card);font-family:inherit;font-size:13px;color:var(--text-secondary);cursor:pointer;font-weight:550;}
+  .seg-btn+.seg-btn{border-left:1px solid var(--border-strong);}
+  .seg-btn.active{background:var(--bg-header);color:#fff;}
+  .btn-tree{padding:7px 12px;border:1px solid var(--border-strong);border-radius:7px;background:var(--bg-card);font-family:inherit;font-size:12.5px;color:var(--text-primary);cursor:pointer;font-weight:500;}
+  .btn-tree:hover{background:var(--surface-hover);}
+  .btn-tree:disabled{opacity:.45;cursor:not-allowed;}
+  .btn-tree:disabled:hover{background:var(--bg-card);}
+  #tree-depth:disabled{opacity:.55;background:var(--surface-3);cursor:not-allowed;}
+
+  .tree{background:var(--bg-card);border-radius:var(--radius);box-shadow:var(--shadow);border:1px solid var(--border);padding:8px 8px 12px;overflow:auto;}
+  .tree-children{margin-left:19px;padding-left:12px;border-left:1px solid var(--border);}
+  .tree-children.collapsed{display:none;}
+  .tree-row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:7px;font-size:13px;white-space:nowrap;}
+  .tree-row:hover{background:var(--surface-hover);}
+  .tree-caret{width:16px;height:16px;flex:none;display:grid;place-items:center;color:var(--text-secondary);cursor:pointer;transition:transform .15s;font-size:10px;user-select:none;}
+  .tree-caret.open{transform:rotate(90deg);}
+  .tree-caret.leaf{visibility:hidden;}
+  .tree-branch{margin-left:auto;flex:none;visibility:hidden;display:inline-grid;place-items:center;width:22px;height:20px;border-radius:5px;color:var(--text-secondary);cursor:pointer;font-size:13px;user-select:none;}
+  .tree-row:hover .tree-branch{visibility:visible;}
+  .tree-branch:hover{background:var(--surface-accent-hover);color:var(--text-primary);}
+  .tree-content{display:flex;align-items:center;gap:8px;min-width:0;cursor:default;}
+  .tree-label{font-weight:600;}
+  .tree-label.click{cursor:pointer;color:var(--accent);}
+  .tree-label.click:hover{text-decoration:underline;}
+  .tree-meta{color:var(--text-secondary);font-size:12px;}
+  .tree-empty{padding:18px;text-align:center;color:var(--text-secondary);font-size:13px;}
 
   /* -------- live-mode additions -------- */
   .sample-badge.live{color:#8ee6a8;background:rgba(31,157,85,.14);border-color:rgba(31,157,85,.4);}
@@ -268,16 +370,23 @@
     <div class="top">
       <div class="brand">
         <div class="logo">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#8db4ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 12h3l2-7 4 14 2-7h3"/><circle cx="20" cy="12" r="1.6" fill="#8db4ff"/>
+          <!-- Gerbil icon: "Seated Mouse" by Lorc (game-icons.net), CC BY 3.0 -->
+          <svg width="22" height="22" viewBox="0 0 512 512" fill="#8db4ff" xmlns="http://www.w3.org/2000/svg">
+            <path d="M240.125 23.563c-14.745.33-28.994 8.14-36.906 21.843-3.423 5.926-6.234 17.854-8.532 31.907-36.383 8.417-75.868 48.232-93.375 94.406 29.49 11.05 58.933 14.183 84.312 11.436-59.315 98.734-49.44 208.705 47.72 208.72 9.06 0 17.345-.91 24.874-2.688 57.812 24.78 100.79 13.996 122.81-13.438 22.414-27.923 22.947-69.86 3.314-102.438-17.974-29.824-26.618-53.295-26.03-69.968.585-16.674 8.498-28.14 29.873-38.875l-8.375-16.69c-25.082 12.596-39.368 31.652-40.187 54.907-.82 23.256 9.914 49.13 28.688 80.282 15.827 26.262 14.738 60.395-1.875 81.092-14.44 17.992-40.735 28.253-83.344 14.563 53.146-35.285 41.39-134.655-19.906-220.188 8.096 2.605 14.99 4.22 19.625 4.22 24.115-.003 43.687-19.543 43.687-43.657 0-23.737-18.97-43.027-42.563-43.625 3.36-17.73-4.552-36.437-21.062-45.97-7.178-4.143-15.026-6.016-22.75-5.843zM99.595 360.219C49.44 373.845 17.03 394.014 17.03 416.405c0 41.018 106.547 74.375 237.72 74.375s237.688-33.356 237.688-74.374c0-22.31-32.125-42.56-81.97-56.187C427.7 369.097 438 379.46 438 390.655c0 32.13-82.313 58.563-183.25 58.563S72.094 422.783 72.094 390.655c0-11.254 10.093-21.528 27.5-30.437z"/>
           </svg>
         </div>
         <div>
-          <h1>Lab Metadata Explorer</h1>
-          <div class="sub">Append-only event log · artifacts &amp; provenance · <span id="asof"></span></div>
+          <h1>Caras Lab Metadata Explorer</h1>
+          <div class="sub">University of Maryland, College Park · <span id="asof"></span></div>
         </div>
       </div>
-      <div class="sample-badge live loading" id="live-status"><span class="dot"></span> <span id="live-status-text">Connecting…</span></div>
+      <div class="header-actions">
+        <button class="btn-theme" id="theme-toggle" type="button" title="Toggle dark / light theme (t)" aria-label="Toggle dark / light theme">
+          <svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+          <svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <div class="sample-badge live loading" id="live-status"><span class="dot"></span> <span id="live-status-text">Connecting…</span></div>
+      </div>
     </div>
 
     <div class="filters">
@@ -302,13 +411,13 @@
         <input type="date" id="f-to">
       </div>
       <label class="filter-toggle"><input type="checkbox" id="f-active" checked> Active only</label>
-      <button class="btn-reset" id="f-clear">Reset filters</button>
+      <button class="btn-reset" id="f-clear" title="Reset filters (f)">Reset filters</button>
     </div>
   </header>
 
   <div class="banner">
     <span><b>Live view:</b> reading the <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">lab</code> schema through <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">/api/data</code>. Full history is loaded; use <b>Active only</b> to hide superseded rows.</span>
-    <span><span class="link" id="btn-refresh">↻ Refresh</span> &nbsp;·&nbsp; <span class="link" id="open-howto">How does this work? →</span></span>
+    <span><span class="link" id="btn-refresh" title="Refresh data (r)">↻ Refresh</span> &nbsp;·&nbsp; <span class="link" id="open-shortcuts" title="Keyboard shortcuts (?)">⌨ Shortcuts</span> &nbsp;·&nbsp; <span class="link" id="open-howto">How does this work? →</span></span>
   </div>
 
   <details class="howto" id="howto">
@@ -358,11 +467,6 @@
         <div class="chart-wrap"><canvas id="chart-time"></canvas></div>
       </div>
       <div class="card">
-        <h3>Subjects by species</h3>
-        <div class="card-sub">Cohort composition</div>
-        <div class="chart-wrap"><canvas id="chart-species"></canvas></div>
-      </div>
-      <div class="card">
         <h3>Storage by artifact role</h3>
         <div class="card-sub">Registered bytes on the NAS</div>
         <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
@@ -376,9 +480,21 @@
       <div><h2>Projects</h2><div class="meta" id="projects-meta"></div></div>
       <div class="toolbar">
         <input type="search" id="projects-search" placeholder="Search name, description, member…">
+        <div class="seg" id="projects-mode" role="tablist" title="Switch between a flat table and a hierarchical tree">
+          <button class="seg-btn active" data-mode="table">Table</button>
+          <button class="seg-btn" data-mode="tree">Tree</button>
+        </div>
+        <select id="tree-depth" title="How deep the tree descends (switch to Tree to use)" disabled>
+          <option value="sessions">Depth: sessions</option>
+          <option value="files" selected>Depth: files</option>
+          <option value="full">Depth: events + files</option>
+        </select>
+        <button class="btn-tree" id="tree-expand" title="Expand every branch (switch to Tree to use)" disabled>⊞ Expand all</button>
+        <button class="btn-tree" id="tree-collapse" title="Collapse every branch (switch to Tree to use)" disabled>⊟ Collapse all</button>
       </div>
     </div>
     <div class="table-wrap" id="projects-table"></div>
+    <div class="tree" id="projects-tree" style="display:none"></div>
   </section>
 
   <!-- SUBJECTS -->
@@ -585,6 +701,24 @@ window.__initDashboard = function(){
   D.events.forEach(e=>{ if(e.session_id && isEventActive(e)) eventCountBySession.set(e.session_id,(eventCountBySession.get(e.session_id)||0)+1); });
   D.artifacts.forEach(a=>{ if(a.session_id) artifactCountBySession.set(a.session_id,(artifactCountBySession.get(a.session_id)||0)+1); });
 
+  // per-project rollups (session/artifact reach a project through their subject)
+  const sessionCountByProject = new Map(), artifactCountByProject = new Map();
+  D.sessions.forEach(s=>{ const sub=subjectById.get(s.subject_id); if(sub&&sub.project_id) sessionCountByProject.set(sub.project_id,(sessionCountByProject.get(sub.project_id)||0)+1); });
+  D.artifacts.forEach(a=>{ if(!a.subject_id||!isArtifactActive(a)) return; const sub=subjectById.get(a.subject_id); if(sub&&sub.project_id) artifactCountByProject.set(sub.project_id,(artifactCountByProject.get(sub.project_id)||0)+1); });
+
+  // parent -> children groupings for the hierarchical tree view
+  const pushInto = (map,key,val)=>{ if(key==null) return; if(!map.has(key)) map.set(key,[]); map.get(key).push(val); };
+  const subjectsByProject = new Map();          // project_id -> [subject]
+  D.subjects.forEach(s=> pushInto(subjectsByProject, s.project_id, s));
+  const sessionsBySubject = new Map();           // subject_id -> [session]
+  D.sessions.forEach(s=> pushInto(sessionsBySubject, s.subject_id, s));
+  const eventsBySession = new Map();             // session_id -> [event]
+  const eventsBySubjectNoSession = new Map();    // subject_id -> [event without a session] (birth/surgery/…)
+  D.events.forEach(e=>{ if(e.session_id) pushInto(eventsBySession, e.session_id, e); else pushInto(eventsBySubjectNoSession, e.subject_id, e); });
+  const artifactsBySession = new Map();          // session_id -> [artifact]
+  const artifactsBySubjectNoSession = new Map(); // subject_id -> [artifact without a session] (e.g. histology)
+  D.artifacts.forEach(a=>{ if(a.session_id) pushInto(artifactsBySession, a.session_id, a); else pushInto(artifactsBySubjectNoSession, a.subject_id, a); });
+
   // ---- formatting ----
   const ETYPES = ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis'];
   const CSSVAR = getComputedStyle(document.documentElement);
@@ -603,6 +737,40 @@ window.__initDashboard = function(){
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
   function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
   function fmtDur(s){ if(s==null) return '—'; const h=Math.floor(s/3600), m=Math.round((s%3600)/60); return h?`${h}h ${m}m`:`${m}m`; }
+
+  // ---- artifact parent-folder links ----------------------------------------
+  // NAS artifacts are located by storage_root + relative_path. Build a UNC-style
+  // file: URI to the *folder* that holds the file (\\root\dir) so the link opens
+  // the parent directory in the OS file browser. Returns null for external-URI
+  // artifacts (project documents) or when the storage root is unknown.
+  function artifactFolderPath(a){
+    const p = String((a&&a.relative_path)||'').replace(/\\/g,'/').replace(/\/+$/,'');
+    const i = p.lastIndexOf('/');
+    return i>=0 ? p.slice(0,i) : '';
+  }
+  function artifactFolderUri(a){
+    if(!a || a.uri) return null;
+    const root = (rootById.get(a.storage_root_id)||{}).name;
+    if(!root) return null;
+    const dir = artifactFolderPath(a);
+    const segs = [root].concat(dir?dir.split('/'):[]).map(encodeURIComponent);
+    return 'file://'+segs.join('/')+'/';
+  }
+  function artifactFolderLabel(a){
+    const root = (rootById.get(a.storage_root_id)||{}).name||'';
+    const dir = artifactFolderPath(a);
+    return dir ? root+'/'+dir : root;
+  }
+  function folderLink(a){
+    const href = artifactFolderUri(a);
+    if(!href) return '';
+    return `<a class="link" href="${esc(href)}" target="_blank" rel="noopener" title="Open parent folder — ${esc(artifactFolderLabel(a))}">folder</a>`;
+  }
+  // folder + open links, used wherever an artifact row is listed
+  function artifactOpenLinks(a){
+    const fl = folderLink(a);
+    return (fl?fl+' ':'')+`<span class="link" data-open-artifact="${esc(a.artifact_id)}">open</span>`;
+  }
 
   function eventSummary(e){
     const d=e.detail||{};
@@ -701,29 +869,22 @@ window.__initDashboard = function(){
   const charts={};
   Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
   Chart.defaults.font.size = 12;
-  Chart.defaults.color = '#6b7688';
+  Chart.defaults.color = CSSVAR.getPropertyValue('--text-secondary').trim();
 
   function buildCharts(){
     charts.events = new Chart(document.getElementById('chart-events'),{
       type:'doughnut',
-      data:{labels:[],datasets:[{data:[],backgroundColor:[],borderColor:'#fff',borderWidth:2}]},
+      data:{labels:[],datasets:[{data:[],backgroundColor:[],borderColor:CSSVAR.getPropertyValue('--bg-card').trim(),borderWidth:2}]},
       options:{responsive:true,maintainAspectRatio:false,cutout:'62%',
         plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:12,boxWidth:8}},
           tooltip:{callbacks:{label:c=>{const t=c.dataset.data.reduce((a,b)=>a+b,0);return ` ${c.label}: ${c.parsed} (${t?(c.parsed/t*100).toFixed(0):0}%)`;}}}}}
-    });
-    charts.species = new Chart(document.getElementById('chart-species'),{
-      type:'doughnut',
-      data:{labels:[],datasets:[{data:[],backgroundColor:['#4C72B0','#DD8452','#55A868','#8172B3'],borderColor:'#fff',borderWidth:2}]},
-      options:{responsive:true,maintainAspectRatio:false,cutout:'62%',
-        plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:12,boxWidth:8}},
-          tooltip:{callbacks:{label:c=>` ${c.label}: ${c.parsed}`}}}}
     });
     charts.storage = new Chart(document.getElementById('chart-storage'),{
       type:'bar',
       data:{labels:[],datasets:[{label:'GB',data:[],backgroundColor:'#4C72B0CC',borderColor:'#4C72B0',borderWidth:1,borderRadius:4}]},
       options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
         plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${fmtBytes(c.raw*1073741824)}`}}},
-        scales:{x:{beginAtZero:true,ticks:{callback:v=>v+' GB'},grid:{color:'#f0f3f8'}},y:{grid:{display:false}}}}
+        scales:{x:{beginAtZero:true,ticks:{callback:v=>v+' GB'},grid:{color:CSSVAR.getPropertyValue('--chart-grid').trim()}},y:{grid:{display:false}}}}
     });
     charts.time = new Chart(document.getElementById('chart-time'),{
       type:'line',
@@ -733,8 +894,19 @@ window.__initDashboard = function(){
       ]},
       options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
         plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:16,boxWidth:8}}},
-        scales:{x:{grid:{display:false},ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:8}},y:{beginAtZero:true,grid:{color:'#f0f3f8'},ticks:{precision:0}}}}
+        scales:{x:{grid:{display:false},ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:8}},y:{beginAtZero:true,grid:{color:CSSVAR.getPropertyValue('--chart-grid').trim()},ticks:{precision:0}}}}
     });
+  }
+
+  // re-reads the live CSS variables (after a theme switch) and repaints existing charts
+  function applyChartTheme(){
+    Chart.defaults.color = CSSVAR.getPropertyValue('--text-secondary').trim();
+    const grid = CSSVAR.getPropertyValue('--chart-grid').trim();
+    const card = CSSVAR.getPropertyValue('--bg-card').trim();
+    if(charts.events) charts.events.data.datasets[0].borderColor = card;
+    if(charts.storage) charts.storage.options.scales.x.grid.color = grid;
+    if(charts.time) charts.time.options.scales.y.grid.color = grid;
+    Object.values(charts).forEach(c=>c.update());
   }
 
   function updateCharts(){
@@ -748,14 +920,6 @@ window.__initDashboard = function(){
     charts.events.data.datasets[0].data = idx.map(i=>byType[i]);
     charts.events.data.datasets[0].backgroundColor = idx.map(i=>etColor(ETYPES[i]));
     charts.events.update('none');
-
-    // species (from subjects in selection)
-    const subs = filteredSubjects();
-    const spCounts = D.species.map(sp=>subs.filter(s=>s.species_code===sp.code).length);
-    const spIdx = D.species.map((s,i)=>i).filter(i=>spCounts[i]>0);
-    charts.species.data.labels = spIdx.map(i=>D.species[i].common_name);
-    charts.species.data.datasets[0].data = spIdx.map(i=>spCounts[i]);
-    charts.species.update('none');
 
     // storage by role
     const roleBytes={};
@@ -843,6 +1007,8 @@ window.__initDashboard = function(){
       {key:'description',label:'Description',sortable:false,render:p=>`<span class="truncate" style="max-width:320px;display:inline-block;vertical-align:bottom" title="${esc(p.description||'')}">${esc(p.description||'—')}</span>`},
       {key:'_members',label:'Members',cls:'num',sortVal:p=>(membersByProject.get(p.project_id)||[]).length,render:p=>(membersByProject.get(p.project_id)||[]).length},
       {key:'_subjects',label:'Subjects',cls:'num',sortVal:p=>subjectCountByProject.get(p.project_id)||0,render:p=>subjectCountByProject.get(p.project_id)||0},
+      {key:'_sessions',label:'Sessions',cls:'num',sortVal:p=>sessionCountByProject.get(p.project_id)||0,render:p=>sessionCountByProject.get(p.project_id)||0},
+      {key:'_files',label:'Files',cls:'num',sortVal:p=>artifactCountByProject.get(p.project_id)||0,render:p=>artifactCountByProject.get(p.project_id)||0},
       {key:'_docs',label:'Documents',cls:'num',sortVal:p=>(docsByProject.get(p.project_id)||[]).length,render:p=>(docsByProject.get(p.project_id)||[]).length},
       {key:'started_on',label:'Started',sortVal:p=>p.started_on,render:p=>fmtDate(p.started_on)},
       {key:'_status',label:'Status',sortVal:p=>p.is_active?0:1,
@@ -852,44 +1018,483 @@ window.__initDashboard = function(){
       rowAttrs:p=>`data-project="${esc(p.project_id)}"`, onClick:d=>openProject(d.project)});
   }
 
+  /* ------------------------------------------------- projects tree (browse) */
+  // Table ⇄ Tree toggle lives in the Projects toolbar. The tree nests
+  // Project → Subject → Session → (Event) → File; the Depth selector picks how
+  // far it descends. Children are built lazily on first expand. Leaf links reuse
+  // the existing open*() modals via one delegated handler on #projects-tree.
+  let treeMode = 'table';
+  let _treeOk = new Set();               // subject_ids passing the global filter bar
+  const treeDepth = () => document.getElementById('tree-depth').value;
+  const stripTags = h => String(h).replace(/<[^>]*>/g,' ');
+
+  // Build one tree node element from a spec { rowHtml, buildChildren?() -> [el] }.
+  // buildChildren is a thunk called the first time the node is expanded.
+  function treeNode(spec){
+    const node = document.createElement('div');
+    node.className = 'tree-node';
+    const canExpand = typeof spec.buildChildren === 'function';
+    const row = document.createElement('div'); row.className = 'tree-row';
+    const caret = document.createElement('span');
+    caret.className = 'tree-caret' + (canExpand ? '' : ' leaf');
+    caret.textContent = '▶';
+    const content = document.createElement('span');
+    content.className = 'tree-content';
+    content.innerHTML = spec.rowHtml;
+    row.appendChild(caret); row.appendChild(content);
+    // per-branch expand/collapse affordance (revealed on row hover)
+    let branch = null;
+    if(canExpand){
+      branch = document.createElement('span');
+      branch.className = 'tree-branch';
+      branch.title = 'Expand / collapse this whole branch';
+      branch.textContent = '⊞';
+      row.appendChild(branch);
+    }
+    node.appendChild(row);
+
+    let childWrap = null, built = false;
+    node._open = false; node._canExpand = canExpand;
+    function build(){
+      if(built) return; built = true;
+      childWrap = document.createElement('div'); childWrap.className = 'tree-children collapsed';
+      const kids = spec.buildChildren() || [];
+      if(!kids.length){ const e=document.createElement('div'); e.className='tree-empty'; e.textContent='None.'; childWrap.appendChild(e); }
+      else kids.forEach(k=> childWrap.appendChild(k));
+      node.appendChild(childWrap);
+    }
+    node._setOpen = function(o){
+      if(!canExpand) return;
+      node._open = !!o;
+      if(o){ build(); childWrap.classList.remove('collapsed'); caret.classList.add('open'); }
+      else if(childWrap){ childWrap.classList.add('collapsed'); caret.classList.remove('open'); }
+      if(branch) branch.textContent = node._open ? '⊟' : '⊞';
+    };
+    if(canExpand){
+      // caret / row: one level; Alt-click: the whole branch. Branch button: whole branch.
+      const toggle = ev => { if(ev && ev.altKey) setSubtreeOpen(node, !node._open); else node._setOpen(!node._open); };
+      caret.onclick = toggle;
+      content.addEventListener('click', ev=>{
+        if(ev.target.closest('[data-open-project],[data-open-subject],[data-open-event],[data-open-artifact],a')) return;
+        toggle(ev);
+      });
+      branch.onclick = ev=>{ ev.stopPropagation(); setSubtreeOpen(node, !node._open); };
+    }
+    return node;
+  }
+
+  // expand/collapse an entire branch (this node + all descendants), building lazily
+  function setSubtreeOpen(node, open){
+    if(open){
+      for(let pass=0; pass<500; pass++){
+        let changed=false;
+        if(node._canExpand && !node._open){ node._setOpen(true); changed=true; }
+        node.querySelectorAll('.tree-node').forEach(n=>{ if(n._canExpand && !n._open){ n._setOpen(true); changed=true; } });
+        if(!changed) break;
+      }
+    } else {
+      node.querySelectorAll('.tree-node').forEach(n=>{ if(n._canExpand && n._open) n._setOpen(false); });
+      if(node._canExpand && node._open) node._setOpen(false);
+    }
+  }
+
+  // ---- node factories (lazy browse) ----
+  function fileNode(a){
+    return treeNode({ rowHtml:
+      `<span class="pill">${esc(a.role||'file')}</span>`+
+      `<span class="mono truncate" style="max-width:440px" title="${esc(a.relative_path||'')}">${esc(a.relative_path||'')}</span>`+
+      `<span class="tree-meta">${fmtBytes(a.size_bytes)}${!isArtifactActive(a)?' · <span class="pill superseded">superseded</span>':''}</span>`+
+      artifactOpenLinks(a) });
+  }
+  function docNode(a){
+    const loc = a.uri ? `<a class="link" href="${esc(a.uri)}" target="_blank" rel="noopener">link</a>`
+      : `<span class="mono truncate" style="max-width:380px" title="${esc(a.relative_path||'')}">${esc((rootById.get(a.storage_root_id)||{}).name||'')}:${esc(a.relative_path||'')}</span>`;
+    return treeNode({ rowHtml:
+      `<span class="pill">${esc(a.kind||'file')}</span><span>${esc(a.title||'')}</span> <span class="tree-meta">${loc}</span>` });
+  }
+  function eventFiles(e){ let arts=(artifactsByEvent.get(e.event_id)||[]); if(F.activeOnly) arts=arts.filter(isArtifactActive); return arts.slice().sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0)); }
+  function eventNode(e){
+    const arts = eventFiles(e);
+    return treeNode({ rowHtml:
+      typeBadge(e.event_type)+
+      `<span class="tree-meta">${fmtDate(e.occurred_at)}</span>`+
+      `<span class="truncate" style="max-width:340px">${eventSummary(e)}</span>`+
+      `<span class="link" data-open-event="${esc(e.event_id)}">details</span>`,
+      buildChildren: arts.length ? ()=>arts.map(fileNode) : null });
+  }
+  function sessionNode(s, depth){
+    let build = null;
+    if(depth==='files'){
+      let arts=(artifactsBySession.get(s.session_id)||[]); if(F.activeOnly) arts=arts.filter(isArtifactActive);
+      arts=arts.slice().sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0));
+      if(arts.length) build=()=>arts.map(fileNode);
+    } else if(depth==='full'){
+      let evs=(eventsBySession.get(s.session_id)||[]); if(F.activeOnly) evs=evs.filter(isEventActive);
+      evs=evs.slice().sort((a,b)=>a.occurred_at<b.occurred_at?-1:1);
+      if(evs.length) build=()=>evs.map(eventNode);
+    }
+    const nEv=eventCountBySession.get(s.session_id)||0, nArt=artifactCountBySession.get(s.session_id)||0;
+    return treeNode({ rowHtml:
+      `<span class="tree-label mono">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')} · ${nEv} ev · ${nArt} files</span>`,
+      buildChildren: build });
+  }
+  function subjectExtras(sub, depth){ // subject-level events (full) or files (files) with no session
+    if(depth==='full'){ let evs=(eventsBySubjectNoSession.get(sub.subject_id)||[]); if(F.activeOnly) evs=evs.filter(isEventActive); return {kind:'events', rows:evs.slice().sort((a,b)=>a.occurred_at<b.occurred_at?-1:1)}; }
+    if(depth==='files'){ let arts=(artifactsBySubjectNoSession.get(sub.subject_id)||[]); if(F.activeOnly) arts=arts.filter(isArtifactActive); return {kind:'files', rows:arts.slice().sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0))}; }
+    return {kind:'none', rows:[]};
+  }
+  function subjectNode(sub, depth){
+    const sc=subjectCurrent.get(sub.subject_id)||{};
+    const status = sc.is_endpointed ? '<span class="pill superseded">endpointed</span>' : '<span class="pill active">active</span>';
+    const sess=(sessionsBySubject.get(sub.subject_id)||[]);
+    const extra=subjectExtras(sub, depth);
+    const hasKids = sess.length + extra.rows.length > 0;
+    const nSess=sessionCountBySubject.get(sub.subject_id)||0, nEv=eventCountBySubject.get(sub.subject_id)||0;
+    return treeNode({ rowHtml:
+      `<span class="tree-label click mono" data-open-subject="${esc(sub.subject_id)}">${esc(sub.subject_id)}</span> `+
+      `<span class="tree-meta">${esc(speciesName(sub.species_code))}</span> ${status} `+
+      `<span class="tree-meta">${nSess} sess · ${nEv} ev</span>`,
+      buildChildren: hasKids ? ()=>{
+        const kids=[];
+        extra.rows.forEach(r=> kids.push(extra.kind==='events'?eventNode(r):fileNode(r)));
+        (sessionsBySubject.get(sub.subject_id)||[]).slice().sort((a,b)=>a.started_at<b.started_at?1:-1).forEach(s=>kids.push(sessionNode(s,depth)));
+        return kids;
+      } : null });
+  }
+  function projectNode(pr){
+    const depth=treeDepth();
+    const subs=(subjectsByProject.get(pr.project_id)||[]).filter(s=>_treeOk.has(s.subject_id)).slice().sort((a,b)=>a.subject_id.localeCompare(b.subject_id));
+    const docs=(docsByProject.get(pr.project_id)||[]);
+    const hasKids = subs.length || (depth==='full' && docs.length);
+    return treeNode({ rowHtml:
+      `<span class="tree-label click" data-open-project="${esc(pr.project_id)}">${esc(pr.name)}</span> `+
+      `${pr.is_active?'':'<span class="pill superseded">inactive</span>'} `+
+      `<span class="tree-meta">${subs.length} subj · ${sessionCountByProject.get(pr.project_id)||0} sess · ${artifactCountByProject.get(pr.project_id)||0} files</span>`,
+      buildChildren: hasKids ? ()=>{
+        const kids=[];
+        if(depth==='full' && docs.length) kids.push(treeNode({ rowHtml:`<span class="tree-label">Documents</span> <span class="tree-meta">${docs.length}</span>`, buildChildren:()=>docs.map(docNode) }));
+        subs.forEach(s=>kids.push(subjectNode(s,depth)));
+        return kids;
+      } : null });
+  }
+
+  // ---- filtered (search) build: only matching branches, auto-expanded ----
+  function ffFiles(rows,q){ return rows.filter(a=>((a.role||'')+' '+(a.relative_path||'')+' '+(a.format||'')).toLowerCase().includes(q)); }
+  function ffEvent(e,q){
+    const arts=eventFiles(e);
+    const self=(e.event_type+' '+stripTags(eventSummary(e))+' '+(e.notes||'')).toLowerCase().includes(q);
+    const kids=(self?arts:ffFiles(arts,q)).map(fileNode);
+    if(!self && !kids.length) return null;
+    const n=treeNode({ rowHtml: typeBadge(e.event_type)+`<span class="tree-meta">${fmtDate(e.occurred_at)}</span><span class="truncate" style="max-width:340px">${eventSummary(e)}</span><span class="link" data-open-event="${esc(e.event_id)}">details</span>`, buildChildren: kids.length?()=>kids:null });
+    if(kids.length) n._setOpen(true);
+    return n;
+  }
+  function ffSession(s,q,depth){
+    const self=(s.label+' '+(s.rig||'')+' '+(s.relative_path||'')).toLowerCase().includes(q);
+    let kids=[];
+    if(depth==='files'){ let arts=(artifactsBySession.get(s.session_id)||[]); if(F.activeOnly) arts=arts.filter(isArtifactActive); kids=(self?arts:ffFiles(arts,q)).map(fileNode); }
+    else if(depth==='full'){ let evs=(eventsBySession.get(s.session_id)||[]); if(F.activeOnly) evs=evs.filter(isEventActive); kids=(self?evs.map(eventNode):evs.map(e=>ffEvent(e,q)).filter(Boolean)); }
+    if(!self && !kids.length) return null;
+    const n=treeNode({ rowHtml:`<span class="tree-label mono">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')}</span>`, buildChildren: kids.length?()=>kids:null });
+    if(kids.length) n._setOpen(true);
+    return n;
+  }
+  function ffSubject(sub,q,depth){
+    const self=(sub.subject_id+' '+speciesName(sub.species_code)+' '+(sub.strain||'')+' '+(sub.genotype||'')).toLowerCase().includes(q);
+    const kids=[];
+    const extra=subjectExtras(sub, depth);
+    (self?extra.rows.map(r=>extra.kind==='events'?eventNode(r):fileNode(r))
+        :extra.rows.map(r=>extra.kind==='events'?ffEvent(r,q):ffFiles([r],q).map(fileNode)[0]).filter(Boolean)).forEach(x=>kids.push(x));
+    (sessionsBySubject.get(sub.subject_id)||[]).slice().sort((a,b)=>a.started_at<b.started_at?1:-1)
+      .forEach(s=>{ const n=self?sessionNode(s,depth):ffSession(s,q,depth); if(n) kids.push(n); });
+    if(!self && !kids.length) return null;
+    const sc=subjectCurrent.get(sub.subject_id)||{};
+    const status=sc.is_endpointed?'<span class="pill superseded">endpointed</span>':'<span class="pill active">active</span>';
+    const n=treeNode({ rowHtml:`<span class="tree-label click mono" data-open-subject="${esc(sub.subject_id)}">${esc(sub.subject_id)}</span> <span class="tree-meta">${esc(speciesName(sub.species_code))}</span> ${status}`, buildChildren: kids.length?()=>kids:null });
+    if(kids.length) n._setOpen(true);
+    return n;
+  }
+  function ffProject(pr,q,depth){
+    const self=(pr.name+' '+(pr.description||'')).toLowerCase().includes(q);
+    const subs=(subjectsByProject.get(pr.project_id)||[]).filter(s=>_treeOk.has(s.subject_id)).slice().sort((a,b)=>a.subject_id.localeCompare(b.subject_id));
+    const kids=[];
+    if(depth==='full'){
+      const allDocs=(docsByProject.get(pr.project_id)||[]);
+      const docs=self?allDocs:allDocs.filter(a=>((a.title||'')+' '+(a.kind||'')+' '+(a.relative_path||'')+' '+(a.uri||'')).toLowerCase().includes(q));
+      if(docs.length){ const dn=treeNode({ rowHtml:`<span class="tree-label">Documents</span> <span class="tree-meta">${docs.length}</span>`, buildChildren:()=>docs.map(docNode) }); dn._setOpen(true); kids.push(dn); }
+    }
+    subs.forEach(s=>{ const n=self?subjectNode(s,depth):ffSubject(s,q,depth); if(n) kids.push(n); });
+    if(!self && !kids.length) return null;
+    const n=treeNode({ rowHtml:`<span class="tree-label click" data-open-project="${esc(pr.project_id)}">${esc(pr.name)}</span> <span class="tree-meta">${subs.length} subj</span>`, buildChildren: kids.length?()=>kids:null });
+    if(kids.length) n._setOpen(true);
+    return n;
+  }
+
+  function renderProjectsTree(){
+    const cont=document.getElementById('projects-tree');
+    const depth=treeDepth();
+    const q=(document.getElementById('projects-search').value||'').trim().toLowerCase();
+    _treeOk=new Set(filteredSubjects().map(s=>s.subject_id));
+    cont.innerHTML='';
+    const projects=(D.projects||[]).slice().sort((a,b)=>a.name.localeCompare(b.name));
+    if(!projects.length){ cont.innerHTML='<div class="tree-empty">No projects.</div>'; return; }
+    if(q){
+      const nodes=projects.map(pr=>ffProject(pr,q,depth)).filter(Boolean);
+      if(!nodes.length){ cont.innerHTML='<div class="tree-empty">No matches in the tree.</div>'; return; }
+      nodes.forEach(n=>cont.appendChild(n));
+    } else {
+      projects.forEach(pr=>cont.appendChild(projectNode(pr)));
+    }
+  }
+  function expandAllTree(){
+    const t=document.getElementById('projects-tree');
+    for(let pass=0; pass<500; pass++){
+      let changed=false;
+      t.querySelectorAll('.tree-node').forEach(n=>{ if(n._canExpand && !n._open){ n._setOpen(true); changed=true; } });
+      if(!changed) break;
+    }
+  }
+  function collapseAllTree(){
+    document.getElementById('projects-tree').querySelectorAll('.tree-node').forEach(n=>{ if(n._canExpand && n._open) n._setOpen(false); });
+  }
+
+  // render up to `limit` rows via `render`, with an empty state and an overflow note;
+  // optionally wrap the rows in a container with class `wrapClass`.
+  function listCapped(rows, limit, render, wrapClass){
+    if(!rows.length) return `<div class="lineage-empty">None.</div>`;
+    let inner=rows.slice(0,limit).map(render).join('');
+    if(rows.length>limit) inner+=`<div class="empty" style="padding:10px">Showing first ${limit} of ${rows.length}.</div>`;
+    return wrapClass ? `<div class="${wrapClass}">${inner}</div>` : inner;
+  }
+
   function openProject(pid){
     const p=projectById.get(pid); if(!p) return;
     const mem=membersByProject.get(pid)||[];
     const docs=docsByProject.get(pid)||[];
-    const subs=D.subjects.filter(s=>s.project_id===pid);
+    const subs=D.subjects.filter(s=>s.project_id===pid).sort((a,b)=>a.subject_id.localeCompare(b.subject_id));
+    const subIds=new Set(subs.map(s=>s.subject_id));
+    // sessions, files (artifacts) and events reach a project through their subject
+    const projSessions=D.sessions.filter(x=>subIds.has(x.subject_id)).sort((a,b)=>a.started_at<b.started_at?1:-1);
+    const projArtifacts=D.artifacts.filter(a=>a.subject_id&&subIds.has(a.subject_id)&&isArtifactActive(a)).sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0));
+    const projEvents=D.events.filter(e=>e.subject_id&&subIds.has(e.subject_id)&&isEventActive(e));
+    const projBytes=projArtifacts.reduce((a,x)=>a+(x.size_bytes||0),0);
 
-    let body = kv([
+    const icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
+    let body = `<div class="export-bar">
+      <span class="export-label">Export all data</span>
+      <button class="btn-export" data-export="csv" title="Download every project table as one CSV file">${icon}CSV</button>
+      <button class="btn-export" data-export="xls" title="Download a multi-sheet Excel workbook (one sheet per table)">${icon}Excel</button>
+      <button class="btn-export" data-export="pdf" title="Open a print-ready report — use your browser's Save as PDF">${icon}PDF</button>
+    </div>`;
+    body += kv([
       ['Name',esc(p.name)],
       ['Description',esc(p.description||'—')],
       ['Started',fmtDate(p.started_on)],
       ['Status', p.is_active?'<span class="pill active">active</span>':'<span class="pill superseded">inactive</span>',true],
       ['Members',mem.length],
       ['Subjects',subs.length],
+      ['Sessions',projSessions.length],
+      ['Events',projEvents.length],
+      ['Files',`${projArtifacts.length} · ${fmtBytes(projBytes)}`],
       ['Documents',docs.length]
     ]);
 
-    body+=`<h4>Members (${mem.length})</h4><div class="timeline">`;
-    mem.forEach(m=>{ body+=`<div class="tl-row"><span class="pill">${esc(m.role||'member')}</span> <span>${esc(personName(m.person_id))}</span></div>`; });
-    body+=`</div>`;
+    body+=`<h4>Members (${mem.length})</h4>`;
+    body+=listCapped(mem, 100,
+      m=>`<div class="tl-row"><span class="pill">${esc(m.role||'member')}</span> <span>${esc(personName(m.person_id))}</span></div>`, 'timeline');
 
-    body+=`<h4>Documents (${docs.length})</h4><div class="timeline">`;
-    docs.forEach(a=>{
+    body+=`<h4>Documents (${docs.length})</h4>`;
+    body+=listCapped(docs, 100, a=>{
       const loc = a.uri
         ? `<a class="link" href="${esc(a.uri)}" target="_blank" rel="noopener">${esc(a.uri)}</a>`
         : `<span class="mono">${esc((rootById.get(a.storage_root_id)||{}).name||'')}:${esc(a.relative_path||'')}</span>`;
-      body+=`<div class="tl-row">${projKindPill(a.kind)} <span>${esc(a.title)}</span> ${a.content_type?`<span class="muted">${esc(a.content_type)}</span>`:''} · ${loc}</div>`;
+      return `<div class="tl-row">${projKindPill(a.kind)} <span>${esc(a.title)}</span> ${a.content_type?`<span class="muted">${esc(a.content_type)}</span>`:''} · ${loc}</div>`;
+    }, 'timeline');
+
+    body+=`<h4>Subjects (${subs.length})</h4>`;
+    body+=listCapped(subs, 200, s=>{
+      const sc=subjectCurrent.get(s.subject_id)||{};
+      const st=sc.is_endpointed?'<span class="pill superseded">endpointed</span>':'<span class="pill active">active</span>';
+      return `<div class="tl-row"><span class="link" data-open-subject="${esc(s.subject_id)}"><span class="mono">${esc(s.subject_id)}</span></span> <span class="muted">${esc(speciesName(s.species_code))}</span> ${st} <span class="muted">${sessionCountBySubject.get(s.subject_id)||0} sess · ${eventCountBySubject.get(s.subject_id)||0} ev</span></div>`;
+    }, 'timeline');
+
+    body+=`<h4>Sessions (${projSessions.length})</h4>`;
+    body+=listCapped(projSessions, 60,
+      s=>`<div class="lineage-node"><span class="link mono" data-open-subject="${esc(s.subject_id)}">${esc(s.label)}</span><span class="muted">${esc(s.subject_id)}</span><span class="muted" style="flex:1">${fmtDateTime(s.started_at)}</span><span class="pill">${esc(s.rig||'—')}</span></div>`);
+
+    body+=`<h4>Files (${projArtifacts.length} · ${fmtBytes(projBytes)})</h4>`;
+    body+=listCapped(projArtifacts, 80,
+      a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${artifactOpenLinks(a)}</div>`);
+
+    openModal(esc(p.name), `${p.is_active?'active':'inactive'} project · ${subs.length} subject${subs.length!==1?'s':''} · ${projArtifacts.length} file${projArtifacts.length!==1?'s':''}`, body);
+    document.getElementById('modal-body').querySelectorAll('[data-export]').forEach(el=>el.onclick=()=>{
+      const fmt=el.dataset.export;
+      if(fmt==='csv') exportProjectCSV(pid);
+      else if(fmt==='xls') exportProjectXLS(pid);
+      else exportProjectPDF(pid);
     });
-    body+=`</div>`;
+  }
 
-    if(subs.length){
-      body+=`<h4>Subjects (${subs.length})</h4><div class="timeline">`;
-      subs.sort((a,b)=>a.subject_id.localeCompare(b.subject_id)).forEach(s=>{
-        body+=`<div class="tl-row"><span class="link" data-open-subject="${esc(s.subject_id)}"><span class="mono">${esc(s.subject_id)}</span></span> <span class="muted">${esc(speciesName(s.species_code))}</span></div>`;
-      });
-      body+=`</div>`;
+  /* ------------------------------------------------------- project data export
+     Gather every table belonging to a project (project row, members, documents,
+     subjects, sessions, events, artifacts — full history, superseded rows
+     included with a `state` column) as arrays of flat row objects, then emit
+     them as a single CSV, a multi-sheet Excel workbook, or a print-ready PDF.
+     Stays fully offline/self-contained — no libraries, no network. */
+  function projectSlug(pid){
+    const p=projectById.get(pid)||{};
+    return (p.name||'project').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'')||'project';
+  }
+  function collectProjectExport(pid){
+    const p=projectById.get(pid);
+    const mem=membersByProject.get(pid)||[];
+    const docs=docsByProject.get(pid)||[];
+    const subs=D.subjects.filter(s=>s.project_id===pid).sort((a,b)=>a.subject_id.localeCompare(b.subject_id));
+    const subIds=new Set(subs.map(s=>s.subject_id));
+    const sessions=D.sessions.filter(x=>subIds.has(x.subject_id)).sort((a,b)=>a.started_at<b.started_at?1:-1);
+    const events=D.events.filter(e=>e.subject_id&&subIds.has(e.subject_id)).sort((a,b)=>a.occurred_at<b.occurred_at?1:-1);
+    const artifacts=D.artifacts.filter(a=>a.subject_id&&subIds.has(a.subject_id)).sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0));
+    const rootName=id=>(rootById.get(id)||{}).name||'';
+    const sessLabel=id=>(sessionById.get(id)||{}).label||'';
+    return {
+      project: p?[{
+        project_id:p.project_id, name:p.name, description:p.description||'',
+        started_on:p.started_on||'', status:p.is_active?'active':'inactive',
+        created_by:personName(p.created_by)
+      }]:[],
+      members: mem.map(m=>{ const per=personById.get(m.person_id)||{};
+        return {role:m.role||'member', name:per.full_name||'', email:per.email||''}; }),
+      documents: docs.map(a=>({
+        title:a.title||'', kind:a.kind||'', content_type:a.content_type||'',
+        location: a.uri || `${rootName(a.storage_root_id)}:${a.relative_path||''}`,
+        description:a.description||'', created_at:a.created_at||'', created_by:personName(a.created_by) })),
+      subjects: subs.map(s=>{ const sc=subjectCurrent.get(s.subject_id)||{};
+        return {
+          subject_id:s.subject_id, species:speciesName(s.species_code), sex:s.sex,
+          strain:s.strain||'', genotype:s.genotype||'', source:s.source||'',
+          date_of_birth:s.date_of_birth||'',
+          latest_weight_g:sc.latest_weight_g!=null?sc.latest_weight_g:'',
+          latest_weight_at:sc.latest_weight_at?fmtDate(sc.latest_weight_at):'',
+          status:sc.is_endpointed?'endpointed':'active',
+          sessions:sessionCountBySubject.get(s.subject_id)||0,
+          events:eventCountBySubject.get(s.subject_id)||0,
+          notes:s.notes||'' }; }),
+      sessions: sessions.map(s=>({
+        label:s.label, subject_id:s.subject_id, started_at:s.started_at, ended_at:s.ended_at,
+        duration_s:Math.round((Date.parse(s.ended_at)-Date.parse(s.started_at))/1000),
+        rig:s.rig||'', storage_root:rootName(s.storage_root_id),
+        relative_path:s.relative_path||'', notes:s.notes||'' })),
+      events: events.map(e=>({
+        event_id:e.event_id, occurred_at:e.occurred_at, recorded_at:e.recorded_at,
+        event_type:e.event_type, subject_id:e.subject_id||'', session:sessLabel(e.session_id),
+        recorded_by:personName(e.recorded_by), state:isEventActive(e)?'active':'superseded',
+        summary:stripTags(eventSummary(e)).replace(/\s+/g,' ').trim(),
+        detail:JSON.stringify(e.detail||{}), notes:e.notes||'' })),
+      artifacts: artifacts.map(a=>({
+        relative_path:a.relative_path, role:a.role||'', format:a.format||'',
+        size_bytes:a.size_bytes||0, subject_id:a.subject_id||'', session:sessLabel(a.session_id),
+        storage_root:rootName(a.storage_root_id), folder:artifactFolderUri(a)||'',
+        checksum:`${a.checksum_algo||''}:${a.checksum||''}`,
+        created_at:a.created_at, created_by:personName(a.created_by),
+        verification:(a.verification||{}).status||'',
+        verified_at:(a.verification||{}).verified_at?fmtDate(a.verification.verified_at):'',
+        state:isArtifactActive(a)?'active':'superseded' }))
+    };
+  }
+  const titleCase = s => s.charAt(0).toUpperCase()+s.slice(1);
+  function downloadBlob(filename, mime, content){
+    const blob=new Blob([content],{type:mime});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download=filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }
+
+  // ---- CSV: one file, tables stacked as titled sections ----
+  function csvCell(v){ const s=v==null?'':String(v); return /[",\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }
+  function tableToCSV(rows){
+    if(!rows.length) return '';
+    const cols=Object.keys(rows[0]);
+    return [cols.map(csvCell).join(',')].concat(rows.map(r=>cols.map(c=>csvCell(r[c])).join(','))).join('\r\n');
+  }
+  function exportProjectCSV(pid){
+    const data=collectProjectExport(pid);
+    const parts=[];
+    Object.keys(data).forEach(name=>{
+      const rows=data[name];
+      parts.push(`# ${titleCase(name)} (${rows.length})`);
+      parts.push(rows.length?tableToCSV(rows):'(none)');
+      parts.push('');
+    });
+    downloadBlob(projectSlug(pid)+'_export.csv','text/csv;charset=utf-8','﻿'+parts.join('\r\n'));
+  }
+
+  // ---- Excel: SpreadsheetML 2003 workbook, one worksheet per table ----
+  function xmlEsc(v){ return String(v==null?'':v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function xlsCell(v, href){ const num=typeof v==='number'&&isFinite(v); const h=href?` ss:HRef="${xmlEsc(href)}"`:''; return `<Cell${h}><Data ss:Type="${num?'Number':'String'}">${xmlEsc(v)}</Data></Cell>`; }
+  function xlsSheet(name, rows){
+    const safe=name.replace(/[\[\]:*?\/\\]/g,' ').slice(0,31);
+    let body='';
+    if(rows.length){
+      const cols=Object.keys(rows[0]);
+      body+='<Row>'+cols.map(c=>xlsCell(c)).join('')+'</Row>';
+      // the `folder` column carries a file: URI — emit it as a clickable hyperlink
+      rows.forEach(r=> body+='<Row>'+cols.map(c=>xlsCell(r[c], c==='folder'&&r[c]?r[c]:null)).join('')+'</Row>');
     }
+    return `<Worksheet ss:Name="${xmlEsc(safe)}"><Table>${body}</Table></Worksheet>`;
+  }
+  function exportProjectXLS(pid){
+    const data=collectProjectExport(pid);
+    const sheets=Object.keys(data).map(name=>xlsSheet(titleCase(name),data[name])).join('');
+    const wb='<?xml version="1.0"?>\r\n<?mso-application progid="Excel.Sheet"?>\r\n'+
+      '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" '+
+      'xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'+sheets+'</Workbook>';
+    downloadBlob(projectSlug(pid)+'_export.xls','application/vnd.ms-excel',wb);
+  }
 
-    openModal(esc(p.name), `${p.is_active?'active':'inactive'} project · ${mem.length} member${mem.length!==1?'s':''}`, body);
+  // ---- PDF: print-ready report in a new window (browser "Save as PDF") ----
+  function exportProjectPDF(pid){
+    const data=collectProjectExport(pid);
+    const p=projectById.get(pid)||{};
+    const w=window.open('','_blank');
+    if(!w){ alert('Could not open the print view — allow pop-ups for this page to export a PDF.'); return; }
+    const section=(name,rows)=>{
+      if(!rows.length) return `<h2>${xmlEsc(titleCase(name))} <span class="ct">(0)</span></h2><p class="none">None.</p>`;
+      const cols=Object.keys(rows[0]);
+      // the `folder` column carries a file: URI — render it as a clickable link
+      const cell=(c,v)=> (c==='folder'&&v) ? `<a href="${xmlEsc(v)}">${xmlEsc(v)}</a>` : xmlEsc(v);
+      return `<h2>${xmlEsc(titleCase(name))} <span class="ct">(${rows.length})</span></h2>`+
+        `<table><thead><tr>${cols.map(c=>`<th>${xmlEsc(c)}</th>`).join('')}</tr></thead><tbody>`+
+        rows.map(r=>`<tr>${cols.map(c=>`<td>${cell(c,r[c])}</td>`).join('')}</tr>`).join('')+`</tbody></table>`;
+    };
+    const bodyHtml=Object.keys(data).map(name=>section(name,data[name])).join('');
+    const asof=new Date(NOW).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${xmlEsc(p.name||'Project')} — export</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1b2432;margin:28px;font-size:11px;line-height:1.45;}
+  h1{font-size:20px;margin:0 0 2px;}
+  .meta{color:#6b7688;font-size:12px;margin-bottom:6px;}
+  .desc{font-size:12px;margin:6px 0 18px;}
+  h2{font-size:13px;margin:22px 0 7px;border-bottom:2px solid #cfd6e2;padding-bottom:3px;page-break-after:avoid;}
+  h2 .ct{color:#6b7688;font-weight:500;font-size:11px;}
+  table{width:100%;border-collapse:collapse;margin-bottom:6px;}
+  th,td{border:1px solid #e3e8f0;padding:4px 6px;text-align:left;vertical-align:top;word-break:break-word;}
+  th{background:#f7f9fc;font-size:9.5px;text-transform:uppercase;letter-spacing:.4px;color:#54617a;}
+  td a{color:#1a52c4;text-decoration:none;word-break:break-all;}
+  tr{page-break-inside:avoid;}
+  .none{color:#6b7688;font-style:italic;margin:0 0 6px;}
+  @media print{body{margin:0;} @page{margin:14mm;}}
+</style></head><body>
+  <h1>${xmlEsc(p.name||'Project')}</h1>
+  <div class="meta">${p.is_active?'Active':'Inactive'} project · started ${xmlEsc(p.started_on||'—')} · exported ${xmlEsc(asof)} · Lab Metadata Explorer</div>
+  ${p.description?`<div class="desc">${xmlEsc(p.description)}</div>`:''}
+  ${bodyHtml}
+</body></html>`);
+    w.document.close();
+    w.focus();
+    setTimeout(()=>{ try{ w.print(); }catch(e){} }, 350);
   }
 
   /* ------------------------------------------------------------- subjects tab */
@@ -1005,7 +1610,47 @@ window.__initDashboard = function(){
   function closeModal(){ overlay.classList.remove('open'); }
   document.getElementById('modal-close').onclick=closeModal;
   overlay.onclick=e=>{ if(e.target===overlay) closeModal(); };
-  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
+
+  /* --------------------------------------------------------- keyboard shortcuts */
+  const SEARCH_BY_VIEW={projects:'projects-search',subjects:'subjects-search',sessions:'sessions-search',events:'events-search',artifacts:'artifacts-search'};
+  function focusCurrentSearch(){
+    const id=SEARCH_BY_VIEW[currentView];
+    if(id) document.getElementById(id).focus();
+  }
+  function showShortcutsHelp(){
+    const kbd=k=>`<span class="mono" style="display:inline-block;min-width:20px;text-align:center;background:var(--hairline);padding:2px 8px;border-radius:5px;border:1px solid var(--border-strong);font-weight:600">${esc(k)}</span>`;
+    const rows=[
+      ['?','Show this shortcuts help'],
+      ['Esc','Close the open dialog'],
+      ['1 – 6','Switch tabs (Overview → Artifacts)'],
+      ['/','Focus the search box for the current tab'],
+      ['r','Refresh data from the database'],
+      ['t','Toggle dark / light theme'],
+      ['f','Reset all filters']
+    ];
+    const body=`<div style="display:grid;grid-template-columns:auto 1fr;gap:11px 16px;align-items:center;font-size:13.5px">`+
+      rows.map(([k,d])=>`<div>${kbd(k)}</div><div>${esc(d)}</div>`).join('')+
+      `</div><div style="margin-top:16px;font-size:12px;color:var(--text-secondary)">Ignored while typing in a text field.</div>`;
+    openModal('Keyboard shortcuts','',body);
+  }
+  document.getElementById('open-shortcuts').onclick=showShortcutsHelp;
+
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){ closeModal(); return; }
+    const tag=(e.target&&e.target.tagName||'').toLowerCase();
+    const typing = tag==='input'||tag==='textarea'||tag==='select'||(e.target&&e.target.isContentEditable);
+    if(e.key==='?'){ if(!typing){ e.preventDefault(); showShortcutsHelp(); } return; }
+    if(typing || e.ctrlKey || e.metaKey || e.altKey || overlay.classList.contains('open')) return;
+    if(e.key>='1' && e.key<='6'){
+      const tabs=[...document.getElementById('tabs').querySelectorAll('.tab')];
+      const t=tabs[Number(e.key)-1]; if(t) t.click();
+      return;
+    }
+    if(e.key==='/'){ e.preventDefault(); focusCurrentSearch(); return; }
+    if(e.key==='r'){ location.reload(); return; }
+    if(e.key==='t'){ document.getElementById('theme-toggle').click(); return; }
+    if(e.key==='f'){ document.getElementById('f-clear').click(); return; }
+  });
 
   function kv(pairs){
     return `<div class="kv">`+pairs.filter(p=>p&&p[1]!=null&&p[1]!=='').map(p=>`<div><div class="k">${esc(p[0])}</div><div class="v">${p[2]?p[1]:esc(p[1])}</div></div>`).join('')+`</div>`;
@@ -1090,11 +1735,11 @@ window.__initDashboard = function(){
     const consumed=(inputsByEvent.get(eid)||[]).map(id=>artifactById.get(id)).filter(Boolean);
     if(produced.length){
       body+=`<h4>Produced artifacts (${produced.length})</h4>`;
-      body+=produced.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span><span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`).join('');
+      body+=produced.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${artifactOpenLinks(a)}</div>`).join('');
     }
     if(consumed.length){
       body+=`<h4>Consumed inputs (${consumed.length})</h4>`;
-      body+=consumed.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`).join('');
+      body+=consumed.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>${artifactOpenLinks(a)}</div>`).join('');
     }
     openModal(typeBadge(e.event_type), `Event · ${fmtDate(e.occurred_at)}`, body);
   }
@@ -1135,7 +1780,7 @@ window.__initDashboard = function(){
       const a=n.artifact, ev=eventById.get(a.produced_by_event_id);
       return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
         <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
-        ${ev?typeBadge(ev.event_type):''}<span class="link" data-open-artifact="${a.artifact_id}">open</span></div>`;
+        ${ev?typeBadge(ev.event_type):''}${artifactOpenLinks(a)}</div>`;
     }).join('');
   }
 
@@ -1145,6 +1790,7 @@ window.__initDashboard = function(){
     const base=[
       ['Path',`<span class="mono">${esc(a.relative_path)}</span>`,true],
       ['Storage root',(rootById.get(a.storage_root_id)||{}).name||'—'],
+      ['Folder', artifactFolderUri(a) ? `<a class="link mono" href="${esc(artifactFolderUri(a))}" target="_blank" rel="noopener" title="Open parent folder in file browser">${esc(artifactFolderLabel(a))}</a>` : '—', true],
       ['Role',`<span class="pill">${esc(a.role||'—')}</span>`,true],
       ['Format',a.format||'—'],
       ['Size',fmtBytes(a.size_bytes)],
@@ -1174,6 +1820,7 @@ window.__initDashboard = function(){
     document.getElementById('tc-artifacts').textContent=filteredArtifacts().length;
     renderKPIs(); updateCharts();
     renderProjects(); renderSubjects(); renderSessions(); renderEvents(); renderArtifacts();
+    if(treeMode==='tree') renderProjectsTree();
   }
 
   /* ---------------------------------------------------------------- filters UI */
@@ -1213,8 +1860,33 @@ window.__initDashboard = function(){
     refreshSubjectOptions(); renderAll();
   };
 
-  document.getElementById('projects-search').oninput=renderProjects;
+  document.getElementById('projects-search').oninput=()=>{ renderProjects(); if(treeMode==='tree') renderProjectsTree(); };
   ['subjects-search'].forEach(id=>document.getElementById(id).oninput=renderSubjects);
+
+  // Projects Table ⇄ Tree toggle + tree controls
+  const projModeSeg=document.getElementById('projects-mode');
+  function setProjectsMode(m){
+    treeMode=m;
+    projModeSeg.querySelectorAll('.seg-btn').forEach(b=>b.classList.toggle('active', b.dataset.mode===m));
+    const isTree = m==='tree';
+    document.getElementById('projects-table').style.display = isTree?'none':'';
+    document.getElementById('projects-tree').style.display = isTree?'':'none';
+    // tree controls stay visible; they're just disabled outside tree mode
+    ['tree-depth','tree-expand','tree-collapse'].forEach(id=>document.getElementById(id).disabled = !isTree);
+    if(isTree) renderProjectsTree();
+  }
+  projModeSeg.querySelectorAll('.seg-btn').forEach(b=> b.onclick=()=>setProjectsMode(b.dataset.mode));
+  document.getElementById('tree-depth').onchange=()=>{ if(treeMode==='tree') renderProjectsTree(); };
+  document.getElementById('tree-expand').onclick=()=>{ if(treeMode==='tree') expandAllTree(); };
+  document.getElementById('tree-collapse').onclick=()=>{ if(treeMode==='tree') collapseAllTree(); };
+  // leaf links reuse the existing detail modals (one delegated handler)
+  document.getElementById('projects-tree').addEventListener('click', ev=>{
+    let el;
+    if((el=ev.target.closest('[data-open-artifact]'))) { ev.preventDefault(); openArtifact(el.dataset.openArtifact); }
+    else if((el=ev.target.closest('[data-open-event]'))) { ev.preventDefault(); openEvent(el.dataset.openEvent); }
+    else if((el=ev.target.closest('[data-open-subject]'))) { ev.preventDefault(); openSubject(el.dataset.openSubject); }
+    else if((el=ev.target.closest('[data-open-project]'))) { ev.preventDefault(); openProject(el.dataset.openProject); }
+  });
   document.getElementById('sessions-search').oninput=renderSessions;
   document.getElementById('events-search').oninput=renderEvents;
   document.getElementById('artifacts-search').oninput=renderArtifacts;
@@ -1233,14 +1905,22 @@ window.__initDashboard = function(){
   });
   document.getElementById('open-howto').onclick=()=>{ const h=document.getElementById('howto'); h.open=true; h.scrollIntoView({behavior:'smooth',block:'nearest'}); };
 
+  document.getElementById('theme-toggle').onclick=()=>{
+    const next = document.documentElement.getAttribute('data-theme')==='dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try{ localStorage.setItem('labdash-theme', next); }catch(e){}
+    applyChartTheme();
+  };
+
   // dates
-  const asof=new Date(D.NOW).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});
+  const asof=new Date(D.NOW).toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'numeric',minute:'2-digit'});
   document.getElementById('asof').textContent='as of '+asof;
   document.getElementById('asof2').textContent=asof;
 
   // go
   populateFilters();
   buildCharts();
+  applyChartTheme();
   renderAll();
 };
 </script>
