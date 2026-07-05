@@ -59,8 +59,14 @@ def _fetch_via_psycopg(sql):
         conn = psycopg2.connect()
     try:
         conn.autocommit = True
+        # A driver's execute() only exposes the result of the LAST statement
+        # in a multi-statement string (lab_data.sql leads with `SET TIME
+        # ZONE`), so run each statement individually and fetch from the last.
+        statements = [s.strip() for s in sql.split(";") if s.strip()]
         with conn.cursor() as cur:
-            cur.execute(sql)
+            for stmt in statements[:-1]:
+                cur.execute(stmt)
+            cur.execute(statements[-1])
             value = cur.fetchone()[0]
         # A json/jsonb column comes back already parsed; a text column is a str.
         if isinstance(value, (dict, list)):

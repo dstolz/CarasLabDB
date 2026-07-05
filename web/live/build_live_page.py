@@ -127,8 +127,8 @@ t = t[:ci] + "};\n</script>" + t[ci + len("})();\n</script>"):]
 # ---- 4. as-of label derives from the live NOW ----------------------------
 t = must_replace(
     t,
-    "  const asof='2 Jul 2026';",
-    "  const asof=new Date(D.NOW).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});",
+    "  const asof=new Date(NOW).toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'numeric',minute:'2-digit'});",
+    "  const asof=new Date(D.NOW).toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'numeric',minute:'2-digit'});",
     "asof",
 )
 
