@@ -128,8 +128,10 @@ PGDATABASE=lab python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/
 ```
 
-See `design_docs/testing-locally.md` for a full local-testing guide and
-`design_docs/deployment-windows.md` for Windows deployment notes.
+See `design_docs/testing-locally.md` for a full local-testing guide,
+`design_docs/deployment-windows.md` for Windows deployment notes,
+`design_docs/deployment-linux.md` for Linux deployment notes, and
+`design_docs/deployment-synology.md` for deploying on a Synology NAS.
 
 ## Repository layout
 
@@ -140,6 +142,8 @@ design_docs/         Schema DDL and design documentation
   database-design.md   Table-by-table rationale
   testing-locally.md   Local testing guide
   deployment-windows.md
+  deployment-linux.md
+  deployment-synology.md
 @CarasLabDB/         MATLAB class: typed DB interface
 @CarasLabDBApp/      MATLAB App Designer GUI
 web/                 Standalone dashboard (synthetic data)
