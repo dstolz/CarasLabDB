@@ -11,7 +11,15 @@ line copy by hand, this script derives the live page from
   * wrapping the app IIFE as `window.__initDashboard` so it boots only after
     the data has arrived;
   * swapping the "synthetic sample data" chrome for live-mode chrome (status
-    badge, banner, how-it-works panel, loading/error overlay).
+    badge, banner, how-it-works panel, loading/error overlay);
+  * adding the one live-only interaction the offline demo has no use for:
+    `r` re-queries the database.
+
+Every live-only difference must be produced *here*. Hand-editing the generated
+page makes the next regeneration silently revert it, so the sanity checks at
+the bottom assert the live-only bits are present. They run *before* the file is
+written, so a transformation that lost something exits non-zero without leaving
+a broken page behind.
 
 The offline demo (`web/lab-dashboard.html`) is left untouched. Re-run this
 whenever the demo's app logic changes:
@@ -143,16 +151,39 @@ t = must_replace(
 
 # ---- 6. banner -----------------------------------------------------------
 old_banner = t[t.find('  <div class="banner">'): t.find('</div>', t.find('  <div class="banner">')) + len('</div>')]
+# The app JS wires up open-shortcuts and open-howto unconditionally, so both
+# ids must survive into the live banner -- dropping one turns into a TypeError
+# inside window.__initDashboard(), which the loader's .catch() then reports as
+# "Could not load data" on a perfectly healthy database.
 NEW_BANNER = ('  <div class="banner">\n'
     '    <span><b>Live view:</b> reading the <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">lab</code> '
     'schema through <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">/api/data</code>. '
     'Full history is loaded; use <b>Active only</b> to hide superseded rows.</span>\n'
-    '    <span><span class="link" id="btn-refresh">↻ Refresh</span> &nbsp;·&nbsp; '
+    '    <span><span class="link" id="btn-refresh" title="Refresh data (r)">↻ Refresh</span> &nbsp;·&nbsp; '
+    '<span class="link" id="open-shortcuts" title="Keyboard shortcuts (?)">⌨ Shortcuts</span> &nbsp;·&nbsp; '
     '<span class="link" id="open-howto">How does this work? →</span></span>\n'
     '  </div>')
 t = must_replace(t, old_banner, NEW_BANNER, "banner")
 
-# ---- 7. howto details block ----------------------------------------------
+# ---- 7. live-only keyboard shortcut: r re-queries the database -----------
+# Offline the data never changes, so this shortcut exists only here. Both the
+# help table and the keydown handler have to learn about it.
+t = must_replace(
+    t,
+    "      ['/','Focus the search box for the current tab'],\n",
+    "      ['/','Focus the search box for the current tab'],\n"
+    "      ['r','Refresh data from the database'],\n",
+    "shortcut help row",
+)
+t = must_replace(
+    t,
+    "    if(e.key==='/'){ e.preventDefault(); focusCurrentSearch(); return; }\n",
+    "    if(e.key==='/'){ e.preventDefault(); focusCurrentSearch(); return; }\n"
+    "    if(e.key==='r'){ location.reload(); return; }\n",
+    "shortcut keydown branch",
+)
+
+# ---- 8. howto details block ----------------------------------------------
 hi = t.find('  <details class="howto" id="howto">')
 he = t.find('</details>', hi) + len('</details>')
 if hi < 0 or he < len('</details>'):
@@ -181,14 +212,14 @@ NEW_HOWTO = '''  <details class="howto" id="howto">
   </details>'''
 t = t[:hi] + NEW_HOWTO + t[he:]
 
-# ---- 8. title + footer wording -------------------------------------------
+# ---- 9. title + footer wording -------------------------------------------
 t = must_replace(t,
     "<title>Lab Metadata Explorer — Caras Lab</title>",
     "<title>Lab Metadata Explorer (Live) — Caras Lab</title>", "title")
 t = must_replace(t, "· self-contained &amp; offline ·",
     "· live database view ·", "footer")
 
-# ---- 9. CSS additions before </style> ------------------------------------
+# ---- 10. CSS additions before </style> -----------------------------------
 CSS = '''
   /* -------- live-mode additions -------- */
   .sample-badge.live{color:#8ee6a8;background:rgba(31,157,85,.14);border-color:rgba(31,157,85,.4);}
@@ -210,13 +241,14 @@ CSS = '''
 </style>'''
 t = must_replace(t, "</style>", CSS, "css")
 
-# ---- 10. boot overlay element right after <body> -------------------------
+# ---- 11. boot overlay element right after <body> -------------------------
 t = must_replace(t, "<body>\n", '<body>\n<div id="boot-overlay"></div>\n', "overlay")
 
-with io.open(DST, "w", encoding="utf-8", newline="") as fh:
-    fh.write(t.replace("\n", "\r\n"))
-
-# sanity checks
+# Sanity checks run BEFORE the write. A lossy transformation must not leave a
+# broken page on disk: the failure mode this guards against (a dropped element
+# the copied app logic still calls getElementById on) surfaces to the user as
+# "Could not load data -- database unavailable", which sends whoever hits it
+# looking at Postgres instead of at this script.
 checks = {
     "single initDashboard def": t.count("window.__initDashboard = function(){") == 1,
     "initDashboard call": "window.__initDashboard();" in t,
@@ -226,11 +258,18 @@ checks = {
     "loader fetches api/data": "fetch('api/data'" in t,
     "one boot overlay": t.count('id="boot-overlay"') == 1,
     "open-howto kept (used by app js)": 'id="open-howto"' in t,
+    "open-shortcuts kept (used by app js)": t.count('id="open-shortcuts"') == 1,
     "refresh button": 'id="btn-refresh"' in t,
     "live status badge": 'id="live-status"' in t,
+    "r shortcut listed in help": "['r','Refresh data from the database']" in t,
+    "r shortcut bound in keydown": "if(e.key==='r'){ location.reload(); return; }" in t,
 }
-print("wrote %s (%d -> %d bytes)" % (DST, orig_len, len(t)))
 for k, v in checks.items():
     print(("  OK   " if v else "  FAIL ") + k)
 if not all(checks.values()):
-    sys.exit(1)
+    sys.exit("refusing to write %s: the transformation lost something above" % DST)
+
+with io.open(DST, "w", encoding="utf-8", newline="") as fh:
+    fh.write(t.replace("\n", "\r\n"))
+
+print("wrote %s (%d -> %d bytes)" % (DST, orig_len, len(t)))

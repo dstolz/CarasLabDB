@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 A metadata/provenance system for the Caras Lab's extracellular electrophysiology
-data. It has three parts:
+data. It has five parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
@@ -28,6 +28,18 @@ data. It has three parts:
   is *generated* from the offline demo (swap the synthetic `<script>` for the
   loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
   offline demo's app logic changes, rather than editing it by hand.
+- **`mcp-server/`** — a Python **read-only** Model Context Protocol server
+  (`src/caraslabdb_mcp/`) that gives an LLM agent typed `get*` tools mirroring
+  `@CarasLabDB`'s read surface (reference tables, subjects/sessions, events and
+  their detail rows, artifacts, verifications, `fn_artifact_lineage`,
+  provenance edges). Its one hard invariant is that it cannot write: no write
+  tools, every query inside a rolled-back `SET TRANSACTION READ ONLY`
+  transaction, and a `SELECT`-only role. No tool accepts a table/column name or
+  raw SQL, and every list tool is bounded by `limit` (default 200, max 1000).
+  The schema's table and column names are hard-coded — the event-detail
+  tables/columns in `src/caraslabdb_mcp/schema_map.py`, the rest in the
+  per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
+  change must be mirrored there. See `design_docs/mcp-server.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are

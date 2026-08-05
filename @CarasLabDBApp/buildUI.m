@@ -17,6 +17,8 @@ function buildUI(obj)
     pos = obj.Prefs.Geometry;
     if isempty(pos) || numel(pos) ~= 4
         pos = local_center(1180, 720);
+    else
+        pos = local_clampToMonitor(reshape(double(pos), 1, 4));
     end
     obj.Fig = uifigure("Name", "CarasLabDB Explorer", "Position", pos, ...
         "CloseRequestFcn", @(s,e) obj.pOnClose(s,e), ...
@@ -91,8 +93,12 @@ function buildUI(obj)
         fr.ColumnSpacing = 4;
         colDd = uidropdown(fr, "Items", {'(none)'}, "Value", '(none)');
         modeDd = uidropdown(fr, "Items", modes, "Value", 'Exact');
-        valEd = uieditfield(fr, "text", "Placeholder", "value");
-        val2Ed = uieditfield(fr, "text", "Placeholder", "…to (range)");
+        % A uifigure does not forward keystrokes to the figure KeyPressFcn
+        % while a text field has focus, so Enter is applied here instead.
+        valEd = uieditfield(fr, "text", "Placeholder", "value", ...
+            "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
+        val2Ed = uieditfield(fr, "text", "Placeholder", "…to (range)", ...
+            "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
         obj.UI.Filter(i) = struct("Col", colDd, "Mode", modeDd, ...
             "Val", valEd, "Val2", val2Ed);
     end
@@ -182,4 +188,34 @@ end
 function pos = local_center(w, h)
     su = get(groot, "ScreenSize");
     pos = [max(1, su(3)/2 - w/2), max(1, su(4)/2 - h/2), w, h];
+end
+
+function pos = local_clampToMonitor(pos)
+    %LOCAL_CLAMPTOMONITOR Keep remembered geometry on a monitor that still exists.
+    %   Geometry saved while docked on a second display would otherwise reopen
+    %   the window off-screen, where it cannot be reached or moved back.
+    mons = get(groot, "MonitorPositions");
+    if isempty(mons)
+        return
+    end
+    areas = zeros(size(mons, 1), 1);
+    for i = 1:size(mons, 1)
+        areas(i) = local_overlap(pos, mons(i, :));
+    end
+    [bestArea, best] = max(areas);
+    if bestArea <= 0
+        best = 1;               % nothing visible anywhere -> primary monitor
+    end
+    m = mons(best, :);
+    w = min(pos(3), m(3));
+    h = min(pos(4), m(4));
+    x = min(max(pos(1), m(1)), m(1) + m(3) - w);
+    y = min(max(pos(2), m(2)), m(2) + m(4) - h);
+    pos = [x, y, w, h];
+end
+
+function a = local_overlap(p, m)
+    dx = max(0, min(p(1) + p(3), m(1) + m(3)) - max(p(1), m(1)));
+    dy = max(0, min(p(2) + p(4), m(2) + m(4)) - max(p(2), m(2)));
+    a = dx * dy;
 end

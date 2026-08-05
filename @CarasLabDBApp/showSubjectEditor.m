@@ -29,6 +29,16 @@ function showSubjectEditor(obj, mode, subjectId)
         speciesChoices = strings(1,0);
     end
 
+    % Project is required by addSubject and NOT NULL in the schema, so it needs
+    % its own dropdown; without one every "Add subject" fails in the argument
+    % validator. Displayed by name, submitted as the project_id.
+    try
+        P = obj.Db.getProjects(IsActive = true);
+        projects = struct("Ids", string(P.project_id), "Choices", string(P.name));
+    catch
+        projects = struct("Ids", strings(1,0), "Choices", strings(1,0));
+    end
+
     row = table();
     if isEdit
         if strlength(subjectId) == 0, return; end
@@ -46,6 +56,7 @@ function showSubjectEditor(obj, mode, subjectId)
 
     fields = [ ...
         local_spec("SubjectId","subject_id","Subject id","text", strings(1,0)), ...
+        local_espec("ProjectId","project_id","Project","enum", projects.Choices), ...
         local_espec("SpeciesCode","species_code","Species","enum", speciesChoices), ...
         local_espec("Sex","sex","Sex","enum", ["M","F","U"]), ...
         local_spec("Strain","strain","Strain","text", strings(1,0)), ...
@@ -60,12 +71,16 @@ function showSubjectEditor(obj, mode, subjectId)
             if ismember(fields(i).Col, vars)
                 val = local_scalar(row.(char(fields(i).Col)));
                 if fields(i).Key == "SpeciesCode"
-                    val = local_speciesDisplay(val, speciesCodes, speciesChoices);
+                    val = local_lookup(val, speciesCodes, speciesChoices);
+                elseif fields(i).Key == "ProjectId"
+                    val = local_lookup(val, projects.Ids, projects.Choices);
                 end
                 fields(i).Value = val;
             end
-            if fields(i).Key == "SubjectId"
-                fields(i).Editable = false;   % key is immutable
+            if ismember(fields(i).Key, ["SubjectId", "ProjectId"])
+                % The key is immutable, and updateSubject takes no ProjectId —
+                % both are shown for context only.
+                fields(i).Editable = false;
             end
         end
         titleText = "Edit subject " + subjectId;
@@ -79,6 +94,10 @@ function showSubjectEditor(obj, mode, subjectId)
         if ~isempty(gerbilIdx)
             fields(idx).Value = speciesChoices(gerbilIdx);
         end
+        if isscalar(projects.Choices)
+            idx = find([fields.Key] == "ProjectId", 1);
+            fields(idx).Value = projects.Choices(1);   % only one choice to make
+        end
         titleText = "Add subject";
     end
 
@@ -86,7 +105,8 @@ function showSubjectEditor(obj, mode, subjectId)
     if ~res.OK, return; end
 
     try
-        [args, subjId] = local_args(fields, res.Values, isEdit, subjectId);
+        [args, subjId] = local_args(fields, res.Values, isEdit, subjectId, ...
+            speciesCodes, speciesChoices, projects);
     catch ME
         uialert(obj.Fig, string(ME.message), "Invalid input");
         return
@@ -101,6 +121,10 @@ function showSubjectEditor(obj, mode, subjectId)
                 uialert(obj.Fig, "Subject id is required.", "Add subject");
                 return
             end
+            if ~any(string(args(1:2:end)) == "ProjectId")
+                uialert(obj.Fig, "Project is required.", "Add subject");
+                return
+            end
             obj.Db.addSubject("SubjectId", subjId, args{:});
             obj.pStatus("Added subject " + subjId);
         end
@@ -112,12 +136,17 @@ function showSubjectEditor(obj, mode, subjectId)
 end
 
 % =============================================================================
-function [args, subjId] = local_args(fields, values, isEdit, subjectId)
+function [args, subjId] = local_args(fields, values, isEdit, subjectId, ...
+        speciesCodes, speciesChoices, projects)
     args = {};
     subjId = subjectId;
     for i = 1:numel(fields)
         f = fields(i);
-        [provided, v] = local_convert(f, values.(char(f.Key)));
+        if isEdit && f.Key == "ProjectId"
+            continue   % updateSubject cannot move a subject between projects
+        end
+        [provided, v] = local_convert(f, values.(char(f.Key)), ...
+            speciesCodes, speciesChoices, projects);
         if f.Key == "SubjectId"
             if ~isEdit && provided
                 subjId = v;
@@ -130,7 +159,7 @@ function [args, subjId] = local_args(fields, values, isEdit, subjectId)
     end
 end
 
-function [provided, v] = local_convert(f, raw)
+function [provided, v] = local_convert(f, raw, speciesCodes, speciesChoices, projects)
     switch f.Type
         case "datetime"
             v = raw;
@@ -142,8 +171,14 @@ function [provided, v] = local_convert(f, raw)
         otherwise
             v = strtrim(string(raw));
             provided = strlength(v) > 0;
-            if provided && f.Key == "SpeciesCode"
-                v = local_speciesCode(v);
+            if ~provided
+                return
+            end
+            % Dropdowns show a friendly label; the database wants the key.
+            if f.Key == "SpeciesCode"
+                v = local_lookup(v, speciesChoices, speciesCodes);
+            elseif f.Key == "ProjectId"
+                v = local_lookup(v, projects.Choices, projects.Ids);
             end
     end
 end
@@ -159,22 +194,17 @@ function s = local_espec(key, col, label, type, choices)
     s = local_spec(key, col, label, type, choices);
 end
 
-% ---- species "Common name (code)" display helpers ----------------------------
-function v = local_speciesDisplay(code, codes, choices)
-    idx = find(codes == code, 1);
+% ---- dropdown label <-> key mapping ------------------------------------------
+function out = local_lookup(key, keys, values)
+    %LOCAL_LOOKUP Translate between a dropdown's label and the key it stands for.
+    %   Used in both directions (label->key on save, key->label on prefill).
+    %   An unknown value passes through, which is what keeps the form usable
+    %   when the lookup table could not be read.
+    idx = find(keys == string(key), 1);
     if isempty(idx)
-        v = string(code);
+        out = string(key);
     else
-        v = choices(idx);
-    end
-end
-
-function code = local_speciesCode(display)
-    tok = regexp(display, "\(([^()]+)\)\s*$", "tokens", "once");
-    if isempty(tok)
-        code = display;
-    else
-        code = string(tok{1});
+        out = values(idx);
     end
 end
 

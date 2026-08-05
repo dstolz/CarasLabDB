@@ -62,6 +62,13 @@ def _fetch_via_psycopg(sql):
         # A driver's execute() only exposes the result of the LAST statement
         # in a multi-statement string (lab_data.sql leads with `SET TIME
         # ZONE`), so run each statement individually and fetch from the last.
+        #
+        # WARNING: this is a naive split, not a SQL parser -- it is correct
+        # only because no statement in lab_data.sql contains a semicolon
+        # inside a string literal, a quoted identifier or a comment. Adding
+        # one there would silently cut the query into fragments. If that ever
+        # becomes necessary, split on an explicit marker instead (or move the
+        # `SET TIME ZONE` out of the file and issue it from here).
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         with conn.cursor() as cur:
             for stmt in statements[:-1]:
@@ -80,13 +87,24 @@ def _fetch_via_psql(sql):
     """Fallback: pipe the query through the psql CLI (reads PG* env vars)."""
     env = dict(os.environ)
     env.setdefault("PGDATABASE", "lab")
+    # -q is load-bearing: -t/-A only control how result *tuples* are printed,
+    # so without it psql also echoes the command-status tag of every non-SELECT
+    # statement -- lab_data.sql leads with `SET TIME ZONE`, which would put a
+    # bare "SET" line in front of the JSON and make the response unparseable.
+    # The query text comes in on stdin so this backend and the psycopg one run
+    # exactly the same SQL string.
     proc = subprocess.run(
-        ["psql", "-tAX", "-v", "ON_ERROR_STOP=1", "-f", SQL_PATH],
-        capture_output=True, text=True, env=env,
+        ["psql", "-tAXq", "-v", "ON_ERROR_STOP=1"],
+        input=sql, capture_output=True, text=True, env=env,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "psql failed")
-    return proc.stdout.strip()
+    # Belt and braces: the payload is the single result tuple, so take the last
+    # non-empty line rather than trusting stdout to hold nothing else.
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError("psql returned no rows")
+    return lines[-1].strip()
 
 
 def fetch_lab_data(sql):
@@ -115,7 +133,10 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.split("?", 1)[0] == "/api/data":
             self.handle_api_data()
             return
-        if self.path in ("/", ""):
+        # Compare against the path only: a bare "/?anything" would otherwise
+        # fall through to the base handler's directory listing and expose
+        # server.py / lab_data.sql / build_live_page.py.
+        if self.path.split("?", 1)[0] in ("/", ""):
             self.path = "/lab-dashboard-live.html"
         super().do_GET()
 

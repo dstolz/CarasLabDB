@@ -2,8 +2,9 @@
 
 Launched over stdio by Claude Code/Desktop. Connection settings come from
 the standard libpq environment variables (see db.py); there is no server
-config beyond that. All tools are SELECT-only (see db.py's READ ONLY
-transaction wrapper) -- there is no insert/update/delete surface in v1.
+config beyond that. All tools are SELECT-only: there is no
+insert/update/delete surface in v1, and db.py's read-only session +
+transaction wrapper is the backstop if one is ever introduced by mistake.
 """
 
 from mcp.server.fastmcp import FastMCP

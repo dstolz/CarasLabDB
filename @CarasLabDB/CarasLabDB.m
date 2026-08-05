@@ -36,7 +36,8 @@ classdef CarasLabDB < handle
 %                       NChannels=64, DurationS=1800);
 %       aid = db.addArtifact(ProducedByEventId=eid, StorageRootId=1, ...
 %                       RelativePath="G-0421/2026-07-02_pen1/raw.dat", ...
-%                       Checksum="ab12...", Role="raw", Format="dat", SizeBytes=1.2e10);
+%                       Checksum=sha256hex, ...   % 64 lower-case hex chars
+%                       Role="raw", Format="dat", SizeBytes=1.2e10);
 %       T   = db.getArtifacts(SubjectId="G-0421");
 %       L   = db.artifactLineage(aid, Direction="up");
 %
@@ -649,16 +650,25 @@ classdef CarasLabDB < handle
             %   Returns every lab.event column plus the detail columns that are
             %   not already present on the base row (event_id, event_type are the
             %   join/discriminator columns and are taken from the base only).
+            %   Reads event_active unless ActiveOnly=false, so a superseded
+            %   event is reported as not found rather than returned as if it
+            %   were current.
             arguments
                 obj (1,1) CarasLabDB
                 opts.EventId (1,1) string
+                opts.ActiveOnly (1,1) logical = obj.UseActiveViews
             end
-            E = obj.pSelect("SELECT event_type FROM " + obj.pT("event") + ...
+            if opts.ActiveOnly
+                eventSrc = obj.pT("event_active");
+            else
+                eventSrc = obj.pT("event");
+            end
+            E = obj.pSelect("SELECT event_type FROM " + eventSrc + ...
                 " WHERE event_id = " + obj.sqlLiteral(opts.EventId) + ";");
             if height(E) == 0
                 error("CarasLabDB:eventNotFound", "No event with id %s.", opts.EventId);
             end
-            detailTable = string(E.event_type(1)) + "_event";
+            detailTable = obj.pDetailTable(E.event_type(1));
 
             % Detail columns minus the ones the base already provides.
             C = obj.pSelect("SELECT column_name FROM information_schema.columns" + ...
@@ -673,7 +683,7 @@ classdef CarasLabDB < handle
             else
                 selectList = "e.*, " + strjoin("d." + reshape(detailCols, 1, []), ", ");
             end
-            T = obj.pSelect("SELECT " + selectList + " FROM " + obj.pT("event") + " e " + ...
+            T = obj.pSelect("SELECT " + selectList + " FROM " + eventSrc + " e " + ...
                 "JOIN " + obj.pT(detailTable) + " d ON d.event_id = e.event_id " + ...
                 "WHERE e.event_id = " + obj.sqlLiteral(opts.EventId) + ";");
         end
@@ -804,7 +814,11 @@ classdef CarasLabDB < handle
             end
             [cols, vals] = obj.pColsVals(s);
             if isempty(cols)
-                return    % nothing provided to change
+                % Reporting success for a call that changed nothing is how a
+                % caller ends up believing an edit was saved when it was not.
+                warning("CarasLabDB:nothingToUpdate", ...
+                    "No columns were supplied; %s was not changed.", tableRef);
+                return
             end
             assignments = cols + " = " + vals;
             sql = "UPDATE " + tableRef + " SET " + strjoin(assignments, ", ") + ...
@@ -812,11 +826,30 @@ classdef CarasLabDB < handle
             obj.pExec(sql);
         end
 
-        function eventId = pInsertEvent(obj, base, detailTable, detail)
+        function eventId = pInsertEvent(obj, base, detailTable, detail, inputs)
             %PINSERTEVENT Insert the base event and its detail row in one transaction.
+            %   INPUTS is an optional table of event_input edges (columns
+            %   artifact_id and role) to attach to the new event. It is written
+            %   inside the same transaction so a correction can never commit an
+            %   event whose provenance edges are only half-copied.
+            arguments
+                obj (1,1) CarasLabDB
+                base (1,1) struct
+                detailTable (1,1) string
+                detail (1,1) struct
+                inputs table = table()
+            end
             conn = obj.Connection;
             priorAutoCommit = conn.AutoCommit;
             restore = onCleanup(@() obj.pRestoreAutoCommit(conn, priorAutoCommit));
+            % Refuse to run inside somebody else's transaction: the commit
+            % below would commit their uncommitted work, and the rollback
+            % would discard it.
+            if strcmpi(string(priorAutoCommit), "off")
+                error("CarasLabDB:transactionInProgress", ...
+                    "AutoCommit is already off: another transaction is in " + ...
+                    "progress on this connection. Commit or roll it back first.");
+            end
             conn.AutoCommit = 'off';
             try
                 eventId = obj.pInsertReturning(obj.pT("event"), base, "event_id");
@@ -825,9 +858,33 @@ classdef CarasLabDB < handle
                     detail.event_type = base.event_type;
                 end
                 obj.pInsert(detailTable, detail);
+                for k = 1:height(inputs)
+                    aid = inputs.artifact_id(k);
+                    if iscell(aid)
+                        aid = aid{1};
+                    end
+                    edge = struct("event_id", eventId, "artifact_id", string(aid));
+                    if ismember("role", string(inputs.Properties.VariableNames))
+                        r = inputs.role(k);
+                        if iscell(r)
+                            r = r{1};
+                        end
+                        if ischar(r) && isempty(r)
+                            r = string(missing);   % SQL NULL, not ''
+                        end
+                        edge = obj.pSet(edge, "role", r);
+                    end
+                    obj.pInsert(obj.pT("event_input"), edge);
+                end
                 commit(conn);
             catch ME
-                rollback(conn);
+                % A failing rollback (dead connection, already-aborted
+                % transaction) must not replace the constraint violation the
+                % caller actually needs to see.
+                try
+                    rollback(conn);
+                catch
+                end
                 rethrow(ME);
             end
         end
@@ -868,7 +925,11 @@ classdef CarasLabDB < handle
                 return
             end
             if obj.pIsProvided(email)
-                where = "email = " + obj.sqlLiteral(email);
+                % Case-insensitive to match the schema's uq_person_email_lower
+                % index: 'Dan@umd.edu' and 'dan@umd.edu' are one person, and a
+                % case-sensitive lookup here would raise personNotFound for a
+                % user who capitalises their own address.
+                where = "lower(email) = lower(" + obj.sqlLiteral(email) + ")";
             elseif obj.pIsProvided(name)
                 where = "full_name = " + obj.sqlLiteral(name);
             else
@@ -939,6 +1000,28 @@ classdef CarasLabDB < handle
             end
         end
 
+        function tbl = pDetailTable(eventType)
+            %PDETAILTABLE Map an event_type code to its detail table name, safely.
+            %   event_type is FK-constrained to lab.event_type(code), but
+            %   addEventType is public, so the vocabulary is not a closed set at
+            %   runtime -- a code inserted there comes back out of the database
+            %   and would otherwise be concatenated straight into SQL as an
+            %   *identifier*, which sqlLiteral does not and cannot protect
+            %   (it escapes values). Validating against the eight types that
+            %   actually have detail tables closes that stored-injection path
+            %   and turns an unknown code into a clear error instead of a
+            %   confusing "relation does not exist".
+            known = ["birth", "surgery", "recording", "behavior", ...
+                     "husbandry", "endpoint", "histology", "analysis"];
+            eventType = string(eventType);
+            if ~isscalar(eventType) || ismissing(eventType) || ~ismember(eventType, known)
+                error("CarasLabDB:unknownEventType", ...
+                    "Event type '%s' has no detail table (expected one of: %s).", ...
+                    eventType, strjoin(known, ", "));
+            end
+            tbl = eventType + "_event";
+        end
+
         function pCheckMember(value, allowed, name)
             %PCHECKMEMBER Error if a provided VALUE is not in ALLOWED (skips unprovided).
             if CarasLabDB.pIsProvided(value) && ~ismember(string(value), allowed)
@@ -965,10 +1048,19 @@ classdef CarasLabDB < handle
         end
 
         function pRestoreAutoCommit(conn, state)
-            %PRESTOREAUTOCOMMIT Best-effort restore of a connection's AutoCommit mode.
+            %PRESTOREAUTOCOMMIT Restore a connection's AutoCommit mode, loudly on failure.
+            %   Swallowing a failure here is silent data loss: the connection
+            %   stays with AutoCommit='off', every later insert runs inside a
+            %   transaction nothing ever commits, the caller gets its generated
+            %   UUIDs back and believes the write succeeded, and the data
+            %   disappears when the connection closes.
             try
                 conn.AutoCommit = state;
-            catch
+            catch ME
+                warning("CarasLabDB:autoCommitNotRestored", ...
+                    "Could not restore AutoCommit='%s'; later writes may never " + ...
+                    "commit. Reconnect before writing again. (%s)", ...
+                    string(state), ME.message);
             end
         end
     end
@@ -1000,6 +1092,16 @@ classdef CarasLabDB < handle
                     out = "NULL";
                     return
                 end
+                % An unzoned datetime is ambiguous: it has to be *assumed* to be
+                % in some zone, and "local" is the only defensible guess for a
+                % value the user typed at this workstation. Prefer passing a
+                % zoned datetime (datetime(..., "TimeZone", "local")) so the
+                % instant is explicit. Note this is why values read back OUT of
+                % the database must not be round-tripped through here -- the
+                % driver returns timestamptz unzoned, so re-tagging it "local"
+                % would shift the instant whenever the server session zone
+                % differs; see supersedeEvent, which reads occurred_at as text
+                % with an explicit UTC offset for exactly this reason.
                 if isempty(v.TimeZone)
                     v.TimeZone = "local";
                 end
@@ -1009,7 +1111,7 @@ classdef CarasLabDB < handle
             end
             if isstruct(v) || isa(v, "containers.Map") || isa(v, "dictionary")
                 js = string(jsonencode(v));
-                out = "'" + replace(js, "'", "''") + "'::jsonb";
+                out = CarasLabDB.pQuoteText(js) + "::jsonb";
                 return
             end
             if islogical(v)
@@ -1031,10 +1133,20 @@ classdef CarasLabDB < handle
                     out = "NULL";
                     return
                 end
+                % Inf would otherwise be emitted verbatim and fail in the server
+                % as a syntax error; catch it here where the message can name
+                % the culprit.
+                if ~isfinite(v)
+                    error("CarasLabDB:nonFiniteValue", ...
+                        "Cannot write a non-finite numeric value (%g) to the database.", v);
+                end
                 if v == floor(v) && abs(v) < 2^53
                     out = string(sprintf("%d", v));
                 else
-                    out = string(sprintf("%.15g", v));
+                    % %.17g round-trips an IEEE double exactly; %.15g silently
+                    % loses the last two digits, which matters for the numeric
+                    % columns (performance, stereotax_*_mm, sample_rate_hz).
+                    out = string(sprintf("%.17g", v));
                 end
                 return
             end
@@ -1043,7 +1155,29 @@ classdef CarasLabDB < handle
             if ~isscalar(s)
                 error("CarasLabDB:scalarExpected", "Text SQL values must be scalar.");
             end
-            out = "'" + replace(s, "'", "''") + "'";
+            out = CarasLabDB.pQuoteText(s);
+        end
+    end
+
+    methods (Static, Access = private)
+        function out = pQuoteText(s)
+            %PQUOTETEXT Quote text as a Postgres literal, safe under either
+            %   setting of standard_conforming_strings.
+            %
+            %   Doubling single quotes is only sufficient while
+            %   standard_conforming_strings = on (the default since PG 9.1). If
+            %   a server or role has it off, a backslash becomes an escape
+            %   character, so the input \' is read as an escaped quote and the
+            %   following quote *closes* the literal -- everything after it
+            %   executes. Emitting an explicit E'' literal (with backslashes
+            %   doubled) is unambiguous under both settings. The jsonb path
+            %   relies on this too, since JSON escaping is backslash-heavy.
+            s = replace(s, "'", "''");
+            if contains(s, "\")
+                out = "E'" + replace(s, "\", "\\") + "'";
+            else
+                out = "'" + s + "'";
+            end
         end
     end
 end

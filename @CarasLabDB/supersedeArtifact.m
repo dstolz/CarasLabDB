@@ -15,6 +15,10 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %   Override struct field names must be actual database column names. Any
 %   column not overridden is carried forward from the superseded row.
 %
+%   Overrides MUST change at least one of storage_root_id, relative_path or
+%   checksum: those three columns are UNIQUE together, so a supersede that
+%   carried all of them forward would duplicate the row being replaced.
+%
 %   Returns the new artifact_id (uuid string).
 %
 %   See also CARASLABDB, ADDARTIFACT, SUPERSEDEEVENT.
@@ -41,6 +45,21 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
         s = obj.pSet(s, c, local_scalar(A.(c)));
     end
     s = obj.pMergeOverrides(s, opts.Overrides);
+
+    % lab.artifact has UNIQUE (storage_root_id, relative_path, checksum), and
+    % every column is carried forward verbatim, so a supersede that changes
+    % only role/format/size_bytes/subject_id/session_id/attributes would
+    % reinsert an identical natural key and die on an opaque unique-violation
+    % from the server. Say so here instead.
+    keyCols = ["storage_root_id", "relative_path", "checksum"];
+    if ~any(ismember(keyCols, string(fieldnames(opts.Overrides))))
+        error("CarasLabDB:artifactSupersedeCollision", ...
+            "A superseding artifact must change at least one of %s -- those " + ...
+            "three columns are UNIQUE together, so carrying all of them " + ...
+            "forward would duplicate the row being replaced.", ...
+            strjoin(keyCols, ", "));
+    end
+
     s.supersedes = oldArtifactId;
     s = obj.pSet(s, "created_by", obj.pCreatedBy(string(missing)));
 

@@ -34,6 +34,12 @@ function updateSubject(obj, subjectId, opts)
 
     obj.pCheckMember(opts.Sex, ["M", "F", "U"], "Sex");
 
+    % subject_id is a hand-typed natural key, so a typo here would otherwise
+    % update zero rows and report success.
+    if height(obj.getSubjects(SubjectId=subjectId)) == 0
+        error("CarasLabDB:subjectNotFound", "No subject with id %s.", subjectId);
+    end
+
     s = struct();
     s = obj.pSet(s, "species_code", opts.SpeciesCode);
     s = obj.pSet(s, "sex", opts.Sex);

@@ -86,8 +86,12 @@ button rather than a blank screen.
 offline demo could load:
 
 ```bash
-psql -tAX -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
+psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
 ```
+
+`-q` matters: `-t`/`-A` only control result-tuple formatting, so without it psql
+also prints the `SET` command-status tag for the query's leading
+`SET TIME ZONE` and the file is no longer valid JSON.
 
 ## Security notes
 

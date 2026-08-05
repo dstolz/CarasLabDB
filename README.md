@@ -32,6 +32,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | `@CarasLabDBApp/` | MATLAB App Designer GUI for interactive metadata entry and browsing |
 | `web/lab-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
 | `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
+| `mcp-server/` | **Read-only** Model Context Protocol server exposing typed `get*` query tools over the `lab` schema to an LLM agent |
 
 ## The data model
 
@@ -74,16 +75,25 @@ db  = CarasLabDB(Username="lab_rw", Password=secret, ...
                  Server="nas-main.lab", DatabaseName="lab", ...
                  PersonEmail="dstolz@umd.edu");
 
-db.addSubject(SubjectId="G-0421", SpeciesCode="meriones_unguiculatus", Sex="M");
+% Every subject belongs to a project, so create (or look up) one first.
+pid = db.addProject(Name="Gerbil AC plasticity");
+
+db.addSubject(SubjectId="G-0421", ProjectId=pid, ...
+                    SpeciesCode="meriones_unguiculatus", Sex="M");
 sid = db.addSession(SubjectId="G-0421", Label="2026-07-02_pen1", ...
                     StorageRootId=1, RelativePath="G-0421/2026-07-02_pen1");
 eid = db.addRecordingEvent(SubjectId="G-0421", SessionId=sid, ...
                     OccurredAt=datetime("now","TimeZone","local"), ...
                     AcquisitionSystemCode="intan_rhx", SampleRateHz=30000, ...
                     NChannels=64, DurationS=1800);
+
+% Checksums are stored as hex of the declared algorithm's exact width
+% (sha256/blake3 = 64 chars, md5 = 32) and normalised to lower case; the
+% database rejects anything else, so a placeholder value will not insert.
+sha = "96856fa7376e06ee8614e194b4ca38a6372e1f7a32861a99b0ab10e680391bd7";
 aid = db.addArtifact(ProducedByEventId=eid, StorageRootId=1, ...
                     RelativePath="G-0421/2026-07-02_pen1/raw.dat", ...
-                    Checksum="ab12...", Role="raw", Format="dat", SizeBytes=1.2e10);
+                    Checksum=sha, Role="raw", Format="dat", SizeBytes=1.2e10);
 T   = db.getArtifacts(SubjectId="G-0421");
 L   = db.artifactLineage(aid, Direction="up");
 ```
@@ -128,7 +138,19 @@ PGDATABASE=lab python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/
 ```
 
+**Query the schema from an LLM agent:** `mcp-server/` is a **read-only** MCP
+server that exposes typed `get*` tools (subjects, sessions, events, artifacts,
+lineage) over the `lab` schema — no insert, update or supersede surface, and no
+tool takes a table name or raw SQL. Install it and register it with your own MCP
+client; see `mcp-server/README.md` and `design_docs/mcp-server.md`.
+
+```sh
+cd mcp-server && pip install -e .
+claude mcp add caraslabdb -e PGDATABASE=lab -e PGUSER=lab_ro -- python -m caraslabdb_mcp.server
+```
+
 See `design_docs/testing-locally.md` for a full local-testing guide,
+`design_docs/mcp-server.md` for the MCP server's design and setup,
 `design_docs/deployment-windows.md` for Windows deployment notes,
 `design_docs/deployment-linux.md` for Linux deployment notes, and
 `design_docs/deployment-synology.md` for deploying on a Synology NAS.
@@ -141,6 +163,7 @@ design_docs/         Schema DDL and design documentation
   overview.md          Conceptual model — read this first
   database-design.md   Table-by-table rationale
   testing-locally.md   Local testing guide
+  mcp-server.md        Read-only MCP server: design and setup
   deployment-windows.md
   deployment-linux.md
   deployment-synology.md
@@ -148,5 +171,7 @@ design_docs/         Schema DDL and design documentation
 @CarasLabDBApp/      MATLAB App Designer GUI
 web/                 Standalone dashboard (synthetic data)
   live/                Live dashboard: /api/data server + query
+mcp-server/          Read-only MCP server (Python): typed query tools for LLM agents
 examples/            End-to-end demo scripts
+CLAUDE.md            Repo conventions for Claude Code / coding agents
 ```

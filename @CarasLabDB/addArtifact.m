@@ -2,14 +2,26 @@ function artifactId = addArtifact(obj, opts)
 %ADDARTIFACT Register a file artifact produced by an event.
 %
 %   artifactId = addArtifact(db, ProducedByEventId=eid, StorageRootId=1, ...
-%                   RelativePath="G-0421/sess/raw.dat", Checksum="ab12...", ...
+%                   RelativePath="G-0421/sess/raw.dat", ...
+%                   Checksum="96856fa7376e06ee8614e194b4ca38a6" + ...
+%                              "372e1f7a32861a99b0ab10e680391bd7", ...
 %                   Role="raw", Format="dat", SizeBytes=1.2e10)
 %
 %   Required:
 %       ProducedByEventId - event that produced this artifact (uuid)
 %       StorageRootId     - storage_root.root_id the path is relative to
-%       RelativePath      - path under the storage root
-%       Checksum          - content checksum
+%       RelativePath      - path under the storage root. Must be genuinely
+%                           relative and use forward slashes: the database
+%                           rejects absolute paths, drive letters, backslashes
+%                           and '..' segments, so that one stored path resolves
+%                           on every machine that mounts the NAS.
+%       Checksum          - content checksum, as hex of the exact width the
+%                           algorithm produces (sha256/blake3 = 64 chars,
+%                           md5 = 32). Case is normalised to lower on insert.
+%                           The database rejects anything else, so a truncated
+%                           or placeholder value fails fast here rather than
+%                           making every later integrity check report a
+%                           mismatch it cannot explain.
 %   Optional Name=Value:
 %       ChecksumAlgo ("sha256"|"md5"|"blake3"; default sha256 in DB),
 %       SizeBytes, Role (artifact_role.code), Format, SubjectId, SessionId,

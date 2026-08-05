@@ -12,7 +12,10 @@ libpq environment-variable connection convention already used by
 
 The implementation lives at `mcp-server/src/caraslabdb_mcp/`. This doc covers
 why it's built the way it is, how to stand it up, and how to extend it
-without breaking its one hard invariant: **it cannot write to the database.**
+without breaking its one hard invariant: **it must not be able to write to
+the database.** That invariant is upheld by three independent layers (no
+write tools, a read-only session/transaction, and a `SELECT`-only role), each
+of which is assumed to be fallible on its own — see §2.
 
 ---
 
@@ -53,11 +56,16 @@ mcp-server/
   Code/Desktop launches per the MCP stdio transport.
 - **`db.py`** owns *all* SQL execution. `fetch_all(sql, params)` runs a
   parameterized query and returns rows as `column -> value` dicts.
-  `select_from(table, filters, limit, order_by)` builds a `SELECT * FROM
-  <table> WHERE <filters ANDed>` for the common case, where `filters` values
-  that are `None` are dropped (i.e. "not filtering on this column") and every
-  non-`None` value is bound as a query parameter — never interpolated into
-  SQL text.
+  `fetch_limited(sql, params, limit)` wraps it with a `LIMIT` and a
+  truncation flag. `select_from(table, filters, limit, order_by)` builds a
+  `SELECT * FROM <table> WHERE <filters ANDed>` for the common case, where
+  `filters` values that are `None` are dropped (i.e. "not filtering on this
+  column", *not* an `IS NULL` test) and every non-`None` value is bound as a
+  query parameter — never interpolated into SQL text. `table`, `order_by`,
+  and the keys of `filters` *are* interpolated as SQL text, so `db.py`
+  validates them itself: `table` against `ALLOWED_TABLES`, `order_by` against
+  `ALLOWED_ORDER_BY`, filter keys against `^[a-z_][a-z0-9_]*$`. That is a
+  check, not a convention — a call site can't skip it.
 - **`schema_map.py`** hardcodes the 8 event types to their detail
   table/columns (built by hand from `schema.sql`, not introspected at
   runtime). This is the one place `get_event_detail` needs a table name that
@@ -71,24 +79,66 @@ mcp-server/
 
 ### The read-only guarantee
 
-Every query goes through `db._read_only_cursor()`:
+Every query goes through `db._read_only_cursor()`, which stacks three
+independent defenses so that no one of them has to be right:
+
+1. **The role.** Connect as `lab_ro` (§5), which holds `SELECT` and nothing
+   else. A write is then rejected on privilege grounds before any of the
+   below matters.
+2. **The session.** `conn.read_only = True` (psycopg 3) /
+   `conn.set_session(readonly=True)` (psycopg2) makes read-only the
+   session default, which holds regardless of transaction bookkeeping.
+3. **The transaction.** `SET TRANSACTION READ ONLY` is still issued as the
+   first statement of each transaction, before any tool-supplied SQL, and
+   the connection is rolled back and closed afterward regardless of outcome.
+
+Layer 3 alone was the original design, but it only lands as the first
+statement of an implicit transaction *because* both drivers default to
+`autocommit=False` — an assumption that used to be unwritten and unchecked.
+`db.py` now asserts it (raising `RuntimeError` if `conn.autocommit` is true)
+in addition to setting layer 2, which does not depend on it. Together with
+"there are no write tools in the first place", the result is that a bug in
+any single layer does not produce a write. This mirrors the defense pattern
+in `@CarasLabDB/runReadOnlyQuery.m`.
+
+The same wrapper also bounds how long a query may hold the server: the
+connection is opened with `connect_timeout=10` (an unreachable `PGHOST` would
+otherwise block the stdio server for the libpq default of minutes), and each
+transaction sets `statement_timeout = '30s'` and
+`idle_in_transaction_session_timeout = '60s'`. Teardown rolls back inside its
+own `try`, with `close()` in a nested `finally` — a rollback that raises
+against a dead backend must not be able to skip the close, since the server
+opens a connection per query and would otherwise leak one file descriptor per
+failure against a flapping database.
+
+### Bounded results
+
+No tool returns an unbounded result set. `select_from`/`fetch_limited`
+always apply a `LIMIT` (`db.DEFAULT_LIMIT` = 200, capped at `db.MAX_LIMIT` =
+1000), fetch one row beyond it to detect truncation, and return an envelope:
 
 ```python
-cur.execute("SET TRANSACTION READ ONLY")
-...
-conn.rollback()
-conn.close()
+{"rows": [...], "row_count": 12, "limit": 200, "truncated": False}
 ```
 
-`SET TRANSACTION READ ONLY` must be the first statement in the transaction to
-take effect — `db.py` issues it before any tool-supplied SQL runs. Even if a
-future tool had a bug that built an `INSERT`/`UPDATE`/`DELETE` statement,
-Postgres itself would reject it at the transaction level, and the connection
-is rolled back and closed afterward regardless. This mirrors the defense
-pattern in `@CarasLabDB/runReadOnlyQuery.m` — belt-and-suspenders on top of
-"we just don't write insert code here."
+Every list tool takes `limit: int = 200` and returns that envelope (only
+`get_event_detail`, which is single-row by construction, returns a bare dict
+— it is also the only caller left on the unbounded `fetch_all`, and only
+because it selects on a primary key). A negative `limit` raises
+`ValueError`; `limit=0` — which used to mean
+"no limit" — is now treated as the default, so an LLM carrying the old
+convention gets a bounded answer rather than the whole table. Tools whose
+tables grow without bound also pass a deterministic `ORDER BY` (events by
+`occurred_at DESC`, artifacts by `created_at DESC`, verifications by
+`verified_at DESC`, each with a unique-column tiebreaker) so that "the first
+200" is a stable, meaningful set rather than whatever the planner returns.
 
-The only two places a tool builds SQL with any dynamic structure (not just
+The `truncated` flag exists because the alternative — an LLM reading a
+silently clipped result as the complete answer and telling a researcher
+"there are 200 recordings for this subject" — is a wrong answer, not a slow
+one.
+
+The only two places a *tool* builds SQL with any dynamic structure (not just
 bound parameter values) are:
 
 - `events.get_event_detail`, which looks up the detail table name in
@@ -99,20 +149,25 @@ bound parameter values) are:
   `lab.fn_artifact_lineage(...)`.
 
 Every other tool parameter flows into `select_from`'s `filters` dict as a
-bound value, never as SQL text.
+bound value, never as SQL text — and the structural parts `select_from` does
+interpolate (`table`, `order_by`, filter keys) are allowlist-checked inside
+`db.py`, as described above.
 
 ## 3. Tool surface
 
-All tools return `list[dict]` (one dict per row) except `get_event_detail`,
-which returns a single `dict`. Every optional parameter that's left as
-`None`/default is simply excluded from the `WHERE` clause, matching
-`@CarasLabDB`'s pattern of omitting unset Name=Value args from a query.
+All tools return the `{"rows", "row_count", "limit", "truncated"}` envelope
+from §2 except `get_event_detail`, which returns a single `dict`. Every
+optional parameter that's left as `None`/default is simply excluded from the
+`WHERE` clause, matching `@CarasLabDB`'s pattern of omitting unset Name=Value
+args from a query — note this means `None` is "don't filter", never "where
+this column IS NULL"; there is no way to ask for the latter through these
+tools. Every list tool also takes `limit: int = 200`.
 
 | Module | Tools |
 |---|---|
 | `reference.py` | `get_species`, `get_storage_roots`, `get_probes`, `get_pipelines`, `get_event_types`, `get_artifact_roles`, `get_acquisition_systems` |
 | `dimensions.py` | `get_persons`, `get_projects`, `get_project_members`, `get_project_artifacts`, `get_subjects`, `get_sessions`, `get_subject_current` |
-| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`, `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table) |
+| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`, `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
 | `artifacts.py` | `get_artifacts` (`active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`), `get_provenance_edges` |
 
@@ -120,6 +175,14 @@ which returns a single `dict`. Every optional parameter that's left as
 `*_active` views (non-superseded rows) by default — same default as
 `@CarasLabDB`'s `UseActiveViews`. Pass `active_only=False` to see full
 correction history, including superseded rows.
+
+Two tools have **no** `active_only` toggle and always walk full history:
+`get_provenance_edges` and `get_artifact_lineage`. That is inherent, not an
+oversight — `lab.provenance_edge` and `lab.fn_artifact_lineage` are defined
+over the raw `lab.artifact` / `lab.event_input` tables, and filtering a
+superseded artifact out of a lineage chain would break the chain that runs
+through it. Their docstrings say so; cross-check an id against
+`get_artifacts` if you need to know whether a row in a lineage is current.
 
 ## 4. Install
 
@@ -146,7 +209,7 @@ same convention as `web/live/server.py` and the MATLAB class:
 |---|---|
 | `PGHOST` | local socket / localhost |
 | `PGPORT` | 5432 |
-| `PGDATABASE` | `lab` (set by `db.py` via `os.environ.setdefault` if unset) |
+| `PGDATABASE` | `lab` — resolved once at import in `db.py`, with a warning logged to stderr if it was unset |
 | `PGUSER` | OS user |
 | `PGPASSWORD` | (or a `~/.pgpass` entry) |
 
@@ -155,22 +218,52 @@ network listener. The server speaks MCP over **stdio**; the client process
 (Claude Code/Desktop) launches it as a subprocess and communicates over its
 stdin/stdout.
 
+The `PGDATABASE` fallback is deliberately noisy because its failure mode is
+silent otherwise: an unset variable means the server queries the **production
+`lab` database** while the operator may believe otherwise. Always set it
+explicitly in the MCP client's server config (§6), not in the shell you run
+the registration command from.
+
+### Use a read-only role
+
+Give the server a role that cannot write, so the read-only session and
+transaction wrapper in §2 are a backstop rather than the only thing standing
+between a bug and the database:
+
+```powershell
+psql -U postgres -d lab_test -c "CREATE ROLE lab_ro LOGIN PASSWORD 'ro-pw';"
+psql -U postgres -d lab_test -c "GRANT USAGE ON SCHEMA lab TO lab_ro;"
+psql -U postgres -d lab_test -c "GRANT SELECT ON ALL TABLES IN SCHEMA lab TO lab_ro;"
+```
+
+(`GRANT SELECT ON ALL TABLES` covers views too. Re-run it, or add
+`ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT SELECT ON TABLES TO lab_ro;`,
+after adding tables to the schema.) Point `PGUSER` at `lab_ro` and do the
+same on the production `lab` database.
+
+Do **not** reuse the `lab_rw` role from [testing-locally.md](testing-locally.md)
+§1 here: it holds `INSERT`, so an `INSERT` that somehow escaped the
+transaction wrapper would succeed. `lab_ro` makes that escape harmless, which
+is the whole point of having more than one layer.
+
 For local testing against a scratch database, follow
-[testing-locally.md](testing-locally.md) §1 to stand up `lab_test`, then set
-`PGDATABASE=lab_test` before registering the server. Point it at the
-**`lab_rw`** role from that guide (`SELECT`/`INSERT` only, no `UPDATE`) if you
-want a second layer of protection beyond the `READ ONLY` transaction —
-though note `lab_rw` still has `INSERT`, so the transaction wrapper is what
-actually prevents writes, not the role's grants.
+[testing-locally.md](testing-locally.md) §1 to stand up `lab_test`, create
+`lab_ro` in it as above, and pass `PGDATABASE=lab_test` to the server in §6.
 
 ## 6. Register with an MCP client
 
 ### Claude Code (personal, not committed to the repo)
 
 ```powershell
-$env:PGDATABASE = "lab_test"   # or "lab" once you're happy with it
-claude mcp add caraslabdb -- python -m caraslabdb_mcp.server
+claude mcp add caraslabdb -e PGDATABASE=lab_test -e PGUSER=lab_ro -- python -m caraslabdb_mcp.server
 ```
+
+Environment variables must be passed with `-e`, which stores them in the
+server's registration and applies them when Claude Code spawns the
+subprocess. Setting `$env:PGDATABASE` in the shell you run `claude mcp add`
+from does **not** reach that subprocess — a server registered that way silently
+connects to production `lab`, which is exactly the mistake §5's warning is
+there to catch. Switch to `-e PGDATABASE=lab` once you're happy with it.
 
 Run this from inside the activated `.venv`, or use the venv's absolute
 `python.exe` path (e.g. `C:\src\CarasLabDB\mcp-server\.venv\Scripts\python.exe`)
@@ -204,17 +297,25 @@ there's nothing Claude-specific in the server itself.
 4. Confirm the identifier allowlists hold: calling `get_artifact_lineage`
    with a `direction` outside `up`/`down` should raise a clear `ValueError`
    before any SQL runs, not a database error.
-5. Confirm the read-only guarantee: there is no tool that performs an
-   `INSERT`/`UPDATE`/`DELETE`, and even a hypothetical one would be rejected
-   by `SET TRANSACTION READ ONLY` — you can sanity-check this directly with
-   `psql`:
+5. Confirm the read-only layers independently. There is no tool that performs
+   an `INSERT`/`UPDATE`/`DELETE`, but check that a hypothetical one would be
+   stopped twice over — once by the transaction wrapper and once by the role:
    ```sql
+   -- as any role: the transaction layer
    BEGIN;
    SET TRANSACTION READ ONLY;
    INSERT INTO lab.person (full_name, email, role) VALUES ('x', 'y@z', 'PI');
    -- expect: ERROR: cannot execute INSERT in a read-only transaction
    ROLLBACK;
+
+   -- as lab_ro, with no READ ONLY at all: the privilege layer
+   INSERT INTO lab.person (full_name, email, role) VALUES ('x', 'y@z', 'PI');
+   -- expect: ERROR: permission denied for table person
    ```
+6. Confirm results are bounded: call `get_events` with no filters against a
+   database holding more than 200 events and check the response comes back
+   with `truncated: true` rather than the whole table. `limit=-1` should
+   raise a `ValueError`.
 
 ## 8. Extending the tool surface
 
@@ -227,6 +328,13 @@ When adding a new read tool:
   `schema_map`-style dict in the tool's own code — **never** from a
   parameter value. Only pass caller-supplied values through as bound query
   parameters (via `db.select_from`'s `filters` or `db.fetch_all`'s `params`).
+  A new table also has to be added to `db.ALLOWED_TABLES`, and a new sort
+  order to `db.ALLOWED_ORDER_BY`, or `select_from` will reject it.
+- Give the tool a `limit: int = db.DEFAULT_LIMIT` parameter and route it
+  through `db.select_from` or `db.fetch_limited` — never `db.fetch_all`
+  directly, which is unbounded — so it returns the truncation envelope like
+  every other tool. If the table can grow without bound, give it a
+  deterministic `ORDER BY` too.
 - Give every parameter a real column name and a type (`Optional[str]`,
   `bool`, `int`, ...) so the tool's schema stays a source of truth for field
   names, matching the "no generic SQL/JSON blob" rule in §2.

@@ -27,13 +27,36 @@ function loadPrefs(obj)
     fn = fieldnames(d);
     for i = 1:numel(fn)
         k = fn{i};
-        if isfield(stored, k) && ~isempty(stored.(k)) ...
-                && strcmp(class(stored.(k)), class(d.(k)))
+        if ~isfield(stored, k) || isempty(stored.(k))
+            continue
+        end
+        if isstruct(d.(k))
+            % Nested structs must be merged field by field. Taking a stored
+            % struct wholesale accepts one written by an older build, and the
+            % first read of a field it predates throws from the constructor,
+            % before any window exists to report it.
+            if isstruct(stored.(k)) && isscalar(stored.(k))
+                p.(k) = local_mergeStruct(d.(k), stored.(k));
+            end
+        elseif strcmp(class(stored.(k)), class(d.(k)))
             p.(k) = stored.(k);
         end
     end
 
     obj.Prefs = p;
+end
+
+function m = local_mergeStruct(defaults, stored)
+    %LOCAL_MERGESTRUCT Overlay STORED onto DEFAULTS, one field at a time.
+    m = defaults;
+    fn = fieldnames(defaults);
+    for i = 1:numel(fn)
+        k = fn{i};
+        if isfield(stored, k) && ~isempty(stored.(k)) ...
+                && strcmp(class(stored.(k)), class(defaults.(k)))
+            m.(k) = stored.(k);
+        end
+    end
 end
 
 function d = local_defaults()

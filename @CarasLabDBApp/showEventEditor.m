@@ -140,7 +140,7 @@ function args = local_addArgs(fields, values)
     args = {};
     for i = 1:numel(fields)
         f = fields(i);
-        [provided, v] = local_convert(f, values.(char(f.Key)));
+        [provided, v] = local_convert(f, values.(char(f.Key)), false);
         if provided
             args(end+1:end+2) = {f.Arg, v};
         end
@@ -158,7 +158,10 @@ function [occ, notes, notesProvided, eventOv, detailOv] = local_overrides(fields
 
     for i = 1:numel(fields)
         f = fields(i);
-        [provided, v] = local_convert(f, values.(char(f.Key)));
+        % A supersede prefills every field from the row being corrected, so
+        % only send back what the user actually altered. Passing an untouched
+        % datetime through as an override rewrites the stored value.
+        [provided, v] = local_convert(f, values.(char(f.Key)), true);
         if ~provided
             continue
         end
@@ -178,8 +181,10 @@ function [occ, notes, notesProvided, eventOv, detailOv] = local_overrides(fields
     end
 end
 
-function [provided, v] = local_convert(f, raw)
+function [provided, v] = local_convert(f, raw, onlyIfChanged)
     %LOCAL_CONVERT Coerce a raw widget value to its typed form; report if set.
+    %   ONLYIFCHANGED suppresses "provided" for a datetime that still matches
+    %   the value the form was prefilled with.
     switch f.Type
         case "number"
             v = raw;                 % double, NaN when blank
@@ -193,11 +198,16 @@ function [provided, v] = local_convert(f, raw)
                 provided = false; return
             end
             v.TimeZone = "local";
-            provided = true;
+            provided = ~(onlyIfChanged && local_sameInstant(v, f.Value));
         otherwise                    % text / textarea / enum
             v = strtrim(string(raw));
             provided = strlength(v) > 0;
-            if provided && local_isJson(f)
+            if ~provided
+                return
+            end
+            if local_isBoolEnum(f)
+                v = (v == "true");
+            elseif local_isJson(f)
                 v = local_parseJson(v, f.Label);
             end
     end
@@ -207,19 +217,57 @@ function tf = local_isJson(f)
     tf = ismember(f.Col, ["attributes","hardware_config","parameters","environment"]);
 end
 
-function v = local_parseJson(str, label)
-    %LOCAL_PARSEJSON Validate JSON and return a struct (so sqlLiteral emits ::jsonb).
-    %   Non-object JSON (arrays/scalars) is passed through as the original string,
-    %   which Postgres still casts into the jsonb column.
+function tf = local_isBoolEnum(f)
+    %LOCAL_ISBOOLENUM True for an enum standing in for a nullable boolean column.
+    %   A checkbox cannot express NULL, so nullable booleans are offered as a
+    %   true/false dropdown whose blank choice leaves the column unset.
+    tf = f.Type == "enum" && ...
+        isequal(sort(reshape(string(f.Choices), 1, [])), ["false", "true"]);
+end
+
+function tf = local_sameInstant(v, orig)
+    %LOCAL_SAMEINSTANT True when a form datetime still equals what it was
+    %   prefilled with. The form only surfaces whole seconds, so compare there.
+    tf = false;
+    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
+        return
+    end
     try
-        decoded = jsondecode(char(str));
+        if isdatetime(orig)
+            o = orig;
+        else
+            o = datetime(string(orig), "TimeZone", "local");
+        end
+    catch
+        return
+    end
+    if ~isscalar(o) || isnat(o)
+        return
+    end
+    if isempty(o.TimeZone)
+        o.TimeZone = "local";
+    end
+    tf = abs(seconds(v - o)) < 1;
+end
+
+function v = local_parseJson(str, label)
+    %LOCAL_PARSEJSON Validate JSON syntax and hand back the user's own text.
+    %   Decoding and re-encoding would rewrite the document: jsondecode renames
+    %   keys that are not valid MATLAB identifiers ("sample-rate" -> sample_rate),
+    %   collapses single-element arrays and reorders fields. sqlLiteral emits a
+    %   quoted text literal for a string and Postgres assignment-casts it into
+    %   the jsonb column, so passing the text straight through is lossless.
+    try
+        jsondecode(char(str));
     catch
         error("CarasLabDBApp:badJson", "%s is not valid JSON.", label);
     end
-    if isstruct(decoded)
-        v = decoded;
-    else
-        v = str;   % array/scalar JSON — let the DB cast the text literal
+    v = strtrim(string(str));
+    if ~startsWith(v, "{")
+        % The schema constrains these columns to JSON objects; refusing here
+        % names the offending field instead of surfacing a CHECK violation.
+        error("CarasLabDBApp:jsonNotObject", ...
+            "%s must be a JSON object, e.g. {""key"": 1}.", label);
     end
 end
 

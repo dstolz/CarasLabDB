@@ -11,13 +11,17 @@ drop — repeatedly — without touching production data. There is no automated 
 suite in this repo, so "testing" here means a disciplined manual walkthrough with
 explicit pass/fail checks.
 
-The three parts and how each is tested:
+The parts this guide covers and how each is tested:
 
 | Part | What you verify | Needs a live DB? |
 |------|-----------------|------------------|
 | PostgreSQL schema (`design_docs/schema.sql`) | DDL loads; append-only triggers, views, and lineage function behave | — |
 | MATLAB interface (`@CarasLabDB`) + GUI (`@CarasLabDBApp`) | Connect, insert every event type, retrieve, supersede, read-only SQL guard | Yes |
 | Web dashboard (`web/lab-dashboard.html`) | Renders from in-page synthetic data | No |
+
+The read-only MCP server (`mcp-server/`) has its own verification steps — stand
+up `lab_test` with §1 below, then follow `mcp-server/README.md` ("Verify") and
+`design_docs/mcp-server.md` §7.
 
 Commands are **PowerShell** unless the block is labelled `matlab` or `sql`.
 
@@ -93,24 +97,102 @@ psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs/schema.sql
 ```
 
 `-v ON_ERROR_STOP=1` makes `psql` exit non-zero on the **first** DDL error instead
-of plowing through — so a clean run with no error output means all 46 `CREATE`
-statements (tables, views, triggers, the `fn_artifact_lineage` function, roles,
-indexes) applied. On PostgreSQL 14+ `gen_random_uuid()` is built in; you should
-**not** need the `pgcrypto` extension.
+of plowing through — so a clean run with no error output means the whole file
+applied: the tables and indexes, the views, the trigger functions and the
+triggers built from them, the lineage and integrity functions, and the seed
+vocabulary `INSERT`s at the end. On PostgreSQL 14+ `gen_random_uuid()` is built
+in; you should **not** need the `pgcrypto` extension.
+
+Note that `schema.sql` creates **no roles** and issues no `GRANT`s (its only
+privilege statement is a `REVOKE` on `lab.fn_rename_subject`). Roles are a
+deployment decision, made separately in §1.4.
 
 **Pass:** command exits 0 with no `ERROR:` lines.
 
 ### 1.2 Verify the objects exist
 
+Rather than counting statements, check that the objects the rest of the system
+depends on are actually there:
+
 ```powershell
 psql -U postgres -d lab_test -c "\dt lab.*"      # tables
 psql -U postgres -d lab_test -c "\dv lab.*"      # views (expect *_active)
-psql -U postgres -d lab_test -c "\df lab.*"      # functions (fn_artifact_lineage, fn_forbid_mutation)
+psql -U postgres -d lab_test -c "\df lab.*"      # functions (all named fn_*)
 ```
 
-**Pass:** you see the reference tables (`person`, `storage_root`, `species`, …),
-the `event` base table, the eight `*_event` detail tables, `artifact`,
-`event_input`, the `event_active` / `artifact_active` views, and both functions.
+If you'd rather have one plain list to diff against `design_docs/schema.sql`:
+
+```powershell
+psql -U postgres -d lab_test -c @'
+SELECT c.relkind, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'lab' AND c.relkind IN ('r','v')
+UNION ALL
+SELECT 'f', p.proname
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'lab'
+ORDER BY 1, 2;
+'@
+```
+
+**Pass:** the listing contains, at minimum —
+
+- **Reference/lookup tables:** `person`, `storage_root`, `species`, `probe`,
+  `pipeline`, `event_type`, `artifact_role`, `acquisition_system`.
+- **Project tables:** `project`, `project_member`, `project_artifact`.
+- **Dimensions:** `subject`, `session`.
+- **The log:** the `event` base table plus the eight `*_event` detail tables
+  (`birth_event` … `analysis_event`).
+- **Provenance:** `artifact`, `event_input`, `artifact_verification`, and
+  `maintenance_log` for audited subject renames.
+- **Views:** `event_active`, `artifact_active`, `provenance_edge`,
+  `subject_current`.
+- **Functions:** the trigger functions `fn_forbid_mutation`,
+  `fn_require_session_for_recording`, `fn_fill_subject_from_session`,
+  `fn_supersede_same_type`, `fn_normalize_checksum`, `fn_normalize_path`;
+  plus `fn_rename_subject`, `fn_artifact_lineage`, and `fn_check_integrity`.
+
+The list grows as the schema does — treat `schema.sql` as the authority and this
+as the "nothing obviously missing" check.
+
+Then confirm the triggers actually got attached (the immutability guarantee is
+worthless if they didn't):
+
+```powershell
+psql -U postgres -d lab_test -c @'
+SELECT c.relname, t.tgname
+FROM pg_trigger t
+JOIN pg_class c     ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'lab' AND NOT t.tgisinternal
+ORDER BY 1, 2;
+'@
+```
+
+**Pass:** every append-only table — `event`, the eight `*_event` detail tables,
+`artifact`, `event_input` — carries *two* immutability triggers:
+`trg_immutable_<table>` (row-level, `UPDATE`/`DELETE`) and
+`trg_immutable_truncate_<table>` (statement-level, `TRUNCATE`, which row-level
+triggers cannot see). The validation and normalization triggers
+`trg_require_session_for_recording`, `trg_event_fill_subject`,
+`trg_artifact_fill_subject`, `trg_event_supersede_same_type`,
+`trg_artifact_normalize`, `trg_verification_normalize`,
+`trg_session_normalize_path`, `trg_artifact_normalize_path` and
+`trg_project_artifact_normalize_path` are there too.
+
+The two normalizers are worth knowing about because they *accept* input a
+strict reading of the constraints would reject: a `relative_path` written
+Windows-style as `G-0421\sess01` is stored as `G-0421/sess01`, and an
+upper-case checksum is stored lower-cased. Both need a project/subject fixture
+to demonstrate, so they are exercised in §2 through the MATLAB layer rather
+than with a standalone `psql` command here.
+
+Finally, the schema ships its own health report; on a freshly loaded, empty
+database it should return no rows:
+
+```powershell
+psql -U postgres -d lab_test -c "SELECT * FROM lab.fn_check_integrity();"
+```
 
 ### 1.3 Seed a person and verify the append-only invariant (the most important schema test)
 
@@ -122,9 +204,15 @@ step safe to re-run:
 psql -U postgres -d lab_test -c @'
 INSERT INTO lab.person (full_name, email, role)
 VALUES ('Test User', 'test@local', 'PI')
-ON CONFLICT (email) DO NOTHING;
+ON CONFLICT (lower(email)) WHERE email IS NOT NULL DO NOTHING;
 '@
 ```
+
+Email uniqueness is enforced by `uq_person_email_lower`, a *partial* unique index
+on `lower(email)` — so the conflict target has to name the expression **and**
+repeat the index predicate. A plain `ON CONFLICT (email)` matches no index and
+fails with *"there is no unique or exclusion constraint matching the ON CONFLICT
+specification"*.
 
 A **successful** test should look like this:
 
@@ -134,28 +222,49 @@ INSERT 0 1
 
 Now test the design's core guarantee directly. Insert one `event` row — the base
 table of the append-only log — then try to mutate it; the triggers must reject
-both `UPDATE` and `DELETE`:
+both `UPDATE` and `DELETE`.
+
+Run the three statements as **three separate `psql -c` calls**. Everything inside
+a single `-c` string runs as one implicit transaction, so if they were sent
+together the `UPDATE`'s exception would roll the `INSERT` back and the `DELETE`
+would never execute — you'd see one error and prove only half the claim:
 
 ```powershell
-psql -U postgres -d lab_test -v ON_ERROR_STOP=0 -c @'
-INSERT INTO lab.event (event_type, occurred_at, notes)
-VALUES ('analysis', now(), 'immutability probe');
--- Both of the next two statements MUST fail with the mutation-forbidden error:
-UPDATE lab.event SET notes = 'changed' WHERE notes = 'immutability probe';
-DELETE FROM lab.event                  WHERE notes = 'immutability probe';
-'@
+psql -U postgres -d lab_test -c "INSERT INTO lab.event (event_type, occurred_at, notes) VALUES ('analysis', now(), 'immutability probe');"
+# Each of the next two MUST fail with the mutation-forbidden error:
+psql -U postgres -d lab_test -c "UPDATE lab.event SET notes = 'changed' WHERE notes = 'immutability probe';"
+psql -U postgres -d lab_test -c "DELETE FROM lab.event WHERE notes = 'immutability probe';"
 ```
 
-**Pass:** the `INSERT` succeeds; the `UPDATE` and `DELETE` each raise an exception
-from `fn_forbid_mutation()`. If either mutation *succeeds*, the immutability
-triggers are broken — stop and fix the schema before going further.
+**Pass:** the `INSERT` succeeds and stays committed; the `UPDATE` and the
+`DELETE` each raise an exception from `fn_forbid_mutation()`. If either mutation
+*succeeds*, the immutability triggers are broken — stop and fix the schema
+before going further.
 
-A **successful** test should look like this:
+A **successful** test should look like this (the `CONTEXT:` line number depends
+on where the `RAISE` sits in the current function body):
 
 ```powershell
+INSERT 0 1
 ERROR:  UPDATE on lab.event is not allowed: this table is append-only. Insert a superseding row instead.
-CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 3 at RAISE
+CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 24 at RAISE
+ERROR:  DELETE on lab.event is not allowed: this table is append-only. Insert a superseding row instead.
+CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 24 at RAISE
 ```
+
+Confirm the row survived both attempts — this is the half of the claim the
+error messages alone don't prove:
+
+```powershell
+psql -U postgres -d lab_test -c "SELECT count(*) FROM lab.event WHERE notes = 'immutability probe';"
+```
+
+**Pass:** `1`.
+
+> This probe row is a bare base `event` with no `analysis_event` detail row, so
+> `lab.fn_check_integrity()` will now report it as an `event_missing_detail`
+> error. That's the check working as designed, not a failure; it clears when you
+> drop `lab_test` in §6.
 
 > Why `event` and not `person`: only the append-only log is trigger-protected —
 > `event`, every `*_event` detail table, `artifact`, and `event_input`. Reference
@@ -380,5 +489,3 @@ Re-run the §2.3 connection smoke test and the §2.4 walkthrough (against a
 **scratch** subject you can leave in place or supersede) from a researcher
 workstation to confirm network + `pg_hba.conf` work end-to-end. Then seed the real
 `person` and reference rows and hand it to users.
-
-```

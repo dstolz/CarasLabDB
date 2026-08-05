@@ -29,6 +29,11 @@ function updateSession(obj, sessionId, opts)
         opts.Notes (1,1) string = string(missing)
     end
 
+    % A wrong session_id would otherwise update zero rows and report success.
+    if height(obj.getSessions(SessionId=sessionId)) == 0
+        error("CarasLabDB:sessionNotFound", "No session with id %s.", sessionId);
+    end
+
     s = struct();
     s = obj.pSet(s, "label", opts.Label);
     s = obj.pSet(s, "storage_root_id", opts.StorageRootId);

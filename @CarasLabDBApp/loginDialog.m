@@ -29,10 +29,16 @@ function db = loginDialog(obj)
     local_label(g, "Username");
     hUser = uieditfield(g, "text", "Value", char(c.Username));
     local_label(g, "Password");
-    hPass = uieditfield(g, "text", "Value", "");
+    % Masked entry is a uieditfield *type*, not a property; assigning a
+    % "Password" property silently fails and shows the password in the clear.
+    passWarning = "";
     try
-        hPass.Password = "on"; %#ok<*STRQUOT>   % mask input where supported
-    catch
+        hPass = uieditfield(g, "password");
+    catch ME
+        hPass = uieditfield(g, "text", "Value", "");
+        passWarning = "Masked password entry is unavailable in this MATLAB " + ...
+            "release (" + string(ME.message) + "). Your password will be " + ...
+            "visible on screen as you type.";
     end
     local_label(g, "Person email");
     hEmail = uieditfield(g, "text", "Value", char(c.PersonEmail));
@@ -45,6 +51,10 @@ function db = loginDialog(obj)
     uibutton(btnRow, "Text", "Cancel", "ButtonPushedFcn", @(~,~) onCancel());
     uibutton(btnRow, "Text", "Connect", "ButtonPushedFcn", @(~,~) onConnect());
 
+    if strlength(passWarning) > 0
+        uialert(f, passWarning, "Password not masked", "Icon", "warning");
+    end
+
     uiwait(f);
     if isvalid(f)
         delete(f);
@@ -53,10 +63,18 @@ function db = loginDialog(obj)
 
     % ---- nested callbacks (share workspace with the parent) -------------
     function onKeyPress(e)
-        %ONKEYPRESS Enter connects, Escape cancels (all fields are single-line).
-        switch e.Key
-            case "return", onConnect();
-            case "escape", onCancel();
+        %ONKEYPRESS Enter connects, Escape cancels (all fields are
+        %   single-line); Ctrl+? lists the shortcuts.
+        mods = string(e.Modifier);
+        ctrl = any(mods == "control") || any(mods == "command");
+        key  = string(e.Key);
+        if ctrl && (ismember(key, ["slash", "questionmark", "help"]) || ...
+                string(e.Character) == "?")
+            CarasLabDBApp.showShortcutHelp(f, "login");
+        elseif key == "return"
+            onConnect();
+        elseif key == "escape"
+            onCancel();
         end
     end
 
@@ -85,10 +103,21 @@ function db = loginDialog(obj)
                 args = [args, {"PersonEmail", email}];
             end
             newDb = CarasLabDB(args{:});
+            failure = "";
         catch ME
-            uialert(f, "Connection failed: " + string(ME.message), "Connect");
+            failure = string(ME.message);
+        end
+
+        % Drop the plaintext password as soon as it has been used, whether or
+        % not the connection succeeded — it is never needed again here.
+        pass = ""; %#ok<NASGU>
+        args = {}; %#ok<NASGU>
+
+        if strlength(failure) > 0
+            uialert(f, "Connection failed: " + failure, "Connect");
             return
         end
+        hPass.Value = '';
 
         % Success: remember non-secret fields and hand back the handle.
         obj.Prefs.Connection = struct("Server", server, "Port", port, ...

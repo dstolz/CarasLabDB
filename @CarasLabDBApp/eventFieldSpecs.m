@@ -14,6 +14,10 @@ function specs = eventFieldSpecs(eventType)
 %       Type   - "text" | "textarea" | "number" | "enum" | "bool" | "datetime"
 %       Choices- allowed values for Type=="enum" (else strings(1,0))
 %
+%   Nullable boolean columns are described as an enum of "true"/"false" rather
+%   than "bool": a checkbox has no third state, so it cannot express NULL and
+%   would write false into a column the user never touched.
+%
 %   See also CARASLABDBAPP, CARASLABDBAPP/SHOWEVENTEDITOR.
 
     arguments
@@ -72,7 +76,8 @@ function specs = eventFieldSpecs(eventType)
             specs = [ ...
                 local_f("Method","method","Method","text"), ...
                 local_f("PerfusionFixative","perfusion_fixative","Perfusion fixative","text"), ...
-                local_b("TissueCollected","tissue_collected","Tissue collected"), ...
+                local_e("TissueCollected","tissue_collected","Tissue collected", ...
+                        ["true","false"]), ...
                 local_f("Disposition","disposition","Disposition","text")];
 
         case "histology"
@@ -84,6 +89,7 @@ function specs = eventFieldSpecs(eventType)
 
         case "analysis"
             specs = [ ...
+                local_f("PipelineId","pipeline_id","Pipeline id","text"), ...
                 local_f("PipelineName","pipeline_name","Pipeline name","text"), ...
                 local_f("CodeVersion","code_version","Code version","text"), ...
                 local_f("Parameters","parameters","Parameters (JSON)","textarea"), ...
@@ -108,10 +114,6 @@ end
 function s = local_e(arg, col, label, choices)
     s = local_f(arg, col, label, "enum");
     s.Choices = string(choices);
-end
-
-function s = local_b(arg, col, label)
-    s = local_f(arg, col, label, "bool");
 end
 
 function s = local_dt(arg, col, label)

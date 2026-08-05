@@ -66,6 +66,7 @@ classdef CarasLabDBApp < handle
 
     methods (Static)
         specs = eventFieldSpecs(eventType)
+        showShortcutHelp(fig, context)
     end
 
     % ==================================================================
@@ -131,7 +132,7 @@ classdef CarasLabDBApp < handle
             defs(end+1) = struct( ...
                 "Key", "subjects", "Title", "Subjects", ...
                 "Table", "subject", "ActiveTable", "", ...
-                "Columns", ["subject_id","species_code","sex","strain", ...
+                "Columns", ["subject_id","project_id","species_code","sex","strain", ...
                             "genotype","source","date_of_birth","notes","created_at"], ...
                 "DateCols", ["date_of_birth","created_at"], "NumCols", strings(1,0), ...
                 "HasSubject", true, "OrderBy", "subject_id", "Entity", "subject");
@@ -207,7 +208,8 @@ classdef CarasLabDBApp < handle
             %   Ctrl+R Refresh · Ctrl+E Export→WS · Ctrl+Shift+E Add Event ·
             %   Ctrl+Shift+S Add Subject · Ctrl+Shift+N Add Session ·
             %   Ctrl+D Edit/Supersede · Enter Apply filters (browse tabs) ·
-            %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters.
+            %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters ·
+            %   Ctrl+? Shortcut list.
             mods  = string(evt.Modifier);
             ctrl  = any(mods == "control") || any(mods == "command");
             shift = any(mods == "shift");
@@ -216,7 +218,12 @@ classdef CarasLabDBApp < handle
             sel = obj.UI.TabGroup.SelectedTab;
             onSqlTab = ~isempty(sel) && string(sel.Tag) == "sql";
 
-            if key == "return" && ctrl
+            % "?" is Shift+/, and which of these the event reports varies by
+            % keyboard layout, so accept every spelling.
+            if ctrl && (ismember(key, ["slash", "questionmark", "help"]) || ...
+                    string(evt.Character) == "?")
+                CarasLabDBApp.showShortcutHelp(obj.Fig, "main");
+            elseif key == "return" && ctrl
                 if onSqlTab, obj.runCustomSQL(); end
             elseif key == "return"
                 if ~onSqlTab, obj.onRefresh(); end
@@ -329,10 +336,13 @@ classdef CarasLabDBApp < handle
             %PPOPULATEFILTERCOLUMNS Refresh the per-row column dropdowns for the tab.
             d = obj.pCurrentTabDef();
             if isempty(d)
-                items = "(none)";
-            else
-                items = ["(none)", d.Columns];
+                % The Custom SQL tab has no browse columns. Blanking the
+                % dropdowns here would orphan the filter values the user has
+                % typed — they stay visible but stop being applied — so leave
+                % the browse filters exactly as they are.
+                return
             end
+            items = ["(none)", d.Columns];
             for i = 1:obj.NumFilterRows
                 w = obj.UI.Filter(i);
                 prev = string(w.Col.Value);

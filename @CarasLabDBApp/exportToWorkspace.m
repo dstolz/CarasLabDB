@@ -36,14 +36,18 @@ function name = local_promptName(defName)
     %LOCAL_PROMPTNAME Small modal asking for a workspace variable name.
     name = "";
     f = uifigure("Name", "Export to workspace", ...
-        "Position", local_center(360, 130), "WindowStyle", "modal", "Resize", "off");
+        "Position", local_center(360, 130), "WindowStyle", "modal", "Resize", "off", ...
+        "KeyPressFcn", @(~,e) onKeyPress(e));
     g = uigridlayout(f, [2 2]);
     g.RowHeight = {30, 34};
     g.ColumnWidth = {110, '1x'};
     g.Padding = [15 15 15 15];
 
     uilabel(g, "Text", "Variable name", "HorizontalAlignment", "right");
-    ed = uieditfield(g, "text", "Value", char(defName));
+    % Enter must be handled on the field too: a uifigure does not forward
+    % keystrokes to its KeyPressFcn while a text component has focus.
+    ed = uieditfield(g, "text", "Value", char(defName), ...
+        "ValueChangedFcn", @(~,~) onOk());
 
     brow = uigridlayout(g, [1 2]);
     brow.Layout.Row = 2; brow.Layout.Column = [1 2];
@@ -55,6 +59,21 @@ function name = local_promptName(defName)
     uiwait(f);
     if isvalid(f), delete(f); end
     return
+
+    function onKeyPress(e)
+        %ONKEYPRESS Enter exports, Escape cancels, Ctrl+? lists the shortcuts.
+        mods = string(e.Modifier);
+        ctrl = any(mods == "control") || any(mods == "command");
+        key  = string(e.Key);
+        if ctrl && (ismember(key, ["slash", "questionmark", "help"]) || ...
+                string(e.Character) == "?")
+            CarasLabDBApp.showShortcutHelp(f, "export");
+        elseif key == "return"
+            onOk();
+        elseif key == "escape"
+            onCancel();
+        end
+    end
 
     function onCancel()
         uiresume(f);

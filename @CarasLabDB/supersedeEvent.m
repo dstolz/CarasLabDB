@@ -24,6 +24,12 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
 %   "subject_id", "weight_g"). Any column not overridden is carried forward
 %   from the superseded row. recorded_by is set to the current person.
 %
+%   The event's event_input edges (the artifacts it consumed) are copied to
+%   the new event in the same transaction. Note the converse is NOT done:
+%   artifacts the old event *produced* keep pointing at the superseded
+%   event_id, since artifact rows are themselves immutable -- use
+%   supersedeArtifact if those need to be re-pointed.
+%
 %   Returns the new event_id (uuid string).
 %
 %   See also CARASLABDB, SUPERSEDEARTIFACT.
@@ -37,15 +43,31 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
         opts.DetailOverrides (1,1) struct = struct()
     end
 
+    if isfield(opts.EventOverrides, "supersedes")
+        error("CarasLabDB:supersedesNotOverridable", ...
+            "supersedes is set by this method and cannot be overridden.");
+    end
+
     litId = obj.sqlLiteral(oldEventId);
 
-    E = obj.pSelect("SELECT event_type, subject_id, session_id, occurred_at, " + ...
+    % occurred_at is read back as an explicit UTC text literal rather than as a
+    % datetime. The Database Toolbox returns timestamptz as an *unzoned*
+    % datetime, and sqlLiteral tags an unzoned datetime as "local" -- so a
+    % round-trip through MATLAB shifts the instant by the UTC offset whenever
+    % the server session zone is not the workstation's zone (a UTC server and
+    % an Eastern workstation move every corrected event by 4-5 hours, and each
+    % further correction moves it again). Text with an explicit offset also
+    % preserves Postgres's microseconds, which the datetime format string
+    % truncates to milliseconds.
+    E = obj.pSelect("SELECT event_type, subject_id, session_id, " + ...
+        "to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') " + ...
+        "  || '+00' AS occurred_at_txt, " + ...
         "notes, attributes FROM " + obj.pT("event") + " WHERE event_id = " + litId + ";");
     if height(E) == 0
         error("CarasLabDB:eventNotFound", "No event with id %s.", oldEventId);
     end
     eventType = string(E.event_type(1));
-    detailTable = obj.pT(eventType + "_event");
+    detailTable = obj.pT(obj.pDetailTable(eventType));
 
     D = obj.pSelect("SELECT * FROM " + detailTable + " WHERE event_id = " + litId + ";");
     if height(D) == 0
@@ -58,7 +80,7 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
     if obj.pIsProvided(opts.OccurredAt)
         base.occurred_at = opts.OccurredAt;
     else
-        base.occurred_at = local_scalar(E.occurred_at);
+        base.occurred_at = local_scalar(E.occurred_at_txt);
     end
     base = obj.pSet(base, "subject_id", local_scalar(E.subject_id));
     base = obj.pSet(base, "session_id", local_scalar(E.session_id));
@@ -84,7 +106,16 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
     end
     detail = obj.pMergeOverrides(detail, opts.DetailOverrides);
 
-    newEventId = obj.pInsertEvent(base, detailTable, detail);
+    % Carry the provenance edges forward. Without this the correction silently
+    % orphans the DAG: event_input rows still point at the superseded event, so
+    % fn_artifact_lineage(...,'up') from anything this event produced walks into
+    % a node with no inputs and reports no ancestry -- while event_active hides
+    % the old event that still holds them. pInsertEvent writes them inside the
+    % same transaction as the base and detail rows.
+    IN = obj.pSelect("SELECT artifact_id, role FROM " + obj.pT("event_input") + ...
+        " WHERE event_id = " + litId + ";");
+
+    newEventId = obj.pInsertEvent(base, detailTable, detail, IN);
 end
 
 function v = local_scalar(colvals)

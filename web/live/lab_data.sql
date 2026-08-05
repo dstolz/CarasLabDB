@@ -21,9 +21,13 @@
 --   * timestamptz values are rendered as UTC ISO-8601 ("...Z") strings and
 --     `NOW` as epoch milliseconds, matching what the front-end parses.
 --
--- Run standalone to produce a static export:
---   psql -tAX -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
--- The bundled server (web/live/server.py) runs it per request instead.
+-- Run standalone to produce a static export. -q is required: -t/-A only govern
+-- result-tuple formatting, so without it psql also prints the "SET" command
+-- status tag for the statement below and the file is no longer valid JSON.
+--   psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
+-- The bundled server (web/live/server.py) runs it per request instead, and
+-- splits this file on the statement separator to execute one statement at a
+-- time -- so keep that character out of comments and string literals here.
 -- ============================================================================
 
 SET TIME ZONE 'UTC';
@@ -114,7 +118,10 @@ events AS (
         'occurred_at', to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
         'recorded_at', to_char(e.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
         'recorded_by', e.recorded_by, 'supersedes', e.supersedes, 'notes', e.notes,
-        'detail', CASE e.event_type
+        -- coalesce: a partially-written event (base row inserted, detail row
+        -- not) would otherwise yield JSON null and make the dashboard's
+        -- ev.detail.<field> lookups throw.
+        'detail', coalesce(CASE e.event_type
             WHEN 'birth'     THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.birth_event     x WHERE x.event_id = e.event_id)
             WHEN 'surgery'   THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.surgery_event   x WHERE x.event_id = e.event_id)
             WHEN 'recording' THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.recording_event x WHERE x.event_id = e.event_id)
@@ -124,7 +131,7 @@ events AS (
             WHEN 'histology' THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.histology_event x WHERE x.event_id = e.event_id)
             WHEN 'analysis'  THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.analysis_event  x WHERE x.event_id = e.event_id)
             ELSE '{}'::jsonb
-        END
+        END, '{}'::jsonb)
     ) ORDER BY e.occurred_at), '[]'::json) AS j
     FROM lab.event e
 ),
@@ -145,7 +152,9 @@ artifacts AS (
             )
             FROM lab.artifact_verification v
             WHERE v.artifact_id = a.artifact_id
-            ORDER BY v.verified_at DESC
+            -- verification_id breaks ties so re-runs of this export agree on
+            -- which check "wins" when two share a verified_at.
+            ORDER BY v.verified_at DESC, v.verification_id DESC
             LIMIT 1
         ), json_build_object('status', 'unverified', 'verified_at', NULL))
     )), '[]'::json) AS j

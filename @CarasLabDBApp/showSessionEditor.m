@@ -104,7 +104,9 @@ function args = local_args(fields, values, isEdit)
         if isEdit && f.Key == "SubjectId"
             continue   % subject is fixed for an existing session
         end
-        [provided, v] = local_convert(f, values.(char(f.Key)));
+        % When editing, the form arrives prefilled; a datetime that still
+        % matches its prefill is not an edit and must not be written back.
+        [provided, v] = local_convert(f, values.(char(f.Key)), isEdit);
         if provided
             args(end+1:end+2) = {f.Arg, v};
         end
@@ -117,14 +119,16 @@ function req = local_missingRequired(fields, values)
     for i = 1:numel(fields)
         f = fields(i);
         if ~ismember(f.Key, required), continue; end
-        [provided, ~] = local_convert(f, values.(char(f.Key)));
+        [provided, ~] = local_convert(f, values.(char(f.Key)), false);
         if ~provided
             req(end+1) = f.Label; %#ok<AGROW>
         end
     end
 end
 
-function [provided, v] = local_convert(f, raw)
+function [provided, v] = local_convert(f, raw, onlyIfChanged)
+    %LOCAL_CONVERT Coerce a raw widget value; ONLYIFCHANGED suppresses
+    %   "provided" for a datetime still equal to what was prefilled.
     switch f.Type
         case "number"
             v = raw;
@@ -135,11 +139,36 @@ function [provided, v] = local_convert(f, raw)
                 provided = false; return
             end
             v.TimeZone = "local";
-            provided = true;
+            provided = ~(onlyIfChanged && local_sameInstant(v, f.Value));
         otherwise
             v = strtrim(string(raw));
             provided = strlength(v) > 0;
     end
+end
+
+function tf = local_sameInstant(v, orig)
+    %LOCAL_SAMEINSTANT True when a form datetime still equals its prefill.
+    %   The form surfaces whole seconds only, so compare at that resolution.
+    tf = false;
+    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
+        return
+    end
+    try
+        if isdatetime(orig)
+            o = orig;
+        else
+            o = datetime(string(orig), "TimeZone", "local");
+        end
+    catch
+        return
+    end
+    if ~isscalar(o) || isnat(o)
+        return
+    end
+    if isempty(o.TimeZone)
+        o.TimeZone = "local";
+    end
+    tf = abs(seconds(v - o)) < 1;
 end
 
 % ---- helpers -----------------------------------------------------------------
