@@ -20,11 +20,11 @@ does not need to reach the internet itself (nothing on it downloads or calls
 out), although IT may of course allow that for routine security updates. It
 should not be reachable from the public internet.
 
-We need three kinds of database login: an admin login for the lab, a
-read-only login, and one personal login for each lab member (we will supply
-the list). Each person must have their own login, so the database can record
-who made each entry. The admin login should be able to create and disable the
-personal logins, so the lab can handle membership changes itself. We also need
+We need IT to create one admin login for the lab, with permission to create
+and manage other logins on this database. The lab admin will then create the
+read-only login and a personal login for each lab member, and will handle all
+membership changes going forward, without involving IT. Each person will have
+their own login, so the database can record who made each entry. We also need
 a nightly database dump kept on separate storage for at least 30 days. The
 server's clock must be set automatically from a network time source (NTP),
 because the database records the date and time of every entry and those
@@ -93,12 +93,13 @@ records, not data files)
 A single small VM is adequate. There is no expected performance concern at
 lab scale.
 
-**Accounts (PostgreSQL roles)** — none are created by our schema file; we
-need IT to create them, or grant the lab an administrative login so we can:
+**Accounts (PostgreSQL roles)** — none are created by our schema file. IT
+creates only the first row of the table below; the lab admin creates the rest
+and manages them from then on:
 
 | Role | Purpose | Privileges |
 |---|---|---|
-| an administrative/owner role | Applies the schema, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab` |
+| lab admin login (created by IT) | Applies the schema, creates and manages the other logins, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab`; `CREATEROLE` |
 | `lab_rw` (group, no login) | Holds the read-write privilege set that every lab member's login inherits | Read and insert on all tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
 | one login per lab member | Used by that person's MATLAB client to record events | Member of `lab_rw`; no privileges of its own |
 | `lab_ro` | Used by the dashboard and the read-only AI query tool | Read only |
@@ -106,11 +107,11 @@ need IT to create them, or grant the lab an administrative login so we can:
 Per-person logins are a requirement, not a preference: the database is to
 record which login made each entry, and that record is only meaningful if
 logins are not shared. The privileges live on the group, so a membership
-change is one login created or disabled. So that the lab can do this itself,
-the admin login needs PostgreSQL's `CREATEROLE` attribute and membership in
-`lab_rw` granted `WITH ADMIN OPTION`. If campus directory authentication
-(LDAP/Kerberos) is available for PostgreSQL, we would prefer it to separate
-passwords; either works for us.
+change is one login created or disabled. The lab admin does this without IT:
+the admin login needs PostgreSQL's `CREATEROLE` attribute, and because it
+creates the `lab_rw` group itself it can add and remove members. If campus
+directory authentication (LDAP/Kerberos) is available for PostgreSQL, we would
+prefer it to separate passwords; either works for us.
 
 The schema file must be applied by the owner role; it is a single SQL file
 (`design_docs/schema.sql`) and takes seconds to run on an empty database.
@@ -194,8 +195,8 @@ known; items marked *IT decision* need input before go-live.
    made each change, so logins are now one per lab member (see §1). The
    client currently still records the self-declared email; we will change it
    to derive the person from the database login so the two cannot disagree.
-   IT's part is creating the per-person logins and, if available, tying them
-   to campus directory authentication.
+   IT's part is only the admin login that can create the others and, if
+   available, campus directory authentication for them.
 
 3. **Encryption on the wire is unverified.** *(IT decision, then lab
    verification)* None of the clients (MATLAB, Python, `psql`) set an
@@ -243,10 +244,9 @@ known; items marked *IT decision* need input before go-live.
 
 - Hostname and port of the PostgreSQL server, and which subnets/VPN can reach it.
 - Confirmation of the PostgreSQL major version installed.
-- Credentials (or a secure hand-off) for the owner role, `lab_ro`, and one
-  login per lab member in the `lab_rw` group — or, if IT prefers, an owner
-  login so the lab creates the others itself.
-- The procedure for adding and removing lab members' logins later.
+- Credentials (or a secure hand-off) for the lab admin login, with
+  `CREATEROLE` and ownership of database `lab`. The lab creates every other
+  login itself.
 - The backup schedule, retention period, and where dumps are kept.
 - Answers to the *IT decision* items in §3: whether campus directory
   authentication is available, TLS policy, expected recovery time, and where
