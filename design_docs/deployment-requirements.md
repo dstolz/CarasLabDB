@@ -1,5 +1,16 @@
 # Server requirements for deploying CarasLabDB
 
+**In brief.** The lab needs one PostgreSQL database server (version 14 or
+newer) on a small virtual machine, holding a single database named `lab`. It
+stores short text records only, so a modest VM (2 cores, 4 GB memory, 50 GB
+disk) is sufficient. It must be reachable on TCP port 5432 from the lab's
+workstations and the campus VPN, and from nowhere else, under a stable DNS
+hostname. We need three database logins created (an owner/admin login and two
+application logins, one read-write and one read-only), a nightly database dump
+kept on separate storage for at least 30 days, and a synchronised clock. The
+server needs nothing beyond PostgreSQL: no access to the NAS, no other software,
+and no internet access.
+
 This page is for IT staff. It describes what the lab needs on the server side
 to run the CarasLabDB metadata database, in plain terms, and lists the open
 design questions that affect deployment. It does not cover researcher
