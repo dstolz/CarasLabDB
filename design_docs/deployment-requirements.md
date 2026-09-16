@@ -1,9 +1,14 @@
 # Server requirements for deploying CarasLabDB
 
-**In brief.** The lab needs one PostgreSQL database server (version 14 or
-newer) on a small virtual machine, holding a single database named `lab`. It
-stores short text records only, so a modest VM (2 cores, 4 GB memory, 50 GB
-disk) is sufficient. It must be reachable over TCP from the lab's workstations
+**In brief.** CarasLabDB is the Caras Lab's record-keeping database. It logs
+what happens in the lab (animal births, surgeries, recordings, analyses) and
+keeps an index of the data files those activities produce, so that any result
+can be traced back to the animal, procedure and recording it came from. The
+data files themselves stay on the lab's NAS; the database holds only the
+records that describe them. To run it, the lab needs one PostgreSQL database
+server (version 14 or newer) on a small virtual machine, holding a single
+database named `lab`. It stores short text records only, so a modest VM
+(2 cores, 4 GB memory, 50 GB disk) is sufficient. It must be reachable over TCP from the lab's workstations
 and the campus VPN, and from nowhere else, under a stable DNS hostname. The
 standard PostgreSQL port is 5432, but any port IT prefers is fine as long as we
 are told what it is. We need three database logins created (an owner/admin login and two
