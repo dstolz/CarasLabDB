@@ -9,8 +9,11 @@ standard PostgreSQL port is 5432, but any port IT prefers is fine as long as we
 are told what it is. We need three database logins created (an owner/admin login and two
 application logins, one read-write and one read-only), a nightly database dump
 kept on separate storage for at least 30 days, and a synchronised clock. The
-server needs nothing beyond PostgreSQL: no access to the NAS, no other software,
-and no internet access.
+server needs nothing beyond PostgreSQL: no access to the NAS and no other
+software. It does not need to reach the internet itself (nothing on it
+downloads or calls out), although IT may of course allow that for routine
+security updates. It should not be reachable *from* the public internet;
+access is from the campus network and VPN only.
 
 This page is for IT staff. It describes what the lab needs on the server side
 to run the CarasLabDB metadata database, in plain terms, and lists the open
@@ -58,8 +61,9 @@ to *reach* the database over the network.
   required (the schema uses only built-in features).
 - Any operating system PostgreSQL supports (Linux preferred; Windows and
   Docker on a Synology NAS are also documented). A virtual machine is fine.
-- The server does **not** need MATLAB, Python, internet access, or a mount of
-  the NAS. It needs nothing but PostgreSQL.
+- The server does **not** need MATLAB, Python, or a mount of the NAS, and
+  nothing on it needs outbound internet access (allowing it for OS and
+  PostgreSQL updates is IT's call). It needs nothing but PostgreSQL.
 
 **Size** (our estimate from the schema; the database stores short text
 records, not data files)
