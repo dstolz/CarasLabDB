@@ -20,16 +20,15 @@ does not need to reach the internet itself (nothing on it downloads or calls
 out), although IT may of course allow that for routine security updates. It
 should not be reachable from the public internet.
 
-We need database logins created: an owner/admin login for the lab, one
-read-only login for reporting tools, and one personal read-write login for
-each lab member (we will supply the list). Logins must be per person, not
-shared, so that the database can record which person made each entry; that
-record is part of the lab's permanent audit trail. Adding and removing lab
-members will be an occasional ongoing request. We also need a nightly database
-dump kept on separate storage for at least 30 days. The server's clock must be
-set automatically from a network time source (NTP), because the database
-records the date and time of every entry and those timestamps are part of the
-lab's permanent record.
+We need three kinds of database login: an admin login for the lab, a
+read-only login, and one personal login for each lab member (we will supply
+the list). Each person must have their own login, so the database can record
+who made each entry. The admin login should be able to create and disable the
+personal logins, so the lab can handle membership changes itself. We also need
+a nightly database dump kept on separate storage for at least 30 days. The
+server's clock must be set automatically from a network time source (NTP),
+because the database records the date and time of every entry and those
+timestamps are part of the lab's permanent record.
 
 This page is for IT staff. It describes what the lab needs on the server side
 to run the CarasLabDB metadata database, in plain terms, and lists the open
@@ -106,10 +105,12 @@ need IT to create them, or grant the lab an administrative login so we can:
 
 Per-person logins are a requirement, not a preference: the database is to
 record which login made each entry, and that record is only meaningful if
-logins are not shared. Membership changes (a new student, someone leaving) are one
-account each; the privileges live on the group. If campus directory
-authentication (LDAP/Kerberos) is available for PostgreSQL, we would prefer it
-to separate passwords; either works for us.
+logins are not shared. The privileges live on the group, so a membership
+change is one login created or disabled. So that the lab can do this itself,
+the admin login needs PostgreSQL's `CREATEROLE` attribute and membership in
+`lab_rw` granted `WITH ADMIN OPTION`. If campus directory authentication
+(LDAP/Kerberos) is available for PostgreSQL, we would prefer it to separate
+passwords; either works for us.
 
 The schema file must be applied by the owner role; it is a single SQL file
 (`design_docs/schema.sql`) and takes seconds to run on an empty database.
