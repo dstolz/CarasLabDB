@@ -1,31 +1,35 @@
 # Server requirements for deploying CarasLabDB
 
-**What it is.** CarasLabDB is the Caras Lab's record-keeping database. It
-logs what happens in the lab (animal births, surgeries, recordings, analyses)
+We want to deploy a record-keeping database (a 'metadata server') that logs
+what happens in the lab (animal births, surgeries, recordings, analyses, etc)
 and keeps an index of the data files those activities produce, so that any
 result can be traced back to the animal, procedure and recording it came from.
 The data files themselves stay on the lab's NAS; the database holds only the
 records that describe them.
 
-**What we need hosted.** One PostgreSQL database server (version 14 or newer)
-on a small virtual machine, holding a single database named `lab`. It stores
-short text records only, so a modest VM (2 cores, 4 GB memory, 50 GB disk) is
-sufficient. The server needs nothing beyond PostgreSQL: no access to the NAS
-and no other software.
+What we need hosted. One PostgreSQL database server (version 14 or newer) on a
+small virtual machine, holding a single database. It stores short text records
+only, so a modest virtual machine (2 cores, 4 GB memory, 50 GB disk) would be
+sufficient. The server needs nothing beyond PostgreSQL: no direct access to the
+NAS and no other software.
 
-**Network.** The server must be reachable from the lab's workstations and the
-campus VPN, and from nowhere else, under a stable DNS hostname. The standard
-PostgreSQL port is 5432, but any port IT prefers is fine as long as we are told
-what it is. The server does not need to reach the internet itself (nothing on
-it downloads or calls out), although IT may of course allow that for routine
-security updates. It should not be reachable *from* the public internet.
+The server must be reachable from the lab's workstations and through the
+campus VPN under a stable DNS hostname. The standard PostgreSQL port is 5432,
+but any port IT prefers is fine as long as we are told what it is. The server
+does not need to reach the internet itself (nothing on it downloads or calls
+out), although IT may of course allow that for routine security updates. It
+should not be reachable from the public internet.
 
-**Accounts, backups and time.** We need three database logins created (an
-owner/admin login and two application logins, one read-write and one
-read-only), and a nightly database dump kept on separate storage for at least
-30 days. The server's clock must be set automatically from a network time
-source (NTP), because the database records the date and time of every entry
-and those timestamps are part of the lab's permanent record.
+We need database logins created: an owner/admin login for the lab, one
+read-only login for reporting tools, and one personal read-write login for
+each lab member (we will supply the list). Logins must be per person, not
+shared, so that the database can record which person made each entry; that
+record is part of the lab's permanent audit trail. Adding and removing lab
+members will be an occasional ongoing request. We also need a nightly database
+dump kept on separate storage for at least 30 days. The server's clock must be
+set automatically from a network time source (NTP), because the database
+records the date and time of every entry and those timestamps are part of the
+lab's permanent record.
 
 This page is for IT staff. It describes what the lab needs on the server side
 to run the CarasLabDB metadata database, in plain terms, and lists the open
@@ -96,8 +100,16 @@ need IT to create them, or grant the lab an administrative login so we can:
 | Role | Purpose | Privileges |
 |---|---|---|
 | an administrative/owner role | Applies the schema, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab` |
-| `lab_rw` | Used by researchers' MATLAB clients to record events | Read and insert on all tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
+| `lab_rw` (group, no login) | Holds the read-write privilege set that every lab member's login inherits | Read and insert on all tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
+| one login per lab member | Used by that person's MATLAB client to record events | Member of `lab_rw`; no privileges of its own |
 | `lab_ro` | Used by the dashboard and the read-only AI query tool | Read only |
+
+Per-person logins are a requirement, not a preference: the database records
+which login made each entry, and that record is only meaningful if logins are
+not shared. Membership changes (a new student, someone leaving) are one
+account each; the privileges live on the group. If campus directory
+authentication (LDAP/Kerberos) is available for PostgreSQL, we would prefer it
+to separate passwords; either works for us.
 
 The schema file must be applied by the owner role; it is a single SQL file
 (`design_docs/schema.sql`) and takes seconds to run on an empty database.
@@ -173,15 +185,16 @@ known; items marked *IT decision* need input before go-live.
    script; IT only needs to know the final privilege set will include update
    on those specific tables and nothing else.
 
-2. **Everyone shares one database login; "who did this" is self-declared.**
-   *(IT decision)* The design has all researchers connect as `lab_rw` and
-   identify themselves by an email address the client looks up in a `person`
-   table. The database does not verify that claim, so the audit trail rests on
-   honesty, and the one audited admin log records the shared role name rather
-   than the person. Options are: accept this for a small trusted lab; create
-   one PostgreSQL login per person; or authenticate against campus directory
-   (LDAP/Kerberos) through `pg_hba.conf`. The last two are IT-side changes and
-   we would like to know which is available.
+2. **Recording who made each entry depends on per-person logins.** *(IT +
+   lab)* The original deployment guides had every researcher connect as one
+   shared `lab_rw` login and identify themselves by an email address the
+   client looks up in a `person` table; the database did not verify that
+   claim. The lab has decided that the database must record which person
+   made each change, so logins are now one per lab member (see §1). The
+   client currently still records the self-declared email; we will change it
+   to derive the person from the database login so the two cannot disagree.
+   IT's part is creating the per-person logins and, if available, tying them
+   to campus directory authentication.
 
 3. **Encryption on the wire is unverified.** *(IT decision, then lab
    verification)* None of the clients (MATLAB, Python, `psql`) set an
@@ -229,9 +242,12 @@ known; items marked *IT decision* need input before go-live.
 
 - Hostname and port of the PostgreSQL server, and which subnets/VPN can reach it.
 - Confirmation of the PostgreSQL major version installed.
-- Credentials (or a secure hand-off) for the owner role, `lab_rw`, and `lab_ro`
-  — or, if IT prefers, an owner login so the lab creates the other two.
+- Credentials (or a secure hand-off) for the owner role, `lab_ro`, and one
+  login per lab member in the `lab_rw` group — or, if IT prefers, an owner
+  login so the lab creates the others itself.
+- The procedure for adding and removing lab members' logins later.
 - The backup schedule, retention period, and where dumps are kept.
-- Answers to the *IT decision* items in §3: per-person logins vs. shared,
-  TLS policy, expected recovery time, and where admin credentials should live.
+- Answers to the *IT decision* items in §3: whether campus directory
+  authentication is available, TLS policy, expected recovery time, and where
+  admin credentials should live.
 - Whether IT will host the optional dashboard, and if so, the URL.
