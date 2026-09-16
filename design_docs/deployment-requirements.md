@@ -10,15 +10,19 @@ records that describe them.
 What we need hosted. One PostgreSQL database server (version 14 or newer) on a
 small virtual machine, holding a single database. It stores short text records
 only, so a modest virtual machine (2 cores, 4 GB memory, 50 GB disk) would be
-sufficient. The server needs nothing beyond PostgreSQL: no direct access to the
-NAS and no other software.
+sufficient. The same machine will also host a small read-only web dashboard
+(a Python 3 program we supply) that shows the database contents in a browser.
+Beyond PostgreSQL and Python 3 the server needs no other software and no
+direct access to the NAS.
 
 The server must be reachable from the lab's workstations and through the
 campus VPN under a stable DNS hostname. The standard PostgreSQL port is 5432,
-but any port IT prefers is fine as long as we are told what it is. The server
-does not need to reach the internet itself (nothing on it downloads or calls
-out), although IT may of course allow that for routine security updates. It
-should not be reachable from the public internet.
+but any port IT prefers is fine as long as we are told what it is. The
+dashboard needs a web address (HTTPS) reachable from the same places, with
+campus login in front of it, because the dashboard program has no login of
+its own. The server does not need to reach the internet itself (nothing on it
+downloads or calls out), although IT may of course allow that for routine
+security updates. It should not be reachable from the public internet.
 
 We need IT to create one admin login for the lab, with permission to create
 and manage other logins on this database. The lab admin will then create the
@@ -59,7 +63,7 @@ historical rows are meaningful) and for account privileges (see §3).
 | Backups of that database | **Yes** | Nightly logical dump, retained off-box. |
 | A stable hostname | **Yes** | Every client is configured with the server name; it must not change. |
 | Network access to the database port | **Yes** | From lab workstations to the server, on the campus network or VPN. Port 5432 by default; any port works. |
-| Live web dashboard host | Optional | A small Python web service that shows the database contents in a browser. Read-only. |
+| Live web dashboard | **Yes** | A small Python web service on the same VM that shows the database contents in a browser. Read-only. Needs HTTPS and campus login in front of it. |
 
 Everything else (MATLAB, the read-only "MCP" query tool for AI assistants,
 the offline demo dashboard) runs on researchers' own machines and only needs
@@ -76,9 +80,9 @@ to *reach* the database over the network.
   required (the schema uses only built-in features).
 - Any operating system PostgreSQL supports (Linux preferred; Windows and
   Docker on a Synology NAS are also documented). A virtual machine is fine.
-- The server does **not** need MATLAB, Python, or a mount of the NAS, and
-  nothing on it needs outbound internet access (allowing it for OS and
-  PostgreSQL updates is IT's call). It needs nothing but PostgreSQL.
+- Python 3 for the dashboard (§2). The server does **not** need MATLAB or a
+  mount of the NAS, and nothing on it needs outbound internet access
+  (allowing it for OS and PostgreSQL updates is IT's call).
 
 **Size** (our estimate from the schema; the database stores short text
 records, not data files)
@@ -148,25 +152,26 @@ in advance of planned downtime because there is no offline mode (§3, concern 6)
 
 ---
 
-## 2. Optional: live dashboard host
+## 2. Live dashboard
 
 `web/live/server.py` is a small Python 3 program (standard library only, no
 packages required if the `psql` command is present) that serves one web page
 and one JSON endpoint. On every page load it runs one read-only query against
 the database and renders charts in the browser.
 
-If IT hosts it:
+It runs on the database VM. It needs:
 
-- Python 3 on any small Linux host (it can share the database VM).
-- A read-only database login (`lab_ro`).
-- One inbound HTTP port (default 8778) reachable from the lab subnet only.
-- **It has no authentication and speaks plain HTTP.** It must sit behind a
-  reverse proxy that adds TLS and campus login, or be reachable only on the
-  internal network / VPN. See §3, concern 4.
+- Python 3. No packages are required if the `psql` command is installed.
+- The read-only database login (created by the lab admin; we will supply it).
+- To be run as a service that starts at boot (a `systemd` unit is given in
+  `deployment-linux.md` §3.2). It listens on one local HTTP port (default
+  8778).
+- **A reverse proxy in front of it that provides HTTPS and campus login**,
+  reachable from the lab subnet and VPN only. The program itself has no
+  authentication and speaks plain HTTP, so it must not be exposed directly.
+  See §3, concern 4.
 - Browsers viewing it need outbound access to `cdn.jsdelivr.net` to load one
   charting library.
-
-The lab can also run this on a lab workstation instead; it is not essential.
 
 ---
 
@@ -251,4 +256,4 @@ known; items marked *IT decision* need input before go-live.
 - Answers to the *IT decision* items in §3: whether campus directory
   authentication is available, TLS policy, expected recovery time, and where
   admin credentials should live.
-- Whether IT will host the optional dashboard, and if so, the URL.
+- The dashboard's URL.
