@@ -7,32 +7,36 @@ result can be traced back to the animal, procedure and recording it came from.
 The data files themselves stay on the lab's NAS; the database holds only the
 records that describe them.
 
-What we need hosted. One PostgreSQL database server (version 14 or newer) on a
-small virtual machine, holding a single database. It stores short text records
-only, so a modest virtual machine (2 cores, 4 GB memory, 50 GB disk) would be
-sufficient. The same machine will also host a small read-only web dashboard
-(a Python 3 program we supply) that shows the database contents in a browser.
-Beyond PostgreSQL and Python 3 the server needs no other software and no
-direct access to the NAS.
+What we need. A PostgreSQL database (version 14 or newer) holding a single
+database of short text records. The load is small: a modest virtual machine
+(2 cores, 4 GB memory, 50 GB disk) would be more than enough, and nothing
+beyond PostgreSQL and Python 3 is needed on it. Alongside the database we have
+a small read-only web dashboard (a Python 3 program we supply) that shows the
+database contents in a browser; we would like it hosted on the same machine
+or wherever you suggest.
 
-The server must be reachable from the lab's workstations and through the
-campus VPN under a stable DNS hostname. The standard PostgreSQL port is 5432,
-but any port IT prefers is fine as long as we are told what it is. The
-dashboard needs a web address (HTTPS) reachable from the same places, with
-campus login in front of it, because the dashboard program has no login of
-its own. The server does not need to reach the internet itself (nothing on it
-downloads or calls out), although IT may of course allow that for routine
-security updates. It should not be reachable from the public internet.
+We are flexible about how this is provided. A dedicated virtual machine on
+the campus network with an administrator login for the lab would let us
+install and maintain everything ourselves from our own guides, which is our
+preference. A managed PostgreSQL service, or a machine that IT sets up for
+us, would also work. We would appreciate knowing which of these you offer.
 
-We need IT to create one admin login for the lab, with permission to create
-and manage other logins on this database. The lab admin will then create the
-read-only login and a personal login for each lab member, and will handle all
-membership changes going forward, without involving IT. Each person will have
-their own login, so the database can record who made each entry. We also need
-a nightly database dump kept on separate storage for at least 30 days. The
-server's clock must be set automatically from a network time source (NTP),
-because the database records the date and time of every entry and those
-timestamps are part of the lab's permanent record.
+Whatever the arrangement, the database needs to be reachable from the lab's
+workstations and through the campus VPN under a stable DNS hostname (the
+standard PostgreSQL port is 5432, but any port is fine as long as we know
+it), and the dashboard needs a web address (HTTPS) reachable from the same
+places with campus login in front of it, since the dashboard program has no
+login of its own. Neither should be reachable from the public internet, and
+nothing on the server needs to reach the internet itself.
+
+Each lab member will have their own database login, so the database can
+record who made each entry, and lab membership changes fairly often. We would
+like the lab's admin login to be able to create and disable these logins
+ourselves; if that is not possible on your service, we would need a simple
+way to request them. We also need a nightly database dump kept on separate
+storage for at least 30 days, and the server's clock set automatically from a
+network time source (NTP), because the database records the date and time of
+every entry and those timestamps are part of the lab's permanent record.
 
 This page is for IT staff. It describes what the lab needs on the server side
 to run the CarasLabDB metadata database, in plain terms, and lists the open
@@ -97,13 +101,14 @@ records, not data files)
 A single small VM is adequate. There is no expected performance concern at
 lab scale.
 
-**Accounts (PostgreSQL roles)** — none are created by our schema file. IT
-creates only the first row of the table below; the lab admin creates the rest
-and manages them from then on:
+**Accounts (PostgreSQL roles)** — none are created by our schema file. Our
+preference is that IT creates only the first row of the table below and the
+lab admin creates the rest and manages them from then on; if that is not
+possible, we need a simple way to request the others:
 
 | Role | Purpose | Privileges |
 |---|---|---|
-| lab admin login (created by IT) | Applies the schema, creates and manages the other logins, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab`; `CREATEROLE` |
+| lab admin login | Applies the schema, creates and manages the other logins, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab`; `CREATEROLE` if permitted |
 | `lab_rw` (group, no login) | Holds the read-write privilege set that every lab member's login inherits | Read and insert on all tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
 | one login per lab member | Used by that person's MATLAB client to record events | Member of `lab_rw`; no privileges of its own |
 | `lab_ro` | Used by the dashboard and the read-only AI query tool | Read only |
@@ -111,11 +116,13 @@ and manages them from then on:
 Per-person logins are a requirement, not a preference: the database is to
 record which login made each entry, and that record is only meaningful if
 logins are not shared. The privileges live on the group, so a membership
-change is one login created or disabled. The lab admin does this without IT:
-the admin login needs PostgreSQL's `CREATEROLE` attribute, and because it
-creates the `lab_rw` group itself it can add and remove members. If campus
-directory authentication (LDAP/Kerberos) is available for PostgreSQL, we would
-prefer it to separate passwords; either works for us.
+change is one login created or disabled. We would like the lab admin to do
+this without a ticket, which needs PostgreSQL's `CREATEROLE` attribute on the
+admin login (and, if it creates the `lab_rw` group itself, it can then add and
+remove members). On a shared, managed cluster that may not be permitted; in
+that case we need a request procedure. If campus directory authentication
+(LDAP/Kerberos) is available for PostgreSQL, we would prefer it to separate
+passwords; either works for us.
 
 The schema file must be applied by the owner role; it is a single SQL file
 (`design_docs/schema.sql`) and takes seconds to run on an empty database.
@@ -159,10 +166,10 @@ packages required if the `psql` command is present) that serves one web page
 and one JSON endpoint. On every page load it runs one read-only query against
 the database and renders charts in the browser.
 
-It runs on the database VM. It needs:
+Preferably on the database machine, otherwise any small Linux host. It needs:
 
 - Python 3. No packages are required if the `psql` command is installed.
-- The read-only database login (created by the lab admin; we will supply it).
+- The read-only database login (`lab_ro`).
 - To be run as a service that starts at boot (a `systemd` unit is given in
   `deployment-linux.md` §3.2). It listens on one local HTTP port (default
   8778).
@@ -200,7 +207,7 @@ known; items marked *IT decision* need input before go-live.
    made each change, so logins are now one per lab member (see §1). The
    client currently still records the self-declared email; we will change it
    to derive the person from the database login so the two cannot disagree.
-   IT's part is only the admin login that can create the others and, if
+   IT's part is the admin login, ideally able to create the others, and, if
    available, campus directory authentication for them.
 
 3. **Encryption on the wire is unverified.** *(IT decision, then lab
@@ -247,11 +254,13 @@ known; items marked *IT decision* need input before go-live.
 
 ## 4. What we need back from IT
 
+- Which hosting arrangement is available: a VM we administer, a managed
+  PostgreSQL service, or a machine IT sets up for us.
 - Hostname and port of the PostgreSQL server, and which subnets/VPN can reach it.
 - Confirmation of the PostgreSQL major version installed.
-- Credentials (or a secure hand-off) for the lab admin login, with
-  `CREATEROLE` and ownership of database `lab`. The lab creates every other
-  login itself.
+- Credentials (or a secure hand-off) for the lab admin login, owning
+  database `lab` and, if permitted, with `CREATEROLE` so the lab creates the
+  other logins itself; otherwise, the procedure for requesting logins.
 - The backup schedule, retention period, and where dumps are kept.
 - Answers to the *IT decision* items in §3: whether campus directory
   authentication is available, TLS policy, expected recovery time, and where
