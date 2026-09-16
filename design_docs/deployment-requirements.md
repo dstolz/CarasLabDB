@@ -104,9 +104,9 @@ need IT to create them, or grant the lab an administrative login so we can:
 | one login per lab member | Used by that person's MATLAB client to record events | Member of `lab_rw`; no privileges of its own |
 | `lab_ro` | Used by the dashboard and the read-only AI query tool | Read only |
 
-Per-person logins are a requirement, not a preference: the database records
-which login made each entry, and that record is only meaningful if logins are
-not shared. Membership changes (a new student, someone leaving) are one
+Per-person logins are a requirement, not a preference: the database is to
+record which login made each entry, and that record is only meaningful if
+logins are not shared. Membership changes (a new student, someone leaving) are one
 account each; the privileges live on the group. If campus directory
 authentication (LDAP/Kerberos) is available for PostgreSQL, we would prefer it
 to separate passwords; either works for us.
