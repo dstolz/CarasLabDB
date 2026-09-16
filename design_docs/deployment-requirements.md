@@ -7,10 +7,12 @@ disk) is sufficient. It must be reachable over TCP from the lab's workstations
 and the campus VPN, and from nowhere else, under a stable DNS hostname. The
 standard PostgreSQL port is 5432, but any port IT prefers is fine as long as we
 are told what it is. We need three database logins created (an owner/admin login and two
-application logins, one read-write and one read-only), a nightly database dump
-kept on separate storage for at least 30 days, and a synchronised clock. The
-server needs nothing beyond PostgreSQL: no access to the NAS and no other
-software. It does not need to reach the internet itself (nothing on it
+application logins, one read-write and one read-only), and a nightly database
+dump kept on separate storage for at least 30 days. The server's clock must be
+set automatically from a network time source (NTP), because the database
+records the date and time of every entry and those timestamps are part of the
+lab's permanent record. The server needs nothing beyond PostgreSQL: no access
+to the NAS and no other software. It does not need to reach the internet itself (nothing on it
 downloads or calls out), although IT may of course allow that for routine
 security updates. It should not be reachable *from* the public internet;
 access is from the campus network and VPN only.
