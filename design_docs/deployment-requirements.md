@@ -3,9 +3,10 @@
 **In brief.** The lab needs one PostgreSQL database server (version 14 or
 newer) on a small virtual machine, holding a single database named `lab`. It
 stores short text records only, so a modest VM (2 cores, 4 GB memory, 50 GB
-disk) is sufficient. It must be reachable on TCP port 5432 from the lab's
-workstations and the campus VPN, and from nowhere else, under a stable DNS
-hostname. We need three database logins created (an owner/admin login and two
+disk) is sufficient. It must be reachable over TCP from the lab's workstations
+and the campus VPN, and from nowhere else, under a stable DNS hostname. The
+standard PostgreSQL port is 5432, but any port IT prefers is fine as long as we
+are told what it is. We need three database logins created (an owner/admin login and two
 application logins, one read-write and one read-only), a nightly database dump
 kept on separate storage for at least 30 days, and a synchronised clock. The
 server needs nothing beyond PostgreSQL: no access to the NAS, no other software,
@@ -39,7 +40,7 @@ historical rows are meaningful) and for account privileges (see §3).
 | PostgreSQL server | **Yes** | The database. One instance, one database named `lab`. |
 | Backups of that database | **Yes** | Nightly logical dump, retained off-box. |
 | A stable hostname | **Yes** | Every client is configured with the server name; it must not change. |
-| Network access on port 5432 | **Yes** | From lab workstations to the server, on the campus network or VPN. |
+| Network access to the database port | **Yes** | From lab workstations to the server, on the campus network or VPN. Port 5432 by default; any port works. |
 | Live web dashboard host | Optional | A small Python web service that shows the database contents in a browser. Read-only. |
 
 Everything else (MATLAB, the read-only "MCP" query tool for AI assistants,
@@ -87,9 +88,10 @@ The schema file must be applied by the owner role; it is a single SQL file
 
 **Network**
 
-- Listen on TCP port **5432** (PostgreSQL default), reachable from the lab's
-  workstation subnet(s) and from the campus VPN. It must **not** be reachable
-  from the public internet.
+- Listen on one TCP port, reachable from the lab's workstation subnet(s) and
+  from the campus VPN. It must **not** be reachable from the public internet.
+  PostgreSQL's default is **5432**; any other port is acceptable, since every
+  client takes the port as a setting. We only need to know which one.
 - Password authentication (`scram-sha-256`, the PostgreSQL default) restricted
   to those subnets in `pg_hba.conf`.
 - A **DNS hostname** for the server. Clients store the hostname in their
