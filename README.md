@@ -149,7 +149,9 @@ cd mcp-server && pip install -e .
 claude mcp add caraslabdb -e PGDATABASE=lab -e PGUSER=lab_ro -- python -m caraslabdb_mcp.server
 ```
 
-See `design_docs/testing-locally.md` for a full local-testing guide,
+See `design_docs/deployment-requirements.md` for the server-side requirements
+summary written for IT staff (plus the deployment-related design concerns),
+`design_docs/testing-locally.md` for a full local-testing guide,
 `design_docs/mcp-server.md` for the MCP server's design and setup,
 `design_docs/deployment-windows.md` for Windows deployment notes,
 `design_docs/deployment-linux.md` for Linux deployment notes, and
@@ -164,6 +166,7 @@ design_docs/         Schema DDL and design documentation
   database-design.md   Table-by-table rationale
   testing-locally.md   Local testing guide
   mcp-server.md        Read-only MCP server: design and setup
+  deployment-requirements.md   Server-side requirements summary for IT
   deployment-windows.md
   deployment-linux.md
   deployment-synology.md
