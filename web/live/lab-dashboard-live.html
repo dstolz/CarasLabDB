@@ -752,8 +752,32 @@ window.__initDashboard = function(){
   }
   function fmtNum(n){ return n==null?'—':n.toLocaleString(); }
   const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  const fmtDate = iso => iso ? iso.slice(0,10) : '—';
-  const fmtDateTime = iso => iso ? iso.slice(0,10)+' '+iso.slice(11,16) : '—';
+  // Timestamps arrive as UTC ISO-8601 ('…Z' or '…+00:00'); dates such as
+  // date_of_birth and started_on arrive as bare 'YYYY-MM-DD'. Timestamps are
+  // shown, filtered and bucketed in the viewer's own time zone (named in the
+  // header), so an event at 14:00 in the lab reads 14:00 and a late-evening
+  // event lands on the right calendar day. A bare date has no zone and is
+  // shown exactly as stored.
+  const VIEW_TZ = (()=>{ try{ return Intl.DateTimeFormat().resolvedOptions().timeZone||'local time'; }catch(e){ return 'local time'; } })();
+  const isDateOnly = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const pad2 = n => String(n).padStart(2,'0');
+  // Fractional seconds beyond milliseconds are dropped before parsing:
+  // Date.parse only guarantees three digits.
+  const parseTs = iso => new Date(String(iso).replace(/(\.\d{3})\d+/, '$1'));
+  function localDay(iso){
+    if(isDateOnly(iso)) return iso;
+    const d=parseTs(iso);
+    if(isNaN(d)) return String(iso).slice(0,10);
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+  }
+  const fmtDate = iso => iso ? localDay(iso) : '—';
+  function fmtDateTime(iso){
+    if(!iso) return '—';
+    if(isDateOnly(iso)) return iso;
+    const d=parseTs(iso);
+    if(isNaN(d)) return String(iso).slice(0,16).replace('T',' ');
+    return `${localDay(iso)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
   const personName = id => { const p=personById.get(id); return p?p.full_name:'—'; };
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
   function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
@@ -825,7 +849,7 @@ window.__initDashboard = function(){
   }
   function withinDate(iso){
     if(!iso) return (!F.from && !F.to);
-    const d=iso.slice(0,10);
+    const d=localDay(iso);
     if(F.from && d<F.from) return false;
     if(F.to && d>F.to) return false;
     return true;
@@ -976,7 +1000,7 @@ window.__initDashboard = function(){
     charts.storage.update('none');
 
     // activity over time (monthly)
-    const months=[]; const key = iso=>iso.slice(0,7);
+    const months=[]; const key = iso=>localDay(iso).slice(0,7);
     const allK={}, recK={};
     evs.forEach(e=>{ const k=key(e.occurred_at); allK[k]=(allK[k]||0)+1; if(e.event_type==='recording') recK[k]=(recK[k]||0)+1; });
     let keys = Object.keys(allK).sort();
@@ -1963,7 +1987,7 @@ window.__initDashboard = function(){
 
   // dates
   const asof=new Date(D.NOW).toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'numeric',minute:'2-digit'});
-  document.getElementById('asof').textContent='as of '+asof;
+  document.getElementById('asof').textContent='as of '+asof+' · times in '+VIEW_TZ;
   document.getElementById('asof2').textContent=asof;
 
   // go
