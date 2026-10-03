@@ -76,9 +76,19 @@ order — no Python package install is strictly required:
 2. `psycopg2`, else
 3. the `psql` CLI (shelled out; reads the same `PG*` variables).
 
-If none can reach the database, `/api/data` returns HTTP 503 with a JSON
-`{error, detail}` body, and the page shows an error card with a **Retry**
-button rather than a blank screen.
+If none can reach the database, `/api/data` returns HTTP 503 with a fixed
+JSON `{error, detail}` body, and the page shows an error card with a **Retry**
+button rather than a blank screen. The driver's own message, which can name
+the host and login, goes to the server's stderr log only.
+
+### Caching and what is served
+
+`/api/data` runs the export at most once every 5 seconds (`CACHE_SECONDS` in
+`server.py`); requests inside that window, including a press of `r`, get the
+same payload. It is gzip-compressed for clients that send
+`Accept-Encoding: gzip`. The server answers only `/` (the page) and
+`/api/data`; every other path is a 404, so nothing else in `web/live/` is
+ever published.
 
 ## Static export (no server)
 
@@ -86,12 +96,12 @@ button rather than a blank screen.
 offline demo could load:
 
 ```bash
-psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
+PGTZ=UTC psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
 ```
 
-`-q` matters: `-t`/`-A` only control result-tuple formatting, so without it psql
-also prints the `SET` command-status tag for the query's leading
-`SET TIME ZONE` and the file is no longer valid JSON.
+`lab_data.sql` is a single statement. `PGTZ=UTC` matches what `server.py`
+does: top-level timestamps are rendered in UTC either way, and it makes the
+offsets inside per-event `detail` objects UTC as well.
 
 ## Security notes
 

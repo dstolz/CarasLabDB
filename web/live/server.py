@@ -7,9 +7,16 @@ live Postgres database and returns the whole ``LAB_DATA`` payload the
 dashboard expects. Everything the browser needs comes from the same origin,
 so there are no CORS concerns.
 
-The query is executed per request, so the dashboard always reflects the
-current database state. Database connection settings are taken from the
-standard libpq environment variables:
+The query runs at most once every CACHE_SECONDS (5 s): concurrent page loads
+and refreshes within that window share one export, and the response is
+gzip-compressed for clients that accept it. Only the page itself and
+/api/data are served; any other path is a 404, so nothing else in this
+directory (source files, or a stray .env / .pgpass) is ever published.
+Database errors are logged to stderr and answered with a fixed message, so
+host and user names in a driver error never reach the browser.
+
+Database connection settings are taken from the standard libpq environment
+variables:
 
     PGHOST      (default: local socket / localhost)
     PGPORT      (default: 5432)
@@ -28,14 +35,27 @@ Usage:
 """
 
 import argparse
+import gzip
 import json
 import os
 import subprocess
 import sys
+import threading
+import time
+import traceback
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SQL_PATH = os.path.join(HERE, "lab_data.sql")
+PAGE = "/lab-dashboard-live.html"
+CACHE_SECONDS = 5.0
+
+# lab_data.sql renders timestamps in UTC; the session zone only affects the
+# offsets inside per-event `detail` objects, but pinning it keeps the payload
+# identical whichever zone the server or the login defaults to. It is set on
+# the connection rather than in the SQL file, which keeps that file a single
+# statement.
+SESSION_TIME_ZONE = "UTC"
 
 
 # --------------------------------------------------------------------------
@@ -59,21 +79,9 @@ def _fetch_via_psycopg(sql):
         conn = psycopg2.connect()
     try:
         conn.autocommit = True
-        # A driver's execute() only exposes the result of the LAST statement
-        # in a multi-statement string (lab_data.sql leads with `SET TIME
-        # ZONE`), so run each statement individually and fetch from the last.
-        #
-        # WARNING: this is a naive split, not a SQL parser -- it is correct
-        # only because no statement in lab_data.sql contains a semicolon
-        # inside a string literal, a quoted identifier or a comment. Adding
-        # one there would silently cut the query into fragments. If that ever
-        # becomes necessary, split on an explicit marker instead (or move the
-        # `SET TIME ZONE` out of the file and issue it from here).
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
         with conn.cursor() as cur:
-            for stmt in statements[:-1]:
-                cur.execute(stmt)
-            cur.execute(statements[-1])
+            cur.execute("SET TIME ZONE '%s'" % SESSION_TIME_ZONE)
+            cur.execute(sql)
             value = cur.fetchone()[0]
         # A json/jsonb column comes back already parsed; a text column is a str.
         if isinstance(value, (dict, list)):
@@ -87,10 +95,9 @@ def _fetch_via_psql(sql):
     """Fallback: pipe the query through the psql CLI (reads PG* env vars)."""
     env = dict(os.environ)
     env.setdefault("PGDATABASE", "lab")
-    # -q is load-bearing: -t/-A only control how result *tuples* are printed,
-    # so without it psql also echoes the command-status tag of every non-SELECT
-    # statement -- lab_data.sql leads with `SET TIME ZONE`, which would put a
-    # bare "SET" line in front of the JSON and make the response unparseable.
+    # libpq sets the session time zone from PGTZ; override any inherited value.
+    env["PGTZ"] = SESSION_TIME_ZONE
+    # -q keeps psql from echoing a command-status tag in front of the JSON.
     # The query text comes in on stdin so this backend and the psycopg one run
     # exactly the same SQL string.
     proc = subprocess.run(
@@ -123,44 +130,88 @@ def fetch_lab_data(sql):
 
 
 # --------------------------------------------------------------------------
-# HTTP handler: static files from this directory + the /api/data endpoint.
+# Short-lived payload cache, shared by all request threads.
+# --------------------------------------------------------------------------
+_cache_lock = threading.Lock()
+_cache = {"at": None, "raw": None, "gz": None}
+
+
+def cached_payload():
+    """(raw bytes, gzip bytes) of the export, re-queried every CACHE_SECONDS.
+
+    The lock is held across the query, so a burst of requests after expiry
+    runs it once rather than once per request.
+    """
+    with _cache_lock:
+        now = time.monotonic()
+        if _cache["at"] is None or now - _cache["at"] >= CACHE_SECONDS:
+            raw = fetch_lab_data(SQL).encode("utf-8")
+            _cache.update(at=now, raw=raw, gz=gzip.compress(raw, compresslevel=6))
+        return _cache["raw"], _cache["gz"]
+
+
+# --------------------------------------------------------------------------
+# HTTP handler: the page itself + the /api/data endpoint, nothing else.
 # --------------------------------------------------------------------------
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=HERE, **kwargs)
 
+    def _route(self):
+        """Map the request path to PAGE or "/api/data"; None for anything else."""
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if path in ("/", "", PAGE):
+            return PAGE
+        if path == "/api/data":
+            return path
+        return None
+
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/api/data":
+        route = self._route()
+        if route == "/api/data":
             self.handle_api_data()
-            return
-        # Compare against the path only: a bare "/?anything" would otherwise
-        # fall through to the base handler's directory listing and expose
-        # server.py / lab_data.sql / build_live_page.py.
-        if self.path.split("?", 1)[0] in ("/", ""):
-            self.path = "/lab-dashboard-live.html"
-        super().do_GET()
+        elif route == PAGE:
+            self.path = PAGE
+            super().do_GET()
+        else:
+            self.send_error(404)
+
+    def do_HEAD(self):
+        if self._route() == PAGE:
+            self.path = PAGE
+            super().do_HEAD()
+        else:
+            self.send_error(404)
+
+    def _send(self, status, body, extra_headers=()):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for name, value in extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     def handle_api_data(self):
         try:
-            payload = fetch_lab_data(SQL).encode("utf-8")
-        except Exception as exc:  # DB down, bad creds, missing schema, ...
+            raw, gz = cached_payload()
+        except Exception:  # DB down, bad creds, missing schema, ...
+            # The driver's message can name the host, port and login; keep it
+            # in the server log and send the browser a fixed message.
+            sys.stderr.write("/api/data failed:\n" + traceback.format_exc())
             body = json.dumps({
                 "error": "Could not read the database.",
-                "detail": str(exc),
+                "detail": "Could not read the database. The dashboard server's "
+                          "log has the cause.",
             }).encode("utf-8")
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(503, body)
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(payload)
+        accepts = self.headers.get("Accept-Encoding", "")
+        if "gzip" in [e.split(";")[0].strip().lower() for e in accepts.split(",")]:
+            self._send(200, gz, [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")])
+        else:
+            self._send(200, raw, [("Vary", "Accept-Encoding")])
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
