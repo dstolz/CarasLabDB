@@ -30,12 +30,19 @@ Read tools mirroring `@CarasLabDB`'s `get*` method surface:
 - **Dimensions**: `get_persons`, `get_projects`, `get_project_members`,
   `get_project_artifacts`, `get_subjects`, `get_sessions`,
   `get_subject_current`.
-- **Events**: `get_events` (filterable by type/subject/session, toggles
+- **Events**: `get_events` (filterable by type/subject/session and by an
+  `occurred_from` / `occurred_before` time range; toggles
   `event`/`event_active` via `active_only`), `get_event_detail` (joins a
   base event to its type-specific detail table; same `active_only` toggle).
-- **Artifacts/provenance**: `get_artifacts`, `get_event_inputs`,
+- **Artifacts/provenance**: `get_artifacts` (also filterable by a
+  `created_from` / `created_before` range), `get_event_inputs`,
   `get_artifact_verifications`, `get_artifact_lineage` (wraps
   `lab.fn_artifact_lineage`), `get_provenance_edges`.
+- **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`; empty
+  means healthy).
+
+`get_persons(email=...)` matches case-insensitively, as the database's own
+uniqueness rule does.
 
 Every tool has named, typed parameters (no generic SQL/JSON blob) so the
 tool's schema is a real source of field names for the calling LLM. No tool
@@ -45,6 +52,11 @@ Every list tool takes `limit` (default 200, max 1000) and returns
 `{"rows": [...], "row_count": n, "limit": n, "truncated": bool}` — there is
 no unlimited mode, and `truncated: true` tells the caller the answer was cut
 off instead of letting it read a clipped result as complete.
+
+The server is written for schema version 2 (`lab.schema_version`). Against a
+database at another version it logs a warning and adds a `schema_warning`
+string to every list result, since its hard-coded column lists may then
+return incomplete rows.
 
 ## Install
 
@@ -70,6 +82,7 @@ same as `web/live/server.py` and the MATLAB class:
 | `PGDATABASE` | `lab` |
 | `PGUSER` | OS user |
 | `PGPASSWORD` | (or a `~/.pgpass` entry) |
+| `PGTZ` | server default; set it (e.g. `America/New_York`) so a time-range bound without a UTC offset, such as `occurred_from="2026-09-01"`, means midnight in the lab's zone |
 
 `PGDATABASE` is read at server start; if it is unset the server falls back to
 `lab` (the production database) and logs a warning to stderr, so set it
@@ -126,3 +139,17 @@ To remove it: `claude mcp remove caraslabdb`.
 5. Confirm results are bounded: `get_events` with no filters against more
    than 200 events should come back with `truncated: true`, not the whole
    table; `limit=-1` should raise a clear error.
+
+## Tests
+
+```powershell
+pip install -e .[test]
+python -m pytest tests                                  # unit tests only
+$env:CARASLABDB_TEST_DB = "lab_test"; python -m pytest tests   # plus integration
+```
+
+The unit tests need no database. The integration tests run only when
+`CARASLABDB_TEST_DB` names a scratch database with `design_docs/schema.sql`
+applied. They connect with the usual `PG*` variables as a login that can
+INSERT, because they seed their own rows (keyed by a random suffix, so they
+can be re-run). CI runs both (`.github/workflows/tests.yml`).

@@ -20,14 +20,16 @@ def register(app):
     ) -> dict:
         """List lab members, optionally filtered by id, email, name, or active status.
 
+        email matches case-insensitively, as the database's uniqueness rule
+        does ("Dan@umd.edu" and "dan@umd.edu" are one person).
         A filter left as None is not applied -- it never means "IS NULL".
         Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.person", {
-            "person_id": person_id, "email": email,
+            "person_id": person_id,
             "full_name": full_name, "is_active": is_active,
-        }, limit=limit)
+        }, limit=limit, ci_filters={"email": email})
 
     @app.tool()
     def get_projects(

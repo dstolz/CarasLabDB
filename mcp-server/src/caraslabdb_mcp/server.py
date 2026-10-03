@@ -9,7 +9,7 @@ transaction wrapper is the backstop if one is ever introduced by mistake.
 
 from mcp.server.fastmcp import FastMCP
 
-from .tools import artifacts, dimensions, events, provenance, reference
+from .tools import artifacts, dimensions, events, health, provenance, reference
 
 app = FastMCP("caraslabdb")
 
@@ -18,6 +18,7 @@ dimensions.register(app)
 events.register(app)
 artifacts.register(app)
 provenance.register(app)
+health.register(app)
 
 
 def main():
