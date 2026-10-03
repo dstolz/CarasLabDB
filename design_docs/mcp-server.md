@@ -49,6 +49,8 @@ mcp-server/
       events.py                     # get_events, get_event_detail
       artifacts.py                  # get_artifacts, get_event_inputs, ...
       provenance.py                 # get_artifact_lineage, get_provenance_edges
+      health.py                     # get_integrity_report
+  tests/                            # pytest: unit (no DB) + integration
 ```
 
 - **`server.py`** builds a `FastMCP("caraslabdb")` app and calls each tool
@@ -57,14 +59,18 @@ mcp-server/
 - **`db.py`** owns *all* SQL execution. `fetch_all(sql, params)` runs a
   parameterized query and returns rows as `column -> value` dicts.
   `fetch_limited(sql, params, limit)` wraps it with a `LIMIT` and a
-  truncation flag. `select_from(table, filters, limit, order_by)` builds a
-  `SELECT * FROM <table> WHERE <filters ANDed>` for the common case, where
+  truncation flag. `read_only_cursor()` gives a tool several queries in one
+  transaction. `select_from(table, filters, limit, order_by, ci_filters,
+  time_ranges)` builds a `SELECT * FROM <table> WHERE <filters ANDed>` for
+  the common case (`ci_filters` compare case-insensitively; `time_ranges`
+  maps a column to an inclusive lower and exclusive upper timestamptz bound), where
   `filters` values that are `None` are dropped (i.e. "not filtering on this
   column", *not* an `IS NULL` test) and every non-`None` value is bound as a
   query parameter — never interpolated into SQL text. `table`, `order_by`,
-  and the keys of `filters` *are* interpolated as SQL text, so `db.py`
-  validates them itself: `table` against `ALLOWED_TABLES`, `order_by` against
-  `ALLOWED_ORDER_BY`, filter keys against `^[a-z_][a-z0-9_]*$`. That is a
+  and the column names in `filters`, `ci_filters` and `time_ranges` *are*
+  interpolated as SQL text, so `db.py` validates them itself: `table` against
+  `ALLOWED_TABLES`, `order_by` against `ALLOWED_ORDER_BY`, column names
+  against `^[a-z_][a-z0-9_]*$`. That is a
   check, not a convention — a call site can't skip it.
 - **`schema_map.py`** hardcodes the 8 event types to their detail
   table/columns (built by hand from `schema.sql`, not introspected at
@@ -90,7 +96,7 @@ independent defenses so that no one of them has to be right:
    session default, which holds regardless of transaction bookkeeping.
 3. **The transaction.** `SET TRANSACTION READ ONLY` is still issued as the
    first statement of each transaction, before any tool-supplied SQL, and
-   the connection is rolled back and closed afterward regardless of outcome.
+   the transaction is rolled back afterward regardless of outcome.
 
 Layer 3 alone was the original design, but it only lands as the first
 statement of an implicit transaction *because* both drivers default to
@@ -105,11 +111,21 @@ The same wrapper also bounds how long a query may hold the server: the
 connection is opened with `connect_timeout=10` (an unreachable `PGHOST` would
 otherwise block the stdio server for the libpq default of minutes), and each
 transaction sets `statement_timeout = '30s'` and
-`idle_in_transaction_session_timeout = '60s'`. Teardown rolls back inside its
-own `try`, with `close()` in a nested `finally` — a rollback that raises
-against a dead backend must not be able to skip the close, since the server
-opens a connection per query and would otherwise leak one file descriptor per
-failure against a flapping database.
+`idle_in_transaction_session_timeout = '60s'`.
+
+One connection is opened on first use and reused for every call, behind a
+lock; each call is still its own READ ONLY transaction, rolled back at the
+end. A rollback that raises (a dead backend after a `statement_timeout` kill
+or a dropped socket) discards the connection, and a connection found dead at
+the start of a call is replaced once, so a server restart costs the caller
+nothing. `get_event_detail` makes its two queries through one cursor, so both
+see the same snapshot. On first connect `db.py` reads `lab.schema_version`;
+if it is not the version the server was written for (`db.SCHEMA_VERSION`),
+it logs a warning and every list result carries a `schema_warning` string.
+
+A time-range bound without a UTC offset (e.g. `occurred_from="2026-09-01"`)
+is read in the session time zone, which libpq takes from `PGTZ` when set and
+otherwise from the server default.
 
 ### Bounded results
 
@@ -167,9 +183,13 @@ tools. Every list tool also takes `limit: int = 200`.
 |---|---|
 | `reference.py` | `get_species`, `get_storage_roots`, `get_probes`, `get_pipelines`, `get_event_types`, `get_artifact_roles`, `get_acquisition_systems` |
 | `dimensions.py` | `get_persons`, `get_projects`, `get_project_members`, `get_project_artifacts`, `get_subjects`, `get_sessions`, `get_subject_current` |
-| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`, `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
-| `artifacts.py` | `get_artifacts` (`active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
+| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id` and by `occurred_from` (inclusive) / `occurred_before` (exclusive); `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
+| `artifacts.py` | `get_artifacts` (`created_from` / `created_before` range; `active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`), `get_provenance_edges` |
+| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`; errors first; empty means healthy) |
+
+`get_persons` compares `email` case-insensitively (`lower(email) = lower(%s)`),
+matching the schema's `uq_person_email_lower` index.
 
 `active_only` defaults to `True` everywhere it appears, so queries read the
 `*_active` views (non-superseded rows) by default — same default as

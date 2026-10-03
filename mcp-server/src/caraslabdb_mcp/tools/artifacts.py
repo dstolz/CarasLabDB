@@ -14,6 +14,8 @@ def register(app):
         session_id: Optional[str] = None,
         role: Optional[str] = None,
         checksum: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_before: Optional[str] = None,
         active_only: bool = True,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
@@ -21,6 +23,11 @@ def register(app):
 
         Reads lab.artifact_active (non-superseded rows only) unless
         active_only=False. Ordered newest-first by created_at.
+
+        created_from (inclusive) and created_before (exclusive) bound
+        created_at, the time the file was registered. Each is an ISO-8601
+        date or timestamp; a value without a UTC offset is read in the
+        database session's time zone.
 
         A filter left as None is simply not applied -- it does not mean
         "where this column IS NULL".
@@ -34,7 +41,8 @@ def register(app):
             "artifact_id": artifact_id, "produced_by_event_id": produced_by_event_id,
             "subject_id": subject_id, "session_id": session_id,
             "role": role, "checksum": checksum,
-        }, limit=limit, order_by=db.ORDER_BY_ARTIFACT)
+        }, limit=limit, order_by=db.ORDER_BY_ARTIFACT,
+            time_ranges={"created_at": (created_from, created_before)})
 
     @app.tool()
     def get_event_inputs(

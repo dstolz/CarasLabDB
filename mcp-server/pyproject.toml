@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 psycopg2 = ["psycopg2-binary>=2.9"]
+test = ["pytest>=7"]
 
 [project.scripts]
 caraslabdb-mcp = "caraslabdb_mcp.server:main"
