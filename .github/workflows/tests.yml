@@ -47,7 +47,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q postgresql-client
           python -m pip install --upgrade pip
-          python -m pip install -e "mcp-server[test]" ruff
+          python -m pip install -e "mcp-server[test]" "ruff==0.15.20"
 
       - name: Lint Python
         run: ruff check mcp-server web/live tests
