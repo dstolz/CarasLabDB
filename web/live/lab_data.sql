@@ -19,18 +19,15 @@
 --   * Each artifact carries a `verification` object = its latest
 --     lab.artifact_verification row, or {status:'unverified'} if none.
 --   * timestamptz values are rendered as UTC ISO-8601 ("...Z") strings and
---     `NOW` as epoch milliseconds, matching what the front-end parses.
+--     `NOW` as epoch milliseconds, matching what the front-end parses. The
+--     timestamps inside `detail` objects carry the session zone's offset;
+--     server.py pins that zone to UTC, and PGTZ=UTC does the same for psql.
 --
--- Run standalone to produce a static export. -q is required: -t/-A only govern
--- result-tuple formatting, so without it psql also prints the "SET" command
--- status tag for the statement below and the file is no longer valid JSON.
---   psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
--- The bundled server (web/live/server.py) runs it per request instead, and
--- splits this file on the statement separator to execute one statement at a
--- time -- so keep that character out of comments and string literals here.
+-- This file is a single statement. Run it standalone to produce a static
+-- export:
+--   PGTZ=UTC psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
+-- The bundled server (web/live/server.py) runs it on demand instead.
 -- ============================================================================
-
-SET TIME ZONE 'UTC';
 
 WITH
 people AS (
