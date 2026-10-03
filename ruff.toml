@@ -1,0 +1,5 @@
+# Lint rules for the Python in this repository (mcp-server/, web/live/, tests/).
+# Listed explicitly so that a ruff release with different defaults does not
+# change what CI checks.
+[lint]
+select = ["E4", "E7", "E9", "F"]
