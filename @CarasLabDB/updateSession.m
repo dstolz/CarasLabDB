@@ -3,7 +3,9 @@ function updateSession(obj, sessionId, opts)
 %
 %   updateSession(db, sessionId, Name=Value) updates the mutable columns of
 %   lab.session for the given session_id (uuid). Like the subject dimension,
-%   session is NOT append-only, so corrections are ordinary UPDATEs.
+%   session is NOT append-only, so corrections are ordinary UPDATEs. The
+%   database records the previous row, the new row and the login that
+%   changed it in lab.row_history.
 %
 %   Only the arguments you supply are changed; omitted ones are left untouched.
 %   The primary key session_id and the owning subject_id are never changed.
@@ -29,11 +31,6 @@ function updateSession(obj, sessionId, opts)
         opts.Notes (1,1) string = string(missing)
     end
 
-    % A wrong session_id would otherwise update zero rows and report success.
-    if height(obj.getSessions(SessionId=sessionId)) == 0
-        error("CarasLabDB:sessionNotFound", "No session with id %s.", sessionId);
-    end
-
     s = struct();
     s = obj.pSet(s, "label", opts.Label);
     s = obj.pSet(s, "storage_root_id", opts.StorageRootId);
@@ -43,5 +40,10 @@ function updateSession(obj, sessionId, opts)
     s = obj.pSet(s, "rig", opts.Rig);
     s = obj.pSet(s, "notes", opts.Notes);
 
-    obj.pUpdate(obj.pT("session"), s, "session_id = " + obj.sqlLiteral(sessionId));
+    % A wrong session_id would otherwise update zero rows and report success;
+    % RETURNING reports the row count.
+    n = obj.pUpdate(obj.pT("session"), s, "session_id = " + obj.sqlLiteral(sessionId), "session_id");
+    if n == 0
+        error("CarasLabDB:sessionNotFound", "No session with id %s.", sessionId);
+    end
 end

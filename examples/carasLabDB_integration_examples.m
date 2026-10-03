@@ -62,7 +62,8 @@ if height(proj) > 0
     subjectsInProject = db.getSubjects(ProjectId=proj.project_id(1));
 end
 
-% 2c. All events for a subject, most recent activity table only (default)
+% 2c. All events for a subject, active (non-superseded) rows only (default).
+% Results are ordered newest first, so row 1 is the most recent event.
 events = db.getEvents(SubjectId="G-0421");
 
 % 2d. Just the recording events for a subject
@@ -195,17 +196,19 @@ correctedWeightEventId = db.supersedeEvent(weightEventId, ...
 fprintf("weight event %s superseded by %s\n", weightEventId, correctedWeightEventId);
 
 % 4b. Correct an artifact the same way (e.g. re-registering after a re-copy
-% with a corrected checksum).
-% The superseding row must change at least one of storage_root_id /
-% relative_path / checksum -- those three are UNIQUE together, so carrying all
-% of them forward unchanged would collide with the row being replaced.
+% with a corrected checksum, or fixing its role). A correction may keep the
+% same file; the database only refuses a second *active* row for one file.
+% supersedeEvent (4a) already re-points the files an event produced at the
+% corrected event, so there is no need to do that by hand.
 % correctedArtifactId = db.supersedeArtifact(rawArtifactId, ...
 %     Overrides = struct("checksum", ...
 %         "4da8f728d65b6887cace643d842d3007e4a7765ab3c3caebd7844288ddf23648"));
 
 % 4c. The subject and session *dimension* tables are the one exception: they
 % are ordinary mutable rows (no immutability trigger), so simple in-place
-% updates are allowed and preferred over supersede for typo fixes.
+% updates are allowed and preferred over supersede for typo fixes. The
+% database keeps the previous values, and the login that changed them, in
+% lab.row_history.
 db.updateSubject(subjectId, Strain="Long-Evans", Notes="re-typed after review");
 % db.updateSession(sessionId, Notes="rig clock resynced mid-session");
 

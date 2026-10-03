@@ -4,7 +4,9 @@ function updateSubject(obj, subjectId, opts)
 %   updateSubject(db, subjectId, Name=Value) updates the mutable descriptive
 %   columns of lab.subject for the given natural-key SubjectId. Unlike events
 %   and artifacts, the subject dimension is NOT append-only (no immutability
-%   trigger), so corrections are ordinary UPDATEs.
+%   trigger), so corrections are ordinary UPDATEs. The database records the
+%   previous row, the new row and the login that changed it in
+%   lab.row_history.
 %
 %   Only the arguments you supply are changed; omitted ones are left untouched
 %   (they are not set to NULL). The natural key subject_id is never changed.
@@ -34,12 +36,6 @@ function updateSubject(obj, subjectId, opts)
 
     obj.pCheckMember(opts.Sex, ["M", "F", "U"], "Sex");
 
-    % subject_id is a hand-typed natural key, so a typo here would otherwise
-    % update zero rows and report success.
-    if height(obj.getSubjects(SubjectId=subjectId)) == 0
-        error("CarasLabDB:subjectNotFound", "No subject with id %s.", subjectId);
-    end
-
     s = struct();
     s = obj.pSet(s, "species_code", opts.SpeciesCode);
     s = obj.pSet(s, "sex", opts.Sex);
@@ -51,5 +47,10 @@ function updateSubject(obj, subjectId, opts)
     end
     s = obj.pSet(s, "notes", opts.Notes);
 
-    obj.pUpdate(obj.pT("subject"), s, "subject_id = " + obj.sqlLiteral(subjectId));
+    % subject_id is a hand-typed natural key, so a typo here would otherwise
+    % update zero rows and report success; RETURNING reports the row count.
+    n = obj.pUpdate(obj.pT("subject"), s, "subject_id = " + obj.sqlLiteral(subjectId), "subject_id");
+    if n == 0
+        error("CarasLabDB:subjectNotFound", "No subject with id %s.", subjectId);
+    end
 end

@@ -299,6 +299,12 @@ function s = local_initNum(v)
         s = "";
     elseif isnumeric(v) && isnan(v)
         s = "";
+    elseif isnumeric(v) && isscalar(v) && isfinite(v)
+        % Show the value exactly: string(v) is a display conversion that
+        % rounds (string(pi) is "3.1416"), and whatever text is shown here
+        % is what the form reads back. sqlLiteral's numeric form is the
+        % shortest text that parses back to the same double.
+        s = char(CarasLabDB.sqlLiteral(double(v)));
     else
         s = char(string(v));
     end
