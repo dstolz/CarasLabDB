@@ -43,7 +43,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | NAS storage | Actual data, laid out as `subject/session/...` |
 | MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database |
 | MATLAB App Designer GUI (`@CarasLabDBApp`) | Interactive metadata entry and browsing for the lab |
-| Web dashboard (`web/lab-dashboard.html`) | Standalone, offline HTML/JS visualization of the data model, rendered from in-page synthetic data |
+| Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
 | MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema |
 

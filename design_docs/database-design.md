@@ -73,9 +73,10 @@ erDiagram
 ## 2. Conventions
 
 - **Identifiers.** `event` and `artifact` use `uuid` primary keys defaulting to
-  `gen_random_uuid()`. UUIDs are client-generatable, so the MATLAB `CarasLabDB`
-  layer can mint IDs offline and batch-insert without a round-trip, and two
-  workstations never collide. `subject` uses its human-meaningful lab ID as a
+  `gen_random_uuid()`. UUIDs could be minted by a client before the row is
+  written, and two workstations would never collide; the MATLAB `CarasLabDB`
+  class does not do this today and takes each new id from the insert's
+  `RETURNING` clause. `subject` uses its human-meaningful lab ID as a
   natural text primary key; lookup tables use short `code` primary keys.
 - **Two clocks.** Every event carries `occurred_at` (when the fact happened in
   the lab) *and* `recorded_at` (when the row was inserted). They differ whenever
@@ -122,7 +123,8 @@ erDiagram
 
 These three tables are the schema's mutable layer. They are intentionally
 **not** covered by the append-only triggers in §4: membership and documents are
-current-state facts, not a log of events.
+current-state facts, not a log of events. Every change to them is still
+recorded, with its previous value, in `row_history` (§3.6).
 
 ### 3.3 Dimensions
 
@@ -162,6 +164,11 @@ Detail tables and their type-specific columns:
 | `histology_event` | `technique`, `target_region`, `stain`, `microscope` |
 | `analysis_event` | `pipeline_id`, `pipeline_name`, `code_version`, `parameters`, `environment`, `started_at`, `finished_at`, `status` |
 
+Every event except an `analysis` run names a subject
+(`event_subject_required_ck`). An analysis may span several animals; any other
+event without a subject is an entry error that every per-subject view would
+silently drop.
+
 Rules that need a trigger rather than a constraint:
 
 - **Recordings require a session.** `trg_require_session_for_recording` rejects a
@@ -175,8 +182,8 @@ Rules that need a trigger rather than a constraint:
 - **`subject_id` is derived from the session when omitted.**
   `trg_event_fill_subject` fills it in, which is what makes the composite FK
   below bite (see "Subject/session agreement").
-- **Immutability.** `event`, every `*_event` detail table, `artifact`, and
-  `event_input` reject `UPDATE`/`DELETE`/`TRUNCATE` (see §4).
+- **Immutability.** `event`, every `*_event` detail table, `artifact`,
+  `event_input` and the audit logs reject `UPDATE`/`DELETE`/`TRUNCATE` (see §4).
 
 **Subject/session agreement.** `event` and `artifact` each carry a composite
 foreign key `(session_id, subject_id) → session(session_id, subject_id)`. An
@@ -195,15 +202,23 @@ ephys), and the `.mp4`/`.avi` files register as artifacts of that event.
 
 **`artifact`** — one row per file on the NAS, referenced by
 `(storage_root_id, relative_path)` plus a `checksum`. It always points at the
-`produced_by_event_id` that created it. `UNIQUE(storage_root_id, relative_path,
-checksum)` dedupes re-registration of the same bytes while allowing a
-re-derived file at the same path (new bytes) to register as a *new* artifact,
-optionally linked to the old one via `supersedes`.
+`produced_by_event_id` that created it. The same bytes at the same path can be
+registered only once: `uq_artifact_file_original` makes
+`(storage_root_id, relative_path, checksum)` unique among original
+registrations, and `trg_artifact_unique_active` rejects a second *active* row
+for one file. A re-derived file at the same path (new bytes) registers as a
+new artifact, optionally linked to the old one via `supersedes`. A correction
+may repeat the file identity of the row it supersedes, which is what lets an
+artifact be re-pointed at a corrected event (§4.2) or have its role, format,
+session or attributes fixed. A table-wide `UNIQUE` on those three columns
+would forbid both.
 
 **`event_input`** — the second edge type: the artifacts an event consumed. It is
 general (any event may consume artifacts) but in practice is populated by
 analysis events. `artifact.produced_by_event_id` + `event_input` are the two
-edges of the provenance DAG.
+edges of the provenance DAG. `trg_event_input_acyclic` keeps it a DAG: an
+event cannot consume an artifact that already derives from that event (found
+by walking `fn_artifact_lineage(…, 'up')`, to the same depth cap of 64).
 
 **`artifact_verification`** — an *append-only log* of integrity checks. Because
 `artifact` rows are immutable, periodic checksum re-verification is recorded here
@@ -235,12 +250,37 @@ session-to-folder mapping and artifact de-duplication. Same reasoning as
 lower-casing checksums — canonicalise on the way in so one real-world thing is
 always one row.
 
+### 3.6 Audit and versioning
+
+**`row_history`** — the previous and new value of every `UPDATE`, and the
+removed row of every `DELETE`, on the mutable tables (the reference tables,
+the project tables, `subject` and `session`). Those tables are edited in place
+by design; this table is what keeps such an edit from erasing the old value
+and who changed it. It is written by the `SECURITY DEFINER` trigger function
+`fn_log_row_change`, so clients need no privilege on it and cannot write it
+directly. `changed_by` is `session_user`, the login that connected, which
+`SET ROLE` cannot change. Updates that change nothing are not recorded.
+
+**`maintenance_log`** — one row per identity-maintenance operation (§4.1).
+
+**`schema_version`** — one row per applied schema version; the current
+version is `max(version)`. `schema.sql` installs the latest version directly;
+an existing database is upgraded by the scripts in
+[`migrations/`](migrations/), each of which records its own row. A fresh
+install and an upgraded database end with identical schemas. The MATLAB class
+and the MCP server read the version at connect time and warn when it is not
+the one they were written for.
+
+All three are append-only (§4).
+
 ---
 
 ## 4. Immutability & corrections
 
 Events are facts; facts do not change. The schema forbids `UPDATE` and `DELETE`
-on all event and artifact tables via `fn_forbid_mutation()`. A mistake is fixed
+on all event and artifact tables, `event_input`, and the logs
+`artifact_verification`, `maintenance_log`, `row_history` and `schema_version`
+via `fn_forbid_mutation()`. A mistake is fixed
 by **appending a superseding row** whose `supersedes` points at the row it
 replaces. The partial unique index on `supersedes` keeps history *linear* — a
 given row can be corrected by at most one successor, so there are no forks.
@@ -271,10 +311,16 @@ updated nor deleted, and creating the correctly-named subject strands that
 animal's history under the wrong ID forever.
 
 So the FKs to `subject(subject_id)` declare `ON UPDATE CASCADE`, and
-`lab.fn_rename_subject(old, new)` performs the rename behind a
-transaction-local flag (`lab.maintenance`) that `fn_forbid_mutation()` honours
-for `UPDATE` only — never `DELETE`, never `TRUNCATE`. Every rename is recorded
-in `lab.maintenance_log`. This is a relabelling of *who* a row is about, not a
+`lab.fn_rename_subject(old, new)` performs the rename behind transaction-local
+settings (`lab.maintenance`, `lab.rename_from`, `lab.rename_to`) that
+`fn_forbid_mutation()` honours for `UPDATE` only — never `DELETE`, never
+`TRUNCATE`. Any session can set a custom setting, so the flag alone is not
+trusted: under it, an `UPDATE` passes only if every column other than the
+subject-id columns is unchanged, each changed subject-id column went from
+`rename_from` to `rename_to`, the old id no longer exists in `lab.subject` and
+the new one does. That is exactly the cascade of a completed rename. Every
+rename is recorded in `lab.maintenance_log` (and the `subject` and `session`
+row changes in `lab.row_history`). This is a relabelling of *who* a row is about, not a
 change to *what happened*, which is why it is the only exception. The function
 is `REVOKE`d from `PUBLIC`; grant it only to an admin role.
 
@@ -297,9 +343,11 @@ SELECT * FROM lab.fn_check_integrity();
 | Check | Severity | Meaning |
 |---|---|---|
 | `event_missing_detail` | error | Typed event whose detail row was never written |
+| `event_missing_subject` | warning | Non-analysis event with no subject; only possible for rows that predate `event_subject_required_ck` in a migrated database |
 | `artifact_verification_failed` | error | Latest integrity check was `missing` or `mismatch` |
 | `event_recorded_before_occurred` | warning | `occurred_at` more than a day after `recorded_at` — usually a client timezone bug |
 | `artifact_never_verified` | warning | Active artifact with no verification on record |
+| `artifact_producer_superseded` | warning | Active artifact whose producing event has been corrected; the corrected event lists no files until the artifact is re-pointed |
 | `duplicate_active_path` | warning | Two active artifacts at one path; the NAS file can only be one of them |
 
 **Worked example — a recording logged with the wrong sample rate:**
@@ -322,7 +370,23 @@ VALUES ('22222222-2222-2222-2222-222222222222', 'intan_rhx', 30000, 64);
 SELECT event_id, sample_rate_hz
 FROM lab.event_active e JOIN lab.recording_event r USING (event_id)
 WHERE e.session_id = :sess;
+
+-- The files the original recording produced still point at it. Re-point each
+-- by superseding it with a copy whose producer is the correction; the file
+-- itself (root, path, checksum) is unchanged.
+INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path,
+                          checksum, checksum_algo, size_bytes, role, format,
+                          subject_id, session_id, attributes, supersedes)
+SELECT '22222222-2222-2222-2222-222222222222', storage_root_id, relative_path,
+       checksum, checksum_algo, size_bytes, role, format,
+       subject_id, session_id, attributes, artifact_id
+FROM lab.artifact_active
+WHERE produced_by_event_id = '11111111-1111-1111-1111-111111111111';
 ```
+
+`CarasLabDB.supersedeEvent` does all of this in one transaction: the new base
+and detail rows, the event's `event_input` edges, and the re-pointed
+artifacts.
 
 ---
 
@@ -371,7 +435,8 @@ schema; the reference/lookup tables; the `project` tables; the `subject` /
 `session` dimensions; the base `event` and its eight detail tables; `artifact` /
 `event_input` / `artifact_verification`; all indexes; the immutability
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
-maintenance function and `maintenance_log`; the `event_active` /
+maintenance function, `maintenance_log`, `row_history` and `schema_version`;
+the `event_active` /
 `artifact_active` / `provenance_edge` / `subject_current` views;
 `fn_artifact_lineage()` and `fn_check_integrity()`; and the seed vocabulary. It
 targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
@@ -380,7 +445,9 @@ targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
 The seed `INSERT`s use `ON CONFLICT DO NOTHING`, so re-applying the file to a
 database that already has the vocabulary is not a hard failure. The `CREATE
 TABLE` statements are not idempotent, however — this is still a
-fresh-database script, not a migration.
+fresh-database script. To upgrade an existing database, apply the scripts in
+[`migrations/`](migrations/) in order (§3.6). Roles and privileges are in
+[`grants.sql`](grants.sql), applied after either.
 
 ---
 
@@ -414,6 +481,11 @@ type/idiom substitutions apply.
 - [mcp-server.md](mcp-server.md) — the read-only MCP interface over this schema.
 - [testing-locally.md](testing-locally.md) — how to load and verify the schema
   on a scratch database.
-- `for-coders.md` *(planned)* — MATLAB versions and connection details for the
-  `CarasLabDB` class. Note it connects through the native `postgresql()`
-  Database Toolbox interface; no JDBC jar or ODBC DSN is involved.
+- [grants.sql](grants.sql) — the roles and privileges every deployment guide
+  applies.
+- [migrations/](migrations/) — upgrade scripts for existing databases.
+- `examples/carasLabDB_integration_examples.m` — how to use the MATLAB
+  `CarasLabDB` class from your own code: connecting, filtering, adding events
+  and artifacts, corrections and error handling. It connects through the
+  native `postgresql()` Database Toolbox interface; no JDBC jar or ODBC DSN is
+  involved.

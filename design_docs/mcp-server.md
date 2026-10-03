@@ -252,14 +252,12 @@ between a bug and the database:
 
 ```powershell
 psql -U postgres -d lab_test -c "CREATE ROLE lab_ro LOGIN PASSWORD 'ro-pw';"
-psql -U postgres -d lab_test -c "GRANT USAGE ON SCHEMA lab TO lab_ro;"
-psql -U postgres -d lab_test -c "GRANT SELECT ON ALL TABLES IN SCHEMA lab TO lab_ro;"
+psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs/grants.sql
 ```
 
-(`GRANT SELECT ON ALL TABLES` covers views too. Re-run it, or add
-`ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT SELECT ON TABLES TO lab_ro;`,
-after adding tables to the schema.) Point `PGUSER` at `lab_ro` and do the
-same on the production `lab` database.
+[`grants.sql`](grants.sql) gives `lab_ro` `SELECT` on every table and view,
+including tables added later (default privileges). Point `PGUSER` at `lab_ro`
+and do the same on the production `lab` database.
 
 Do **not** reuse the `lab_rw` role from [testing-locally.md](testing-locally.md)
 §1 here: it holds `INSERT`, so an `INSERT` that somehow escaped the

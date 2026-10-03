@@ -48,8 +48,11 @@ The schema is built around an **append-only event log**:
   artifacts an event consumed. Together they form the provenance DAG, walkable
   via the recursive `fn_artifact_lineage(artifact_id, 'up'|'down')` function.
 - **Immutability** is enforced by triggers on `event`, every `*_event` detail
-  table, `artifact`, and `event_input`. Corrections use a `supersedes` link; the
-  `event_active` / `artifact_active` views filter to current rows.
+  table, `artifact`, `event_input` and the audit logs. Corrections use a
+  `supersedes` link; the `event_active` / `artifact_active` views filter to
+  current rows. The descriptive tables (`subject`, `session`, the project and
+  reference tables) are edited in place, and every edit is kept in
+  `lab.row_history`.
 - Every event carries two timestamps: `occurred_at` (when it happened) and
   `recorded_at` (when the row was inserted) — they routinely differ.
 
@@ -67,8 +70,10 @@ Read `design_docs/overview.md` first for the conceptual model, then
 - Read helpers default to the `*_active` views; set `UseActiveViews=false`
   globally or `ActiveOnly=false` per call to see full history.
 - `supersedeEvent` / `supersedeArtifact` implement the correction workflow:
-  carry every column of the old row forward except explicit overrides, set
-  `supersedes`, insert as new.
+  carry every column of the old row forward exactly as stored except explicit
+  overrides, set `supersedes`, insert as new. `supersedeEvent` also carries
+  the event's inputs over and re-points the files it produced at the
+  correction, in the same transaction.
 
 ```matlab
 db  = CarasLabDB(Username="lab_rw", Password=secret, ...
@@ -107,10 +112,23 @@ event creates a superseding correction rather than mutating in place.
 
 ## Getting started
 
-**Apply the schema:**
+**Apply the schema and privileges:**
 
 ```sh
 createdb lab && psql -d lab -f design_docs/schema.sql
+psql -d lab -f design_docs/grants.sql
+```
+
+To upgrade an existing database instead, apply the scripts in
+`design_docs/migrations/` in order.
+
+**Run the tests:** `tests/schema_test.sql` checks the schema's constraints and
+triggers against a freshly loaded database, and `mcp-server/tests/` covers the
+MCP server. CI runs both (`.github/workflows/tests.yml`).
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/schema_test.sql
+cd mcp-server && pip install -e .[test] && CARASLABDB_TEST_DB=lab_test python -m pytest tests
 ```
 
 **Use the MATLAB class:** add the repo root to the MATLAB path (so `@CarasLabDB`
@@ -122,7 +140,8 @@ It needs a reachable Postgres instance with the schema applied.
 
 **View the dashboard (synthetic):** serve the `web/` directory statically and
 open `lab-dashboard.html`. It renders entirely from in-page synthetic data — no
-backend required.
+backend required. Its charts load Chart.js from a CDN; without network access
+the page shows a notice in their place and everything else still works.
 
 ```sh
 python -m http.server 8777 --directory web
@@ -161,7 +180,9 @@ summary written for IT staff (plus the deployment-related design concerns),
 
 ```
 design_docs/         Schema DDL and design documentation
-  schema.sql           Canonical PostgreSQL DDL (schema `lab`)
+  schema.sql           Canonical PostgreSQL DDL (schema `lab`), latest version
+  grants.sql           Roles and privileges (lab_rw, lab_ro)
+  migrations/          Upgrade scripts for existing databases
   overview.md          Conceptual model — read this first
   database-design.md   Table-by-table rationale
   testing-locally.md   Local testing guide
@@ -176,5 +197,6 @@ web/                 Standalone dashboard (synthetic data)
   live/                Live dashboard: /api/data server + query
 mcp-server/          Read-only MCP server (Python): typed query tools for LLM agents
 examples/            End-to-end demo scripts
+tests/               Schema assertions (psql)
 CLAUDE.md            Repo conventions for Claude Code / coding agents
 ```

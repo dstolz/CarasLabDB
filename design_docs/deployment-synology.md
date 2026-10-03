@@ -129,17 +129,25 @@ sudo docker exec -it caraslabdb-postgres-1 \
 
 ### 2.3 Create the application role
 
-Same append-only privilege model as every other deployment — `SELECT` +
-`INSERT`, never `UPDATE`:
+Same privilege model as every other deployment, from the one grant script
+they all use, [`grants.sql`](grants.sql):
 
 ```bash
-sudo docker exec -it caraslabdb-postgres-1 psql -U postgres -d lab <<'SQL'
-CREATE ROLE lab_rw LOGIN PASSWORD 'CHANGE_ME';
-GRANT USAGE ON SCHEMA lab TO lab_rw;
-GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lab TO lab_rw;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;
-SQL
+sudo docker exec -i caraslabdb-postgres-1 psql -U postgres -d lab \
+    -c "CREATE ROLE lab_rw LOGIN PASSWORD 'CHANGE_ME';"
+sudo docker exec -i caraslabdb-postgres-1 psql -U postgres -d lab -v ON_ERROR_STOP=1 \
+    < design_docs/grants.sql
 ```
+
+The event log is **append-only**: `UPDATE`/`DELETE` on events, artifacts and
+provenance edges are blocked by triggers whatever is granted, and corrections
+happen through superseding inserts. `grants.sql` therefore gives `lab_rw`
+`SELECT` + `INSERT` everywhere, plus `UPDATE` on only the descriptive tables
+the MATLAB client and GUI edit in place (`subject`, `session`, `project`,
+`project_member`, `project_artifact`, `person`; every edit is recorded in
+`lab.row_history`). It also creates `lab_ro` (read only) for the dashboard
+server and the MCP server, and sets default privileges for tables added
+later. Re-run it after any schema change.
 
 Seed at least one `person` row and your reference/lookup data before real use
 — the MATLAB client resolves a "current person" at connect time.
@@ -268,7 +276,8 @@ Restore into a fresh container the same way as any other Postgres instance:
       (or your project's container names) as **Up**.
 - [ ] `sudo docker exec -it caraslabdb-postgres-1 psql -U postgres -d lab -c "\dt lab.*"`
       lists the schema tables.
-- [ ] `lab_rw` can `SELECT`/`INSERT` but not `UPDATE`.
+- [ ] `lab_rw` can `SELECT`/`INSERT`, can `UPDATE` only the descriptive tables
+      listed in `grants.sql`, and cannot `UPDATE` an event.
 - [ ] `curl -s http://<nas-ip>:8778/api/data` returns JSON, not an error object.
 - [ ] `http://<nas-ip>:8778/` renders the dashboard in a browser on the LAN.
 - [ ] A workstation's MATLAB can `CarasLabDB(Server="<nas-ip>", ...)` and

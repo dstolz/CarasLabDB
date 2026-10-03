@@ -1192,18 +1192,12 @@ ON CONFLICT (version) DO NOTHING;
 -- ---------------------------------------------------------------------------
 -- This file creates no roles: role names, passwords and cluster membership are
 -- per-deployment, and roles are cluster-wide rather than database-scoped.
+-- design_docs/grants.sql sets up the two roles every deployment uses -- lab_rw
+-- (read, insert, and update of the mutable descriptive tables) and lab_ro
+-- (read only, for the dashboard server and the MCP server) -- and is applied
+-- after this file:
 --
--- Do create a read-only role for the consumers that only ever read -- the web
--- dashboard's server and the MCP server. The triggers above stop UPDATE and
--- DELETE, but nothing in SQL stops an INSERT of a bogus event, and a client
--- that cannot write is a stronger guarantee than one that merely does not:
---
---     CREATE ROLE lab_ro LOGIN PASSWORD '...';
---     GRANT CONNECT ON DATABASE lab TO lab_ro;
---     GRANT USAGE ON SCHEMA lab TO lab_ro;
---     GRANT SELECT ON ALL TABLES IN SCHEMA lab TO lab_ro;
---     ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT SELECT ON TABLES TO lab_ro;
+--     psql -v ON_ERROR_STOP=1 -d lab -f design_docs/grants.sql
 --
 -- lab.fn_rename_subject is REVOKEd from PUBLIC above; grant EXECUTE on it only
 -- to the administrator role that is expected to run identity maintenance.
--- See design_docs/mcp-server.md and the deployment guides for the full setup.

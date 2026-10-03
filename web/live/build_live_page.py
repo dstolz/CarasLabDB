@@ -216,7 +216,7 @@ t = t[:hi] + NEW_HOWTO + t[he:]
 t = must_replace(t,
     "<title>Lab Metadata Explorer — Caras Lab</title>",
     "<title>Lab Metadata Explorer (Live) — Caras Lab</title>", "title")
-t = must_replace(t, "· self-contained &amp; offline ·",
+t = must_replace(t, "· synthetic data, no server ·",
     "· live database view ·", "footer")
 
 # ---- 10. CSS additions before </style> -----------------------------------

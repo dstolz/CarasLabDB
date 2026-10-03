@@ -7,9 +7,11 @@ that guide is about *installing* the system; this one is about *proving it works
 
 The goal of local testing is a throwaway `lab` database on `localhost` that you
 can create, exercise end-to-end through both the MATLAB class and the GUI, then
-drop — repeatedly — without touching production data. There is no automated test
-suite in this repo, so "testing" here means a disciplined manual walkthrough with
-explicit pass/fail checks.
+drop — repeatedly — without touching production data. The schema and the MCP
+server have automated tests (`tests/schema_test.sql`, `mcp-server/tests/`, run
+in CI by `.github/workflows/tests.yml`); MATLAB and the GUI do not, so for
+those "testing" here means a disciplined manual walkthrough with explicit
+pass/fail checks.
 
 The parts this guide covers and how each is tested:
 
@@ -143,14 +145,17 @@ ORDER BY 1, 2;
 - **Dimensions:** `subject`, `session`.
 - **The log:** the `event` base table plus the eight `*_event` detail tables
   (`birth_event` … `analysis_event`).
-- **Provenance:** `artifact`, `event_input`, `artifact_verification`, and
-  `maintenance_log` for audited subject renames.
+- **Provenance:** `artifact`, `event_input`, `artifact_verification`.
+- **Audit and versioning:** `maintenance_log` (subject renames), `row_history`
+  (edits to the mutable tables) and `schema_version`.
 - **Views:** `event_active`, `artifact_active`, `provenance_edge`,
   `subject_current`.
 - **Functions:** the trigger functions `fn_forbid_mutation`,
   `fn_require_session_for_recording`, `fn_fill_subject_from_session`,
-  `fn_supersede_same_type`, `fn_normalize_checksum`, `fn_normalize_path`;
-  plus `fn_rename_subject`, `fn_artifact_lineage`, and `fn_check_integrity`.
+  `fn_supersede_same_type`, `fn_normalize_checksum`, `fn_normalize_path`,
+  `fn_artifact_unique_active`, `fn_forbid_provenance_cycle`,
+  `fn_log_row_change`; plus `fn_rename_subject`, `fn_artifact_lineage`, and
+  `fn_check_integrity`.
 
 The list grows as the schema does — treat `schema.sql` as the authority and this
 as the "nothing obviously missing" check.
@@ -170,15 +175,20 @@ ORDER BY 1, 2;
 ```
 
 **Pass:** every append-only table — `event`, the eight `*_event` detail tables,
-`artifact`, `event_input` — carries *two* immutability triggers:
+`artifact`, `event_input`, and the logs `artifact_verification`,
+`maintenance_log`, `row_history`, `schema_version` — carries *two*
+immutability triggers:
 `trg_immutable_<table>` (row-level, `UPDATE`/`DELETE`) and
 `trg_immutable_truncate_<table>` (statement-level, `TRUNCATE`, which row-level
 triggers cannot see). The validation and normalization triggers
 `trg_require_session_for_recording`, `trg_event_fill_subject`,
 `trg_artifact_fill_subject`, `trg_event_supersede_same_type`,
 `trg_artifact_normalize`, `trg_verification_normalize`,
-`trg_session_normalize_path`, `trg_artifact_normalize_path` and
-`trg_project_artifact_normalize_path` are there too.
+`trg_session_normalize_path`, `trg_artifact_normalize_path`,
+`trg_project_artifact_normalize_path`, `trg_artifact_unique_active` and
+`trg_event_input_acyclic` are there too, as is one `trg_history_<table>` on each
+mutable table (`person`, `subject`, `session`, the project tables and the
+reference tables).
 
 The two normalizers are worth knowing about because they *accept* input a
 strict reading of the constraints would reject: a `relative_path` written
@@ -186,6 +196,16 @@ Windows-style as `G-0421\sess01` is stored as `G-0421/sess01`, and an
 upper-case checksum is stored lower-cased. Both need a project/subject fixture
 to demonstrate, so they are exercised in §2 through the MATLAB layer rather
 than with a standalone `psql` command here.
+
+The scripted version of these checks, and of most of §1.3, is
+`tests/schema_test.sql`. It runs in one transaction that it rolls back, so it
+leaves `lab_test` empty:
+
+```powershell
+psql -U postgres -d lab_test -X -v ON_ERROR_STOP=1 -f tests/schema_test.sql
+```
+
+**Pass:** it ends with `schema_test.sql: all assertions passed`.
 
 Finally, the schema ships its own health report; on a freshly loaded, empty
 database it should return no rows:
@@ -247,9 +267,9 @@ on where the `RAISE` sits in the current function body):
 ```powershell
 INSERT 0 1
 ERROR:  UPDATE on lab.event is not allowed: this table is append-only. Insert a superseding row instead.
-CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 24 at RAISE
+CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 68 at RAISE
 ERROR:  DELETE on lab.event is not allowed: this table is append-only. Insert a superseding row instead.
-CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 24 at RAISE
+CONTEXT:  PL/pgSQL function lab.fn_forbid_mutation() line 68 at RAISE
 ```
 
 Confirm the row survived both attempts — this is the half of the claim the
@@ -274,17 +294,18 @@ psql -U postgres -d lab_test -c "SELECT count(*) FROM lab.event WHERE notes = 'i
 ### 1.4 Create the application role and confirm least privilege
 
 Mirror what the server will run with — researchers connect as a non-superuser
-with INSERT/SELECT only:
+with the privileges from [`grants.sql`](grants.sql), the same script the
+deployment guides use:
 
 ```powershell
 psql -U postgres -d lab_test -c "CREATE ROLE lab_rw LOGIN PASSWORD 'test-pw';"
-psql -U postgres -d lab_test -c "GRANT USAGE ON SCHEMA lab TO lab_rw;"
-psql -U postgres -d lab_test -c "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lab TO lab_rw;"
-psql -U postgres -d lab_test -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;"
+psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs/grants.sql
 ```
 
-Confirm this role can read/insert but is blocked from UPDATE by both privilege
-and trigger. Use it for the MATLAB tests below rather than `postgres`.
+Confirm this role can read and insert, can update a subject or session (the
+GUI's Edit Subject / Edit Session need that), and is blocked from updating an
+event by both privilege and trigger. Use it for the MATLAB tests below rather
+than `postgres`.
 
 ---
 
@@ -452,7 +473,8 @@ Run top to bottom against `lab_test` before you deploy to a server:
 - [ ] `schema.sql` loads clean with `ON_ERROR_STOP=1`.
 - [ ] Schema objects present (`\dt`, `\dv`, `\df` in the `lab` schema).
 - [ ] `UPDATE`/`DELETE` on an immutable row are rejected by `fn_forbid_mutation()`.
-- [ ] `lab_rw` role can `SELECT`/`INSERT`, cannot `UPDATE`.
+- [ ] `lab_rw` role can `SELECT`/`INSERT`, can `UPDATE` a subject or session, cannot
+      `UPDATE` an event.
 - [ ] MATLAB `ver` / `Database_Toolbox` / `exist('postgresql')` all check out.
 - [ ] `CarasLabDB(...)` connects to `localhost`/`lab_test` and `isOpen()`.
 - [ ] `carasLabDB_demo.m` runs end-to-end; lineage and supersede work.
