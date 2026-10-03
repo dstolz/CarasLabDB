@@ -21,14 +21,21 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
 %       DetailOverrides - struct of detail-table column -> new value
 %
 %   Override struct field names must be actual database column names (e.g.
-%   "subject_id", "weight_g"). Any column not overridden is carried forward
-%   from the superseded row. recorded_by is set to the current person.
+%   "subject_id", "weight_g"). Every column not overridden is carried forward
+%   from the superseded row exactly as stored -- read as the text Postgres
+%   prints for it and written back as that text, so numbers keep their digits
+%   and timestamps their instant and microseconds (see pRowsAsText).
+%   recorded_by is set to the current person; recorded_at is regenerated.
 %
-%   The event's event_input edges (the artifacts it consumed) are copied to
-%   the new event in the same transaction. Note the converse is NOT done:
-%   artifacts the old event *produced* keep pointing at the superseded
-%   event_id, since artifact rows are themselves immutable -- use
-%   supersedeArtifact if those need to be re-pointed.
+%   In the same transaction the correction also carries over the event's
+%   provenance:
+%     * its event_input edges (the artifacts it consumed) are copied to the
+%       new event;
+%     * every active artifact it produced is superseded by a copy whose
+%       produced_by_event_id is the new event, so the corrected event lists
+%       its files. Without this the files stay attached to the hidden row
+%       and lab.fn_check_integrity() reports them as
+%       artifact_producer_superseded.
 %
 %   Returns the new event_id (uuid string).
 %
@@ -48,92 +55,58 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
             "supersedes is set by this method and cannot be overridden.");
     end
 
-    litId = obj.sqlLiteral(oldEventId);
+    where = "r.event_id = " + obj.sqlLiteral(oldEventId);
 
-    % occurred_at is read back as an explicit UTC text literal rather than as a
-    % datetime. The Database Toolbox returns timestamptz as an *unzoned*
-    % datetime, and sqlLiteral tags an unzoned datetime as "local" -- so a
-    % round-trip through MATLAB shifts the instant by the UTC offset whenever
-    % the server session zone is not the workstation's zone (a UTC server and
-    % an Eastern workstation move every corrected event by 4-5 hours, and each
-    % further correction moves it again). Text with an explicit offset also
-    % preserves Postgres's microseconds, which the datetime format string
-    % truncates to milliseconds.
-    E = obj.pSelect("SELECT event_type, subject_id, session_id, " + ...
-        "to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') " + ...
-        "  || '+00' AS occurred_at_txt, " + ...
-        "notes, attributes FROM " + obj.pT("event") + " WHERE event_id = " + litId + ";");
-    if height(E) == 0
+    E = obj.pRowsAsText(obj.pT("event"), where, "event_id");
+    if isempty(E)
         error("CarasLabDB:eventNotFound", "No event with id %s.", oldEventId);
     end
-    eventType = string(E.event_type(1));
+    E = E{1};
+    eventType = E.event_type;
     detailTable = obj.pT(obj.pDetailTable(eventType));
 
-    D = obj.pSelect("SELECT * FROM " + detailTable + " WHERE event_id = " + litId + ";");
-    if height(D) == 0
+    D = obj.pRowsAsText(detailTable, where, "event_id");
+    if isempty(D)
         error("CarasLabDB:detailNotFound", ...
             "No %s detail row for event %s.", eventType, oldEventId);
     end
+    D = D{1};
 
-    % --- assemble the new base event from the old row + overrides ---
-    base = struct("event_type", eventType);
+    % --- the new base event: every column carried forward except the ones
+    % regenerated for the new row, then the overrides ---
+    base = rmfield(E, intersect(fieldnames(E), ...
+        {'event_id', 'recorded_at', 'recorded_by', 'supersedes'}));
     if obj.pIsProvided(opts.OccurredAt)
         base.occurred_at = opts.OccurredAt;
-    else
-        base.occurred_at = local_scalar(E.occurred_at_txt);
     end
-    base = obj.pSet(base, "subject_id", local_scalar(E.subject_id));
-    base = obj.pSet(base, "session_id", local_scalar(E.session_id));
     if obj.pIsProvided(opts.Notes)
         base.notes = opts.Notes;
-    else
-        base = obj.pSet(base, "notes", local_scalar(E.notes));
     end
-    base = obj.pSet(base, "attributes", local_scalar(E.attributes));
     base = obj.pSet(base, "recorded_by", obj.pCreatedBy(string(missing)));
     base = obj.pMergeOverrides(base, opts.EventOverrides);
     base.supersedes = oldEventId;   % always point at the row we replace
 
-    % --- assemble the new detail row, carrying every column forward ---
-    detail = struct();
-    dcols = string(D.Properties.VariableNames);
-    for i = 1:numel(dcols)
-        c = dcols(i);
-        if ismember(c, ["event_id", "event_type"])
-            continue    % set by pInsertEvent
-        end
-        detail = obj.pSet(detail, c, local_scalar(D.(c)));
-    end
+    % --- the new detail row: every column carried forward, then overrides
+    % (event_id and event_type are set by pInsertEvent) ---
+    detail = rmfield(D, intersect(fieldnames(D), {'event_id', 'event_type'}));
     detail = obj.pMergeOverrides(detail, opts.DetailOverrides);
 
     % Carry the provenance edges forward. Without this the correction silently
     % orphans the DAG: event_input rows still point at the superseded event, so
     % fn_artifact_lineage(...,'up') from anything this event produced walks into
     % a node with no inputs and reports no ancestry -- while event_active hides
-    % the old event that still holds them. pInsertEvent writes them inside the
-    % same transaction as the base and detail rows.
-    IN = obj.pSelect("SELECT artifact_id, role FROM " + obj.pT("event_input") + ...
-        " WHERE event_id = " + litId + ";");
+    % the old event that still holds them.
+    inputs = obj.pRowsAsText(obj.pT("event_input"), where, "artifact_id");
+    for k = 1:numel(inputs)
+        inputs{k} = rmfield(inputs{k}, "event_id");   % set by pInsertEvent
+    end
 
-    newEventId = obj.pInsertEvent(base, detailTable, detail, IN);
-end
+    % Re-point the files this event produced at the corrected event.
+    produced = obj.pRowsAsText(obj.pT("artifact_active"), ...
+        "r.produced_by_event_id = " + obj.sqlLiteral(oldEventId), "artifact_id");
+    for k = 1:numel(produced)
+        produced{k} = obj.pArtifactSuccessor(produced{k});
+    end
 
-function v = local_scalar(colvals)
-%LOCAL_SCALAR Extract row-1 of a fetched table column as an insertable scalar.
-    if isempty(colvals)
-        v = string(missing);
-        return
-    end
-    if iscell(colvals)
-        v = colvals{1};
-    else
-        v = colvals(1);
-    end
-    if ischar(v)
-        if isempty(v)
-            v = string(missing);
-        else
-            v = string(v);
-        end
-    end
+    newEventId = obj.pInsertEvent(base, detailTable, detail, inputs, produced);
 end

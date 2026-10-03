@@ -159,8 +159,10 @@ function [occ, notes, notesProvided, eventOv, detailOv] = local_overrides(fields
     for i = 1:numel(fields)
         f = fields(i);
         % A supersede prefills every field from the row being corrected, so
-        % only send back what the user actually altered. Passing an untouched
-        % datetime through as an override rewrites the stored value.
+        % only send back what the user actually altered. An untouched field is
+        % then carried forward by supersedeEvent exactly as stored; sending it
+        % back would rewrite it through the widget's rendering of it (a
+        % datetime to whole seconds, JSON re-spaced, a number re-parsed).
         [provided, v] = local_convert(f, values.(char(f.Key)), true);
         if ~provided
             continue
@@ -183,15 +185,16 @@ end
 
 function [provided, v] = local_convert(f, raw, onlyIfChanged)
     %LOCAL_CONVERT Coerce a raw widget value to its typed form; report if set.
-    %   ONLYIFCHANGED suppresses "provided" for a datetime that still matches
-    %   the value the form was prefilled with.
+    %   ONLYIFCHANGED suppresses "provided" for a value that still matches the
+    %   value the form was prefilled with (f.Value).
     switch f.Type
         case "number"
             v = raw;                 % double, NaN when blank
-            provided = ~isnan(v);
+            provided = ~isnan(v) && ~(onlyIfChanged && local_sameNumber(v, f.Value));
         case "bool"
             v = logical(raw);
-            provided = true;
+            provided = ~(onlyIfChanged && islogical(f.Value) && isscalar(f.Value) ...
+                && f.Value == v);
         case "datetime"
             v = raw;
             if isnat(v)
@@ -201,7 +204,8 @@ function [provided, v] = local_convert(f, raw, onlyIfChanged)
             provided = ~(onlyIfChanged && local_sameInstant(v, f.Value));
         otherwise                    % text / textarea / enum
             v = strtrim(string(raw));
-            provided = strlength(v) > 0;
+            provided = strlength(v) > 0 ...
+                && ~(onlyIfChanged && v == local_prefillText(f.Value));
             if ~provided
                 return
             end
@@ -210,6 +214,30 @@ function [provided, v] = local_convert(f, raw, onlyIfChanged)
             elseif local_isJson(f)
                 v = local_parseJson(v, f.Label);
             end
+    end
+end
+
+function tf = local_sameNumber(v, orig)
+    %LOCAL_SAMENUMBER True when a number field still holds its prefilled value.
+    %   pFormDialog prefills numbers with the shortest text that parses back
+    %   to the same double, so an untouched field reads back exactly equal.
+    tf = isnumeric(orig) && isscalar(orig) && double(orig) == v;
+end
+
+function t = local_prefillText(orig)
+    %LOCAL_PREFILLTEXT The text a text/textarea/enum field was prefilled with,
+    %   normalized the way pFormDialog reads it back (lines joined with
+    %   newline, trimmed), so an untouched field compares equal.
+    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
+        t = "";
+        return
+    end
+    try
+        t = strtrim(strjoin(splitlines(string(orig)), newline));
+    catch
+        % Not representable as text: treat the field as changed, so its
+        % value is sent rather than silently dropped.
+        t = string(missing);
     end
 end
 

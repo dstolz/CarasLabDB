@@ -25,6 +25,12 @@ classdef CarasLabDB < handle
 %   created_by / recorded_by provenance columns on inserts (override per
 %   call with CreatedBy=/RecordedBy=).
 %
+%   At connection the session time zone is set to this workstation's zone,
+%   so timestamps come back as local wall-clock time (see PINITSESSION), and
+%   the database's schema version is read into SchemaVersion; a version other
+%   than SchemaVersionExpected raises a CarasLabDB:schemaVersionMismatch
+%   warning.
+%
 %   Example:
 %       db  = CarasLabDB(Username="u", Password="p", PersonEmail="me@lab");
 %       db.addSubject(SubjectId="G-0421", SpeciesCode="meriones_unguiculatus", Sex="M");
@@ -59,6 +65,11 @@ classdef CarasLabDB < handle
         Connection                              % Database Toolbox connection object
         Schema (1,1) string = "lab"           % Postgres schema that owns the tables
         CurrentPersonId (1,1) string = string(missing)  % person_id for provenance columns
+        SchemaVersion (1,1) double = NaN        % max(lab.schema_version.version); NaN if none
+    end
+
+    properties (Constant)
+        SchemaVersionExpected = 2               % schema version this class is written for
     end
 
     properties
@@ -107,6 +118,7 @@ classdef CarasLabDB < handle
                 opts.PersonName (1,1) string = string(missing)
                 opts.UseActiveViews (1,1) logical = true
                 opts.Connection = []    % inject an existing connection instead of opening one
+                                        % (its session time zone is changed; see pInitSession)
             end
 
             obj.Schema = opts.Schema;
@@ -139,6 +151,7 @@ classdef CarasLabDB < handle
                 error("CarasLabDB:connectionFailed", "Database connection failed. %s", msg);
             end
 
+            obj.pInitSession();
             obj.CurrentPersonId = obj.pResolvePerson(opts.PersonId, opts.PersonEmail, opts.PersonName);
         end
 
@@ -488,18 +501,25 @@ classdef CarasLabDB < handle
             end
             f = struct();
             f = obj.pSet(f, "person_id", opts.PersonId);
-            f = obj.pSet(f, "email", opts.Email);
             f = obj.pSet(f, "full_name", opts.FullName);
             f = obj.pSet(f, "is_active", opts.IsActive);
-            T = obj.pSelectFrom(obj.pT("person"), f);
+            extra = strings(1, 0);
+            if obj.pIsProvided(opts.Email)
+                % Case-insensitive, like uq_person_email_lower and
+                % pResolvePerson: 'Dan@umd.edu' and 'dan@umd.edu' are one
+                % person, so a search for either must find the stored row.
+                extra = "lower(email) = lower(" + obj.sqlLiteral(opts.Email) + ")";
+            end
+            T = obj.pSelectFrom(obj.pT("person"), f, ...
+                OrderBy="full_name, person_id", Where=extra);
         end
 
         function T = getSpecies(obj)
-            T = obj.pSelectFrom(obj.pT("species"), struct());
+            T = obj.pSelectFrom(obj.pT("species"), struct(), OrderBy="code");
         end
 
         function T = getStorageRoots(obj)
-            T = obj.pSelectFrom(obj.pT("storage_root"), struct());
+            T = obj.pSelectFrom(obj.pT("storage_root"), struct(), OrderBy="root_id");
         end
 
         function T = getProbes(obj, opts)
@@ -508,7 +528,7 @@ classdef CarasLabDB < handle
                 opts.ProbeId (1,1) string = string(missing)
             end
             f = obj.pSet(struct(), "probe_id", opts.ProbeId);
-            T = obj.pSelectFrom(obj.pT("probe"), f);
+            T = obj.pSelectFrom(obj.pT("probe"), f, OrderBy="probe_id");
         end
 
         function T = getPipelines(obj, opts)
@@ -520,19 +540,19 @@ classdef CarasLabDB < handle
             f = struct();
             f = obj.pSet(f, "pipeline_id", opts.PipelineId);
             f = obj.pSet(f, "name", opts.Name);
-            T = obj.pSelectFrom(obj.pT("pipeline"), f);
+            T = obj.pSelectFrom(obj.pT("pipeline"), f, OrderBy="name");
         end
 
         function T = getEventTypes(obj)
-            T = obj.pSelectFrom(obj.pT("event_type"), struct());
+            T = obj.pSelectFrom(obj.pT("event_type"), struct(), OrderBy="code");
         end
 
         function T = getArtifactRoles(obj)
-            T = obj.pSelectFrom(obj.pT("artifact_role"), struct());
+            T = obj.pSelectFrom(obj.pT("artifact_role"), struct(), OrderBy="code");
         end
 
         function T = getAcquisitionSystems(obj)
-            T = obj.pSelectFrom(obj.pT("acquisition_system"), struct());
+            T = obj.pSelectFrom(obj.pT("acquisition_system"), struct(), OrderBy="code");
         end
     end
 
@@ -552,7 +572,7 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "name", opts.Name);
             f = obj.pSet(f, "is_active", opts.IsActive);
-            T = obj.pSelectFrom(obj.pT("project"), f);
+            T = obj.pSelectFrom(obj.pT("project"), f, OrderBy="name");
         end
 
         function T = getProjectMembers(obj, opts)
@@ -565,7 +585,7 @@ classdef CarasLabDB < handle
             f = struct();
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "person_id", opts.PersonId);
-            T = obj.pSelectFrom(obj.pT("project_member"), f);
+            T = obj.pSelectFrom(obj.pT("project_member"), f, OrderBy="project_id, person_id");
         end
 
         function T = getProjectArtifacts(obj, opts)
@@ -580,7 +600,8 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "project_artifact_id", opts.ProjectArtifactId);
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "kind", opts.Kind);
-            T = obj.pSelectFrom(obj.pT("project_artifact"), f);
+            T = obj.pSelectFrom(obj.pT("project_artifact"), f, ...
+                OrderBy="project_id, created_at, project_artifact_id");
         end
     end
 
@@ -602,7 +623,7 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "species_code", opts.SpeciesCode);
             f = obj.pSet(f, "sex", opts.Sex);
-            T = obj.pSelectFrom(obj.pT("subject"), f);
+            T = obj.pSelectFrom(obj.pT("subject"), f, OrderBy="subject_id");
         end
 
         function T = getSessions(obj, opts)
@@ -619,11 +640,12 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "label", opts.Label);
             f = obj.pSet(f, "storage_root_id", opts.StorageRootId);
-            T = obj.pSelectFrom(obj.pT("session"), f);
+            T = obj.pSelectFrom(obj.pT("session"), f, OrderBy="subject_id, label");
         end
 
         function T = getEvents(obj, opts)
             %GETEVENTS Retrieve base event rows. Reads event_active unless ActiveOnly=false.
+            %   Rows are ordered newest first (occurred_at DESC, event_id).
             arguments
                 obj (1,1) CarasLabDB
                 opts.EventId (1,1) string = string(missing)
@@ -642,7 +664,9 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "event_type", opts.EventType);
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "session_id", opts.SessionId);
-            T = obj.pSelectFrom(tbl, f, opts.Limit);
+            % Newest first, ties broken by a unique column, so a Limit= result
+            % is a stable, well-defined subset (same order as the MCP server).
+            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="occurred_at DESC, event_id");
         end
 
         function T = getEventDetail(obj, opts)
@@ -663,33 +687,25 @@ classdef CarasLabDB < handle
             else
                 eventSrc = obj.pT("event");
             end
+            litId = obj.sqlLiteral(opts.EventId);
             E = obj.pSelect("SELECT event_type FROM " + eventSrc + ...
-                " WHERE event_id = " + obj.sqlLiteral(opts.EventId) + ";");
+                " WHERE event_id = " + litId + ";");
             if height(E) == 0
                 error("CarasLabDB:eventNotFound", "No event with id %s.", opts.EventId);
             end
             detailTable = obj.pDetailTable(E.event_type(1));
 
-            % Detail columns minus the ones the base already provides.
-            C = obj.pSelect("SELECT column_name FROM information_schema.columns" + ...
-                " WHERE table_schema = " + obj.sqlLiteral(obj.Schema) + ...
-                " AND table_name = " + obj.sqlLiteral(detailTable) + ...
-                " AND column_name NOT IN ('event_id', 'event_type')" + ...
-                " ORDER BY ordinal_position;");
-            detailCols = string(C.column_name);
-
-            if isempty(detailCols)
-                selectList = "e.*";
-            else
-                selectList = "e.*, " + strjoin("d." + reshape(detailCols, 1, []), ", ");
-            end
-            T = obj.pSelect("SELECT " + selectList + " FROM " + eventSrc + " e " + ...
-                "JOIN " + obj.pT(detailTable) + " d ON d.event_id = e.event_id " + ...
-                "WHERE e.event_id = " + obj.sqlLiteral(opts.EventId) + ";");
+            % JOIN ... USING emits event_id and event_type once, then the
+            % remaining lab.event columns, then the remaining detail columns:
+            % exactly the column set described above, with no catalog lookup.
+            T = obj.pSelect("SELECT * FROM " + eventSrc + " e JOIN " + ...
+                obj.pT(detailTable) + " d USING (event_id, event_type) " + ...
+                "WHERE event_id = " + litId + ";");
         end
 
         function T = getArtifacts(obj, opts)
             %GETARTIFACTS Retrieve artifacts. Reads artifact_active unless ActiveOnly=false.
+            %   Rows are ordered newest first (created_at DESC, artifact_id).
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
@@ -712,7 +728,7 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "session_id", opts.SessionId);
             f = obj.pSet(f, "role", opts.Role);
             f = obj.pSet(f, "checksum", opts.Checksum);
-            T = obj.pSelectFrom(tbl, f, opts.Limit);
+            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="created_at DESC, artifact_id");
         end
 
         function T = getEventInputs(obj, opts)
@@ -725,7 +741,7 @@ classdef CarasLabDB < handle
             f = struct();
             f = obj.pSet(f, "event_id", opts.EventId);
             f = obj.pSet(f, "artifact_id", opts.ArtifactId);
-            T = obj.pSelectFrom(obj.pT("event_input"), f);
+            T = obj.pSelectFrom(obj.pT("event_input"), f, OrderBy="event_id, artifact_id");
         end
 
         function T = getArtifactVerifications(obj, opts)
@@ -735,7 +751,8 @@ classdef CarasLabDB < handle
                 opts.ArtifactId (1,1) string = string(missing)
             end
             f = obj.pSet(struct(), "artifact_id", opts.ArtifactId);
-            T = obj.pSelectFrom(obj.pT("artifact_verification"), f);
+            T = obj.pSelectFrom(obj.pT("artifact_verification"), f, ...
+                OrderBy="verified_at DESC, verification_id DESC");
         end
 
         function T = getSubjectCurrent(obj, opts)
@@ -745,7 +762,7 @@ classdef CarasLabDB < handle
                 opts.SubjectId (1,1) string = string(missing)
             end
             f = obj.pSet(struct(), "subject_id", opts.SubjectId);
-            T = obj.pSelectFrom(obj.pT("subject_current"), f);
+            T = obj.pSelectFrom(obj.pT("subject_current"), f, OrderBy="subject_id");
         end
 
         function T = getProvenanceEdges(obj, opts)
@@ -760,7 +777,8 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "from_id", opts.FromId);
             f = obj.pSet(f, "to_id", opts.ToId);
             f = obj.pSet(f, "edge_type", opts.EdgeType);
-            T = obj.pSelectFrom(obj.pT("provenance_edge"), f);
+            T = obj.pSelectFrom(obj.pT("provenance_edge"), f, ...
+                OrderBy="edge_type, from_id, to_id");
         end
     end
 
@@ -802,15 +820,19 @@ classdef CarasLabDB < handle
             idOut = string(v(1));
         end
 
-        function pUpdate(obj, tableRef, s, whereClause)
+        function n = pUpdate(obj, tableRef, s, whereClause, keyCol)
             %PUPDATE Build and execute an UPDATE from a column->value struct.
-            %   No-op when S has no fields. WHERECLAUSE is built by the caller
-            %   from internal identifiers plus sqlLiteral-escaped key values.
+            %   Returns the number of rows updated (via RETURNING KEYCOL, so
+            %   callers can detect a key that matched nothing without a
+            %   separate existence query), or NaN when S has no fields and
+            %   nothing was sent. WHERECLAUSE is built by the caller from
+            %   internal identifiers plus sqlLiteral-escaped key values.
             arguments
                 obj (1,1) CarasLabDB
                 tableRef (1,1) string
                 s (1,1) struct
                 whereClause (1,1) string
+                keyCol (1,1) string
             end
             [cols, vals] = obj.pColsVals(s);
             if isempty(cols)
@@ -818,26 +840,32 @@ classdef CarasLabDB < handle
                 % caller ends up believing an edit was saved when it was not.
                 warning("CarasLabDB:nothingToUpdate", ...
                     "No columns were supplied; %s was not changed.", tableRef);
+                n = NaN;
                 return
             end
             assignments = cols + " = " + vals;
             sql = "UPDATE " + tableRef + " SET " + strjoin(assignments, ", ") + ...
-                " WHERE " + whereClause + ";";
-            obj.pExec(sql);
+                " WHERE " + whereClause + " RETURNING " + keyCol + ";";
+            n = height(obj.pSelect(sql));
         end
 
-        function eventId = pInsertEvent(obj, base, detailTable, detail, inputs)
+        function eventId = pInsertEvent(obj, base, detailTable, detail, inputs, artifacts)
             %PINSERTEVENT Insert the base event and its detail row in one transaction.
-            %   INPUTS is an optional table of event_input edges (columns
-            %   artifact_id and role) to attach to the new event. It is written
-            %   inside the same transaction so a correction can never commit an
-            %   event whose provenance edges are only half-copied.
+            %   INPUTS is an optional cell array of lab.event_input structs
+            %   (artifact_id, role) to attach to the new event, and ARTIFACTS
+            %   an optional cell array of lab.artifact insert structs for files
+            %   the new event produced (supersedeEvent passes the successors
+            %   of the old event's artifacts); event_id / produced_by_event_id
+            %   are filled in here. Both are written inside the same
+            %   transaction, so a correction can never commit an event whose
+            %   provenance edges or files are only half-carried over.
             arguments
                 obj (1,1) CarasLabDB
                 base (1,1) struct
                 detailTable (1,1) string
                 detail (1,1) struct
-                inputs table = table()
+                inputs cell = {}
+                artifacts cell = {}
             end
             conn = obj.Connection;
             priorAutoCommit = conn.AutoCommit;
@@ -858,23 +886,15 @@ classdef CarasLabDB < handle
                     detail.event_type = base.event_type;
                 end
                 obj.pInsert(detailTable, detail);
-                for k = 1:height(inputs)
-                    aid = inputs.artifact_id(k);
-                    if iscell(aid)
-                        aid = aid{1};
-                    end
-                    edge = struct("event_id", eventId, "artifact_id", string(aid));
-                    if ismember("role", string(inputs.Properties.VariableNames))
-                        r = inputs.role(k);
-                        if iscell(r)
-                            r = r{1};
-                        end
-                        if ischar(r) && isempty(r)
-                            r = string(missing);   % SQL NULL, not ''
-                        end
-                        edge = obj.pSet(edge, "role", r);
-                    end
+                for k = 1:numel(inputs)
+                    edge = inputs{k};
+                    edge.event_id = eventId;
                     obj.pInsert(obj.pT("event_input"), edge);
+                end
+                for k = 1:numel(artifacts)
+                    a = artifacts{k};
+                    a.produced_by_event_id = eventId;
+                    obj.pInsert(obj.pT("artifact"), a);
                 end
                 commit(conn);
             catch ME
@@ -944,25 +964,42 @@ classdef CarasLabDB < handle
             pid = string(T.person_id(1));
         end
 
-        function T = pSelectFrom(obj, tableRef, filters, limitN)
-            %PSELECTFROM SELECT * FROM tableRef with equality filters and optional LIMIT.
+        function T = pSelectFrom(obj, tableRef, filters, opts)
+            %PSELECTFROM SELECT * FROM tableRef with equality filters, ORDER BY and LIMIT.
+            %   OrderBy and Where (extra ANDed clauses) are built internally,
+            %   never from caller input. Every getter passes an OrderBy whose
+            %   columns together are unique, so the order is total: without
+            %   one, LIMIT returns whichever rows the planner reaches first
+            %   and row 1 can change between calls.
             arguments
                 obj (1,1) CarasLabDB
                 tableRef (1,1) string
                 filters (1,1) struct
-                limitN (1,1) double = 0
+                opts.Limit (1,1) double = 0
+                opts.OrderBy (1,1) string = ""
+                opts.Where (1,:) string = strings(1, 0)
             end
-            sql = "SELECT * FROM " + tableRef + obj.pWhere(filters);
-            if limitN > 0
-                sql = sql + " LIMIT " + string(limitN);
+            sql = "SELECT * FROM " + tableRef + obj.pWhere(filters, opts.Where);
+            if strlength(opts.OrderBy) > 0
+                sql = sql + " ORDER BY " + opts.OrderBy;
+            end
+            if opts.Limit > 0
+                sql = sql + " LIMIT " + string(opts.Limit);
             end
             T = obj.pSelect(sql + ";");
         end
 
-        function w = pWhere(obj, filters)
+        function w = pWhere(obj, filters, extra)
             %PWHERE Build a WHERE clause of ANDed equality tests from a struct.
+            %   EXTRA is an optional string array of further internally-built
+            %   clauses to AND in.
+            arguments
+                obj (1,1) CarasLabDB
+                filters (1,1) struct
+                extra (1,:) string = strings(1, 0)
+            end
             fn = string(fieldnames(filters));
-            clauses = strings(1, 0);
+            clauses = extra;
             for i = 1:numel(fn)
                 v = filters.(char(fn(i)));
                 if obj.pIsProvided(v)
@@ -974,6 +1011,97 @@ classdef CarasLabDB < handle
             else
                 w = " WHERE " + strjoin(clauses, " AND ");
             end
+        end
+
+        function pInitSession(obj)
+            %PINITSESSION Align the session time zone and read the schema version.
+            %   The native driver returns timestamptz as an *unzoned* datetime
+            %   holding the server session's wall-clock reading, while
+            %   sqlLiteral tags an unzoned datetime as this workstation's
+            %   "local" zone. Setting the session zone to the workstation's
+            %   zone makes the two agree: get* results and the GUI show local
+            %   time (not the server's zone, typically UTC, unlabelled), and a
+            %   timestamp read back and written again keeps its instant.
+            tz = string(datetime("now", "TimeZone", "local").TimeZone);
+            try
+                obj.pExec("SET TIME ZONE " + obj.sqlLiteral(tz) + ";");
+            catch ME
+                warning("CarasLabDB:timeZoneNotSet", ...
+                    "Could not set the session time zone to '%s'; timestamps " + ...
+                    "read from the database are in the server's zone. (%s)", ...
+                    tz, ME.message);
+            end
+
+            % Version 1 of the schema had no schema_version table. Probe for
+            % it rather than letting the SELECT fail, which would abort the
+            % caller's transaction on an injected connection.
+            obj.SchemaVersion = NaN;
+            R = obj.pSelect("SELECT to_regclass(" + ...
+                obj.sqlLiteral(obj.pT("schema_version")) + ") IS NOT NULL AS present;");
+            if logical(R.present(1))
+                V = obj.pSelect("SELECT max(version) AS v FROM " + ...
+                    obj.pT("schema_version") + ";");
+                obj.SchemaVersion = double(V.v(1));
+            end
+            if ~isequal(obj.SchemaVersion, CarasLabDB.SchemaVersionExpected)
+                if isnan(obj.SchemaVersion)
+                    found = "unknown (no schema_version table, i.e. version 1)";
+                else
+                    found = string(obj.SchemaVersion);
+                end
+                warning("CarasLabDB:schemaVersionMismatch", ...
+                    "Database schema version is %s; this CarasLabDB class is " + ...
+                    "written for version %d. Upgrade the database with the " + ...
+                    "scripts in design_docs/migrations/, or use a matching client.", ...
+                    found, CarasLabDB.SchemaVersionExpected);
+            end
+        end
+
+        function rows = pRowsAsText(obj, tableRef, whereClause, idCol)
+            %PROWSASTEXT Read rows as structs of exact text values (missing = NULL).
+            %   Each column comes back as the text Postgres itself prints for
+            %   it (jsonb_each_text(to_jsonb(row))): numeric with its stored
+            %   digits and scale, timestamptz as ISO 8601 with an explicit
+            %   offset, jsonb as its JSON text, '' distinct from NULL. Written
+            %   back through sqlLiteral those strings are assignment-cast into
+            %   the same column types, so a value carried forward by a
+            %   correction is stored exactly as it was: it never passes through
+            %   a MATLAB double or an unzoned datetime. WHERECLAUSE refers to
+            %   the row as alias r; IDCOL is a column unique within the result.
+            %   Returns a cell array of structs, one per row, ordered by IDCOL.
+            R = obj.pSelect("SELECT r." + idCol + "::text AS row_id, j.key, j.value, " + ...
+                "(j.value IS NULL) AS is_null FROM " + tableRef + " r " + ...
+                "CROSS JOIN LATERAL jsonb_each_text(to_jsonb(r)) j " + ...
+                "WHERE " + whereClause + " ORDER BY r." + idCol + ", j.key;");
+            rows = {};
+            if height(R) == 0
+                return
+            end
+            ids = CarasLabDB.pColText(R.row_id);
+            keys = CarasLabDB.pColText(R.key);
+            vals = CarasLabDB.pColText(R.value);
+            vals(logical(R.is_null)) = string(missing);
+            [~, first] = unique(ids, "stable");
+            bounds = [first; numel(ids) + 1];
+            rows = cell(1, numel(first));
+            for k = 1:numel(first)
+                s = struct();
+                for i = bounds(k):bounds(k + 1) - 1
+                    s.(char(keys(i))) = vals(i);
+                end
+                rows{k} = s;
+            end
+        end
+
+        function s = pArtifactSuccessor(obj, row)
+            %PARTIFACTSUCCESSOR Insert struct for the row that supersedes artifact ROW.
+            %   ROW is a pRowsAsText struct of lab.artifact. Every column is
+            %   carried forward except the regenerated ones; supersedes points
+            %   at ROW and created_by is the current person.
+            s = rmfield(row, intersect(fieldnames(row), ...
+                {'artifact_id', 'created_at', 'created_by', 'supersedes'}));
+            s.supersedes = row.artifact_id;
+            s = obj.pSet(s, "created_by", obj.pCreatedBy(string(missing)));
         end
     end
 
@@ -1047,6 +1175,44 @@ classdef CarasLabDB < handle
             end
         end
 
+        function s = pColText(col)
+            %PCOLTEXT A fetched text column as a string column vector.
+            %   The driver may hand text back as a string array or a cell of
+            %   char; anything else in a cell (a NULL) becomes missing.
+            if iscell(col)
+                s = strings(numel(col), 1);
+                for i = 1:numel(col)
+                    v = col{i};
+                    if isstring(v) && isscalar(v)
+                        s(i) = v;
+                    elseif ischar(v)
+                        s(i) = string(v);
+                    else
+                        s(i) = string(missing);
+                    end
+                end
+            else
+                s = reshape(string(col), [], 1);
+            end
+        end
+
+        function s = pShortestDecimal(v)
+            %PSHORTESTDECIMAL Shortest %g text (15-17 significant digits) that reads back as V.
+            %   %.17g always round-trips an IEEE double, but it spells out the
+            %   binary value: 71.9 becomes 71.900000000000006, and a numeric
+            %   column stores that text verbatim, so weight_g = 71.9 is then
+            %   false. The decimal the user typed is the shortest text that
+            %   parses back to the same double; 15 significant digits are
+            %   enough for any value typed by hand, and the loop falls through
+            %   to 17 only for doubles that need it (e.g. 0.1 + 0.2).
+            for fmt = ["%.15g", "%.16g", "%.17g"]
+                s = string(sprintf(fmt, v));
+                if str2double(s) == v
+                    return
+                end
+            end
+        end
+
         function pRestoreAutoCommit(conn, state)
             %PRESTOREAUTOCOMMIT Restore a connection's AutoCommit mode, loudly on failure.
             %   Swallowing a failure here is silent data loss: the connection
@@ -1100,12 +1266,15 @@ classdef CarasLabDB < handle
                 % the database must not be round-tripped through here -- the
                 % driver returns timestamptz unzoned, so re-tagging it "local"
                 % would shift the instant whenever the server session zone
-                % differs; see supersedeEvent, which reads occurred_at as text
-                % with an explicit UTC offset for exactly this reason.
+                % differs. pInitSession sets the session zone to the local
+                % zone to keep the two aligned, and supersedeEvent carries
+                % values forward as exact text (pRowsAsText), not datetimes.
                 if isempty(v.TimeZone)
                     v.TimeZone = "local";
                 end
-                v.Format = "yyyy-MM-dd HH:mm:ss.SSSxxx";
+                % Microseconds: timestamptz stores them, and a millisecond
+                % format would drop the last three digits of every value.
+                v.Format = "yyyy-MM-dd HH:mm:ss.SSSSSSxxx";
                 out = "TIMESTAMPTZ '" + string(v) + "'";
                 return
             end
@@ -1143,10 +1312,7 @@ classdef CarasLabDB < handle
                 if v == floor(v) && abs(v) < 2^53
                     out = string(sprintf("%d", v));
                 else
-                    % %.17g round-trips an IEEE double exactly; %.15g silently
-                    % loses the last two digits, which matters for the numeric
-                    % columns (performance, stereotax_*_mm, sample_rate_hz).
-                    out = string(sprintf("%.17g", v));
+                    out = CarasLabDB.pShortestDecimal(v);
                 end
                 return
             end

@@ -2,12 +2,14 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %SUPERSEDEARTIFACT Correct an artifact by inserting a superseding copy.
 %
 %   Like SUPERSEDEEVENT, but for lab.artifact. Reads the old row, carries
-%   every column forward except artifact_id and created_at (regenerated),
-%   applies your overrides, sets supersedes to the old id and created_by to
-%   the current person, and inserts the new row.
+%   every column forward exactly as stored except artifact_id and created_at
+%   (regenerated), applies your overrides, sets supersedes to the old id and
+%   created_by to the current person, and inserts the new row.
 %
 %   newId = supersedeArtifact(db, oldArtifactId, ...
 %               Overrides=struct("checksum","ff00...", "size_bytes",123))
+%   newId = supersedeArtifact(db, oldArtifactId, ...
+%               Overrides=struct("role","derived"))          % metadata only
 %
 %   Name=Value:
 %       Overrides - struct of lab.artifact column -> new value
@@ -15,9 +17,11 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %   Override struct field names must be actual database column names. Any
 %   column not overridden is carried forward from the superseded row.
 %
-%   Overrides MUST change at least one of storage_root_id, relative_path or
-%   checksum: those three columns are UNIQUE together, so a supersede that
-%   carried all of them forward would duplicate the row being replaced.
+%   A correction may keep the same file (storage_root_id, relative_path,
+%   checksum) -- e.g. to fix role/format/session, or to re-point
+%   produced_by_event_id at a corrected event, which SUPERSEDEEVENT does for
+%   you. The database still rejects a second *active* row for one file, so
+%   this cannot be used to register a file twice.
 %
 %   Returns the new artifact_id (uuid string).
 %
@@ -29,59 +33,19 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
         opts.Overrides (1,1) struct = struct()
     end
 
-    A = obj.pSelect("SELECT * FROM " + obj.pT("artifact") + " WHERE artifact_id = " + ...
-        obj.sqlLiteral(oldArtifactId) + ";");
-    if height(A) == 0
+    if isfield(opts.Overrides, "supersedes")
+        error("CarasLabDB:supersedesNotOverridable", ...
+            "supersedes is set by this method and cannot be overridden.");
+    end
+
+    A = obj.pRowsAsText(obj.pT("artifact"), ...
+        "r.artifact_id = " + obj.sqlLiteral(oldArtifactId), "artifact_id");
+    if isempty(A)
         error("CarasLabDB:artifactNotFound", "No artifact with id %s.", oldArtifactId);
     end
 
-    s = struct();
-    cols = string(A.Properties.VariableNames);
-    for i = 1:numel(cols)
-        c = cols(i);
-        if ismember(c, ["artifact_id", "created_at", "created_by", "supersedes"])
-            continue    % regenerated / set explicitly below
-        end
-        s = obj.pSet(s, c, local_scalar(A.(c)));
-    end
+    s = obj.pArtifactSuccessor(A{1});
     s = obj.pMergeOverrides(s, opts.Overrides);
 
-    % lab.artifact has UNIQUE (storage_root_id, relative_path, checksum), and
-    % every column is carried forward verbatim, so a supersede that changes
-    % only role/format/size_bytes/subject_id/session_id/attributes would
-    % reinsert an identical natural key and die on an opaque unique-violation
-    % from the server. Say so here instead.
-    keyCols = ["storage_root_id", "relative_path", "checksum"];
-    if ~any(ismember(keyCols, string(fieldnames(opts.Overrides))))
-        error("CarasLabDB:artifactSupersedeCollision", ...
-            "A superseding artifact must change at least one of %s -- those " + ...
-            "three columns are UNIQUE together, so carrying all of them " + ...
-            "forward would duplicate the row being replaced.", ...
-            strjoin(keyCols, ", "));
-    end
-
-    s.supersedes = oldArtifactId;
-    s = obj.pSet(s, "created_by", obj.pCreatedBy(string(missing)));
-
     newArtifactId = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
-end
-
-function v = local_scalar(colvals)
-%LOCAL_SCALAR Extract row-1 of a fetched table column as an insertable scalar.
-    if isempty(colvals)
-        v = string(missing);
-        return
-    end
-    if iscell(colvals)
-        v = colvals{1};
-    else
-        v = colvals(1);
-    end
-    if ischar(v)
-        if isempty(v)
-            v = string(missing);
-        else
-            v = string(v);
-        end
-    end
 end
