@@ -125,7 +125,8 @@ that case we need a request procedure. If campus directory authentication
 passwords; either works for us.
 
 The schema file must be applied by the owner role; it is a single SQL file
-(`design_docs/schema.sql`) and takes seconds to run on an empty database.
+(`design_docs/schema.sql`) and takes seconds to run on an empty database. The
+privileges above are then applied by a second file, `design_docs/grants.sql`.
 
 **Network**
 
@@ -188,16 +189,13 @@ These were found while reviewing the code and documentation for this page.
 Items marked *lab* are ours to fix later and are listed so IT knows they are
 known; items marked *IT decision* need input before go-live.
 
-1. **Documented account privileges do not match what the client does.**
-   *(lab)* The deployment guides grant `lab_rw` only read and insert. But the
-   schema deliberately leaves the descriptive tables (`subject`, `session`,
-   `project`, `project_member`, `project_artifact`, `person`) editable, and
-   the MATLAB client issues updates to `subject` and `session`. Under the
-   documented grants those operations fail with a permission error. The grant
-   script also lacks default-privilege rules, so tables added later would be
-   invisible to `lab_rw`/`lab_ro` until re-granted. We will correct the grant
-   script; IT only needs to know the final privilege set will include update
-   on those specific tables and nothing else.
+1. **Account privileges.** *(lab; resolved)* The privilege set is now one
+   script, `design_docs/grants.sql`, which every guide applies. `lab_rw` can
+   read and insert everywhere, and can update only the descriptive tables the
+   MATLAB client edits (`subject`, `session`, `project`, `project_member`,
+   `project_artifact`, `person`); every such edit is recorded in the database
+   with the login that made it. `lab_ro` can only read. Default-privilege
+   rules cover tables added later.
 
 2. **Recording who made each entry depends on per-person logins.** *(IT +
    lab)* The original deployment guides had every researcher connect as one
@@ -224,12 +222,12 @@ known; items marked *IT decision* need input before go-live.
    internal network or VPN behind a reverse proxy, not for direct exposure.
    We will not ask for it to be exposed beyond the lab subnet.
 
-5. **There is no schema upgrade mechanism.** *(lab)* `schema.sql` builds a
-   fresh, empty database only; it is not a migration script and there is no
-   recorded schema version in the database. Once real data exists, every
-   schema change will need a hand-written migration applied by the owner role
-   in a maintenance window. IT should expect occasional short requests of that
-   kind; we will supply the SQL.
+5. **Schema upgrades.** *(lab)* `schema.sql` builds a fresh, empty database.
+   The database records its schema version (`lab.schema_version`), and an
+   existing database is upgraded by the numbered scripts in
+   `design_docs/migrations/`, each applied once by the owner role in a
+   maintenance window and refusing to run twice. IT should expect occasional
+   short requests of that kind; we will supply the SQL.
 
 6. **Single instance, no offline mode.** *(IT decision)* Clients write
    directly to the database and have no local queue. If the server is down,

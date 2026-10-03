@@ -100,18 +100,23 @@ the `event` base table, the per-type `*_event` detail tables, `artifact`, and
 ### 1.3 Create application roles (recommended)
 
 Do not have researchers connect as the `postgres` superuser. Create a
-read/write role for the MATLAB clients:
+read/write role for the MATLAB clients, then apply the privileges from the
+one grant script every guide uses, [`grants.sql`](grants.sql):
 
 ```powershell
 psql -U postgres -d lab -c "CREATE ROLE lab_rw LOGIN PASSWORD 'CHANGE_ME';"
-psql -U postgres -d lab -c "GRANT USAGE ON SCHEMA lab TO lab_rw;"
-psql -U postgres -d lab -c "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA lab TO lab_rw;"
-psql -U postgres -d lab -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;"
+psql -U postgres -d lab -v ON_ERROR_STOP=1 -f design_docs/grants.sql
 ```
 
-Note the schema is **append-only**: `UPDATE`/`DELETE` are blocked by triggers,
-so `INSERT` + `SELECT` is the correct privilege set for normal use.
-Corrections happen through superseding inserts, not updates.
+The event log is **append-only**: `UPDATE`/`DELETE` on events, artifacts and
+provenance edges are blocked by triggers whatever is granted, and corrections
+happen through superseding inserts. `grants.sql` therefore gives `lab_rw`
+`SELECT` + `INSERT` everywhere, plus `UPDATE` on only the descriptive tables
+the MATLAB client and GUI edit in place (`subject`, `session`, `project`,
+`project_member`, `project_artifact`, `person`; every edit is recorded in
+`lab.row_history`). It also creates `lab_ro` (read only) for the dashboard
+server and the MCP server, and sets default privileges for tables added
+later. Re-run it after any schema change.
 
 Seed at least one `person` row (the MATLAB client resolves a "current person"
 for provenance columns) and your reference/lookup rows (`storage_root`,
@@ -249,7 +254,8 @@ etc.) — no server-side runtime is required.
 
 - [ ] `Get-Service postgresql*` shows the service **Running**.
 - [ ] `psql -U postgres -d lab -c "\dt lab.*"` lists the schema tables.
-- [ ] A non-superuser role (`lab_rw`) can `SELECT`/`INSERT` but not `UPDATE`.
+- [ ] A non-superuser role (`lab_rw`) can `SELECT`/`INSERT`, can `UPDATE` only the
+      descriptive tables listed in `grants.sql`, and cannot `UPDATE` an event.
 - [ ] MATLAB: `ver`, `license('test','Database_Toolbox')`, and
       `exist('postgresql')` all check out.
 - [ ] `CarasLabDB(...)` constructs without error and

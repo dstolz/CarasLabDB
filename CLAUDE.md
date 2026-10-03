@@ -9,15 +9,20 @@ data. It has five parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
-  redefine it.
+  redefine it. It installs the latest schema version; `design_docs/migrations/`
+  upgrades existing databases, and `design_docs/grants.sql` holds the roles
+  and privileges every deployment guide applies.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
-- **`web/lab-dashboard.html`** — a standalone, self-contained HTML/JS
-  dashboard (Chart.js via CDN) that visualizes the schema's data model with
-  seeded synthetic data (`window.LAB_DATA`, generated in-page by a
-  mulberry32 PRNG). It has no backend/API calls — it does not talk to the
-  live Postgres database. Keep it self-contained/offline.
+- **`web/lab-dashboard.html`** — a standalone HTML/JS dashboard that
+  visualizes the schema's data model with seeded synthetic data
+  (`window.LAB_DATA`, generated in-page by a mulberry32 PRNG). It has no
+  backend/API calls — it does not talk to the live Postgres database. Its one
+  network dependency is Chart.js from a CDN; without it the page shows a
+  notice in place of the charts and everything else works. Keep it that way:
+  no backend, no other external resources. Timestamps are shown in the
+  viewer's time zone (`fmtDate` / `fmtDateTime` / `localDay`).
 - **`web/live/`** — a *live* variant of that dashboard. It reuses the exact
   markup and render logic from the offline demo, but a loader fetches
   `/api/data` (served by `web/live/server.py`, which runs `web/live/lab_data.sql`
@@ -27,19 +32,23 @@ data. It has five parts:
   artifact with its latest `verification`. `web/live/lab-dashboard-live.html`
   is *generated* from the offline demo (swap the synthetic `<script>` for the
   loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
-  offline demo's app logic changes, rather than editing it by hand.
+  offline demo's app logic changes, rather than editing it by hand. The
+  script writes CRLF line endings; the repository stores the file with LF.
+  `server.py` serves only the page and `/api/data`, caches the export for 5 s
+  and gzips it.
 - **`mcp-server/`** — a Python **read-only** Model Context Protocol server
   (`src/caraslabdb_mcp/`) that gives an LLM agent typed `get*` tools mirroring
   `@CarasLabDB`'s read surface (reference tables, subjects/sessions, events and
   their detail rows, artifacts, verifications, `fn_artifact_lineage`,
-  provenance edges). Its one hard invariant is that it cannot write: no write
+  provenance edges, `fn_check_integrity`). Its one hard invariant is that it cannot write: no write
   tools, every query inside a rolled-back `SET TRANSACTION READ ONLY`
   transaction, and a `SELECT`-only role. No tool accepts a table/column name or
   raw SQL, and every list tool is bounded by `limit` (default 200, max 1000).
   The schema's table and column names are hard-coded — the event-detail
   tables/columns in `src/caraslabdb_mcp/schema_map.py`, the rest in the
   per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
-  change must be mirrored there. See `design_docs/mcp-server.md`.
+  change must be mirrored there, and `db.SCHEMA_VERSION` bumped. See
+  `design_docs/mcp-server.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are
@@ -61,16 +70,29 @@ records:
   recursive `fn_artifact_lineage(artifact_id, 'up'|'down')` SQL function.
 - **Immutability.** `UPDATE`/`DELETE` are blocked by triggers
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
-  `artifact`, and `event_input`. Corrections are made by inserting a new row
-  whose `supersedes` column points at the row it replaces. `event_active` /
-  `artifact_active` views filter to non-superseded (current) rows; a partial
-  unique index on `supersedes` keeps correction chains linear (no forks).
+  `artifact`, `event_input`, and the logs `artifact_verification`,
+  `maintenance_log`, `row_history` and `schema_version`. Corrections are made
+  by inserting a new row whose `supersedes` column points at the row it
+  replaces. `event_active` / `artifact_active` views filter to non-superseded
+  (current) rows; a partial unique index on `supersedes` keeps correction
+  chains linear (no forks). An artifact correction may describe the same file
+  as the row it replaces (that is how a corrected event's files are
+  re-pointed); only one *active* row per file is allowed.
+- The mutable tables (reference, project, `subject`, `session`) are edited in
+  place, and the `fn_log_row_change` triggers record every UPDATE/DELETE in
+  `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
   (when the row was inserted) — they routinely differ.
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
-`(event_id, event_type)` composite-FK trick.
+`(event_id, event_type)` composite-FK trick. A schema change also needs: a new
+numbered script in `design_docs/migrations/` that inserts its
+`lab.schema_version` row; the same change in `schema.sql` with its seeded
+version bumped (a fresh install and an upgraded database must give identical
+`pg_dump --schema-only` output); `CarasLabDB.SchemaVersionExpected` and the MCP
+server's `db.SCHEMA_VERSION` bumped; `grants.sql` updated if the new table
+needs anything beyond read/insert; and assertions in `tests/schema_test.sql`.
 
 ## The MATLAB interface (`@CarasLabDB`)
 
@@ -89,8 +111,10 @@ Key behaviors baked into the class:
   unless overridden per call.
 - `UseActiveViews` (default `true`) controls whether `get*` methods read
   `*_active` views or full history; overridable per call with `ActiveOnly=`.
-- All SQL is built by hand and values are escaped via the private static
-  `sqlLiteral` helper (quote-doubling, typed casts for `timestamptz`/`jsonb`).
+- All SQL is built by hand and values are escaped via the static
+  `sqlLiteral` helper (quote-doubling, typed casts for `timestamptz`/`jsonb`,
+  non-integer numbers as the shortest decimal that round-trips the double,
+  timestamps to microseconds).
   **Table/column identifiers are always supplied internally, never from
   end-user input** — preserve that invariant in any new method.
 - `pSet`/`pIsProvided` implement "omit unset Name=Value args from the INSERT
@@ -99,9 +123,16 @@ Key behaviors baked into the class:
 - Event inserts go through `pInsertEvent`, which writes the base `event` row
   and its detail row in one transaction (manual `AutoCommit` toggle +
   commit/rollback), matching the schema's paired base+detail design.
+- At connection the class sets the session time zone to the workstation's
+  zone (unzoned datetimes read back are then local) and reads the schema
+  version, warning on a mismatch.
 - `supersedeEvent`/`supersedeArtifact` implement the correction workflow:
-  read the old row(s), carry every column forward except explicit overrides,
-  set `supersedes`, insert as new.
+  read the old row(s) as exact text (`pRowsAsText`, via
+  `jsonb_each_text(to_jsonb(row))`), carry every column forward except
+  explicit overrides, set `supersedes`, insert as new. Carried values never
+  pass through a MATLAB double or datetime. `supersedeEvent` also copies the
+  event's `event_input` edges and supersedes each active artifact it produced
+  with one pointing at the new event, all in one transaction.
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →
@@ -129,10 +160,19 @@ walkthrough script, not an automated test, and assumes a reachable database.
 
 ## Running things
 
-There is no build/lint/test tooling in this repo (no CI config, no MATLAB
-test suite, no package.json). Practical ways to exercise the code:
+CI (`.github/workflows/tests.yml`) applies the schema to PostgreSQL, runs
+`tests/schema_test.sql`, checks that a v1 database plus the migrations matches
+a fresh install, runs `lab_data.sql` and checks the JSON shape, checks that the
+live dashboard page is up to date with its generator, and runs the MCP
+server's pytest suite. There is no MATLAB test suite and no package.json.
+Practical ways to exercise the code:
 
-- **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`
+- **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,
+  then `psql -X -v ON_ERROR_STOP=1 -d lab -f tests/schema_test.sql` (rolls
+  itself back)
+- **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
+  tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
+  integration tests)
 - **MATLAB class**: add the repo root to the MATLAB path (so `@CarasLabDB` is
   visible as a class folder), then adapt `examples/carasLabDB_demo.m` — it
   needs a real reachable Postgres instance with the schema applied.
