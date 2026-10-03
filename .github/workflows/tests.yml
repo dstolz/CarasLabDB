@@ -1,0 +1,105 @@
+# Schema, migration, live-dashboard and MCP server checks against PostgreSQL 16.
+# Nothing here needs MATLAB; the MATLAB class and GUI are still tested by hand
+# (design_docs/testing-locally.md).
+
+name: tests
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      # The last commit whose schema.sql is version 1 (no lab.schema_version).
+      # Migration 002 is checked by upgrading that schema and comparing the
+      # result with a fresh install of the current one.
+      SCHEMA_V1_COMMIT: "1778007"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SCHEMA_V1_COMMIT must be reachable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the psql client and Python dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-client
+          python -m pip install --upgrade pip
+          python -m pip install -e "mcp-server[test]" ruff
+
+      - name: Lint Python
+        run: ruff check mcp-server web/live tests
+
+      - name: Apply schema.sql to a fresh database
+        run: |
+          createdb lab_test
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_test -f design_docs/schema.sql
+
+      - name: Schema assertions
+        run: psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/schema_test.sql
+
+      - name: Grant script applies, twice
+        run: |
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_test -f design_docs/grants.sql
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_test -f design_docs/grants.sql
+
+      - name: v1 plus migrations matches a fresh install
+        run: |
+          git show "$SCHEMA_V1_COMMIT:design_docs/schema.sql" > "$RUNNER_TEMP/schema_v1.sql"
+          createdb lab_fresh
+          createdb lab_migrated
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_fresh -f design_docs/schema.sql
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated -f "$RUNNER_TEMP/schema_v1.sql"
+          for m in design_docs/migrations/*.sql; do
+            echo "applying $m"
+            psql -X -q -v ON_ERROR_STOP=1 -1 -d lab_migrated -f "$m"
+          done
+          # pg_dump runs inside the service container so its version matches
+          # the server's; its \restrict / \unrestrict lines carry a random key.
+          dump() {
+            docker exec "${{ job.services.postgres.id }}" \
+              pg_dump -U postgres --schema-only -d "$1" | grep -v '^\\\(un\)\?restrict '
+          }
+          dump lab_fresh > "$RUNNER_TEMP/fresh.sql"
+          dump lab_migrated > "$RUNNER_TEMP/migrated.sql"
+          diff -u "$RUNNER_TEMP/fresh.sql" "$RUNNER_TEMP/migrated.sql"
+          psql -X -v ON_ERROR_STOP=1 -d lab_migrated -f tests/schema_test.sql
+
+      - name: MCP server tests (unit and integration)
+        env:
+          CARASLABDB_TEST_DB: lab_test
+        run: python -m pytest -q mcp-server/tests
+
+      - name: Live dashboard export has the expected shape
+        env:
+          PGDATABASE: lab_test   # holds the rows the MCP tests seeded
+        run: python tests/check_lab_data.py
+
+      - name: Live dashboard page is up to date with its generator
+        run: |
+          python web/live/build_live_page.py
+          # The generator writes CRLF; the repository stores LF.
+          sed -i 's/\r$//' web/live/lab-dashboard-live.html
+          git diff --exit-code web/live/lab-dashboard-live.html
