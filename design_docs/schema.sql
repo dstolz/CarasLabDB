@@ -7,12 +7,33 @@
 --
 --     createdb lab && psql -d lab -f design_docs/schema.sql
 --
+-- This file installs the latest schema version (see lab.schema_version below).
+-- To upgrade an existing database instead, apply the scripts in
+-- design_docs/migrations/ in order; a fresh install from this file and an
+-- upgraded database end up with identical schemas.
+--
 -- Requires privileges to create a schema. gen_random_uuid() is in core since
 -- PG 13; the pgcrypto line is a fallback for older servers.
 -- ============================================================================
 
 -- CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- only needed on PG < 13
 CREATE SCHEMA IF NOT EXISTS lab;
+
+-- ---------------------------------------------------------------------------
+-- Schema version
+-- ---------------------------------------------------------------------------
+-- One row per applied schema version; the current version is max(version).
+-- This file installs the latest version directly; an existing database is
+-- brought up to date by the scripts in design_docs/migrations/, each of which
+-- inserts its own row. Clients (the CarasLabDB MATLAB class, the MCP server)
+-- read max(version) at connect time and warn when it is not the version they
+-- were written for -- a client with hard-coded column lists can otherwise
+-- return wrong data against a changed schema rather than failing.
+CREATE TABLE lab.schema_version (
+    version     integer PRIMARY KEY,
+    applied_at  timestamptz NOT NULL DEFAULT now(),
+    description text NOT NULL
+);
 
 -- ---------------------------------------------------------------------------
 -- Reference / lookup tables
@@ -223,6 +244,14 @@ CREATE TABLE lab.event (
     -- a client that writes a bare array or scalar breaks every consumer that
     -- does attributes->>'key', and the GIN index below assumes object shape.
     CONSTRAINT event_attributes_object_ck CHECK (jsonb_typeof(attributes) = 'object'),
+    -- Every event is about an animal except an analysis run, which may span
+    -- several (a cross-animal analysis). A birth, surgery, recording, behavior,
+    -- husbandry, endpoint or histology event with no subject is an entry
+    -- error that every per-subject view would silently drop. A session-only
+    -- insert still passes: trg_event_fill_subject runs BEFORE INSERT, ahead of
+    -- this CHECK, and fills subject_id in from the session.
+    CONSTRAINT event_subject_required_ck CHECK (
+        subject_id IS NOT NULL OR event_type = 'analysis'),
     UNIQUE (event_id, event_type),              -- FK target for detail tables
     -- An event that names a session must name that session's subject. Without
     -- this an event could be filed under animal A while pointing at a session
@@ -393,7 +422,10 @@ CREATE TABLE lab.artifact (
     attributes           jsonb NOT NULL DEFAULT '{}'::jsonb,
     CHECK (supersedes <> artifact_id),
     CONSTRAINT artifact_attributes_object_ck CHECK (jsonb_typeof(attributes) = 'object'),
-    UNIQUE (storage_root_id, relative_path, checksum),
+    -- File identity (storage_root_id, relative_path, checksum) is de-duplicated
+    -- by uq_artifact_file_original and trg_artifact_unique_active below, not by
+    -- a table-wide UNIQUE: a correction to an artifact's metadata, or to the
+    -- event that produced it, is a new row describing the *same* file.
     -- Same subject/session agreement rule as lab.event; see the comment there.
     -- NO ACTION for the same reason as event_session_subject_fk above.
     CONSTRAINT artifact_session_subject_fk FOREIGN KEY (session_id, subject_id)
@@ -404,8 +436,8 @@ CREATE TABLE lab.artifact (
     -- a malformed registration. Require the exact hex width of the declared
     -- algorithm. trg_artifact_normalize lower-cases the value first, so mixed
     -- case is accepted on input but stored canonically -- without that, 'AB..'
-    -- and 'ab..' are two different rows under the UNIQUE above and the same
-    -- bytes get registered twice.
+    -- and 'ab..' are two different keys to uq_artifact_file_original (below)
+    -- and the same bytes get registered twice.
     CONSTRAINT artifact_checksum_format_ck CHECK (
         checksum ~ '^[0-9a-f]+$'
         AND length(checksum) = CASE checksum_algo
@@ -430,6 +462,15 @@ CREATE TABLE lab.artifact (
 );
 CREATE UNIQUE INDEX uq_artifact_supersedes
     ON lab.artifact (supersedes) WHERE supersedes IS NOT NULL;
+-- One original registration per file: the same bytes at the same path cannot
+-- be registered twice. Corrections (supersedes IS NOT NULL) are exempt because
+-- a correction that only changes role/format/session/attributes, or re-points
+-- produced_by_event_id at a corrected event, necessarily describes the same
+-- file as the row it replaces. trg_artifact_unique_active (below) closes the
+-- remaining gap: no two *active* rows may describe the same file.
+CREATE UNIQUE INDEX uq_artifact_file_original
+    ON lab.artifact (storage_root_id, relative_path, checksum)
+    WHERE supersedes IS NULL;
 
 CREATE TABLE lab.event_input (
     event_id    uuid NOT NULL REFERENCES lab.event(event_id),
@@ -451,6 +492,44 @@ CREATE TABLE lab.artifact_verification (
         status <> 'mismatch' OR observed_checksum IS NOT NULL),
     CONSTRAINT verification_checksum_format_ck CHECK (
         observed_checksum IS NULL OR observed_checksum ~ '^[0-9a-f]+$')
+);
+
+-- ---------------------------------------------------------------------------
+-- Audit logs
+-- ---------------------------------------------------------------------------
+-- Both are append-only (see the trigger loop below). Clients never write to
+-- them directly: maintenance_log is written by lab.fn_rename_subject, and
+-- row_history by the lab.fn_log_row_change triggers.
+
+-- Identity-maintenance operations (subject renames); see lab.fn_rename_subject.
+CREATE TABLE lab.maintenance_log (
+    maintenance_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    performed_at   timestamptz NOT NULL DEFAULT now(),
+    performed_by   text NOT NULL DEFAULT current_user,
+    operation      text NOT NULL,
+    details        jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- Prior versions of rows in the *mutable* tables (the reference tables,
+-- project tables, subject and session). Those tables are deliberately editable
+-- in place, but an in-place edit with no record of the previous value or of
+-- who made it is the same provenance gap the event log exists to close. One
+-- row per UPDATE that changed something, or per DELETE.
+--
+-- changed_by is session_user -- the login that connected -- rather than
+-- current_user, which SET ROLE can change and which is the function owner
+-- inside the SECURITY DEFINER trigger that writes this table. With per-person
+-- logins it identifies the editor without client cooperation.
+CREATE TABLE lab.row_history (
+    history_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    changed_by text NOT NULL DEFAULT session_user,
+    table_name text NOT NULL,
+    operation  text NOT NULL CHECK (operation IN ('UPDATE','DELETE')),
+    row_key    jsonb NOT NULL,           -- primary key of the row, before the change
+    old_row    jsonb NOT NULL,
+    new_row    jsonb,                    -- NULL for a DELETE
+    CONSTRAINT row_history_new_row_ck CHECK ((operation = 'UPDATE') = (new_row IS NOT NULL))
 );
 
 -- ---------------------------------------------------------------------------
@@ -493,16 +572,60 @@ CREATE INDEX ix_project_artifact_project ON lab.project_artifact (project_id);
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION lab.fn_forbid_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$
+DECLARE
+    v_from text;
+    v_to   text;
+    v_old  jsonb;
+    v_new  jsonb;
+    v_ok   boolean;
+    c      text;
 BEGIN
     -- Narrow, audited escape hatch for identity maintenance only. Renaming a
     -- subject cascades an UPDATE into these append-only tables (see
     -- lab.fn_rename_subject), which is a relabelling of *who* a row is about,
     -- not a change to *what happened*. DELETE and TRUNCATE are never allowed,
-    -- and the flag is transaction-local (set_config(..., is_local => true)).
+    -- and the flags are transaction-local (set_config(..., is_local => true)).
+    --
+    -- The flag alone is not trusted -- any session can set a custom setting --
+    -- so under it only an UPDATE that is exactly the cascade of a completed
+    -- rename passes: every column other than the subject-id columns is
+    -- unchanged, every subject-id column that changed went from
+    -- lab.rename_from to lab.rename_to, the old subject id no longer exists
+    -- and the new one does.
     IF TG_OP = 'UPDATE'
        AND coalesce(current_setting('lab.maintenance', true), '') = 'subject_rename'
     THEN
-        RETURN NEW;
+        v_from := coalesce(current_setting('lab.rename_from', true), '');
+        v_to   := coalesce(current_setting('lab.rename_to', true), '');
+        v_old  := to_jsonb(OLD);
+        v_new  := to_jsonb(NEW);
+        v_ok   := v_from <> '' AND v_to <> ''
+              AND NOT EXISTS (SELECT 1 FROM lab.subject WHERE subject_id = v_from)
+              AND EXISTS (SELECT 1 FROM lab.subject WHERE subject_id = v_to)
+              AND (v_old - 'subject_id' - 'dam_subject_id' - 'sire_subject_id')
+                = (v_new - 'subject_id' - 'dam_subject_id' - 'sire_subject_id');
+        IF v_ok THEN
+            FOREACH c IN ARRAY ARRAY['subject_id', 'dam_subject_id', 'sire_subject_id'] LOOP
+                IF (v_old -> c) IS DISTINCT FROM (v_new -> c)
+                   AND NOT ((v_old ->> c) = v_from AND (v_new ->> c) = v_to) THEN
+                    v_ok := false;
+                END IF;
+            END LOOP;
+        END IF;
+        IF v_ok THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION
+          'lab.maintenance = subject_rename admits only the subject-id relabelling '
+          'performed by lab.fn_rename_subject; this UPDATE on %.% is not one',
+          TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;
+
+    IF TG_TABLE_NAME IN ('artifact_verification', 'maintenance_log',
+                         'row_history', 'schema_version') THEN
+        RAISE EXCEPTION
+          '% on %.% is not allowed: this table is an append-only log.',
+          TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
 
     IF TG_TABLE_NAME = 'event_input' THEN
@@ -527,7 +650,8 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'event','birth_event','surgery_event','recording_event','behavior_event',
         'husbandry_event','endpoint_event','histology_event','analysis_event',
-        'artifact','event_input'
+        'artifact','event_input',
+        'artifact_verification','maintenance_log','row_history','schema_version'
     ] LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_immutable_%1$s ON lab.%1$s;', t);
@@ -622,8 +746,8 @@ CREATE TRIGGER trg_event_supersede_same_type
 
 -- Canonicalize checksums to lower-case hex on the way in, so that the same
 -- bytes registered by a client that emits upper-case hex de-duplicate against
--- UNIQUE(storage_root_id, relative_path, checksum) instead of creating a
--- second artifact row for the identical file.
+-- uq_artifact_file_original / trg_artifact_unique_active instead of creating
+-- a second artifact row for the identical file.
 CREATE OR REPLACE FUNCTION lab.fn_normalize_checksum() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -641,7 +765,7 @@ CREATE TRIGGER trg_artifact_normalize
     FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_checksum();
 
 CREATE TRIGGER trg_verification_normalize
-    BEFORE INSERT OR UPDATE ON lab.artifact_verification
+    BEFORE INSERT ON lab.artifact_verification
     FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_checksum();
 
 -- Canonicalize path separators on the way in, for the same reason checksums
@@ -676,6 +800,116 @@ CREATE TRIGGER trg_project_artifact_normalize_path
     BEFORE INSERT OR UPDATE ON lab.project_artifact
     FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_path();
 
+-- No two *active* artifacts may describe the same file. uq_artifact_file_original
+-- covers original registrations only, because a correction necessarily repeats
+-- the file identity of the row it supersedes; this covers the rest: a new row
+-- is rejected when an active artifact other than the one it supersedes already
+-- has the same (storage_root_id, relative_path, checksum). The trigger name
+-- sorts after trg_artifact_normalize and trg_artifact_normalize_path, and
+-- BEFORE triggers fire in name order, so the comparison sees the normalized
+-- checksum and path.
+CREATE OR REPLACE FUNCTION lab.fn_artifact_unique_active() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE dup uuid;
+BEGIN
+    SELECT a.artifact_id INTO dup
+    FROM lab.artifact_active a
+    WHERE a.storage_root_id = NEW.storage_root_id
+      AND a.relative_path   = NEW.relative_path
+      AND a.checksum        = NEW.checksum
+      AND a.artifact_id IS DISTINCT FROM NEW.supersedes
+    LIMIT 1;
+    IF dup IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'unique_violation',
+            MESSAGE = format('active artifact %s already registers this file '
+                             '(storage_root_id %s, relative_path %s, checksum %s)',
+                             dup, NEW.storage_root_id, NEW.relative_path, NEW.checksum),
+            HINT    = 'Supersede that artifact instead of registering the file again.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_artifact_unique_active
+    BEFORE INSERT ON lab.artifact
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_artifact_unique_active();
+
+-- The provenance graph must stay acyclic. An event that consumes an artifact
+-- derived from its own output (most simply, the artifact it produced) makes
+-- fn_artifact_lineage walk the loop to its depth cap and report a long,
+-- wrong ancestry. Reject the edge if the event already appears among the
+-- artifact's ancestors (bounded by the same depth cap of 64).
+CREATE OR REPLACE FUNCTION lab.fn_forbid_provenance_cycle() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM lab.fn_artifact_lineage(NEW.artifact_id, 'up') l
+               WHERE l.event_id = NEW.event_id) THEN
+        RAISE EXCEPTION
+          'event % cannot consume artifact %: the artifact derives from that '
+          'event, so the edge would make the provenance graph cyclic',
+          NEW.event_id, NEW.artifact_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_event_input_acyclic
+    BEFORE INSERT ON lab.event_input
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_forbid_provenance_cycle();
+
+-- Edit history for the mutable tables (see lab.row_history). SECURITY DEFINER
+-- so that clients need no INSERT privilege on row_history and cannot write
+-- forged history rows; the trigger arguments name the table's primary-key
+-- columns.
+CREATE OR REPLACE FUNCTION lab.fn_log_row_change() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_key jsonb := '{}'::jsonb;
+    i     integer;
+BEGIN
+    IF TG_OP = 'UPDATE' AND to_jsonb(OLD) = to_jsonb(NEW) THEN
+        RETURN NULL;    -- nothing changed, nothing to record
+    END IF;
+    FOR i IN 0 .. TG_NARGS - 1 LOOP
+        v_key := v_key || jsonb_build_object(TG_ARGV[i], to_jsonb(OLD) -> TG_ARGV[i]);
+    END LOOP;
+    INSERT INTO lab.row_history (table_name, operation, row_key, old_row, new_row)
+    VALUES (TG_TABLE_NAME, TG_OP, v_key, to_jsonb(OLD),
+            CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(NEW) END);
+    RETURN NULL;        -- AFTER trigger: the return value is ignored
+END;
+$$;
+
+DO $$
+DECLARE r record;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('person',             '''person_id'''),
+        ('storage_root',       '''root_id'''),
+        ('species',            '''code'''),
+        ('probe',              '''probe_id'''),
+        ('pipeline',           '''pipeline_id'''),
+        ('event_type',         '''code'''),
+        ('artifact_role',      '''code'''),
+        ('acquisition_system', '''code'''),
+        ('project',            '''project_id'''),
+        ('project_member',     '''project_id'', ''person_id'''),
+        ('project_artifact',   '''project_artifact_id'''),
+        ('subject',            '''subject_id'''),
+        ('session',            '''session_id''')
+    ) AS v(tbl, pk_args) LOOP
+        EXECUTE format(
+          'DROP TRIGGER IF EXISTS trg_history_%1$s ON lab.%1$s;', r.tbl);
+        EXECUTE format(
+          'CREATE TRIGGER trg_history_%1$s
+             AFTER UPDATE OR DELETE ON lab.%1$s
+             FOR EACH ROW EXECUTE FUNCTION lab.fn_log_row_change(%2$s);',
+          r.tbl, r.pk_args);
+    END LOOP;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Identity maintenance
 -- ---------------------------------------------------------------------------
@@ -687,16 +921,9 @@ CREATE TRIGGER trg_project_artifact_normalize_path
 -- subject strands that animal's history under the wrong ID forever.
 --
 -- The FKs to lab.subject(subject_id) therefore declare ON UPDATE CASCADE, and
--- lab.fn_rename_subject performs the rename behind a transaction-local flag
--- that fn_forbid_mutation honours for UPDATE only. Every rename is recorded.
-CREATE TABLE lab.maintenance_log (
-    maintenance_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    performed_at   timestamptz NOT NULL DEFAULT now(),
-    performed_by   text NOT NULL DEFAULT current_user,
-    operation      text NOT NULL,
-    details        jsonb NOT NULL DEFAULT '{}'::jsonb
-);
-
+-- lab.fn_rename_subject performs the rename behind transaction-local flags
+-- that fn_forbid_mutation honours for exactly this relabelling and nothing
+-- else. Every rename is recorded in lab.maintenance_log.
 CREATE OR REPLACE FUNCTION lab.fn_rename_subject(p_old text, p_new text)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
@@ -715,9 +942,15 @@ BEGIN
     END IF;
 
     -- is_local => true: scoped to this transaction, reset automatically.
+    -- fn_forbid_mutation checks every cascaded row change against the
+    -- from/to pair, so the flag cannot be used to change anything else.
     PERFORM set_config('lab.maintenance', 'subject_rename', true);
+    PERFORM set_config('lab.rename_from', p_old, true);
+    PERFORM set_config('lab.rename_to', p_new, true);
     UPDATE lab.subject SET subject_id = p_new WHERE subject_id = p_old;
     PERFORM set_config('lab.maintenance', '', true);
+    PERFORM set_config('lab.rename_from', '', true);
+    PERFORM set_config('lab.rename_to', '', true);
 
     INSERT INTO lab.maintenance_log (operation, details)
     VALUES ('subject_rename',
@@ -861,6 +1094,15 @@ LANGUAGE sql STABLE AS $$
         UNION ALL SELECT event_id FROM lab.analysis_event)
 
     UNION ALL
+    -- Non-analysis events with no subject. event_subject_required_ck rejects
+    -- these on insert; this reports rows that predate the constraint in a
+    -- database migrated from schema version 1 (where it may be NOT VALID).
+    SELECT 'warning', 'event_missing_subject', e.event_id::text,
+           format('%s event has no subject_id', e.event_type)
+    FROM lab.event e
+    WHERE e.subject_id IS NULL AND e.event_type <> 'analysis'
+
+    UNION ALL
     -- Artifacts whose most recent integrity check failed.
     SELECT 'error', 'artifact_verification_failed', a.artifact_id::text,
            format('latest verification is %s (%s)', v.status, v.verified_at)
@@ -886,6 +1128,18 @@ LANGUAGE sql STABLE AS $$
     FROM lab.artifact_active a
     WHERE NOT EXISTS (SELECT 1 FROM lab.artifact_verification av
                       WHERE av.artifact_id = a.artifact_id)
+
+    UNION ALL
+    -- Active artifacts whose producing event has been corrected: the current
+    -- version of the event lists no files while these stay attached to a row
+    -- event_active hides. Supersede each such artifact with
+    -- produced_by_event_id set to the current event (CarasLabDB.supersedeEvent
+    -- does this as part of the correction).
+    SELECT 'warning', 'artifact_producer_superseded', a.artifact_id::text,
+           format('produced by event %s, which is superseded by event %s',
+                  a.produced_by_event_id, s.event_id)
+    FROM lab.artifact_active a
+    JOIN lab.event s ON s.supersedes = a.produced_by_event_id
 
     UNION ALL
     -- Two active artifacts at one path: the NAS file can only be one of them.
@@ -925,6 +1179,13 @@ INSERT INTO lab.species (code, common_name) VALUES
     ('mus_musculus','House mouse'),
     ('rattus_norvegicus','Norway rat')
 ON CONFLICT (code) DO NOTHING;
+
+-- The version this file installs. Keep in step with the newest script in
+-- design_docs/migrations/ and with the client constants that check it
+-- (CarasLabDB.SchemaVersionExpected, caraslabdb_mcp.db.SCHEMA_VERSION).
+INSERT INTO lab.schema_version (version, description) VALUES
+    (2, 'Fresh install from schema.sql')
+ON CONFLICT (version) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Roles (deployment-specific -- intentionally not created here)
