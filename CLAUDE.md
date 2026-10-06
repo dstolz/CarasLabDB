@@ -141,10 +141,10 @@ walkthrough script, not an automated test, and assumes a reachable database.
 
 ## MATLAB coding conventions (enforced, not optional)
 
-- Target **MATLAB R2025a or later**.
+- Target **MATLAB R2024b or later** (developed on R2025a; the database-free code and GUI were checked on R2024b).
 - Parse all function inputs with the `arguments` block syntax (Name=Value
   style throughout this codebase).
-- R2025a validates `arguments` default values eagerly, so
+- `arguments` default values are validated eagerly (R2024b and later), so
   `double {mustBeInteger} = NaN` fails even when the argument is omitted —
   use `double {mustBeInteger, mustBeScalarOrEmpty} = []` for optional
   integer scalars (see `NChannels` in multiple files for the pattern).

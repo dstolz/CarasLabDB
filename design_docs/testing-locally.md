@@ -40,7 +40,7 @@ Everything runs on one Windows 11 box:
 
 - **PostgreSQL 14+** installed and the service running (`Get-Service postgresql*`).
 - `psql`, `createdb`, `dropdb`, `pg_dump` on `PATH` (see `deployment-windows.md` §1.1).
-- **MATLAB R2025a+** with **Database Toolbox**.
+- **MATLAB R2024b+** with **Database Toolbox**.
 - **Python** (optional) if you want to serve the dashboard over HTTP.
 - The repo checked out at a stable path, e.g. `C:\src\CarasLabDB`.
 
@@ -314,7 +314,7 @@ than `postgres`.
 ### 2.1 Confirm the toolchain
 
 ```matlab
-ver                                  % MATLAB >= 25.1 (R2025a)
+ver                                  % MATLAB >= 24.2 (R2024b)
 license('test','Database_Toolbox')   % 1 = licensed
 exist('postgresql')                  % 2 = native interface present
 ```

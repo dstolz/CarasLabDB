@@ -108,7 +108,7 @@ and browse subjects, sessions, events and artifacts; add and correct events; run
 vetted read-only custom SQL. Because the schema is append-only, "editing" an
 event creates a superseding correction rather than mutating in place.
 
-**Requirements:** MATLAB R2025a or later with the Database Toolbox.
+**Requirements:** MATLAB R2024b or later with the Database Toolbox.
 
 ## Getting started
 

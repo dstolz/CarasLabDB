@@ -13,7 +13,7 @@
 % File > Save As > Live Script (.mlx) if you want the binary Live Script
 % format instead of this plain .m.
 %
-% Requires MATLAB R2025a+, Database Toolbox, and a reachable Postgres
+% Requires MATLAB R2024b+, Database Toolbox, and a reachable Postgres
 % instance with design_docs/schema.sql applied.
 addpath("C:\src\CarasLabDB");
 

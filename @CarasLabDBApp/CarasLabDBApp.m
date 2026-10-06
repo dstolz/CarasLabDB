@@ -17,7 +17,7 @@ classdef CarasLabDBApp < handle
 %       app = CarasLabDBApp();          % opens a login dialog
 %       app = CarasLabDBApp(db);        % reuse an open CarasLabDB handle
 %
-%   Requires MATLAB R2025a or later and the Database Toolbox.
+%   Requires MATLAB R2024b or later and the Database Toolbox.
 %
 %   See also CARASLABDB.
 

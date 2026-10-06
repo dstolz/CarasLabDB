@@ -32,7 +32,7 @@ you want it hosted there, but any static host works.
 |-----------|----------|---------------|
 | Database | DSM 7.2+, **Container Manager** package, an x86_64 Synology model | The NAS |
 | Live dashboard | Same Container Manager stack | The NAS |
-| MATLAB interface + GUI | MATLAB **R2025a+** with **Database Toolbox** | Each researcher workstation |
+| MATLAB interface + GUI | MATLAB **R2024b+** with **Database Toolbox** | Each researcher workstation |
 | Static dashboard | Any modern browser; optionally Web Station | Anywhere |
 
 **Check Docker support before committing to this plan.** Container Manager

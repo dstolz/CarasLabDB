@@ -54,7 +54,7 @@ classdef CarasLabDB < handle
 %       addAnalysisEvent, addArtifact, supersedeEvent, supersedeArtifact,
 %       artifactLineage.
 %
-%   Requires MATLAB R2025a or later and the Database Toolbox.
+%   Requires MATLAB R2024b or later and the Database Toolbox.
 %
 %   NOTE ON SQL SAFETY: values are escaped and formatted into SQL literals
 %   by the private SQLLITERAL helper (single quotes doubled, typed casts for

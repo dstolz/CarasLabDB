@@ -29,7 +29,7 @@ run as your normal login user.
 | Component | Requires | Where it runs |
 |-----------|----------|---------------|
 | Database  | PostgreSQL 14 or newer | Lab server (or localhost for testing) |
-| MATLAB interface + GUI | MATLAB **R2025a+** with **Database Toolbox** | Each researcher workstation |
+| MATLAB interface + GUI | MATLAB **R2024b+** with **Database Toolbox** | Each researcher workstation |
 | Web dashboard | Any modern browser; Python 3 (optional, only to serve it) | Anywhere |
 
 The database and MATLAB pieces can both live on one machine for a single-user
@@ -176,18 +176,18 @@ Restrict the firewall rule and `pg_hba.conf` to trusted subnets; do not expose
 
 ### 2.1 Requirements
 
-- **MATLAB R2025a or later** (the code uses `arguments`-block features and
-  validation behavior specific to R2025a). The Linux installer places MATLAB
-  under `/usr/local/MATLAB/R2025a` by default; launch it with `matlab` (symlink
+- **MATLAB R2024b or later** (the code uses `arguments`-block syntax with
+  eager default-value validation; developed on R2025a; the GUI and non-database code were checked on R2024b). The Linux installer places MATLAB
+  under `/usr/local/MATLAB/<release>` (e.g. `R2024b`) by default; launch it with `matlab` (symlink
   the binary onto your `PATH` if the installer did not: `sudo ln -s
-  /usr/local/MATLAB/R2025a/bin/matlab /usr/local/bin/matlab`).
+  /usr/local/MATLAB/R2024b/bin/matlab /usr/local/bin/matlab`).
 - **Database Toolbox** — the class connects via the native `postgresql()`
   interface. No ODBC DSN or JDBC `.jar` configuration is required.
 
 Confirm both are present in MATLAB:
 
 ```matlab
-ver                              % check MATLAB version >= 25.1 (R2025a)
+ver                              % check MATLAB version >= 24.2 (R2024b)
 license('test','Database_Toolbox')   % returns 1 if licensed
 exist('postgresql')              % returns 2 if the native interface is available
 ```

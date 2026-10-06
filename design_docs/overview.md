@@ -47,7 +47,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
 | MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema |
 
-MATLAB target: R2025a or newer, with the Database Toolbox. The class connects
+MATLAB target: R2024b or newer, with the Database Toolbox. The class connects
 through the toolbox's **native `postgresql()`** interface, so no ODBC DSN and no
 JDBC driver `.jar` need to be installed or configured. See
 [Database design](database-design.md) for the table-by-table model and
