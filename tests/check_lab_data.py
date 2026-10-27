@@ -15,7 +15,8 @@ import server  # noqa: E402
 
 ARRAYS = ("people", "probes", "pipelines", "storageRoots", "species", "projects",
           "projectMembers", "projectArtifacts", "subjects", "sessions", "events",
-          "artifacts", "eventInputs", "eventTypeMeta", "roleMeta")
+          "artifacts", "eventInputs", "eventTypeMeta", "roleMeta",
+          "tagNamespaces", "tags", "tagAssignments")
 
 
 def fail(msg):
@@ -40,5 +41,13 @@ for e in data["events"]:
 for a in data["artifacts"]:
     if not isinstance(a.get("verification"), dict) or "status" not in a["verification"]:
         fail("artifact %s has no verification status" % a.get("artifact_id"))
-print("check_lab_data: OK (%d events, %d artifacts)"
-      % (len(data["events"]), len(data["artifacts"])))
+for n in data["tagNamespaces"]:
+    if not isinstance(n.get("applies_to"), list):
+        fail("tag namespace %s applies_to is not an array" % n.get("namespace"))
+for r in data["tagAssignments"]:
+    if not isinstance(r.get("entity_id"), str) or r.get("op") not in ("add", "remove"):
+        fail("tag assignment %s has no entity_id or a bad op" % r.get("assignment_id"))
+    if not str(r.get("applied_at", "")).endswith("Z"):
+        fail("tag assignment %s applied_at is not UTC ISO-8601" % r.get("assignment_id"))
+print("check_lab_data: OK (%d events, %d artifacts, %d tag assignments)"
+      % (len(data["events"]), len(data["artifacts"]), len(data["tagAssignments"])))

@@ -136,12 +136,14 @@ try{
   .filters{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;}
   .filter-group{display:flex;flex-direction:column;gap:4px;}
   .filter-group label{font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:rgba(234,240,251,.55);font-weight:600;}
-  .filter-group select,.filter-group input[type="date"]{
+  .filter-group select,.filter-group input[type="date"],.filter-group input[type="search"]{
     padding:7px 10px;border:1px solid rgba(255,255,255,.16);border-radius:7px;
     background:rgba(255,255,255,.06);color:var(--text-on-dark);font-size:13px;min-width:150px;
     font-family:inherit;
   }
   .filter-group input[type="date"]{color-scheme:dark;min-width:135px;}
+  .filter-group input[type="search"]{color-scheme:dark;min-width:230px;}
+  .filter-group input[type="search"]::placeholder{color:rgba(234,240,251,.38);}
   .filter-group select option{background:var(--bg-header);color:var(--text-on-dark);}
   .filter-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:rgba(234,240,251,.8);cursor:pointer;user-select:none;padding-bottom:7px;}
   .filter-toggle input{accent-color:var(--accent);width:15px;height:15px;}
@@ -246,6 +248,16 @@ try{
   .pill.succeeded{background:rgba(31,157,85,.13);color:#187a41;}
   .pill.failed{background:rgba(220,53,69,.13);color:#b02a37;}
   .pill.running{background:rgba(76,114,176,.14);color:#3a5c94;}
+
+  /* Tag chips (namespace:value; bare tags shown bare) */
+  .tag-chip{display:inline-block;padding:1px 7px;margin:1px 4px 1px 0;border-radius:10px;font-size:11px;font-weight:600;
+    font-family:'SF Mono',ui-monospace,'Cascadia Mono',Menlo,Consolas,monospace;white-space:nowrap;cursor:pointer;
+    background:rgba(63,167,183,.10);color:#2b7d8b;border:1px solid rgba(63,167,183,.28);}
+  .tag-chip:hover{background:rgba(63,167,183,.2);}
+  .tag-chip.retired{opacity:.6;text-decoration:line-through;}
+  html[data-theme="dark"] .tag-chip{background:rgba(63,167,183,.18);color:#8fdcea;border-color:rgba(63,167,183,.4);}
+  .tags-card{margin-bottom:var(--gap);}
+  .tags-table{overflow:auto;max-height:420px;}
 
   .link{color:var(--accent);cursor:pointer;font-weight:550;}
   .link:hover{text-decoration:underline;}
@@ -396,6 +408,11 @@ try{
         <label for="f-to">To (occurred)</label>
         <input type="date" id="f-to">
       </div>
+      <div class="filter-group">
+        <label for="f-tags">Tags</label>
+        <input type="search" id="f-tags" placeholder="stage:raw -qc:fail topic:*" autocomplete="off" spellcheck="false"
+               title="Space-separated tags, all of which must match. -tag excludes, ns:* is any tag in a namespace, a bare word is a bare tag (#)">
+      </div>
       <label class="filter-toggle"><input type="checkbox" id="f-active" checked> Active only</label>
       <button class="btn-reset" id="f-clear" title="Reset filters (f)">Reset filters</button>
     </div>
@@ -428,9 +445,14 @@ try{
   artifacts:[ /* {artifact_id,produced_by_event_id,storage_root_id,relative_path,
                  checksum,size_bytes,role,format,subject_id,session_id,supersedes,
                  verification:{status,verified_at}} */ ],
-  eventInputs:[ /* {event_id, artifact_id, role} */ ]
+  eventInputs:[ /* {event_id, artifact_id, role} */ ],
+  tagNamespaces:[ /* {namespace,description,mutability,cardinality,open_vocabulary,
+                     applies_to:[...],created_at,created_by} */ ],
+  tags:[ /* {tag,namespace,value,description,retired_at,created_at,created_by} */ ],
+  tagAssignments:[ /* append-only log, oldest first: {assignment_id,entity_kind,
+                      entity_id,tag,op:'add'|'remove',note,applied_at,applied_by} */ ]
 };</pre>
-      <p>Field names mirror the schema columns. <code>detail</code> holds the class-table-inheritance columns for that event type (e.g. <code>recording_event.sample_rate_hz</code>). Superseded rows are detected via the <code>supersedes</code> links, exactly like the <code>event_active</code> / <code>artifact_active</code> views.</p>
+      <p>Field names mirror the schema columns. <code>detail</code> holds the class-table-inheritance columns for that event type (e.g. <code>recording_event.sample_rate_hz</code>). Superseded rows are detected via the <code>supersedes</code> links, exactly like the <code>event_active</code> / <code>artifact_active</code> views, and each row's current tags are derived from <code>tagAssignments</code> the way <code>lab.tag_current</code> derives them (latest row per entity and tag wins if it is an <code>add</code>).</p>
     </div>
   </details>
 
@@ -462,6 +484,11 @@ try{
         <div class="card-sub">Registered bytes on the NAS</div>
         <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
       </div>
+    </div>
+    <div class="card tags-card">
+      <h3>Tags</h3>
+      <div class="card-sub"><span id="tags-meta"></span> · current tags on the rows in the current selection; click a tag to filter by it</div>
+      <div id="tags-table" class="tags-table"></div>
     </div>
   </section>
 
@@ -909,11 +936,209 @@ try{
     }
   });
 
+  // -- tags -------------------------------------------------------------------
+  // Drawn after everything above, so adding tags left the rest of the dataset
+  // (same seed, same stream) exactly as it was. The vocabulary mirrors the
+  // schema.sql seed, and the assignment log obeys each namespace's policy the
+  // way lab.fn_tag and trg_tag_assignment_policy would: applies_to, single
+  // cardinality as remove + add, immutable tags never removed, closed
+  // vocabularies limited to their registered values, retired tags not reused.
+  const HOUR = 3600000;
+  const T = s => Date.parse(s);
+  const TAG_SEEDED_AT = iso(T('2024-09-01T12:00:00Z'));
+  const ALL_KINDS = ['event','artifact','subject','session','project'];
+  const tagNamespaces = [
+    {namespace:'cohort',    description:'Experimental cohort; permanent once assigned.',
+     mutability:'immutable', cardinality:'single', open_vocabulary:true,  applies_to:['subject','session']},
+    {namespace:'condition', description:'Experimental condition or group; permanent once assigned.',
+     mutability:'immutable', cardinality:'single', open_vocabulary:true,  applies_to:['subject','session','event']},
+    {namespace:'qc',        description:'Quality-control outcome.',
+     mutability:'mutable',   cardinality:'single', open_vocabulary:false, applies_to:['artifact','event','session']},
+    {namespace:'stage',     description:'Where an artifact is in the processing pipeline; changes as it moves on. Distinct from artifact.role, which is what the file is and is fixed at registration.',
+     mutability:'mutable',   cardinality:'single', open_vocabulary:false, applies_to:['artifact']},
+    {namespace:'tag',       description:'Bare tags, written without a namespace (auditory_cortex is tag:auditory_cortex). Reserved: its policy cannot change.',
+     mutability:'mutable',   cardinality:'multi',  open_vocabulary:true,  applies_to:ALL_KINDS.slice()},
+    {namespace:'topic',     description:'Free-form subject matter.',
+     mutability:'mutable',   cardinality:'multi',  open_vocabulary:true,  applies_to:ALL_KINDS.slice()}
+  ].map(n=>Object.assign(n,{created_at:TAG_SEEDED_AT, created_by:null}));
+  const nsByName = new Map(tagNamespaces.map(n=>[n.namespace,n]));
+
+  const tags = [], tagByName = new Map();
+  function registerTag(tag, description, at, by, auto){
+    const i = tag.indexOf(':');
+    const t = {tag, namespace:tag.slice(0,i), value:tag.slice(i+1), description:description||null,
+               retired_at:null, created_at:iso(at), created_by:by, _auto:!!auto, _at:at};
+    tags.push(t); tagByName.set(tag,t); return t;
+  }
+  [['stage:raw','As acquired'],['stage:preprocessed','Filtered / re-referenced / converted'],
+   ['stage:sorted','Spike-sorted'],['stage:curated','Sorting curated by hand'],
+   ['stage:analyzed','Used in a finished analysis'],['qc:pending','Not yet reviewed'],
+   ['qc:pass','Passed review'],['qc:fail','Failed review']]
+    .forEach(([t,d])=>registerTag(t,d,T(TAG_SEEDED_AT),null));
+  // one retired tag: it stays on the rows that carry it but takes no new ones
+  registerTag('tag:legacy_import','Imported from the pre-database spreadsheet',T(TAG_SEEDED_AT),PI.person_id)
+    .retired_at = iso(T('2025-12-01T17:00:00Z'));
+
+  const tagLog = [];            // assignment ids are handed out after a time sort
+  const curTags = new Map();    // 'kind|id' -> Set of current tags, to police the policy
+  const nsOf = t => t.slice(0, t.indexOf(':'));
+  // Mirrors lab.fn_tag (tags are passed canonical). Calls for one entity must
+  // come in time order; a call the policy would reject is simply not logged.
+  function tagIt(kind, id, tag, at, by, op, note){
+    op = op||'add';
+    const ns = nsByName.get(nsOf(tag));
+    if(at > NOW || !ns || !ns.applies_to.includes(kind)) return false;
+    const key = kind+'|'+id;
+    if(!curTags.has(key)) curTags.set(key, new Set());
+    const cur = curTags.get(key);
+    const log = (t,o,n)=> tagLog.push({entity_kind:kind, entity_id:id, tag:t, op:o, note:n||null,
+                                       applied_at:at, applied_by:by.person_id, _seq:tagLog.length});
+    if(op==='remove'){
+      if(!cur.has(tag) || ns.mutability==='immutable') return false;
+      cur.delete(tag); log(tag,'remove',note); return true;
+    }
+    let def = tagByName.get(tag);
+    if(cur.has(tag) || (!def && !ns.open_vocabulary) || (def && def.retired_at && T(def.retired_at)<=at)) return false;
+    const prev = ns.cardinality==='single' ? [...cur].find(t=>nsOf(t)===ns.namespace) : null;
+    if(prev){
+      if(ns.mutability==='immutable') return false;
+      cur.delete(prev); log(prev,'remove',`replaced by ${tag}`);
+    }
+    if(!def) def = registerTag(tag, null, at, by.person_id, true);
+    else if(def._auto && at < def._at){ def._at=at; def.created_at=iso(at); def.created_by=by.person_id; }
+    cur.add(tag); log(tag,'add',note); return true;
+  }
+  // a correction inherits its predecessor's current tags, as supersedeEvent does
+  function carryTags(kind, oldId, newId, at, by){
+    [...(curTags.get(kind+'|'+oldId)||[])].sort()
+      .forEach(t=> tagIt(kind, newId, t, at, by, 'add', `carried forward from ${oldId}`));
+  }
+  const personOf = id => people.find(p=>p.person_id===id) || PI;
+
+  // projects: subject matter, and one topic dropped when the pilot wound down
+  const projectTopics = [
+    ['topic:plasticity','topic:perceptual_learning','tag:auditory_cortex'],
+    ['topic:am_coding','tag:auditory_cortex'],
+    ['topic:development','topic:thalamocortical'],
+    ['tag:pilot','topic:methods','topic:go_nogo']
+  ];
+  projects.forEach((pr,i)=>{
+    const at0 = T(pr.started_on) + 15*HOUR + ri(0,14)*DAY;
+    projectTopics[i].forEach((t,j)=> tagIt('project', pr.project_id, t, at0 + j*60000, PI));
+  });
+  tagIt('project', projects[3].project_id, 'topic:go_nogo', T('2026-05-04T15:00:00Z'), PI, 'remove',
+    'Pilot wound down; go/nogo training moved to the main projects.');
+
+  // subjects: cohort + condition (immutable), plus bare tags
+  const surgeryBySubject = new Map();
+  events.forEach(e=>{ if(e.event_type==='surgery') surgeryBySubject.set(e.subject_id, e); });
+  subjects.forEach(s=>{
+    const sid = s.subject_id;
+    const at = T(s.created_at) + ri(0,6)*DAY + 2*HOUR;
+    const made = new Date(T(s.created_at));
+    if(chance(0.85)) tagIt('subject', sid, `cohort:${made.getUTCFullYear()}${made.getUTCMonth()<6?'a':'b'}`, at, PI);
+    if(s.species_code==='meriones_unguiculatus' && chance(0.8))
+      tagIt('subject', sid, `condition:${pick(['control','noise_exposed'])}`, at+60000, PI);
+    if(s.source && s.source.startsWith('vendor:')) tagIt('subject', sid, 'tag:legacy_import', at+120000, people[4]);
+    if(s.notes==='Backup animal.') tagIt('subject', sid, 'tag:backup_animal', at+180000, people[4]);
+    const surg = surgeryBySubject.get(sid);
+    if(surg){
+      const region = (surg.detail&&surg.detail.target_region)||'';
+      tagIt('subject', sid, /^(A1|AAF)/.test(region)?'tag:auditory_cortex':'tag:subcortical',
+        T(surg.occurred_at)+DAY, personOf(surg.recorded_by));
+    }
+  });
+
+  // sessions: reviewed after acquisition (qc:pending -> pass/fail)
+  sessions.forEach(s=>{
+    const at = T(s.ended_at) + ri(1,4)*HOUR;
+    tagIt('session', s.session_id, 'qc:pending', at, pick([people[1],people[2],people[3]]));
+    if(s.notes==='Excellent unit yield.') tagIt('session', s.session_id, 'tag:high_yield', at+60000, people[2]);
+    if(s.notes==='Some motion artifact early on.') tagIt('session', s.session_id, 'tag:motion_artifact', at+60000, people[2]);
+    if(chance(0.85)) tagIt('session', s.session_id, chance(0.88)?'qc:pass':'qc:fail', at+ri(1,9)*DAY, pick([PI,people[1]]));
+  });
+
+  // events: recording QC (carried across sample-rate corrections), analysis topics
+  const successorOf = new Map(events.filter(e=>e.supersedes).map(e=>[e.supersedes,e]));
+  events.forEach(e=>{
+    const by = personOf(e.recorded_by);
+    if(e.event_type==='recording' && !e.supersedes){
+      const at = T(e.recorded_at) + HOUR;
+      tagIt('event', e.event_id, 'qc:pending', at, by);
+      const succ = successorOf.get(e.event_id);
+      if(succ){
+        const cat = Math.max(T(succ.recorded_at), at + HOUR);
+        carryTags('event', e.event_id, succ.event_id, cat, personOf(succ.recorded_by));
+        if(chance(0.9)) tagIt('event', succ.event_id, 'qc:pass', cat+ri(1,5)*DAY, people[1]);
+      } else if(chance(0.85)){
+        tagIt('event', e.event_id, chance(0.9)?'qc:pass':'qc:fail', at+ri(1,7)*DAY, pick([PI,people[1]]));
+      }
+    } else if(e.event_type==='analysis'){
+      const d = e.detail||{};
+      const at = T(e.recorded_at);
+      tagIt('event', e.event_id, d.pipeline_name==='kilosort4'?'topic:spike_sorting':'topic:neurometrics', at, by);
+      if(d.status==='failed') tagIt('event', e.event_id, 'qc:fail', at+60000, by, 'add', 'Sorting failed; rerun queued.');
+    } else if(e.event_type==='behavior' && e.detail && e.detail.performance>=0.9){
+      tagIt('event', e.event_id, 'tag:criterion_met', T(e.recorded_at), by);
+    }
+  });
+
+  // artifacts: pipeline stage (single, mutable) and raw-data QC
+  const genEventById = new Map(events.map(e=>[e.event_id,e]));
+  const firstUse = new Map();   // artifact_id -> earliest occurred_at of an event consuming it
+  eventInputs.forEach(ei=>{
+    const t = T(genEventById.get(ei.event_id).occurred_at);
+    if(!firstUse.has(ei.artifact_id) || t < firstUse.get(ei.artifact_id)) firstUse.set(ei.artifact_id, t);
+  });
+  artifacts.forEach(a=>{
+    const id = a.artifact_id, at = T(a.created_at) + 30*60000, by = personOf(a.created_by);
+    const used = firstUse.get(id);
+    switch(a.role){
+      case 'raw':
+        tagIt('artifact', id, 'stage:raw', at, by);
+        tagIt('artifact', id, 'qc:pending', at+60000, by);
+        if(chance(0.8)) tagIt('artifact', id, a.verification.status==='ok' && chance(0.92) ? 'qc:pass' : 'qc:fail',
+          at+ri(1,6)*DAY, pick([PI,people[1]]));
+        break;
+      case 'video':
+        tagIt('artifact', id, 'stage:raw', at, by);
+        tagIt('artifact', id, 'topic:behavior_video', at+60000, by);
+        break;
+      case 'lfp':
+        tagIt('artifact', id, 'stage:preprocessed', at, by);
+        break;
+      case 'waveforms':
+        tagIt('artifact', id, 'stage:sorted', at, by);
+        break;
+      case 'spikes': {
+        tagIt('artifact', id, 'stage:sorted', at, by);
+        const curatedAt = at + ri(1,8)*DAY;
+        if(chance(0.5) && (used==null || curatedAt < used)) tagIt('artifact', id, 'stage:curated', curatedAt, pick([people[1],people[2]]));
+        if(used!=null) tagIt('artifact', id, 'stage:analyzed', used + HOUR, pick([people[1],people[3]]));
+        break;
+      }
+      case 'figure': case 'report': {
+        const ev = genEventById.get(a.produced_by_event_id);
+        tagIt('artifact', id, 'stage:analyzed', at, by);
+        tagIt('artifact', id, ev && ev.event_type==='histology' ? 'tag:probe_track' : 'topic:neurometrics', at+60000, by);
+        break;
+      }
+    }
+  });
+
+  tagLog.sort((a,b)=> a.applied_at-b.applied_at || a._seq-b._seq);
+  const tagAssignments = tagLog.map((r,i)=>({
+    assignment_id:i+1, entity_kind:r.entity_kind, entity_id:r.entity_id, tag:r.tag, op:r.op,
+    note:r.note, applied_at:iso(r.applied_at), applied_by:r.applied_by }));
+  tags.sort((a,b)=> a.tag<b.tag?-1:a.tag>b.tag?1:0);
+  tags.forEach(t=>{ delete t._auto; delete t._at; });
+
   // expose
   window.LAB_DATA = {
     people, probes, pipelines, storageRoots, species,
     projects, projectMembers, projectArtifacts,
-    eventTypeMeta, roleMeta, subjects, sessions, events, artifacts, eventInputs, NOW
+    eventTypeMeta, roleMeta, subjects, sessions, events, artifacts, eventInputs,
+    tagNamespaces, tags, tagAssignments, NOW
   };
 })();
 </script>
@@ -930,7 +1155,7 @@ try{
   // below and leave a white screen, so default every collection to empty.
   ['people','probes','pipelines','storageRoots','species','projects','projectMembers',
    'projectArtifacts','subjects','sessions','events','artifacts','eventInputs',
-   'eventTypeMeta','roleMeta'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
+   'eventTypeMeta','roleMeta','tagNamespaces','tags','tagAssignments'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
   const NOW = D.NOW;
 
   // ---- lookups ----
@@ -965,6 +1190,36 @@ try{
   const supersededArtifacts = new Set(D.artifacts.filter(a=>a.supersedes).map(a=>a.supersedes));
   const isEventActive = e => !supersededEvents.has(e.event_id);
   const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
+
+  // current tags per entity, derived from the append-only assignment log like
+  // lab.tag_current: the latest row per (entity, tag) -- by applied_at, then
+  // assignment_id -- counts when it is an 'add'.
+  const tagNsByName = new Map(D.tagNamespaces.map(n=>[n.namespace,n]));
+  const tagByName = new Map(D.tags.map(t=>[t.tag,t]));
+  const tagKey = (kind,id) => kind+'|'+id;
+  // applied_at compares as text once the fraction has a fixed width (the live
+  // export carries microseconds, the synthetic data milliseconds)
+  const tsKey = s => { const m=/^(.*?)(?:\.(\d+))?Z$/.exec(s||''); return m ? m[1]+'.'+((m[2]||'')+'000000').slice(0,6) : String(s||''); };
+  const latestTagRow = new Map();         // 'kind|id|tag' -> newest log row
+  D.tagAssignments.forEach(r=>{
+    const k=tagKey(r.entity_kind,r.entity_id)+'|'+r.tag, p=latestTagRow.get(k);
+    const rk=tsKey(r.applied_at), pk=p&&tsKey(p.applied_at);
+    if(!p || rk>pk || (rk===pk && r.assignment_id>p.assignment_id)) latestTagRow.set(k,r);
+  });
+  const currentTagsByEntity = new Map();  // 'kind|id' -> [tag], sorted
+  latestTagRow.forEach(r=>{
+    if(r.op!=='add') return;
+    const k=tagKey(r.entity_kind,r.entity_id);
+    if(!currentTagsByEntity.has(k)) currentTagsByEntity.set(k,[]);
+    currentTagsByEntity.get(k).push(r.tag);
+  });
+  currentTagsByEntity.forEach(list=>list.sort());
+  const entityTags = (kind,id) => currentTagsByEntity.get(tagKey(kind,id))||[];
+  // mirrors lab.fn_canonical_tag: lower case and trim; a bare tag (no colon)
+  // lives in the reserved 'tag' namespace. Nothing else is rewritten.
+  const canonicalTag = s => { const t=String(s==null?'':s).trim().toLowerCase(); return t.includes(':') ? t : 'tag:'+t; };
+  const displayTag = t => t.startsWith('tag:') ? t.slice(4) : t;   // as lab.tag_current.display_tag
+  const tagNamespace = t => t.slice(0, t.indexOf(':'));
 
   // provenance edges (produces + consumes), like lab.provenance_edge
   const inputsByEvent = new Map();      // event_id -> [artifact_id]
@@ -1070,6 +1325,14 @@ try{
   const personName = id => { const p=personById.get(id); return p?p.full_name:'—'; };
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
   function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
+  // current tags as clickable chips (a click appends the tag to the tag filter)
+  function tagChips(kind,id){
+    return entityTags(kind,id).map(t=>{
+      const d=displayTag(t), r=(tagByName.get(t)||{}).retired_at;
+      return `<span class="tag-chip${r?' retired':''}" data-tag="${esc(d)}" title="Filter by ${esc(d)}${r?' (retired '+esc(fmtDate(r))+')':''}">${esc(d)}</span>`;
+    }).join('');
+  }
+  const tagCol = kind => ({key:'_tags',label:'Tags',sortable:false,render:r=>tagChips(kind,r[kind+'_id'])});
   function fmtDur(s){ if(s==null) return '—'; const h=Math.floor(s/3600), m=Math.round((s%3600)/60); return h?`${h}h ${m}m`:`${m}m`; }
   // session.started_at/ended_at are both nullable, and fmtDur only guards null —
   // an open session would otherwise render "NaNm". Return null for "unknown".
@@ -1129,8 +1392,28 @@ try{
   }
 
   // ---- filters / state ----
-  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true };
+  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true, tags:'' };
   let currentView='overview';
+
+  // Tag filter: space-separated tokens that must all hold (AND); '-tok' must
+  // not, 'ns:*' is any current tag in namespace ns, and a bare token means
+  // tag:<token>. The same semantics as lab.fn_tag_match(all, NULL, none).
+  function parseTagFilter(text){
+    const q={all:[], none:[]};
+    String(text||'').split(/\s+/).forEach(tok=>{
+      const neg=tok.startsWith('-'), t=neg?tok.slice(1):tok;
+      if(t.trim()) (neg?q.none:q.all).push(canonicalTag(t));
+    });
+    return q;
+  }
+  let tagQuery=parseTagFilter('');
+  function setTagFilter(text){ F.tags=text||''; tagQuery=parseTagFilter(F.tags); }
+  const tagHit = (tags,t) => t.endsWith(':*') ? tags.some(x=>tagNamespace(x)===t.slice(0,-2)) : tags.includes(t);
+  function passTags(kind,id){
+    if(!tagQuery.all.length && !tagQuery.none.length) return true;
+    const tags=entityTags(kind,id);
+    return tagQuery.all.every(t=>tagHit(tags,t)) && !tagQuery.none.some(t=>tagHit(tags,t));
+  }
 
   function passSpecies(subjectId){
     if(F.species==='all') return true;
@@ -1151,6 +1434,7 @@ try{
       if(F.subject!=='all' && e.subject_id!==F.subject) return false;
       if(!passSpecies(e.subject_id)) return false;
       if((F.from||F.to) && !withinDate(e.occurred_at)) return false;
+      if(!passTags('event',e.event_id)) return false;
       return true;
     });
   }
@@ -1158,6 +1442,7 @@ try{
     return D.subjects.filter(s=>{
       if(F.species!=='all' && s.species_code!==F.species) return false;
       if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      if(!passTags('subject',s.subject_id)) return false;
       return true;
     });
   }
@@ -1166,6 +1451,7 @@ try{
       if(F.subject!=='all' && s.subject_id!==F.subject) return false;
       if(!passSpecies(s.subject_id)) return false;
       if((F.from||F.to) && !withinDate(s.started_at)) return false;
+      if(!passTags('session',s.session_id)) return false;
       return true;
     });
   }
@@ -1175,8 +1461,13 @@ try{
       if(F.subject!=='all' && a.subject_id!==F.subject) return false;
       if(!passSpecies(a.subject_id)) return false;
       if((F.from||F.to) && !withinDate(a.created_at)) return false;
+      if(!passTags('artifact',a.artifact_id)) return false;
       return true;
     });
+  }
+  // projects sit outside the species/subject/date filters; only tags narrow them
+  function filteredProjects(){
+    return (D.projects||[]).filter(p=>passTags('project',p.project_id));
   }
 
   /* ------------------------------------------------------------------ KPIs */
@@ -1355,7 +1646,7 @@ try{
   const projKindPill = k => `<span class="pill">${esc(k||'file')}</span>`;
   function renderProjects(){
     const q=(document.getElementById('projects-search').value||'').toLowerCase();
-    let rows=(D.projects||[]).slice();
+    let rows=filteredProjects();
     if(q) rows=rows.filter(p=>{
       const mem=(membersByProject.get(p.project_id)||[]).map(m=>personName(m.person_id)).join(' ');
       return (p.name+' '+(p.description||'')+' '+mem).toLowerCase().includes(q);
@@ -1371,7 +1662,8 @@ try{
       {key:'_docs',label:'Documents',cls:'num',sortVal:p=>(docsByProject.get(p.project_id)||[]).length,render:p=>(docsByProject.get(p.project_id)||[]).length},
       {key:'started_on',label:'Started',sortVal:p=>p.started_on,render:p=>fmtDate(p.started_on)},
       {key:'_status',label:'Status',sortVal:p=>p.is_active?0:1,
-        render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`}
+        render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`},
+      tagCol('project')
     ];
     sortableTable('projects-table',cols,rows,{clickable:true,defaultSort:'name',defaultDir:'asc',
       rowAttrs:p=>`data-project="${esc(p.project_id)}"`, onClick:d=>openProject(d.project)});
@@ -1655,7 +1947,8 @@ try{
       ['Sessions',projSessions.length],
       ['Events',projEvents.length],
       ['Files',`${projArtifacts.length} · ${fmtBytes(projBytes)}`],
-      ['Documents',docs.length]
+      ['Documents',docs.length],
+      ['Tags',tagChips('project',pid),true]
     ]);
 
     body+=`<h4>Members (${mem.length})</h4>`;
@@ -1876,7 +2169,8 @@ try{
       {key:'_sessions',label:'Sessions',cls:'num',sortVal:s=>sessionCountBySubject.get(s.subject_id)||0,render:s=>sessionCountBySubject.get(s.subject_id)||0},
       {key:'_events',label:'Events',cls:'num',sortVal:s=>eventCountBySubject.get(s.subject_id)||0,render:s=>eventCountBySubject.get(s.subject_id)||0},
       {key:'_status',label:'Status',sortVal:s=>subjectCurrent.get(s.subject_id).is_endpointed?1:0,
-        render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`}
+        render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`},
+      tagCol('subject')
     ];
     sortableTable('subjects-table',cols,rows,{clickable:true,defaultSort:'subject_id',defaultDir:'asc',
       rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
@@ -1897,7 +2191,8 @@ try{
       {key:'_root',label:'Storage',render:s=>esc((rootById.get(s.storage_root_id)||{}).name||'—')},
       {key:'relative_path',label:'Path',cls:'mono',render:s=>`<span class="truncate" title="${esc(s.relative_path)}">${esc(s.relative_path)}</span>`},
       {key:'_ev',label:'Events',cls:'num',sortVal:s=>eventCountBySession.get(s.session_id)||0,render:s=>eventCountBySession.get(s.session_id)||0},
-      {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0}
+      {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0},
+      tagCol('session')
     ];
     sortableTable('sessions-table',cols,rows,{clickable:true,defaultSort:'started_at',defaultDir:'desc',
       rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
@@ -1919,7 +2214,8 @@ try{
       {key:'_summary',label:'Summary',sortable:false,render:e=>`<span class="truncate" style="max-width:360px;display:inline-block;vertical-align:bottom">${eventSummary(e)}</span>`},
       {key:'_by',label:'Recorded by',render:e=>esc(personName(e.recorded_by))},
       {key:'_state',label:'State',sortVal:e=>isEventActive(e)?0:1,
-        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`}
+        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`},
+      tagCol('event')
     ];
     sortableTable('events-table',cols,rows,{clickable:true,defaultSort:'occurred_at',defaultDir:'desc',limit:400,
       rowAttrs:e=>`data-event="${e.event_id}"`, onClick:d=>openEvent(d.event)});
@@ -1946,10 +2242,42 @@ try{
       {key:'created_at',label:'Created',sortVal:a=>a.created_at,render:a=>fmtDate(a.created_at)},
       {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
         render:a=>`<span class="pill ${a.verification.status}">${a.verification.status}</span>`},
+      tagCol('artifact'),
       {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
     ];
     sortableTable('artifacts-table',cols,rows,{clickable:true,defaultSort:'size_bytes',defaultDir:'desc',limit:400,
       rowAttrs:a=>`data-artifact="${a.artifact_id}"`, onClick:d=>openArtifact(d.artifact)});
+  }
+
+  /* ------------------------------------------------------- overview: tags */
+  // per-tag counts over the rows in the current selection (current tags only)
+  function renderTagsPanel(){
+    const counts=new Map();   // tag -> {event, artifact, subject, session, project}
+    const tally=(kind,id)=> entityTags(kind,id).forEach(t=>{
+      if(!counts.has(t)) counts.set(t,{event:0,artifact:0,subject:0,session:0,project:0});
+      counts.get(t)[kind]++;
+    });
+    filteredEvents().forEach(e=>tally('event',e.event_id));
+    filteredArtifacts().forEach(a=>tally('artifact',a.artifact_id));
+    filteredSubjects().forEach(s=>tally('subject',s.subject_id));
+    filteredSessions().forEach(s=>tally('session',s.session_id));
+    filteredProjects().forEach(p=>tally('project',p.project_id));
+    const rows=[...counts].map(([tag,c])=>Object.assign({tag, ns:tagNamespace(tag),
+      total:c.event+c.artifact+c.subject+c.session+c.project}, c));
+    document.getElementById('tags-meta').textContent = `${rows.length} tag${rows.length!==1?'s':''} in use · ${D.tagAssignments.length} log row${D.tagAssignments.length!==1?'s':''}`;
+    if(!rows.length){ document.getElementById('tags-table').innerHTML='<div class="empty">No tags on the rows in the current selection.</div>'; return; }
+    const policy = ns => { const n=tagNsByName.get(ns); return n?`${n.mutability} · ${n.cardinality}${n.open_vocabulary?'':' · closed'}`:'—'; };
+    const num = k => ({key:k,label:k==='total'?'Total':k[0].toUpperCase()+k.slice(1)+'s',cls:'num',render:r=>r[k]||'<span class="muted">·</span>'});
+    const cols=[
+      {key:'tag',label:'Tag',sortVal:r=>displayTag(r.tag),render:r=>{
+        const d=displayTag(r.tag), t=tagByName.get(r.tag)||{};
+        return `<span class="tag-chip${t.retired_at?' retired':''}" data-tag="${esc(d)}" title="${esc(t.description||('Filter by '+d))}">${esc(d)}</span>${t.retired_at?' <span class="pill superseded">retired</span>':''}`;
+      }},
+      {key:'ns',label:'Namespace',render:r=>`<span class="mono">${esc(r.ns)}</span>`},
+      {key:'_policy',label:'Policy',sortable:false,render:r=>`<span class="muted">${esc(policy(r.ns))}</span>`},
+      num('event'), num('artifact'), num('subject'), num('session'), num('project'), num('total')
+    ];
+    sortableTable('tags-table',cols,rows,{defaultSort:'total',defaultDir:'desc'});
   }
 
   /* --------------------------------------------------------------- modals */
@@ -1982,6 +2310,7 @@ try{
       ['Esc','Close the open dialog'],
       ['1 – 6','Switch tabs (Overview → Artifacts)'],
       ['/','Focus the search box for the current tab'],
+      ['#','Focus the tag filter (e.g. stage:raw -qc:fail topic:*)'],
       ['t','Toggle dark / light theme'],
       ['f','Reset all filters']
     ];
@@ -2004,6 +2333,7 @@ try{
       return;
     }
     if(e.key==='/'){ e.preventDefault(); focusCurrentSearch(); return; }
+    if(e.key==='#'){ e.preventDefault(); document.getElementById('f-tags').focus(); return; }
     if(e.key==='t'){ document.getElementById('theme-toggle').click(); return; }
     if(e.key==='f'){ document.getElementById('f-clear').click(); return; }
   });
@@ -2033,7 +2363,8 @@ try{
       ['Latest weight',sc.latest_weight_g!=null?`${sc.latest_weight_g} g (${fmtDate(sc.latest_weight_at)})`:'—'],
       ['Status', sc.is_endpointed?`<span class="pill superseded">endpointed ${fmtDate(sc.endpoint_at)}</span>`:'<span class="pill active">active</span>',true],
       ['Sessions',subSessions.length],
-      ['Artifacts',`${arts.length} · ${fmtBytes(arts.reduce((a,x)=>a+(x.size_bytes||0),0))}`]
+      ['Artifacts',`${arts.length} · ${fmtBytes(arts.reduce((a,x)=>a+(x.size_bytes||0),0))}`],
+      ['Tags',tagChips('subject',sid),true]
     ]);
     if(s.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-6px 0 6px">${esc(s.notes)}</div>`;
 
@@ -2065,7 +2396,8 @@ try{
       ['Occurred at',fmtDateTime(e.occurred_at)],
       ['Recorded at',fmtDateTime(e.recorded_at)],
       ['Recorded by',personName(e.recorded_by)],
-      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['Tags',tagChips('event',eid),true]
     ];
     if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${e.supersedes}">${fmtDate(p.occurred_at)} ${etLabel.get(p.event_type)}</span>`:'(prior row)',true]); }
     // detail rows per type
@@ -2159,7 +2491,8 @@ try{
       ['Created by',personName(a.created_by)],
       ['Verification',`<span class="pill ${a.verification.status}">${a.verification.status}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
       ['Produced by', ev?`<span class="link" data-open-event="${ev.event_id}">${etLabel.get(ev.event_type)} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
-      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['Tags',tagChips('artifact',aid),true]
     ];
     let body=kv(base);
     body+=`<div class="lineage-col">
@@ -2171,12 +2504,12 @@ try{
 
   /* ---------------------------------------------------------------- render all */
   function renderAll(){
-    document.getElementById('tc-projects').textContent=(D.projects||[]).length;
+    document.getElementById('tc-projects').textContent=filteredProjects().length;
     document.getElementById('tc-subjects').textContent=filteredSubjects().length;
     document.getElementById('tc-sessions').textContent=filteredSessions().length;
     document.getElementById('tc-events').textContent=filteredEvents().length;
     document.getElementById('tc-artifacts').textContent=filteredArtifacts().length;
-    renderKPIs(); updateCharts();
+    renderKPIs(); updateCharts(); renderTagsPanel();
     renderProjects(); renderSubjects(); renderSessions(); renderEvents(); renderArtifacts();
     if(treeMode==='tree') renderProjectsTree();
   }
@@ -2211,14 +2544,31 @@ try{
   document.getElementById('f-from').onchange=e=>{ F.from=e.target.value; renderAll(); };
   document.getElementById('f-to').onchange=e=>{ F.to=e.target.value; renderAll(); };
   document.getElementById('f-active').onchange=e=>{ F.activeOnly=e.target.checked; renderAll(); };
+  document.getElementById('f-tags').oninput=e=>{ setTagFilter(e.target.value); renderAll(); };
   document.getElementById('f-clear').onclick=()=>{
-    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;
+    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;setTagFilter('');
+    document.getElementById('f-tags').value='';
     document.getElementById('f-species').value='all';
     document.getElementById('f-event').value='all';
     document.getElementById('f-from').value='';document.getElementById('f-to').value='';
     document.getElementById('f-active').checked=true;
     refreshSubjectOptions(); renderAll();
   };
+
+  // A tag chip anywhere (tables, Tags panel, dialogs) appends its tag to the
+  // tag filter. Caught in the capture phase so the click does not also open
+  // the row's dialog.
+  function addTagToFilter(tok){
+    const el=document.getElementById('f-tags'), cur=el.value.trim();
+    if(!parseTagFilter(cur).all.includes(canonicalTag(tok))) el.value=(cur?cur+' ':'')+tok;
+    setTagFilter(el.value); renderAll();
+  }
+  document.addEventListener('click',ev=>{
+    const chip=ev.target.closest && ev.target.closest('.tag-chip[data-tag]');
+    if(!chip) return;
+    ev.preventDefault(); ev.stopPropagation();
+    closeModal(); addTagToFilter(chip.dataset.tag);
+  },true);
 
   document.getElementById('projects-search').oninput=()=>{ renderProjects(); if(treeMode==='tree') renderProjectsTree(); };
   ['subjects-search'].forEach(id=>document.getElementById(id).oninput=renderSubjects);

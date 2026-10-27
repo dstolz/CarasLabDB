@@ -7,7 +7,8 @@
 --
 --   people, probes, pipelines, storageRoots, species, projects,
 --   projectMembers, projectArtifacts, subjects, sessions, events,
---   artifacts, eventInputs, eventTypeMeta, roleMeta, NOW
+--   artifacts, eventInputs, eventTypeMeta, roleMeta, tagNamespaces, tags,
+--   tagAssignments, NOW
 --
 -- Notes on the mapping:
 --   * Full history is returned (superseded rows included). The dashboard
@@ -18,6 +19,14 @@
 --     bookkeeping columns.
 --   * Each artifact carries a `verification` object = its latest
 --     lab.artifact_verification row, or {status:'unverified'} if none.
+--   * Tags: `tagNamespaces` and `tags` are the vocabulary (applies_to as a
+--     JSON array); `tagAssignments` is the whole append-only log in
+--     assignment_id order, each row naming its entity as (entity_kind,
+--     entity_id) -- entity_id computed exactly as lab.tag_current does. The
+--     dashboard derives current tags from the log (latest row per entity and
+--     tag by applied_at, then assignment_id, kept if it is an 'add'), like
+--     lab.tag_current. applied_at keeps its microseconds so that ordering
+--     survives the trip; the other timestamps are whole seconds.
 --   * timestamptz values are rendered as UTC ISO-8601 ("...Z") strings and
 --     `NOW` as epoch milliseconds, matching what the front-end parses. The
 --     timestamps inside `detail` objects carry the session zone's offset;
@@ -172,6 +181,37 @@ event_type_meta AS (
 role_meta AS (
     SELECT coalesce(json_agg(code ORDER BY code), '[]'::json) AS j
     FROM lab.artifact_role
+),
+tag_namespaces AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'namespace', namespace, 'description', description,
+        'mutability', mutability, 'cardinality', cardinality,
+        'open_vocabulary', open_vocabulary, 'applies_to', applies_to,
+        'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_by', created_by
+    ) ORDER BY namespace), '[]'::json) AS j
+    FROM lab.tag_namespace
+),
+tags AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'tag', tag, 'namespace', namespace, 'value', value,
+        'description', description,
+        'retired_at', to_char(retired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_by', created_by
+    ) ORDER BY tag), '[]'::json) AS j
+    FROM lab.tag
+),
+tag_assignments AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'assignment_id', assignment_id, 'entity_kind', entity_kind,
+        'entity_id', coalesce(event_id::text, artifact_id::text, subject_id,
+                              session_id::text, project_id::text),
+        'tag', tag, 'op', op, 'note', note,
+        'applied_at', to_char(applied_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+        'applied_by', applied_by
+    ) ORDER BY assignment_id), '[]'::json) AS j
+    FROM lab.tag_assignment
 )
 SELECT json_build_object(
     'NOW',              (extract(epoch FROM now()) * 1000)::bigint,
@@ -189,8 +229,12 @@ SELECT json_build_object(
     'artifacts',        artifacts.j,
     'eventInputs',      event_inputs.j,
     'eventTypeMeta',    event_type_meta.j,
-    'roleMeta',         role_meta.j
+    'roleMeta',         role_meta.j,
+    'tagNamespaces',    tag_namespaces.j,
+    'tags',             tags.j,
+    'tagAssignments',   tag_assignments.j
 ) AS lab_data
 FROM people, probes, pipelines, storage_roots, species, projects,
      project_members, project_artifacts, subjects, sessions, events,
-     artifacts, event_inputs, event_type_meta, role_meta;
+     artifacts, event_inputs, event_type_meta, role_meta, tag_namespaces,
+     tags, tag_assignments;

@@ -21,16 +21,22 @@ web/live/
    returns a **single JSON object** shaped exactly like the `window.LAB_DATA`
    contract the dashboard consumes (one array per table; each event carries its
    class-table-inheritance row as a `detail` object; each artifact carries its
-   latest `verification`; timestamps are UTC ISO-8601 strings and `NOW` is epoch
-   milliseconds).
+   latest `verification`; the tag vocabulary comes as `tagNamespaces` and
+   `tags`, and the whole append-only tag log as `tagAssignments`, each row
+   naming its entity by `entity_kind` + `entity_id`; timestamps are UTC
+   ISO-8601 strings and `NOW` is epoch milliseconds).
 3. The page's loader assigns the response to `window.LAB_DATA` and boots the
    dashboard. Everything downstream — filters, KPIs, charts, timelines,
    provenance lineage — is the same code the offline demo runs.
 
 Full history is returned (superseded rows included); active vs. superseded state
 is derived in the browser from the `supersedes` links, mirroring the
-`lab.event_active` / `lab.artifact_active` views. The **Active only** toggle
-hides superseded rows; **↻ Refresh** re-queries the database.
+`lab.event_active` / `lab.artifact_active` views. Current tags are derived the
+same way from the tag log, mirroring `lab.tag_current`: the latest row per
+entity and tag (by `applied_at`, then `assignment_id`) counts if it is an
+`add`. `applied_at` keeps its microseconds so that order survives the export.
+The **Active only** toggle hides superseded rows; **↻ Refresh** re-queries the
+database.
 
 ## Running it
 
