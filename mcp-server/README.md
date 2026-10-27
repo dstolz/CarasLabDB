@@ -38,6 +38,12 @@ Read tools mirroring `@CarasLabDB`'s `get*` method surface:
   `created_from` / `created_before` range), `get_event_inputs`,
   `get_artifact_verifications`, `get_artifact_lineage` (wraps
   `lab.fn_artifact_lineage`), `get_provenance_edges`.
+- **Tags**: `get_tag_namespaces`, `get_tags`, `get_entity_tags`,
+  `find_by_tags` (wraps `lab.fn_find_by_tags`). `get_events`,
+  `get_artifacts`, `get_subjects`, `get_sessions` and `get_projects` also
+  take `tags` / `any_tags` / `none_tags` lists (`namespace:value`; a bare tag
+  means `tag:<x>`; `namespace:*` matches any tag in that namespace). See
+  [`design_docs/mcp-server.md`](../design_docs/mcp-server.md) §3.
 - **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`; empty
   means healthy).
 
@@ -53,7 +59,7 @@ Every list tool takes `limit` (default 200, max 1000) and returns
 no unlimited mode, and `truncated: true` tells the caller the answer was cut
 off instead of letting it read a clipped result as complete.
 
-The server is written for schema version 2 (`lab.schema_version`). Against a
+The server is written for schema version 3 (`lab.schema_version`). Against a
 database at another version it logs a warning and adds a `schema_warning`
 string to every list result, since its hard-coded column lists may then
 return incomplete rows.

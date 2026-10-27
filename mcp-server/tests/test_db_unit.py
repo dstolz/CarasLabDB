@@ -97,3 +97,84 @@ def test_select_from_open_ended_range_and_ci_filter(captured):
     assert captured[0][1] == ["Dan@UMD.edu"]
     assert captured[1][0] == "SELECT * FROM lab.artifact WHERE created_at < %s::timestamptz"
     assert captured[2][0] == "SELECT * FROM lab.artifact"
+
+
+def test_tag_filters_emit_the_fixed_template(captured):
+    db.select_from(
+        "lab.event_active",
+        {"subject_id": "G1"},
+        limit=10,
+        order_by=db.ORDER_BY_EVENT,
+        tag_filters=("event", ["stage:raw", "cohort:a"], ["qc:*"], ["qc:fail"]),
+    )
+    sql, params, _ = captured[0]
+    assert sql == (
+        "SELECT * FROM lab.event_active WHERE subject_id = %s "
+        "AND lab.fn_tag_match(%s, event_id::text, %s::text[], %s::text[], %s::text[]) "
+        "ORDER BY occurred_at DESC, event_id"
+    )
+    assert params == ["G1", "event", ["stage:raw", "cohort:a"], ["qc:*"], ["qc:fail"]]
+
+
+@pytest.mark.parametrize("kind, table, pk", [
+    ("event", "lab.event", "event_id"),
+    ("artifact", "lab.artifact_active", "artifact_id"),
+    ("subject", "lab.subject", "subject_id"),
+    ("session", "lab.session", "session_id"),
+    ("project", "lab.project", "project_id"),
+])
+def test_tag_filters_pk_comes_from_the_fixed_map(captured, kind, table, pk):
+    db.select_from(table, {}, tag_filters=(kind, None, ["x"], None))
+    sql, params, _ = captured[0]
+    assert sql == (
+        f"SELECT * FROM {table} WHERE "
+        f"lab.fn_tag_match(%s, {pk}::text, %s::text[], %s::text[], %s::text[])"
+    )
+    # Unused lists are sent as NULL; the kind and tokens are bound, not inlined.
+    assert params == [kind, None, ["x"], None]
+
+
+def test_tag_filters_without_tokens_add_no_clause(captured):
+    db.select_from("lab.event", {}, tag_filters=("event", None, [], None))
+    assert captured[0][0] == "SELECT * FROM lab.event"
+    assert captured[0][1] == []
+
+
+@pytest.mark.parametrize("kind", [
+    "tag", "events", "Event", "", None, "event_id", "event; DROP TABLE x",
+    "lab.event",
+])
+def test_tag_filters_reject_unknown_kinds(captured, kind):
+    with pytest.raises(ValueError, match="entity kind"):
+        db.select_from("lab.event", {}, tag_filters=(kind, ["a:b"], None, None))
+    assert captured == []
+
+
+def test_tag_filters_never_inline_token_text(captured):
+    evil = "x'); DROP TABLE lab.event; --"
+    db.select_from("lab.event", {}, tag_filters=("event", [evil], [evil], [evil]))
+    sql, params, _ = captured[0]
+    assert "DROP" not in sql and evil not in sql
+    assert params == ["event", [evil], [evil], [evil]]
+
+
+def test_tag_filters_reject_a_bare_string_for_a_list(captured):
+    # A string would otherwise be adapted as a list of characters' worth of tags.
+    with pytest.raises(ValueError, match="list"):
+        db.select_from("lab.event", {}, tag_filters=("event", "stage:raw", None, None))
+
+
+def test_tag_tables_are_allowed_and_tag_orderings_listed():
+    for table in ("lab.tag_namespace", "lab.tag", "lab.tag_assignment",
+                  "lab.tag_current", "lab.entity_tags"):
+        assert table in db.ALLOWED_TABLES
+    assert db.ORDER_BY_TAG_ASSIGNMENT == "applied_at DESC, assignment_id DESC"
+    assert db.ORDER_BY_TAG_ASSIGNMENT in db.ALLOWED_ORDER_BY
+    assert db.ORDER_BY_TAG_CURRENT in db.ALLOWED_ORDER_BY
+    assert db.SCHEMA_VERSION == 3
+
+
+def test_tag_pk_rejects_unknown_kind():
+    assert db.tag_pk("subject") == "subject_id"
+    with pytest.raises(ValueError, match="entity kind"):
+        db.tag_pk("person")

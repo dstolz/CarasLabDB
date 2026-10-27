@@ -14,6 +14,9 @@ def register(app):
         session_id: Optional[str] = None,
         occurred_from: Optional[str] = None,
         occurred_before: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        any_tags: Optional[list[str]] = None,
+        none_tags: Optional[list[str]] = None,
         active_only: bool = True,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
@@ -33,6 +36,14 @@ def register(app):
         A filter left as None is simply not applied -- it does not mean
         "where this column IS NULL".
 
+        Tag filters (current tags only; see get_tag_namespaces / get_tags):
+        `tags` = the event must have ALL of these, `any_tags` = at least
+        ONE of these, `none_tags` = NONE of these. A tag is `namespace:value`,
+        lowercase (e.g. ["condition:x", "qc:pass"]); a bare tag with no colon
+        means `tag:<x>`; "namespace:*" matches any tag in that namespace
+        (none_tags=["qc:*"] = not yet QC'd). Unset or empty lists are not
+        applied.
+
         Returns {"rows": [...], "row_count": n, "limit": n, "truncated":
         bool}. `truncated` true means more rows matched than were returned:
         filter more narrowly or raise `limit` (max 1000).
@@ -42,7 +53,8 @@ def register(app):
             "event_id": event_id, "event_type": event_type,
             "subject_id": subject_id, "session_id": session_id,
         }, limit=limit, order_by=db.ORDER_BY_EVENT,
-            time_ranges={"occurred_at": (occurred_from, occurred_before)})
+            time_ranges={"occurred_at": (occurred_from, occurred_before)},
+            tag_filters=("event", tags, any_tags, none_tags))
 
     @app.tool()
     def get_event_detail(event_id: str, active_only: bool = True) -> dict:

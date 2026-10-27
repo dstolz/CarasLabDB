@@ -69,6 +69,10 @@ def seed():
             "relative_path, checksum) VALUES (%s, %s, %s, %s, %s) RETURNING artifact_id",
             [ids["sep"], sess, root, f"{ids['subject']}/s1/raw.dat",
              uuid.uuid4().hex + uuid.uuid4().hex]).fetchone()[0]
+        # The one tag write the fixtures make: a fresh topic value on the
+        # September recording (topic is open, so fn_tag registers it).
+        ids["topic"] = f"topic:t{tag}"
+        q("SELECT lab.fn_tag('event', %s::text, %s)", [ids["sep"], ids["topic"]])
     return {k: str(v) for k, v in ids.items()}
 
 
@@ -126,6 +130,113 @@ def test_connection_is_reused_and_replaced_when_it_dies(seed):
     assert db._conn is not first
 
 
+def test_get_tag_namespaces_serialises_applies_to_as_a_list(seed):
+    res = call("get_tag_namespaces")
+    by_name = {r["namespace"]: r for r in res["rows"]}
+    assert {"tag", "stage", "qc", "cohort", "condition", "topic"} <= set(by_name)
+    assert isinstance(by_name["topic"]["applies_to"], list)
+    assert sorted(by_name["topic"]["applies_to"]) == [
+        "artifact", "event", "project", "session", "subject"]
+    assert by_name["stage"]["applies_to"] == ["artifact"]
+    # Round-trips through JSON (what the MCP client actually receives).
+    json.dumps(res, default=str)
+
+
+def test_get_tags(seed):
+    topic = [r["tag"] for r in call("get_tags", namespace="topic", limit=1000)["rows"]]
+    assert seed["topic"] in topic and all(t.startswith("topic:") for t in topic)
+    stage = call("get_tags", namespace="stage")["rows"]
+    assert [r["value"] for r in stage] == sorted(r["value"] for r in stage)
+    assert "raw" in [r["value"] for r in stage]
+    assert call("get_tags", namespace="no_such_ns")["row_count"] == 0
+
+
+def test_find_by_tags(seed):
+    assert call("find_by_tags", entity_kind="event",
+                all_of=[seed["topic"]])["rows"] == [{"entity_id": seed["sep"]}]
+    # Case and surrounding whitespace are normalised by the database.
+    assert call("find_by_tags", entity_kind="event",
+                all_of=[f"  {seed['topic'].upper()} "])["row_count"] == 1
+    res = call("find_by_tags", entity_kind="event",
+               any_of=["topic:*", "stage:raw"], limit=1000)
+    assert seed["sep"] in [r["entity_id"] for r in res["rows"]]
+    res = call("find_by_tags", entity_kind="event",
+               none_of=[seed["topic"]], limit=1000)
+    ids = [r["entity_id"] for r in res["rows"]]
+    assert seed["aug"] in ids and seed["sep"] not in ids
+    assert call("find_by_tags", entity_kind="event",
+                all_of=[seed["topic"], "qc:fail"])["row_count"] == 0
+    # Tags sit on the event row, not on the artifact it produced.
+    assert call("find_by_tags", entity_kind="artifact",
+                all_of=[seed["topic"]])["row_count"] == 0
+
+
+def test_find_by_tags_rejects_unknown_kind(seed):
+    with pytest.raises(Exception, match="entity kind"):
+        call("find_by_tags", entity_kind="person", all_of=["a:b"])
+
+
+def test_find_by_tags_is_bounded(seed):
+    res = call("find_by_tags", entity_kind="event", none_of=["qc:fail"], limit=1)
+    assert res["row_count"] == 1 and res["limit"] == 1
+    assert res["truncated"] is True    # the fixtures alone hold two events
+
+
+def test_get_events_tag_filters(seed):
+    def ids(**tag_args):
+        res = call("get_events", subject_id=seed["subject"], **tag_args)
+        return sorted(r["event_id"] for r in res["rows"])
+
+    assert ids(tags=[seed["topic"]]) == [seed["sep"]]
+    assert ids(any_tags=["topic:*"]) == [seed["sep"]]
+    assert ids(none_tags=[seed["topic"]]) == [seed["aug"]]
+    assert ids(tags=[seed["topic"]], none_tags=["topic:*"]) == []
+    assert ids(tags=[]) == sorted([seed["aug"], seed["sep"]])   # empty = no filter
+    assert ids() == sorted([seed["aug"], seed["sep"]])
+
+
+def test_tag_filters_on_the_other_entity_tools(seed):
+    # Nothing but the September recording is tagged, so every other kind is empty.
+    for name, key in (("get_artifacts", "subject_id"), ("get_sessions", "subject_id"),
+                      ("get_subjects", "subject_id")):
+        args = {key: seed["subject"]}
+        assert call(name, tags=[seed["topic"]], **args)["row_count"] == 0
+        assert call(name, none_tags=[seed["topic"]], **args)["row_count"] == 1
+    assert call("get_projects", tags=[seed["topic"]])["row_count"] == 0
+
+
+def test_get_entity_tags(seed):
+    res = call("get_entity_tags", entity_kind="event", entity_id=seed["sep"])
+    assert [r["tag"] for r in res["rows"]] == [seed["topic"]]
+    assert res["rows"][0]["display_tag"] == seed["topic"]   # only `tag:` is stripped
+    assert call("get_entity_tags", entity_kind="event",
+                entity_id=seed["aug"])["row_count"] == 0
+    hist = call("get_entity_tags", entity_kind="event", entity_id=seed["sep"],
+                include_history=True)
+    assert [(r["tag"], r["op"]) for r in hist["rows"]] == [(seed["topic"], "add")]
+    # The subject kind keys on a text id, not a uuid.
+    assert call("get_entity_tags", entity_kind="subject",
+                entity_id=seed["subject"])["row_count"] == 0
+    with pytest.raises(Exception, match="entity kind"):
+        call("get_entity_tags", entity_kind="person", entity_id=seed["sep"])
+
+
 def test_writes_are_refused(seed):
     with pytest.raises(Exception, match="read-only transaction"):
         db.fetch_all("INSERT INTO lab.species (code, common_name) VALUES ('x', 'x') RETURNING code")
+
+
+def test_fn_tag_is_refused_through_the_read_only_path(seed):
+    # fn_tag is the lab's tag write path; a tool (or a bug) that reached it
+    # through the server's connection must hit the read-only transaction.
+    with pytest.raises(Exception, match="read-only transaction"):
+        db.fetch_all("SELECT lab.fn_tag('event', %s, %s)",
+                     [seed["aug"], f"topic:refused{seed['tag']}"])
+    with pytest.raises(Exception, match="read-only transaction"):
+        db.fetch_all("SELECT lab.fn_register_tag(%s)", [f"topic:refused{seed['tag']}"])
+    # ...and nothing leaked in.
+    assert call("get_entity_tags", entity_kind="event",
+                entity_id=seed["aug"])["row_count"] == 0
+    leaked = [r["tag"] for r in call("get_tags", namespace="topic", limit=1000)["rows"]
+              if f"refused{seed['tag']}" in r["tag"]]
+    assert leaked == []
