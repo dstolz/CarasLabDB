@@ -136,12 +136,14 @@ try{
   .filters{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-top:16px;}
   .filter-group{display:flex;flex-direction:column;gap:4px;}
   .filter-group label{font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:rgba(234,240,251,.55);font-weight:600;}
-  .filter-group select,.filter-group input[type="date"]{
+  .filter-group select,.filter-group input[type="date"],.filter-group input[type="search"]{
     padding:7px 10px;border:1px solid rgba(255,255,255,.16);border-radius:7px;
     background:rgba(255,255,255,.06);color:var(--text-on-dark);font-size:13px;min-width:150px;
     font-family:inherit;
   }
   .filter-group input[type="date"]{color-scheme:dark;min-width:135px;}
+  .filter-group input[type="search"]{color-scheme:dark;min-width:230px;}
+  .filter-group input[type="search"]::placeholder{color:rgba(234,240,251,.38);}
   .filter-group select option{background:var(--bg-header);color:var(--text-on-dark);}
   .filter-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:rgba(234,240,251,.8);cursor:pointer;user-select:none;padding-bottom:7px;}
   .filter-toggle input{accent-color:var(--accent);width:15px;height:15px;}
@@ -246,6 +248,16 @@ try{
   .pill.succeeded{background:rgba(31,157,85,.13);color:#187a41;}
   .pill.failed{background:rgba(220,53,69,.13);color:#b02a37;}
   .pill.running{background:rgba(76,114,176,.14);color:#3a5c94;}
+
+  /* Tag chips (namespace:value; bare tags shown bare) */
+  .tag-chip{display:inline-block;padding:1px 7px;margin:1px 4px 1px 0;border-radius:10px;font-size:11px;font-weight:600;
+    font-family:'SF Mono',ui-monospace,'Cascadia Mono',Menlo,Consolas,monospace;white-space:nowrap;cursor:pointer;
+    background:rgba(63,167,183,.10);color:#2b7d8b;border:1px solid rgba(63,167,183,.28);}
+  .tag-chip:hover{background:rgba(63,167,183,.2);}
+  .tag-chip.retired{opacity:.6;text-decoration:line-through;}
+  html[data-theme="dark"] .tag-chip{background:rgba(63,167,183,.18);color:#8fdcea;border-color:rgba(63,167,183,.4);}
+  .tags-card{margin-bottom:var(--gap);}
+  .tags-table{overflow:auto;max-height:420px;}
 
   .link{color:var(--accent);cursor:pointer;font-weight:550;}
   .link:hover{text-decoration:underline;}
@@ -415,6 +427,11 @@ try{
         <label for="f-to">To (occurred)</label>
         <input type="date" id="f-to">
       </div>
+      <div class="filter-group">
+        <label for="f-tags">Tags</label>
+        <input type="search" id="f-tags" placeholder="stage:raw -qc:fail topic:*" autocomplete="off" spellcheck="false"
+               title="Space-separated tags, all of which must match. -tag excludes, ns:* is any tag in a namespace, a bare word is a bare tag (#)">
+      </div>
       <label class="filter-toggle"><input type="checkbox" id="f-active" checked> Active only</label>
       <button class="btn-reset" id="f-clear" title="Reset filters (f)">Reset filters</button>
     </div>
@@ -476,6 +493,11 @@ try{
         <div class="card-sub">Registered bytes on the NAS</div>
         <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
       </div>
+    </div>
+    <div class="card tags-card">
+      <h3>Tags</h3>
+      <div class="card-sub"><span id="tags-meta"></span> · current tags on the rows in the current selection; click a tag to filter by it</div>
+      <div id="tags-table" class="tags-table"></div>
     </div>
   </section>
 
@@ -641,7 +663,7 @@ window.__initDashboard = function(){
   // below and leave a white screen, so default every collection to empty.
   ['people','probes','pipelines','storageRoots','species','projects','projectMembers',
    'projectArtifacts','subjects','sessions','events','artifacts','eventInputs',
-   'eventTypeMeta','roleMeta'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
+   'eventTypeMeta','roleMeta','tagNamespaces','tags','tagAssignments'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
   const NOW = D.NOW;
 
   // ---- lookups ----
@@ -676,6 +698,36 @@ window.__initDashboard = function(){
   const supersededArtifacts = new Set(D.artifacts.filter(a=>a.supersedes).map(a=>a.supersedes));
   const isEventActive = e => !supersededEvents.has(e.event_id);
   const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
+
+  // current tags per entity, derived from the append-only assignment log like
+  // lab.tag_current: the latest row per (entity, tag) -- by applied_at, then
+  // assignment_id -- counts when it is an 'add'.
+  const tagNsByName = new Map(D.tagNamespaces.map(n=>[n.namespace,n]));
+  const tagByName = new Map(D.tags.map(t=>[t.tag,t]));
+  const tagKey = (kind,id) => kind+'|'+id;
+  // applied_at compares as text once the fraction has a fixed width (the live
+  // export carries microseconds, the synthetic data milliseconds)
+  const tsKey = s => { const m=/^(.*?)(?:\.(\d+))?Z$/.exec(s||''); return m ? m[1]+'.'+((m[2]||'')+'000000').slice(0,6) : String(s||''); };
+  const latestTagRow = new Map();         // 'kind|id|tag' -> newest log row
+  D.tagAssignments.forEach(r=>{
+    const k=tagKey(r.entity_kind,r.entity_id)+'|'+r.tag, p=latestTagRow.get(k);
+    const rk=tsKey(r.applied_at), pk=p&&tsKey(p.applied_at);
+    if(!p || rk>pk || (rk===pk && r.assignment_id>p.assignment_id)) latestTagRow.set(k,r);
+  });
+  const currentTagsByEntity = new Map();  // 'kind|id' -> [tag], sorted
+  latestTagRow.forEach(r=>{
+    if(r.op!=='add') return;
+    const k=tagKey(r.entity_kind,r.entity_id);
+    if(!currentTagsByEntity.has(k)) currentTagsByEntity.set(k,[]);
+    currentTagsByEntity.get(k).push(r.tag);
+  });
+  currentTagsByEntity.forEach(list=>list.sort());
+  const entityTags = (kind,id) => currentTagsByEntity.get(tagKey(kind,id))||[];
+  // mirrors lab.fn_canonical_tag: lower case and trim; a bare tag (no colon)
+  // lives in the reserved 'tag' namespace. Nothing else is rewritten.
+  const canonicalTag = s => { const t=String(s==null?'':s).trim().toLowerCase(); return t.includes(':') ? t : 'tag:'+t; };
+  const displayTag = t => t.startsWith('tag:') ? t.slice(4) : t;   // as lab.tag_current.display_tag
+  const tagNamespace = t => t.slice(0, t.indexOf(':'));
 
   // provenance edges (produces + consumes), like lab.provenance_edge
   const inputsByEvent = new Map();      // event_id -> [artifact_id]
@@ -781,6 +833,14 @@ window.__initDashboard = function(){
   const personName = id => { const p=personById.get(id); return p?p.full_name:'—'; };
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
   function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
+  // current tags as clickable chips (a click appends the tag to the tag filter)
+  function tagChips(kind,id){
+    return entityTags(kind,id).map(t=>{
+      const d=displayTag(t), r=(tagByName.get(t)||{}).retired_at;
+      return `<span class="tag-chip${r?' retired':''}" data-tag="${esc(d)}" title="Filter by ${esc(d)}${r?' (retired '+esc(fmtDate(r))+')':''}">${esc(d)}</span>`;
+    }).join('');
+  }
+  const tagCol = kind => ({key:'_tags',label:'Tags',sortable:false,render:r=>tagChips(kind,r[kind+'_id'])});
   function fmtDur(s){ if(s==null) return '—'; const h=Math.floor(s/3600), m=Math.round((s%3600)/60); return h?`${h}h ${m}m`:`${m}m`; }
   // session.started_at/ended_at are both nullable, and fmtDur only guards null —
   // an open session would otherwise render "NaNm". Return null for "unknown".
@@ -840,8 +900,28 @@ window.__initDashboard = function(){
   }
 
   // ---- filters / state ----
-  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true };
+  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true, tags:'' };
   let currentView='overview';
+
+  // Tag filter: space-separated tokens that must all hold (AND); '-tok' must
+  // not, 'ns:*' is any current tag in namespace ns, and a bare token means
+  // tag:<token>. The same semantics as lab.fn_tag_match(all, NULL, none).
+  function parseTagFilter(text){
+    const q={all:[], none:[]};
+    String(text||'').split(/\s+/).forEach(tok=>{
+      const neg=tok.startsWith('-'), t=neg?tok.slice(1):tok;
+      if(t.trim()) (neg?q.none:q.all).push(canonicalTag(t));
+    });
+    return q;
+  }
+  let tagQuery=parseTagFilter('');
+  function setTagFilter(text){ F.tags=text||''; tagQuery=parseTagFilter(F.tags); }
+  const tagHit = (tags,t) => t.endsWith(':*') ? tags.some(x=>tagNamespace(x)===t.slice(0,-2)) : tags.includes(t);
+  function passTags(kind,id){
+    if(!tagQuery.all.length && !tagQuery.none.length) return true;
+    const tags=entityTags(kind,id);
+    return tagQuery.all.every(t=>tagHit(tags,t)) && !tagQuery.none.some(t=>tagHit(tags,t));
+  }
 
   function passSpecies(subjectId){
     if(F.species==='all') return true;
@@ -862,6 +942,7 @@ window.__initDashboard = function(){
       if(F.subject!=='all' && e.subject_id!==F.subject) return false;
       if(!passSpecies(e.subject_id)) return false;
       if((F.from||F.to) && !withinDate(e.occurred_at)) return false;
+      if(!passTags('event',e.event_id)) return false;
       return true;
     });
   }
@@ -869,6 +950,7 @@ window.__initDashboard = function(){
     return D.subjects.filter(s=>{
       if(F.species!=='all' && s.species_code!==F.species) return false;
       if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      if(!passTags('subject',s.subject_id)) return false;
       return true;
     });
   }
@@ -877,6 +959,7 @@ window.__initDashboard = function(){
       if(F.subject!=='all' && s.subject_id!==F.subject) return false;
       if(!passSpecies(s.subject_id)) return false;
       if((F.from||F.to) && !withinDate(s.started_at)) return false;
+      if(!passTags('session',s.session_id)) return false;
       return true;
     });
   }
@@ -886,8 +969,13 @@ window.__initDashboard = function(){
       if(F.subject!=='all' && a.subject_id!==F.subject) return false;
       if(!passSpecies(a.subject_id)) return false;
       if((F.from||F.to) && !withinDate(a.created_at)) return false;
+      if(!passTags('artifact',a.artifact_id)) return false;
       return true;
     });
+  }
+  // projects sit outside the species/subject/date filters; only tags narrow them
+  function filteredProjects(){
+    return (D.projects||[]).filter(p=>passTags('project',p.project_id));
   }
 
   /* ------------------------------------------------------------------ KPIs */
@@ -1066,7 +1154,7 @@ window.__initDashboard = function(){
   const projKindPill = k => `<span class="pill">${esc(k||'file')}</span>`;
   function renderProjects(){
     const q=(document.getElementById('projects-search').value||'').toLowerCase();
-    let rows=(D.projects||[]).slice();
+    let rows=filteredProjects();
     if(q) rows=rows.filter(p=>{
       const mem=(membersByProject.get(p.project_id)||[]).map(m=>personName(m.person_id)).join(' ');
       return (p.name+' '+(p.description||'')+' '+mem).toLowerCase().includes(q);
@@ -1082,7 +1170,8 @@ window.__initDashboard = function(){
       {key:'_docs',label:'Documents',cls:'num',sortVal:p=>(docsByProject.get(p.project_id)||[]).length,render:p=>(docsByProject.get(p.project_id)||[]).length},
       {key:'started_on',label:'Started',sortVal:p=>p.started_on,render:p=>fmtDate(p.started_on)},
       {key:'_status',label:'Status',sortVal:p=>p.is_active?0:1,
-        render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`}
+        render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`},
+      tagCol('project')
     ];
     sortableTable('projects-table',cols,rows,{clickable:true,defaultSort:'name',defaultDir:'asc',
       rowAttrs:p=>`data-project="${esc(p.project_id)}"`, onClick:d=>openProject(d.project)});
@@ -1366,7 +1455,8 @@ window.__initDashboard = function(){
       ['Sessions',projSessions.length],
       ['Events',projEvents.length],
       ['Files',`${projArtifacts.length} · ${fmtBytes(projBytes)}`],
-      ['Documents',docs.length]
+      ['Documents',docs.length],
+      ['Tags',tagChips('project',pid),true]
     ]);
 
     body+=`<h4>Members (${mem.length})</h4>`;
@@ -1587,7 +1677,8 @@ window.__initDashboard = function(){
       {key:'_sessions',label:'Sessions',cls:'num',sortVal:s=>sessionCountBySubject.get(s.subject_id)||0,render:s=>sessionCountBySubject.get(s.subject_id)||0},
       {key:'_events',label:'Events',cls:'num',sortVal:s=>eventCountBySubject.get(s.subject_id)||0,render:s=>eventCountBySubject.get(s.subject_id)||0},
       {key:'_status',label:'Status',sortVal:s=>subjectCurrent.get(s.subject_id).is_endpointed?1:0,
-        render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`}
+        render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`},
+      tagCol('subject')
     ];
     sortableTable('subjects-table',cols,rows,{clickable:true,defaultSort:'subject_id',defaultDir:'asc',
       rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
@@ -1608,7 +1699,8 @@ window.__initDashboard = function(){
       {key:'_root',label:'Storage',render:s=>esc((rootById.get(s.storage_root_id)||{}).name||'—')},
       {key:'relative_path',label:'Path',cls:'mono',render:s=>`<span class="truncate" title="${esc(s.relative_path)}">${esc(s.relative_path)}</span>`},
       {key:'_ev',label:'Events',cls:'num',sortVal:s=>eventCountBySession.get(s.session_id)||0,render:s=>eventCountBySession.get(s.session_id)||0},
-      {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0}
+      {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0},
+      tagCol('session')
     ];
     sortableTable('sessions-table',cols,rows,{clickable:true,defaultSort:'started_at',defaultDir:'desc',
       rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
@@ -1630,7 +1722,8 @@ window.__initDashboard = function(){
       {key:'_summary',label:'Summary',sortable:false,render:e=>`<span class="truncate" style="max-width:360px;display:inline-block;vertical-align:bottom">${eventSummary(e)}</span>`},
       {key:'_by',label:'Recorded by',render:e=>esc(personName(e.recorded_by))},
       {key:'_state',label:'State',sortVal:e=>isEventActive(e)?0:1,
-        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`}
+        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`},
+      tagCol('event')
     ];
     sortableTable('events-table',cols,rows,{clickable:true,defaultSort:'occurred_at',defaultDir:'desc',limit:400,
       rowAttrs:e=>`data-event="${e.event_id}"`, onClick:d=>openEvent(d.event)});
@@ -1657,10 +1750,42 @@ window.__initDashboard = function(){
       {key:'created_at',label:'Created',sortVal:a=>a.created_at,render:a=>fmtDate(a.created_at)},
       {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
         render:a=>`<span class="pill ${a.verification.status}">${a.verification.status}</span>`},
+      tagCol('artifact'),
       {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
     ];
     sortableTable('artifacts-table',cols,rows,{clickable:true,defaultSort:'size_bytes',defaultDir:'desc',limit:400,
       rowAttrs:a=>`data-artifact="${a.artifact_id}"`, onClick:d=>openArtifact(d.artifact)});
+  }
+
+  /* ------------------------------------------------------- overview: tags */
+  // per-tag counts over the rows in the current selection (current tags only)
+  function renderTagsPanel(){
+    const counts=new Map();   // tag -> {event, artifact, subject, session, project}
+    const tally=(kind,id)=> entityTags(kind,id).forEach(t=>{
+      if(!counts.has(t)) counts.set(t,{event:0,artifact:0,subject:0,session:0,project:0});
+      counts.get(t)[kind]++;
+    });
+    filteredEvents().forEach(e=>tally('event',e.event_id));
+    filteredArtifacts().forEach(a=>tally('artifact',a.artifact_id));
+    filteredSubjects().forEach(s=>tally('subject',s.subject_id));
+    filteredSessions().forEach(s=>tally('session',s.session_id));
+    filteredProjects().forEach(p=>tally('project',p.project_id));
+    const rows=[...counts].map(([tag,c])=>Object.assign({tag, ns:tagNamespace(tag),
+      total:c.event+c.artifact+c.subject+c.session+c.project}, c));
+    document.getElementById('tags-meta').textContent = `${rows.length} tag${rows.length!==1?'s':''} in use · ${D.tagAssignments.length} log row${D.tagAssignments.length!==1?'s':''}`;
+    if(!rows.length){ document.getElementById('tags-table').innerHTML='<div class="empty">No tags on the rows in the current selection.</div>'; return; }
+    const policy = ns => { const n=tagNsByName.get(ns); return n?`${n.mutability} · ${n.cardinality}${n.open_vocabulary?'':' · closed'}`:'—'; };
+    const num = k => ({key:k,label:k==='total'?'Total':k[0].toUpperCase()+k.slice(1)+'s',cls:'num',render:r=>r[k]||'<span class="muted">·</span>'});
+    const cols=[
+      {key:'tag',label:'Tag',sortVal:r=>displayTag(r.tag),render:r=>{
+        const d=displayTag(r.tag), t=tagByName.get(r.tag)||{};
+        return `<span class="tag-chip${t.retired_at?' retired':''}" data-tag="${esc(d)}" title="${esc(t.description||('Filter by '+d))}">${esc(d)}</span>${t.retired_at?' <span class="pill superseded">retired</span>':''}`;
+      }},
+      {key:'ns',label:'Namespace',render:r=>`<span class="mono">${esc(r.ns)}</span>`},
+      {key:'_policy',label:'Policy',sortable:false,render:r=>`<span class="muted">${esc(policy(r.ns))}</span>`},
+      num('event'), num('artifact'), num('subject'), num('session'), num('project'), num('total')
+    ];
+    sortableTable('tags-table',cols,rows,{defaultSort:'total',defaultDir:'desc'});
   }
 
   /* --------------------------------------------------------------- modals */
@@ -1694,6 +1819,7 @@ window.__initDashboard = function(){
       ['1 – 6','Switch tabs (Overview → Artifacts)'],
       ['/','Focus the search box for the current tab'],
       ['r','Refresh data from the database'],
+      ['#','Focus the tag filter (e.g. stage:raw -qc:fail topic:*)'],
       ['t','Toggle dark / light theme'],
       ['f','Reset all filters']
     ];
@@ -1717,6 +1843,7 @@ window.__initDashboard = function(){
     }
     if(e.key==='/'){ e.preventDefault(); focusCurrentSearch(); return; }
     if(e.key==='r'){ location.reload(); return; }
+    if(e.key==='#'){ e.preventDefault(); document.getElementById('f-tags').focus(); return; }
     if(e.key==='t'){ document.getElementById('theme-toggle').click(); return; }
     if(e.key==='f'){ document.getElementById('f-clear').click(); return; }
   });
@@ -1746,7 +1873,8 @@ window.__initDashboard = function(){
       ['Latest weight',sc.latest_weight_g!=null?`${sc.latest_weight_g} g (${fmtDate(sc.latest_weight_at)})`:'—'],
       ['Status', sc.is_endpointed?`<span class="pill superseded">endpointed ${fmtDate(sc.endpoint_at)}</span>`:'<span class="pill active">active</span>',true],
       ['Sessions',subSessions.length],
-      ['Artifacts',`${arts.length} · ${fmtBytes(arts.reduce((a,x)=>a+(x.size_bytes||0),0))}`]
+      ['Artifacts',`${arts.length} · ${fmtBytes(arts.reduce((a,x)=>a+(x.size_bytes||0),0))}`],
+      ['Tags',tagChips('subject',sid),true]
     ]);
     if(s.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-6px 0 6px">${esc(s.notes)}</div>`;
 
@@ -1778,7 +1906,8 @@ window.__initDashboard = function(){
       ['Occurred at',fmtDateTime(e.occurred_at)],
       ['Recorded at',fmtDateTime(e.recorded_at)],
       ['Recorded by',personName(e.recorded_by)],
-      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['Tags',tagChips('event',eid),true]
     ];
     if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${e.supersedes}">${fmtDate(p.occurred_at)} ${etLabel.get(p.event_type)}</span>`:'(prior row)',true]); }
     // detail rows per type
@@ -1872,7 +2001,8 @@ window.__initDashboard = function(){
       ['Created by',personName(a.created_by)],
       ['Verification',`<span class="pill ${a.verification.status}">${a.verification.status}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
       ['Produced by', ev?`<span class="link" data-open-event="${ev.event_id}">${etLabel.get(ev.event_type)} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
-      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true]
+      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['Tags',tagChips('artifact',aid),true]
     ];
     let body=kv(base);
     body+=`<div class="lineage-col">
@@ -1884,12 +2014,12 @@ window.__initDashboard = function(){
 
   /* ---------------------------------------------------------------- render all */
   function renderAll(){
-    document.getElementById('tc-projects').textContent=(D.projects||[]).length;
+    document.getElementById('tc-projects').textContent=filteredProjects().length;
     document.getElementById('tc-subjects').textContent=filteredSubjects().length;
     document.getElementById('tc-sessions').textContent=filteredSessions().length;
     document.getElementById('tc-events').textContent=filteredEvents().length;
     document.getElementById('tc-artifacts').textContent=filteredArtifacts().length;
-    renderKPIs(); updateCharts();
+    renderKPIs(); updateCharts(); renderTagsPanel();
     renderProjects(); renderSubjects(); renderSessions(); renderEvents(); renderArtifacts();
     if(treeMode==='tree') renderProjectsTree();
   }
@@ -1924,14 +2054,31 @@ window.__initDashboard = function(){
   document.getElementById('f-from').onchange=e=>{ F.from=e.target.value; renderAll(); };
   document.getElementById('f-to').onchange=e=>{ F.to=e.target.value; renderAll(); };
   document.getElementById('f-active').onchange=e=>{ F.activeOnly=e.target.checked; renderAll(); };
+  document.getElementById('f-tags').oninput=e=>{ setTagFilter(e.target.value); renderAll(); };
   document.getElementById('f-clear').onclick=()=>{
-    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;
+    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;setTagFilter('');
+    document.getElementById('f-tags').value='';
     document.getElementById('f-species').value='all';
     document.getElementById('f-event').value='all';
     document.getElementById('f-from').value='';document.getElementById('f-to').value='';
     document.getElementById('f-active').checked=true;
     refreshSubjectOptions(); renderAll();
   };
+
+  // A tag chip anywhere (tables, Tags panel, dialogs) appends its tag to the
+  // tag filter. Caught in the capture phase so the click does not also open
+  // the row's dialog.
+  function addTagToFilter(tok){
+    const el=document.getElementById('f-tags'), cur=el.value.trim();
+    if(!parseTagFilter(cur).all.includes(canonicalTag(tok))) el.value=(cur?cur+' ':'')+tok;
+    setTagFilter(el.value); renderAll();
+  }
+  document.addEventListener('click',ev=>{
+    const chip=ev.target.closest && ev.target.closest('.tag-chip[data-tag]');
+    if(!chip) return;
+    ev.preventDefault(); ev.stopPropagation();
+    closeModal(); addTagToFilter(chip.dataset.tag);
+  },true);
 
   document.getElementById('projects-search').oninput=()=>{ renderProjects(); if(treeMode==='tree') renderProjectsTree(); };
   ['subjects-search'].forEach(id=>document.getElementById(id).oninput=renderSubjects);
