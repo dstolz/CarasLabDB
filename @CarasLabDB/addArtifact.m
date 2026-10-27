@@ -27,6 +27,9 @@ function artifactId = addArtifact(obj, opts)
 %       SizeBytes, Role (artifact_role.code), Format, SubjectId, SessionId,
 %       Supersedes, Attributes (jsonb), CreatedBy
 %
+%   With Supersedes=, the superseded artifact's current tags are copied onto
+%   the new row in the same transaction (as SUPERSEDEARTIFACT does).
+%
 %   Returns the generated artifact_id (uuid string).
 %
 %   See also CARASLABDB, ADDEVENTINPUT, SUPERSEDEARTIFACT, ARTIFACTLINEAGE.
@@ -65,5 +68,10 @@ function artifactId = addArtifact(obj, opts)
     s = obj.pSet(s, "attributes",    opts.Attributes);
     s = obj.pSet(s, "created_by",    obj.pCreatedBy(opts.CreatedBy));
 
-    artifactId = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
+    if isfield(s, "supersedes")
+        % A correction: the row and its carried-forward tags in one transaction.
+        artifactId = obj.pTransact(@() obj.pInsertArtifact(s));
+    else
+        artifactId = obj.pInsertArtifact(s);
+    end
 end

@@ -52,7 +52,22 @@ classdef CarasLabDB < handle
 %       addBirthEvent, addSurgeryEvent, addRecordingEvent, addBehaviorEvent,
 %       addHusbandryEvent, addEndpointEvent, addHistologyEvent,
 %       addAnalysisEvent, addArtifact, supersedeEvent, supersedeArtifact,
-%       artifactLineage.
+%       artifactLineage, addTagNamespace, registerTag, addTag, removeTag,
+%       setTag, getEntityTags, findByTags.
+%
+%   Tags. Events, artifacts, subjects, sessions and projects can carry
+%   namespace:value tags (stage:raw, cohort:a, qc:fail; a bare tag such as
+%   auditory_cortex is stored as tag:auditory_cortex). Every tag write goes
+%   through lab.fn_tag, so the namespace's policy (mutable/immutable,
+%   single/multi, open/closed vocabulary, applies_to) is enforced by the
+%   database for this class exactly as for psql or the MCP server:
+%       db.setTag("artifact", aid, "stage:raw");          % single-valued: replace
+%       db.addTag("artifact", aid, ["topic:a1", "auditory_cortex"]);
+%       T   = db.getArtifacts(Tags="stage:raw", NotTags="qc:fail");
+%       ids = db.findByTags("artifact", Tags="topic:*");
+%   Superseding an event or artifact (supersedeEvent, supersedeArtifact, or
+%   Supersedes= on an add method) copies its current tags onto the successor
+%   in the same transaction.
 %
 %   Requires MATLAB R2024b or later and the Database Toolbox.
 %
@@ -69,7 +84,7 @@ classdef CarasLabDB < handle
     end
 
     properties (Constant)
-        SchemaVersionExpected = 2               % schema version this class is written for
+        SchemaVersionExpected = 3               % schema version this class is written for
     end
 
     properties
@@ -99,6 +114,13 @@ classdef CarasLabDB < handle
         T           = runReadOnlyQuery(obj, sql)
         updateSubject(obj, subjectId, opts)
         updateSession(obj, sessionId, opts)
+        namespace   = addTagNamespace(obj, opts)
+        tag         = registerTag(obj, tag, opts)
+        assignmentIds = addTag(obj, kind, entityId, tags, opts)
+        assignmentIds = removeTag(obj, kind, entityId, tags, opts)
+        [assignmentId, changed] = setTag(obj, kind, entityId, tag, opts)
+        T           = getEntityTags(obj, kind, entityId, opts)
+        ids         = findByTags(obj, kind, opts)
     end
 
     % ==================================================================
@@ -562,17 +584,22 @@ classdef CarasLabDB < handle
     methods
         function T = getProjects(obj, opts)
             %GETPROJECTS Retrieve projects filtered by any of the given columns.
+            %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS).
             arguments
                 obj (1,1) CarasLabDB
                 opts.ProjectId (1,1) string = string(missing)
                 opts.Name (1,1) string = string(missing)
                 opts.IsActive = []   % logical scalar or [] for any
+                opts.Tags string = strings(1, 0)       % must carry all of these
+                opts.AnyTags string = strings(1, 0)    % ... and at least one of these
+                opts.NotTags string = strings(1, 0)    % ... and none of these
             end
             f = struct();
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "name", opts.Name);
             f = obj.pSet(f, "is_active", opts.IsActive);
-            T = obj.pSelectFrom(obj.pT("project"), f, OrderBy="name");
+            T = obj.pSelectFrom(obj.pT("project"), f, OrderBy="name", ...
+                Where=obj.pTagWhere("project", opts.Tags, opts.AnyTags, opts.NotTags));
         end
 
         function T = getProjectMembers(obj, opts)
@@ -611,41 +638,60 @@ classdef CarasLabDB < handle
     methods
         function T = getSubjects(obj, opts)
             %GETSUBJECTS Retrieve subjects filtered by any of the given columns.
+            %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS).
             arguments
                 obj (1,1) CarasLabDB
                 opts.SubjectId (1,1) string = string(missing)
                 opts.ProjectId (1,1) string = string(missing)
                 opts.SpeciesCode (1,1) string = string(missing)
                 opts.Sex (1,1) string = string(missing)
+                opts.Tags string = strings(1, 0)       % must carry all of these
+                opts.AnyTags string = strings(1, 0)    % ... and at least one of these
+                opts.NotTags string = strings(1, 0)    % ... and none of these
             end
             f = struct();
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "project_id", opts.ProjectId);
             f = obj.pSet(f, "species_code", opts.SpeciesCode);
             f = obj.pSet(f, "sex", opts.Sex);
-            T = obj.pSelectFrom(obj.pT("subject"), f, OrderBy="subject_id");
+            T = obj.pSelectFrom(obj.pT("subject"), f, OrderBy="subject_id", ...
+                Where=obj.pTagWhere("subject", opts.Tags, opts.AnyTags, opts.NotTags));
         end
 
         function T = getSessions(obj, opts)
             %GETSESSIONS Retrieve sessions filtered by any of the given columns.
+            %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS).
             arguments
                 obj (1,1) CarasLabDB
                 opts.SessionId (1,1) string = string(missing)
                 opts.SubjectId (1,1) string = string(missing)
                 opts.Label (1,1) string = string(missing)
                 opts.StorageRootId double {mustBeInteger, mustBeScalarOrEmpty} = []
+                opts.Tags string = strings(1, 0)       % must carry all of these
+                opts.AnyTags string = strings(1, 0)    % ... and at least one of these
+                opts.NotTags string = strings(1, 0)    % ... and none of these
             end
             f = struct();
             f = obj.pSet(f, "session_id", opts.SessionId);
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "label", opts.Label);
             f = obj.pSet(f, "storage_root_id", opts.StorageRootId);
-            T = obj.pSelectFrom(obj.pT("session"), f, OrderBy="subject_id, label");
+            T = obj.pSelectFrom(obj.pT("session"), f, OrderBy="subject_id, label", ...
+                Where=obj.pTagWhere("session", opts.Tags, opts.AnyTags, opts.NotTags));
         end
 
         function T = getEvents(obj, opts)
             %GETEVENTS Retrieve base event rows. Reads event_active unless ActiveOnly=false.
             %   Rows are ordered newest first (occurred_at DESC, event_id).
+            %
+            %   Tag filters (string arrays; each element is a tag such as
+            %   "stage:raw", a bare tag such as "auditory_cortex", which means
+            %   "tag:auditory_cortex", or a wildcard "ns:*" for any tag of
+            %   namespace ns). A row is kept when it currently carries every
+            %   tag in Tags=, at least one in AnyTags= (when given), and none
+            %   in NotTags=. Semantics are lab.fn_tag_match's, so they are the
+            %   same as in the GUI, the dashboard and the MCP server:
+            %       T = db.getEvents(Tags="qc:pass", NotTags=["qc:fail", "tag:pilot"]);
             arguments
                 obj (1,1) CarasLabDB
                 opts.EventId (1,1) string = string(missing)
@@ -654,6 +700,9 @@ classdef CarasLabDB < handle
                 opts.SessionId (1,1) string = string(missing)
                 opts.ActiveOnly (1,1) logical = obj.UseActiveViews
                 opts.Limit (1,1) double {mustBeInteger, mustBeNonnegative} = 0
+                opts.Tags string = strings(1, 0)       % must carry all of these
+                opts.AnyTags string = strings(1, 0)    % ... and at least one of these
+                opts.NotTags string = strings(1, 0)    % ... and none of these
             end
             tbl = obj.pT("event");
             if opts.ActiveOnly
@@ -666,7 +715,8 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "session_id", opts.SessionId);
             % Newest first, ties broken by a unique column, so a Limit= result
             % is a stable, well-defined subset (same order as the MCP server).
-            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="occurred_at DESC, event_id");
+            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="occurred_at DESC, event_id", ...
+                Where=obj.pTagWhere("event", opts.Tags, opts.AnyTags, opts.NotTags));
         end
 
         function T = getEventDetail(obj, opts)
@@ -706,6 +756,8 @@ classdef CarasLabDB < handle
         function T = getArtifacts(obj, opts)
             %GETARTIFACTS Retrieve artifacts. Reads artifact_active unless ActiveOnly=false.
             %   Rows are ordered newest first (created_at DESC, artifact_id).
+            %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS):
+            %       T = db.getArtifacts(SessionId=sid, Tags="stage:raw");
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
@@ -716,6 +768,9 @@ classdef CarasLabDB < handle
                 opts.Checksum (1,1) string = string(missing)
                 opts.ActiveOnly (1,1) logical = obj.UseActiveViews
                 opts.Limit (1,1) double {mustBeInteger, mustBeNonnegative} = 0
+                opts.Tags string = strings(1, 0)       % must carry all of these
+                opts.AnyTags string = strings(1, 0)    % ... and at least one of these
+                opts.NotTags string = strings(1, 0)    % ... and none of these
             end
             tbl = obj.pT("artifact");
             if opts.ActiveOnly
@@ -728,7 +783,8 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "session_id", opts.SessionId);
             f = obj.pSet(f, "role", opts.Role);
             f = obj.pSet(f, "checksum", opts.Checksum);
-            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="created_at DESC, artifact_id");
+            T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="created_at DESC, artifact_id", ...
+                Where=obj.pTagWhere("artifact", opts.Tags, opts.AnyTags, opts.NotTags));
         end
 
         function T = getEventInputs(obj, opts)
@@ -779,6 +835,131 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "edge_type", opts.EdgeType);
             T = obj.pSelectFrom(obj.pT("provenance_edge"), f, ...
                 OrderBy="edge_type, from_id, to_id");
+        end
+    end
+
+    % ==================================================================
+    % Tags — vocabulary (namespaces and tags). Writing tags onto rows and
+    % reading them back live in their own files: addTag, removeTag, setTag,
+    % getEntityTags, findByTags, addTagNamespace, registerTag.
+    % ==================================================================
+    methods
+        function T = getTagNamespaces(obj, opts)
+            %GETTAGNAMESPACES Tag namespaces and their policies.
+            %   T = db.getTagNamespaces()
+            %   T = db.getTagNamespaces(AppliesTo="artifact")   % usable on artifacts
+            %   T = db.getTagNamespaces(Namespace="stage")
+            %
+            %   applies_to comes back as comma-separated text
+            %   ("event,artifact"). The column is a text[], which the native
+            %   postgresql() interface does not read, so it is flattened with
+            %   array_to_string in SQL instead of being fetched with SELECT *.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.Namespace (1,1) string = string(missing)
+                opts.AppliesTo (1,1) string = string(missing)
+            end
+            f = obj.pSet(struct(), "namespace", opts.Namespace);
+            extra = strings(1, 0);
+            if obj.pIsProvided(opts.AppliesTo)
+                CarasLabDB.pTagEntity(opts.AppliesTo);   % validates the kind
+                extra = obj.sqlLiteral(opts.AppliesTo) + " = ANY (applies_to)";
+            end
+            T = obj.pSelect("SELECT namespace, description, mutability, cardinality, " + ...
+                "open_vocabulary, array_to_string(applies_to, ',') AS applies_to, " + ...
+                "created_at, created_by FROM " + obj.pT("tag_namespace") + ...
+                obj.pWhere(f, extra) + " ORDER BY namespace;");
+        end
+
+        function T = getTags(obj, opts)
+            %GETTAGS Registered tags (the vocabulary), optionally of one namespace.
+            %   T = db.getTags()                                  % every live tag
+            %   T = db.getTags(Namespace="stage")
+            %   T = db.getTags(Namespace="stage", IncludeRetired=true)
+            %   Retired tags (retired_at set) are left out unless
+            %   IncludeRetired=true. Ordered by namespace, value.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.Namespace (1,1) string = string(missing)
+                opts.IncludeRetired (1,1) logical = false
+            end
+            f = obj.pSet(struct(), "namespace", opts.Namespace);
+            extra = strings(1, 0);
+            if ~opts.IncludeRetired
+                extra = "retired_at IS NULL";
+            end
+            T = obj.pSelectFrom(obj.pT("tag"), f, OrderBy="namespace, value", Where=extra);
+        end
+
+        function updateTagNamespace(obj, namespace, opts)
+            %UPDATETAGNAMESPACE Edit a tag namespace in place (row_history logs it).
+            %   db.updateTagNamespace("topic", Description="Free-form subject matter")
+            %   db.updateTagNamespace("qc", AppliesTo=["artifact","event","session","subject"])
+            %   db.updateTagNamespace("cohort", OpenVocabulary=false)
+            %
+            %   Only the arguments you supply are changed. AppliesTo is the
+            %   complete new list of entity kinds. Once any tag of the
+            %   namespace has been assigned the database freezes its policy:
+            %   Mutability and Cardinality can no longer change and AppliesTo
+            %   may only grow (the reserved 'tag' namespace is frozen from the
+            %   start); such an update raises the database's error.
+            arguments
+                obj (1,1) CarasLabDB
+                namespace (1,1) string
+                opts.Description (1,1) string = string(missing)
+                opts.OpenVocabulary logical {mustBeScalarOrEmpty} = logical.empty
+                opts.AppliesTo string = strings(1, 0)
+                opts.Mutability (1,1) string = string(missing)
+                opts.Cardinality (1,1) string = string(missing)
+            end
+            obj.pCheckMember(opts.Mutability, ["mutable", "immutable"], "Mutability");
+            obj.pCheckMember(opts.Cardinality, ["single", "multi"], "Cardinality");
+            s = struct();
+            s = obj.pSet(s, "description", opts.Description);
+            s = obj.pSet(s, "open_vocabulary", opts.OpenVocabulary);
+            if ~isempty(opts.AppliesTo)
+                s.applies_to = CarasLabDB.pAppliesToLiteral(opts.AppliesTo);
+            end
+            s = obj.pSet(s, "mutability", opts.Mutability);
+            s = obj.pSet(s, "cardinality", opts.Cardinality);
+            n = obj.pUpdate(obj.pT("tag_namespace"), s, ...
+                "namespace = " + obj.sqlLiteral(namespace), "namespace");
+            if n == 0
+                error("CarasLabDB:tagNamespaceNotFound", "No tag namespace %s.", namespace);
+            end
+        end
+
+        function retireTag(obj, tag, opts)
+            %RETIRETAG Retire a tag (no new assignments), or bring it back.
+            %   db.retireTag("stage:curated")
+            %   db.retireTag("stage:curated", Unretire=true)
+            %
+            %   A tag is never renamed or deleted, because the assignment log
+            %   refers to it by name: retire it and register the replacement.
+            %   Rows that carry it keep it until it is removed. Retiring a tag
+            %   that is already retired (or un-retiring a live one) changes
+            %   nothing, so the original retired_at is kept.
+            arguments
+                obj (1,1) CarasLabDB
+                tag (1,1) string
+                opts.Unretire (1,1) logical = false
+            end
+            tag = CarasLabDB.normalizeTag(tag);
+            where = "tag = " + obj.sqlLiteral(tag);
+            R = obj.pSelect("SELECT (retired_at IS NOT NULL) AS is_retired FROM " + ...
+                obj.pT("tag") + " WHERE " + where + ";");
+            if height(R) == 0
+                error("CarasLabDB:tagNotFound", "No registered tag %s.", tag);
+            end
+            if logical(R.is_retired(1)) ~= opts.Unretire
+                return   % already in the requested state
+            end
+            if opts.Unretire
+                s = struct("retired_at", NaT);    % sqlLiteral(NaT) -> NULL
+            else
+                s = struct("retired_at", datetime("now", "TimeZone", "local"));
+            end
+            obj.pUpdate(obj.pT("tag"), s, where, "tag");
         end
     end
 
@@ -859,6 +1040,12 @@ classdef CarasLabDB < handle
             %   are filled in here. Both are written inside the same
             %   transaction, so a correction can never commit an event whose
             %   provenance edges or files are only half-carried over.
+            %
+            %   When BASE sets supersedes (supersedeEvent, or Supersedes= on an
+            %   addXEvent method), the superseded event's current tags are
+            %   copied onto the new event, and each artifact with supersedes
+            %   gets its predecessor's tags, in the same transaction (see
+            %   PCARRYTAGS).
             arguments
                 obj (1,1) CarasLabDB
                 base (1,1) struct
@@ -867,9 +1054,111 @@ classdef CarasLabDB < handle
                 inputs cell = {}
                 artifacts cell = {}
             end
+            eventId = obj.pTransact(@() ...
+                obj.pInsertEventRows(base, detailTable, detail, inputs, artifacts));
+        end
+
+        function eventId = pInsertEventRows(obj, base, detailTable, detail, inputs, artifacts)
+            %PINSERTEVENTROWS The writes of PINSERTEVENT. Run only inside PTRANSACT.
+            eventId = obj.pInsertReturning(obj.pT("event"), base, "event_id");
+            detail.event_id = eventId;
+            if ~isfield(detail, "event_type")
+                detail.event_type = base.event_type;
+            end
+            obj.pInsert(detailTable, detail);
+            for k = 1:numel(inputs)
+                edge = inputs{k};
+                edge.event_id = eventId;
+                obj.pInsert(obj.pT("event_input"), edge);
+            end
+            if isfield(base, "supersedes") && obj.pIsProvided(base.supersedes)
+                obj.pCarryTags("event", base.supersedes, eventId);
+            end
+            for k = 1:numel(artifacts)
+                a = artifacts{k};
+                a.produced_by_event_id = eventId;
+                obj.pInsertArtifact(a);
+            end
+        end
+
+        function artifactId = pInsertArtifact(obj, s)
+            %PINSERTARTIFACT Insert one lab.artifact row; carry tags if it supersedes.
+            %   S is a column->value insert struct. When it sets supersedes, the
+            %   predecessor's current tags are copied onto the new row, so the
+            %   caller must run this inside PTRANSACT: the artifact and its
+            %   carried tags commit together or not at all.
+            artifactId = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
+            if isfield(s, "supersedes") && obj.pIsProvided(s.supersedes)
+                obj.pCarryTags("artifact", s.supersedes, artifactId);
+            end
+        end
+
+        function pCarryTags(obj, kind, oldId, newId)
+            %PCARRYTAGS Copy the current tags of a superseded event/artifact to its successor.
+            %   A correction is a new row, so without this it would start with
+            %   no tags and drop out of every tag filter the original matched
+            %   (lab.fn_check_integrity reports that as tag_not_carried_forward).
+            %   One INSERT ... SELECT writes a new 'add' log row per current tag
+            %   of OLDID, noted "carried forward from <OLDID>" and applied by
+            %   the current person; nothing existing is altered. The successor
+            %   is brand new, so no row can be a duplicate, and copying the
+            %   predecessor's (policy-valid) current set cannot break a
+            %   single-valued namespace or applies_to.
+            %
+            %   Retired tags are skipped, with a CarasLabDB:retiredTagsNotCarried
+            %   warning. The policy trigger rejects any new assignment of a
+            %   retired tag, so carrying one would make the whole correction
+            %   fail -- a weight could not be fixed because a stage value was
+            %   retired. Skipping keeps the correction possible and stays
+            %   visible: the warning names the tags, and fn_check_integrity
+            %   keeps reporting tag_not_carried_forward for the successor until
+            %   someone re-tags it (or un-retires the tag and adds it).
+            %
+            %   Must run inside PTRANSACT, with the successor's insert.
+            arguments
+                obj (1,1) CarasLabDB
+                kind (1,1) string {mustBeMember(kind, ["event", "artifact"])}
+                oldId (1,1) string
+                newId (1,1) string
+            end
+            [~, pk] = CarasLabDB.pTagEntity(kind);
+            litKind = obj.sqlLiteral(kind);
+            litOld  = obj.sqlLiteral(oldId);
+            src = " FROM " + obj.pT("tag_current") + " c JOIN " + obj.pT("tag") + ...
+                " t ON t.tag = c.tag WHERE c.entity_kind = " + litKind + ...
+                " AND c." + pk + " = " + litOld + "::uuid";
+
+            R = obj.pSelect("SELECT c.tag" + src + " AND t.retired_at IS NOT NULL ORDER BY c.tag;");
+            if height(R) > 0
+                warning("CarasLabDB:retiredTagsNotCarried", ...
+                    "%s %s supersedes %s, whose retired tag(s) %s were not carried " + ...
+                    "forward (a retired tag cannot be assigned); lab.fn_check_integrity() " + ...
+                    "reports this as tag_not_carried_forward.", kind, newId, oldId, ...
+                    strjoin(reshape(CarasLabDB.pColText(R.tag), 1, []), ", "));
+            end
+
+            obj.pExec("INSERT INTO " + obj.pT("tag_assignment") + ...
+                " (entity_kind, " + pk + ", tag, op, note, applied_by)" + ...
+                " SELECT " + litKind + ", " + obj.sqlLiteral(newId) + "::uuid, c.tag, 'add', " + ...
+                obj.sqlLiteral("carried forward from " + oldId) + ", " + ...
+                obj.sqlLiteral(obj.CurrentPersonId) + "::uuid" + ...
+                src + " AND t.retired_at IS NULL ORDER BY c.tag;");
+        end
+
+        function out = pTransact(obj, fn)
+            %PTRANSACT Run FN() as one transaction: commit on success, roll back on error.
+            %   OUT = pTransact(obj, @() ...) returns FN's single output. FN's
+            %   statements go through obj.Connection with AutoCommit off; the
+            %   prior AutoCommit mode is restored however this exits (onCleanup).
+            %   Every multi-statement write of this class goes through here, so
+            %   none of them can commit half its rows.
+            arguments
+                obj (1,1) CarasLabDB
+                fn (1,1) function_handle
+            end
             conn = obj.Connection;
             priorAutoCommit = conn.AutoCommit;
-            restore = onCleanup(@() obj.pRestoreAutoCommit(conn, priorAutoCommit));
+            restore = onCleanup(@() CarasLabDB.pRestoreAutoCommit(conn, priorAutoCommit)); %#ok<NASGU>
             % Refuse to run inside somebody else's transaction: the commit
             % below would commit their uncommitted work, and the rollback
             % would discard it.
@@ -880,22 +1169,7 @@ classdef CarasLabDB < handle
             end
             conn.AutoCommit = 'off';
             try
-                eventId = obj.pInsertReturning(obj.pT("event"), base, "event_id");
-                detail.event_id = eventId;
-                if ~isfield(detail, "event_type")
-                    detail.event_type = base.event_type;
-                end
-                obj.pInsert(detailTable, detail);
-                for k = 1:numel(inputs)
-                    edge = inputs{k};
-                    edge.event_id = eventId;
-                    obj.pInsert(obj.pT("event_input"), edge);
-                end
-                for k = 1:numel(artifacts)
-                    a = artifacts{k};
-                    a.produced_by_event_id = eventId;
-                    obj.pInsert(obj.pT("artifact"), a);
-                end
+                out = fn();
                 commit(conn);
             catch ME
                 % A failing rollback (dead connection, already-aborted
@@ -907,6 +1181,57 @@ classdef CarasLabDB < handle
                 end
                 rethrow(ME);
             end
+        end
+
+        function w = pTagWhere(obj, kind, allTags, anyTags, noneTags)
+            %PTAGWHERE The lab.fn_tag_match clause for Tags= / AnyTags= / NotTags=.
+            %   Returns strings(1,0) when no token was given, so pSelectFrom
+            %   adds nothing. The id column comes from the fixed PTAGENTITY
+            %   map, never from the caller; every token is validated locally
+            %   (PTAGARRAYLITERAL) and passed as a sqlLiteral value.
+            [~, pk] = CarasLabDB.pTagEntity(kind);
+            arrs = [CarasLabDB.pTagArrayLiteral(allTags), ...
+                    CarasLabDB.pTagArrayLiteral(anyTags), ...
+                    CarasLabDB.pTagArrayLiteral(noneTags)];
+            if all(arrs == "NULL::text[]")
+                w = strings(1, 0);
+                return
+            end
+            w = obj.pT("fn_tag_match") + "(" + obj.sqlLiteral(kind) + ", " + ...
+                pk + "::text, " + strjoin(arrs, ", ") + ")";
+        end
+
+        function ids = pApplyTags(obj, kind, entityId, tags, op, note, appliedBy)
+            %PAPPLYTAGS lab.fn_tag(kind, id, tag, OP) for each tag; one transaction if several.
+            %   Shared by ADDTAG and REMOVETAG. Tags are validated and
+            %   canonicalised locally, then de-duplicated (so "Pilot" and
+            %   "pilot" are one write, not a duplicate-add error).
+            CarasLabDB.pTagEntity(kind);   % validates the kind
+            tags = unique(CarasLabDB.normalizeTag(reshape(tags, 1, [])), "stable");
+            by = obj.pCreatedBy(appliedBy);
+            write = @() obj.pFnTagEach(kind, entityId, tags, op, note, by);
+            if isscalar(tags)
+                ids = write();            % one statement is atomic by itself
+            else
+                ids = obj.pTransact(write);
+            end
+        end
+
+        function ids = pFnTagEach(obj, kind, entityId, tags, op, note, by)
+            %PFNTAGEACH The loop of PAPPLYTAGS. Several tags: run only inside PTRANSACT.
+            ids = zeros(1, numel(tags));
+            for i = 1:numel(tags)
+                ids(i) = obj.pFnTag(kind, entityId, tags(i), op, note, by);
+            end
+        end
+
+        function id = pFnTag(obj, kind, entityId, tag, op, note, by)
+            %PFNTAG One call of lab.fn_tag; returns the assignment_id it wrote.
+            R = obj.pSelect("SELECT " + obj.pT("fn_tag") + "(" + ...
+                obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + ", " + ...
+                obj.sqlLiteral(tag) + ", " + obj.sqlLiteral(op) + ", " + ...
+                obj.sqlLiteral(note) + ", " + obj.sqlLiteral(by) + "::uuid) AS assignment_id;");
+            id = double(R.assignment_id(1));
         end
 
         function base = pEventBase(obj, eventType, opts)
@@ -1150,6 +1475,67 @@ classdef CarasLabDB < handle
             tbl = eventType + "_event";
         end
 
+        function [tbl, pk] = pTagEntity(kind)
+            %PTAGENTITY Map a taggable entity kind to its table and id column, safely.
+            %   The id column is also the column of that kind in
+            %   lab.tag_assignment / lab.tag_current. Like PDETAILTABLE, this
+            %   is a fixed map so that a caller's kind string can only select
+            %   one of five internal identifiers, never become one.
+            kind = string(kind);
+            if ~isscalar(kind) || ismissing(kind)
+                kind = "<missing>";
+            end
+            switch kind
+                case "event",    tbl = "event";    pk = "event_id";
+                case "artifact", tbl = "artifact"; pk = "artifact_id";
+                case "subject",  tbl = "subject";  pk = "subject_id";
+                case "session",  tbl = "session";  pk = "session_id";
+                case "project",  tbl = "project";  pk = "project_id";
+                otherwise
+                    error("CarasLabDB:unknownEntityKind", ...
+                        "Entity kind '%s' cannot be tagged (expected one of: " + ...
+                        "event, artifact, subject, session, project).", kind);
+            end
+        end
+
+        function lit = pTagArrayLiteral(tokens)
+            %PTAGARRAYLITERAL Tag-filter tokens as an ARRAY[...]::text[] literal.
+            %   Missing and blank elements are dropped (lab.fn_tag_match ignores
+            %   them too); the rest are validated and canonicalised with
+            %   normalizeTag(AllowWildcard=true) so a malformed token fails here
+            %   with a clear message. No token left gives NULL::text[], which
+            %   lab.fn_tag_match treats as "no constraint".
+            tokens = reshape(string(tokens), 1, []);
+            tokens = tokens(~ismissing(tokens));
+            tokens = tokens(strlength(strip(tokens, "both", " ")) > 0);
+            if isempty(tokens)
+                lit = "NULL::text[]";
+                return
+            end
+            tokens = CarasLabDB.normalizeTag(tokens, AllowWildcard=true);
+            lits = strings(1, numel(tokens));
+            for i = 1:numel(tokens)
+                lits(i) = CarasLabDB.sqlLiteral(tokens(i));
+            end
+            lit = "ARRAY[" + strjoin(lits, ", ") + "]::text[]";
+        end
+
+        function lit = pAppliesToLiteral(kinds)
+            %PAPPLIESTOLITERAL Validated text[] literal body for applies_to, e.g. {event,artifact}.
+            %   Every element must be a taggable kind; duplicates are dropped
+            %   and the kinds put in a fixed order. The result is plain text
+            %   ('{event,artifact}') that sqlLiteral quotes and Postgres
+            %   assignment-casts to text[]; validation here means it can only
+            %   ever contain the five known words.
+            known = ["event", "artifact", "subject", "session", "project"];
+            kinds = reshape(string(kinds), 1, []);
+            if isempty(kinds) || any(ismissing(kinds)) || ~all(ismember(kinds, known))
+                error("CarasLabDB:invalidValue", ...
+                    "AppliesTo must be a non-empty list of: %s.", strjoin(known, ", "));
+            end
+            lit = "{" + strjoin(known(ismember(known, kinds)), ",") + "}";
+        end
+
         function pCheckMember(value, allowed, name)
             %PCHECKMEMBER Error if a provided VALUE is not in ALLOWED (skips unprovided).
             if CarasLabDB.pIsProvided(value) && ~ismember(string(value), allowed)
@@ -1322,6 +1708,80 @@ classdef CarasLabDB < handle
                 error("CarasLabDB:scalarExpected", "Text SQL values must be scalar.");
             end
             out = CarasLabDB.pQuoteText(s);
+        end
+
+        function tags = normalizeTag(tags, opts)
+            %NORMALIZETAG Canonical spelling of one or more tags, validated locally.
+            %   t = CarasLabDB.normalizeTag(" Stage:Raw ")      % -> "stage:raw"
+            %   t = CarasLabDB.normalizeTag("Auditory_Cortex")  % -> "tag:auditory_cortex"
+            %   t = CarasLabDB.normalizeTag("qc:*", AllowWildcard=true)   % filters only
+            %
+            %   Mirrors lab.fn_canonical_tag: lower case, surrounding spaces
+            %   removed, and a tag with no colon placed in the reserved 'tag'
+            %   namespace. Nothing else is rewritten: a tag whose namespace
+            %   does not match ^[a-z][a-z0-9_]{0,31}$ or whose value does not
+            %   match ^[a-z0-9][a-z0-9_.-]{0,63}$ raises CarasLabDB:invalidTag
+            %   here, before the database would reject it less helpfully.
+            %   AllowWildcard=true also accepts the value '*' ("any tag of the
+            %   namespace"), which only tag filters understand.
+            arguments
+                tags string
+                opts.AllowWildcard (1,1) logical = false
+            end
+            for i = 1:numel(tags)
+                [ns, val] = CarasLabDB.parseTag(tags(i), AllowWildcard=opts.AllowWildcard);
+                tags(i) = ns + ":" + val;
+            end
+        end
+
+        function [namespace, value] = parseTag(tag, opts)
+            %PARSETAG Split a tag into its namespace and value, after normalizing it.
+            %   [ns, val] = CarasLabDB.parseTag("Stage:Raw")       % "stage", "raw"
+            %   [ns, val] = CarasLabDB.parseTag("auditory_cortex") % "tag", "auditory_cortex"
+            %   Same rules and errors as NORMALIZETAG; the split is at the
+            %   first colon, so a second colon lands in the value and fails
+            %   its pattern.
+            arguments
+                tag (1,1) string
+                opts.AllowWildcard (1,1) logical = false
+            end
+            if ismissing(tag)
+                error("CarasLabDB:invalidTag", "A tag is required (got <missing>).");
+            end
+            % lab.fn_canonical_tag uses btrim(), which strips spaces only.
+            t = lower(strip(tag, "both", " "));
+            k = strfind(t, ":");
+            if isempty(k)
+                namespace = "tag";
+                value = t;
+            else
+                namespace = extractBefore(t, k(1));
+                value = extractAfter(t, k(1));
+            end
+            if isempty(regexp(char(namespace), '^[a-z][a-z0-9_]{0,31}$', 'once'))
+                error("CarasLabDB:invalidTag", ...
+                    "Invalid tag '%s': the namespace '%s' must be a lower-case letter " + ...
+                    "followed by at most 31 of a-z, 0-9 and _.", tag, namespace);
+            end
+            isWildcard = opts.AllowWildcard && value == "*";
+            if ~isWildcard && isempty(regexp(char(value), '^[a-z0-9][a-z0-9_.-]{0,63}$', 'once'))
+                error("CarasLabDB:invalidTag", ...
+                    "Invalid tag '%s': the value '%s' must start with a-z or 0-9 and " + ...
+                    "have at most 64 characters of a-z, 0-9, _, . and -.", tag, value);
+            end
+        end
+
+        function d = displayTag(tags)
+            %DISPLAYTAG A tag as people write it: a bare tag shows without 'tag:'.
+            %   CarasLabDB.displayTag("tag:auditory_cortex")   % -> "auditory_cortex"
+            %   CarasLabDB.displayTag("stage:raw")             % -> "stage:raw"
+            %   The same rule as the display_tag column of lab.tag_current.
+            arguments
+                tags string
+            end
+            d = tags;
+            bare = startsWith(d, "tag:");
+            d(bare) = extractAfter(d(bare), 4);
         end
     end
 

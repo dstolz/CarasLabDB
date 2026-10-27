@@ -23,7 +23,15 @@ function applyFilters(obj)
     rows = obj.pReadFilterRows();
     quickText = string(obj.UI.QuickSearch.Value);
     quickRegex = logical(obj.UI.QuickRegex.Value);
-    where = obj.buildWhere(d, rows, quickText, quickRegex);
+    tagText = string(obj.UI.TagFilter.Value);
+    try
+        where = obj.buildWhere(d, rows, quickText, quickRegex, tagText);
+    catch ME
+        % A malformed tag token (CarasLabDB:invalidTag) is reported, not thrown.
+        obj.pStatus("Filter error: " + string(ME.message));
+        uialert(obj.Fig, string(ME.message), "Invalid filter");
+        return
+    end
 
     sql = "SELECT * FROM " + obj.pQualify(tableName) + where + ...
         " ORDER BY " + d.OrderBy + " LIMIT " + string(obj.RowLimit) + ";";
@@ -46,7 +54,11 @@ function applyFilters(obj)
     if n >= obj.RowLimit
         capNote = " (capped at " + string(obj.RowLimit) + ")";
     end
-    obj.pStatus(d.Title + ": " + string(n) + " row(s)" + capNote + " · " + tableName);
+    tagNote = "";
+    if strlength(strtrim(tagText)) > 0
+        tagNote = " · tags: " + strtrim(tagText);
+    end
+    obj.pStatus(d.Title + ": " + string(n) + " row(s)" + capNote + " · " + tableName + tagNote);
 end
 
 % =============================================================================

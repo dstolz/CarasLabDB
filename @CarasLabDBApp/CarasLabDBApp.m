@@ -2,8 +2,10 @@ classdef CarasLabDBApp < handle
 %CARASLABDBAPP Interactive GUI for browsing and editing the CarasLabDB database.
 %
 %   CarasLabDBApp is a uifigure-based front end over the CarasLabDB class. It
-%   lets you search and browse subjects, sessions, events and artifacts; add
-%   and correct events; add/edit subjects and sessions; export any filtered
+%   lets you search and browse subjects, sessions, events and artifacts
+%   (including by tag: stage:raw -qc:fail topic:*); add and correct events;
+%   add/edit subjects and sessions; view and edit the tags of any row
+%   (Ctrl+T); export any filtered
 %   table to the base workspace; and run vetted read-only custom SQL with
 %   history recall. Window geometry, connection (minus password), the active
 %   view toggle, and SQL history persist between sessions.
@@ -50,6 +52,7 @@ classdef CarasLabDBApp < handle
         showEventEditor(obj, mode, eventType, eventId)
         showSubjectEditor(obj, mode, subjectId)
         showSessionEditor(obj, mode, sessionId)
+        showTagEditor(obj, kind, entityId)
         runCustomSQL(obj)
     end
 
@@ -57,7 +60,7 @@ classdef CarasLabDBApp < handle
         db = loginDialog(obj)
         loadPrefs(obj)
         savePrefs(obj)
-        w = buildWhere(obj, tabDef, rows, quickText, quickRegex)
+        w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
     end
 
     methods (Static, Access = private)
@@ -207,7 +210,8 @@ classdef CarasLabDBApp < handle
             %ONKEYPRESS Keyboard shortcuts mirroring the toolbar/filter buttons.
             %   Ctrl+R Refresh · Ctrl+E Export→WS · Ctrl+Shift+E Add Event ·
             %   Ctrl+Shift+S Add Subject · Ctrl+Shift+N Add Session ·
-            %   Ctrl+D Edit/Supersede · Enter Apply filters (browse tabs) ·
+            %   Ctrl+D Edit/Supersede · Ctrl+T Tags of the selected row ·
+            %   Enter Apply filters (browse tabs) ·
             %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters ·
             %   Ctrl+? Shortcut list.
             mods  = string(evt.Modifier);
@@ -239,6 +243,8 @@ classdef CarasLabDBApp < handle
                 obj.onExport();
             elseif key == "d" && ctrl
                 obj.onEditSelected();
+            elseif key == "t" && ctrl
+                obj.onEditTags();
             elseif key == "r" && ctrl
                 obj.onRefresh();
             end
@@ -275,6 +281,21 @@ classdef CarasLabDBApp < handle
                 otherwise
                     uialert(obj.Fig, "This entity is read-only in the GUI.", "Edit");
             end
+        end
+
+        function onEditTags(obj, ~, ~)
+            %ONEDITTAGS Open the tag editor for the selected row (Ctrl+T).
+            d = obj.pCurrentTabDef();
+            if isempty(d)
+                uialert(obj.Fig, "Tags are edited on the browse tabs.", "Tags");
+                return
+            end
+            id = obj.pSelectedId(d);
+            if ismissing(id)
+                uialert(obj.Fig, "Select a row first.", "Tags");
+                return
+            end
+            obj.showTagEditor(d.Entity, id);
         end
 
         function id = pSelectedId(obj, d)
@@ -379,6 +400,7 @@ classdef CarasLabDBApp < handle
                 w.Val2.Value = '';
             end
             obj.UI.QuickSearch.Value = '';
+            obj.UI.TagFilter.Value = '';
             obj.refreshActiveTab();
         end
     end

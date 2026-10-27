@@ -1,8 +1,8 @@
 function savePrefs(obj)
 %SAVEPREFS Persist obj.Prefs (updated from live UI state) via setpref.
 %
-%   Captures window geometry, the active-view toggle, the selected tab, and
-%   the current SQL editor text before writing. The database password is
+%   Captures window geometry, the active-view toggle, the selected tab, the
+%   Tags filter text, and the current SQL editor text before writing. The database password is
 %   never stored.
 %
 %   See also CARASLABDBAPP/LOADPREFS.
@@ -20,6 +20,9 @@ function savePrefs(obj)
         end
         if isfield(obj.UI, "TabGroup") && isvalid(obj.UI.TabGroup)
             p.LastTab = string(obj.UI.TabGroup.SelectedTab.Tag);
+        end
+        if isfield(obj.UI, "TagFilter") && isvalid(obj.UI.TagFilter)
+            p.LastTagFilter = string(obj.UI.TagFilter.Value);
         end
         if isfield(obj.UI, "SqlEditor") && isvalid(obj.UI.SqlEditor)
             p.LastSql = string(local_joinlines(obj.UI.SqlEditor.Value));
