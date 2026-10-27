@@ -49,6 +49,7 @@ mcp-server/
       events.py                     # get_events, get_event_detail
       artifacts.py                  # get_artifacts, get_event_inputs, ...
       provenance.py                 # get_artifact_lineage, get_provenance_edges
+      tags.py                       # get_tag_namespaces, get_tags, get_entity_tags, find_by_tags
       health.py                     # get_integrity_report
   tests/                            # pytest: unit (no DB) + integration
 ```
@@ -61,9 +62,13 @@ mcp-server/
   `fetch_limited(sql, params, limit)` wraps it with a `LIMIT` and a
   truncation flag. `read_only_cursor()` gives a tool several queries in one
   transaction. `select_from(table, filters, limit, order_by, ci_filters,
-  time_ranges)` builds a `SELECT * FROM <table> WHERE <filters ANDed>` for
+  time_ranges, tag_filters)` builds a `SELECT * FROM <table> WHERE <filters ANDed>` for
   the common case (`ci_filters` compare case-insensitively; `time_ranges`
-  maps a column to an inclusive lower and exclusive upper timestamptz bound), where
+  maps a column to an inclusive lower and exclusive upper timestamptz bound;
+  `tag_filters` is a `(kind, all_of, any_of, none_of)` tuple that adds the one
+  fixed clause `lab.fn_tag_match(%s, <pk>::text, %s::text[], %s::text[],
+  %s::text[])`, with `<pk>` taken from `db.TAG_PK` and omitted when all three
+  lists are empty — see [tagging.md](tagging.md) for the tag syntax), where
   `filters` values that are `None` are dropped (i.e. "not filtering on this
   column", *not* an `IS NULL` test) and every non-`None` value is bound as a
   query parameter — never interpolated into SQL text. `table`, `order_by`,
@@ -85,7 +90,7 @@ mcp-server/
 
 ### The read-only guarantee
 
-Every query goes through `db._read_only_cursor()`, which stacks three
+Every query goes through `db.read_only_cursor()`, which stacks three
 independent defenses so that no one of them has to be right:
 
 1. **The role.** Connect as `lab_ro` (§5), which holds `SELECT` and nothing
@@ -154,7 +159,7 @@ silently clipped result as the complete answer and telling a researcher
 "there are 200 recordings for this subject" — is a wrong answer, not a slow
 one.
 
-The only two places a *tool* builds SQL with any dynamic structure (not just
+The only three places a *tool* builds SQL with any dynamic structure (not just
 bound parameter values) are:
 
 - `events.get_event_detail`, which looks up the detail table name in
@@ -163,6 +168,12 @@ bound parameter values) are:
 - `provenance.get_artifact_lineage`, which validates `direction` is exactly
   `"up"` or `"down"` (raising `ValueError` otherwise) before passing it to
   `lab.fn_artifact_lineage(...)`.
+- `tags.get_entity_tags`, which uses the entity's id column name as a filter
+  key. `db.tag_pk(entity_kind)` takes it from the fixed `db.TAG_PK` map and
+  raises `ValueError` for any kind outside event / artifact / subject /
+  session / project, so the caller's string never becomes an identifier. (The
+  tag filters on the list tools and `find_by_tags` use fixed templates with
+  every value bound.)
 
 Every other tool parameter flows into `select_from`'s `filters` dict as a
 bound value, never as SQL text — and the structural parts `select_from` does
@@ -186,7 +197,7 @@ tools. Every list tool also takes `limit: int = 200`.
 | `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`, by `occurred_from` (inclusive) / `occurred_before` (exclusive), and by `tags`/`any_tags`/`none_tags`; `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
 | `artifacts.py` | `get_artifacts` (`created_from` / `created_before` range and `tags`/`any_tags`/`none_tags`; `active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`), `get_provenance_edges` |
-| `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current`, or the full assignment log), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
+| `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current` ordered by tag, or with `include_history` the full assignment log, newest first), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
 | `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`; errors first; empty means healthy) |
 
 `get_projects`, `get_subjects`, `get_sessions`, `get_events` and `get_artifacts`

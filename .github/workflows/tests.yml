@@ -30,8 +30,9 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       # The last commit whose schema.sql is version 1 (no lab.schema_version).
-      # Migration 002 is checked by upgrading that schema and comparing the
-      # result with a fresh install of the current one.
+      # The migrations are checked by upgrading that schema with every
+      # script in design_docs/migrations/ and comparing the result with a
+      # fresh install of the current one.
       SCHEMA_V1_COMMIT: "1778007"
     steps:
       - uses: actions/checkout@v4

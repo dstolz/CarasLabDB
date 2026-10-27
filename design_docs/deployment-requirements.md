@@ -193,7 +193,8 @@ known; items marked *IT decision* need input before go-live.
    script, `design_docs/grants.sql`, which every guide applies. `lab_rw` can
    read and insert everywhere, and can update only the descriptive tables the
    MATLAB client edits (`subject`, `session`, `project`, `project_member`,
-   `project_artifact`, `person`); every such edit is recorded in the database
+   `project_artifact`, `person`, and the tag vocabulary tables `tag_namespace`
+   and `tag`); every such edit is recorded in the database
    with the login that made it. `lab_ro` can only read. Default-privilege
    rules cover tables added later.
 

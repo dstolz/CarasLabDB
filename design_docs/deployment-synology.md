@@ -144,8 +144,8 @@ provenance edges are blocked by triggers whatever is granted, and corrections
 happen through superseding inserts. `grants.sql` therefore gives `lab_rw`
 `SELECT` + `INSERT` everywhere, plus `UPDATE` on only the descriptive tables
 the MATLAB client and GUI edit in place (`subject`, `session`, `project`,
-`project_member`, `project_artifact`, `person`; every edit is recorded in
-`lab.row_history`). It also creates `lab_ro` (read only) for the dashboard
+`project_member`, `project_artifact`, `person`, and the tag vocabulary
+`tag_namespace` / `tag`; every edit is recorded in `lab.row_history`). It also creates `lab_ro` (read only) for the dashboard
 server and the MCP server, and sets default privileges for tables added
 later. Re-run it after any schema change.
 

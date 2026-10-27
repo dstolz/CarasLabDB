@@ -11,7 +11,9 @@ data. It has five parts:
   This is the single source of truth for the data model; nothing else should
   redefine it. It installs the latest schema version; `design_docs/migrations/`
   upgrades existing databases, and `design_docs/grants.sql` holds the roles
-  and privileges every deployment guide applies.
+  and privileges every deployment guide applies. It includes the tag tables
+  (`tag_namespace`, `tag`, `tag_assignment`); `design_docs/tagging.md` is the
+  user-facing tag guide.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
@@ -29,7 +31,9 @@ data. It has five parts:
   against the `lab` schema) and assigns the result to `window.LAB_DATA` instead
   of generating it. The SQL emits the whole `LAB_DATA` shape as one JSON object
   — one array per table, each event with its detail row as `detail`, each
-  artifact with its latest `verification`. `web/live/lab-dashboard-live.html`
+  artifact with its latest `verification`, the tag vocabulary as
+  `tagNamespaces`/`tags` and the whole tag log as `tagAssignments` (current
+  tags are derived in the browser, like `tag_current`). `web/live/lab-dashboard-live.html`
   is *generated* from the offline demo (swap the synthetic `<script>` for the
   loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
   offline demo's app logic changes, rather than editing it by hand. The
@@ -40,7 +44,9 @@ data. It has five parts:
   (`src/caraslabdb_mcp/`) that gives an LLM agent typed `get*` tools mirroring
   `@CarasLabDB`'s read surface (reference tables, subjects/sessions, events and
   their detail rows, artifacts, verifications, `fn_artifact_lineage`,
-  provenance edges, `fn_check_integrity`). Its one hard invariant is that it cannot write: no write
+  provenance edges, `fn_check_integrity`, and the tag tools `get_tag_namespaces`,
+  `get_tags`, `get_entity_tags`, `find_by_tags` plus `tags`/`any_tags`/`none_tags`
+  filters on the entity tools). Its one hard invariant is that it cannot write: no write
   tools, every query inside a rolled-back `SET TRANSACTION READ ONLY`
   transaction, and a `SELECT`-only role. No tool accepts a table/column name or
   raw SQL, and every list tool is bounded by `limit` (default 200, max 1000).
@@ -71,7 +77,8 @@ records:
 - **Immutability.** `UPDATE`/`DELETE` are blocked by triggers
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
-  `maintenance_log`, `row_history` and `schema_version`. Corrections are made
+  `maintenance_log`, `row_history`, `schema_version` and `tag_assignment`.
+  Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
   replaces. `event_active` / `artifact_active` views filter to non-superseded
   (current) rows; a partial unique index on `supersedes` keeps correction
@@ -83,6 +90,23 @@ records:
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
   (when the row was inserted) — they routinely differ.
+- **Tags** (`namespace:value`, e.g. `stage:raw`; a colon-less *bare* tag is
+  stored as `tag:<x>` in the reserved `tag` namespace) follow the same pattern:
+  `tag_assignment` is an append-only log of `add`/`remove` rows, and current
+  tags are the `tag_current` view (latest row per entity and tag, kept if an
+  `add`) — never a mutable "tags" column. The vocabulary (`tag_namespace`
+  with its mutability / cardinality / open_vocabulary / applies_to policy, and
+  `tag`) is mutable and in `row_history`; a namespace's policy is frozen once
+  it is in use. **`lab.fn_tag` is the write path** (it canonicalises,
+  auto-registers in open namespaces, and replaces the value of a mutable
+  single-valued namespace); `fn_tag_match` is the one definition of filter
+  semantics. **No derived `entity_id` column on `tag_assignment`:** the
+  subject-rename hatch in `fn_forbid_mutation` passes only if every column
+  except `subject_id` is unchanged under the cascade, so a stored copy of the
+  id would make `fn_rename_subject` fail for tagged subjects — `entity_id` is
+  computed in the views and functions. A correction does not inherit tags: the
+  MATLAB class copies them forward, and `fn_check_integrity` warns
+  `tag_not_carried_forward` otherwise.
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
@@ -121,18 +145,33 @@ Key behaviors baked into the class:
   so the DB default/NULL applies" — MATLAB's `missing` string / `NaN` / `NaT`
   / `[]` all mean "not provided."
 - Event inserts go through `pInsertEvent`, which writes the base `event` row
-  and its detail row in one transaction (manual `AutoCommit` toggle +
-  commit/rollback), matching the schema's paired base+detail design.
+  and its detail row in one transaction (via `pTransact`), matching the
+  schema's paired base+detail design.
 - At connection the class sets the session time zone to the workstation's
   zone (unzoned datetimes read back are then local) and reads the schema
   version, warning on a mismatch.
+- Tags: `addTag`/`removeTag`/`setTag`/`registerTag`/`addTagNamespace`/
+  `getEntityTags`/`findByTags` (own files) and `getTagNamespaces`/`getTags`/
+  `updateTagNamespace`/`retireTag` (inline) write through `lab.fn_tag` or the
+  vocabulary tables; `Tags=`/`AnyTags=`/`NotTags=` on the `get*` methods call
+  `lab.fn_tag_match` via `pTagWhere`. Static `normalizeTag`/`parseTag`/
+  `displayTag` mirror `fn_canonical_tag` locally (keep them in step with it);
+  the kind-to-(table, pk) map `pTagEntity` is fixed, like the other
+  identifiers.
+- `pTransact(fn)` runs a multi-statement write as one transaction (manual
+  `AutoCommit` toggle + commit/rollback); use it for any new method that writes more than
+  one statement. `pInsertEvent`, `supersedeArtifact`, `addArtifact(Supersedes=)`
+  and multi-tag `addTag`/`removeTag` go through it.
 - `supersedeEvent`/`supersedeArtifact` implement the correction workflow:
   read the old row(s) as exact text (`pRowsAsText`, via
   `jsonb_each_text(to_jsonb(row))`), carry every column forward except
   explicit overrides, set `supersedes`, insert as new. Carried values never
   pass through a MATLAB double or datetime. `supersedeEvent` also copies the
   event's `event_input` edges and supersedes each active artifact it produced
-  with one pointing at the new event, all in one transaction.
+  with one pointing at the new event, all in one transaction. Any insert that
+  sets `supersedes` (those two, and `Supersedes=` on the add methods) also
+  copies the predecessor's current tags onto the successor (`pCarryTags`),
+  skipping retired tags with a warning.
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →

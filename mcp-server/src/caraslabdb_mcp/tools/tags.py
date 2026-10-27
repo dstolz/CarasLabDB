@@ -136,8 +136,11 @@ def register(app):
         "cohort:a"]. A bare tag with no colon is shorthand for tag:<x>
         ("auditory_cortex" = "tag:auditory_cortex"). "namespace:*" matches
         any current tag in that namespace (none_of=["qc:*"] = never
-        QC-checked). Example: artifacts that are raw, from cohort A, and not
-        failed -- all_of=["stage:raw", "cohort:a"], none_of=["qc:fail"].
+        QC-checked). Example: artifacts that are raw, tagged topic:tonotopy,
+        and not failed -- all_of=["stage:raw", "topic:tonotopy"],
+        none_of=["qc:fail"]. Each namespace applies only to some kinds
+        (see get_tag_namespaces): cohort, for instance, is on subjects and
+        sessions, never on artifacts.
 
         active_only (default True) skips superseded events and artifacts,
         like get_events / get_artifacts; it has no effect on other kinds.

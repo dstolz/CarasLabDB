@@ -48,13 +48,19 @@ The schema is built around an **append-only event log**:
   artifacts an event consumed. Together they form the provenance DAG, walkable
   via the recursive `fn_artifact_lineage(artifact_id, 'up'|'down')` function.
 - **Immutability** is enforced by triggers on `event`, every `*_event` detail
-  table, `artifact`, `event_input` and the audit logs. Corrections use a
+  table, `artifact`, `event_input`, `tag_assignment` and the audit logs. Corrections use a
   `supersedes` link; the `event_active` / `artifact_active` views filter to
   current rows. The descriptive tables (`subject`, `session`, the project and
-  reference tables) are edited in place, and every edit is kept in
+  reference tables, the tag vocabulary) are edited in place, and every edit is kept in
   `lab.row_history`.
 - Every event carries two timestamps: `occurred_at` (when it happened) and
   `recorded_at` (when the row was inserted) — they routinely differ.
+- **Tags** — hashtag-style `namespace:value` labels (`stage:raw`, `cohort:a`,
+  `qc:fail`; a bare `auditory_cortex` is `tag:auditory_cortex`) on events,
+  artifacts, subjects, sessions and projects. Each namespace carries a policy
+  (mutable or permanent, one value or many, open or closed vocabulary). Tag
+  assignments are an append-only log written through `lab.fn_tag`; current tags
+  are a view. See `design_docs/tagging.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale.
@@ -73,7 +79,9 @@ Read `design_docs/overview.md` first for the conceptual model, then
   carry every column of the old row forward exactly as stored except explicit
   overrides, set `supersedes`, insert as new. `supersedeEvent` also carries
   the event's inputs over and re-points the files it produced at the
-  correction, in the same transaction.
+  correction, in the same transaction, and copy the tags across.
+- `setTag` / `addTag` / `removeTag` label rows, `findByTags` and the `Tags=` /
+  `AnyTags=` / `NotTags=` options on the `get*` methods filter by them.
 
 ```matlab
 db  = CarasLabDB(Username="lab_rw", Password=secret, ...
@@ -104,7 +112,8 @@ L   = db.artifactLineage(aid, Direction="up");
 ```
 
 The GUI (`@CarasLabDBApp`) is a `uifigure` front end over the same class: search
-and browse subjects, sessions, events and artifacts; add and correct events; run
+and browse subjects, sessions, events and artifacts (including by tag, e.g.
+`stage:raw -qc:fail`); add and correct events; edit a row's tags (Ctrl+T); run
 vetted read-only custom SQL. Because the schema is append-only, "editing" an
 event creates a superseding correction rather than mutating in place.
 
@@ -159,7 +168,7 @@ PGDATABASE=lab python web/live/server.py --port 8778
 
 **Query the schema from an LLM agent:** `mcp-server/` is a **read-only** MCP
 server that exposes typed `get*` tools (subjects, sessions, events, artifacts,
-lineage) over the `lab` schema — no insert, update or supersede surface, and no
+lineage, tags) over the `lab` schema — no insert, update or supersede surface, and no
 tool takes a table name or raw SQL. Install it and register it with your own MCP
 client; see `mcp-server/README.md` and `design_docs/mcp-server.md`.
 
@@ -185,6 +194,7 @@ design_docs/         Schema DDL and design documentation
   migrations/          Upgrade scripts for existing databases
   overview.md          Conceptual model — read this first
   database-design.md   Table-by-table rationale
+  tagging.md           Tags: syntax, policy flags, filters, corrections
   testing-locally.md   Local testing guide
   mcp-server.md        Read-only MCP server: design and setup
   deployment-requirements.md   Server-side requirements summary for IT
