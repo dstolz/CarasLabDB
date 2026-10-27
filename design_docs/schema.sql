@@ -1573,7 +1573,7 @@ $$;
 -- tags. Only current tags count (lab.tag_current).
 --
 --     WHERE lab.fn_tag_match('artifact', a.artifact_id::text,
---                            ARRAY['stage:raw', 'cohort:a'], NULL, ARRAY['qc:fail'])
+--                            ARRAY['stage:raw', 'topic:tonotopy'], NULL, ARRAY['qc:fail'])
 CREATE OR REPLACE FUNCTION lab.fn_tag_match(
     p_kind text,
     p_id   text,

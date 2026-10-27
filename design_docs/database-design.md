@@ -14,7 +14,7 @@ complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
 ## 1. Overview & ER diagram
 
-The schema has five layers:
+The schema has six layers:
 
 1. **Reference tables** — mostly-static vocabulary and registries (`person`,
    `probe`, `pipeline`, `storage_root`, `species`, and the categorical lookups
@@ -29,6 +29,10 @@ The schema has five layers:
 5. **Artifacts & provenance** — `artifact` rows point at the event that produced
    them; `event_input` records which artifacts an event consumed. Together these
    two edge types form the provenance DAG.
+6. **Tags** — a vocabulary of `namespace:value` labels (`tag_namespace`, `tag`)
+   and an append-only log (`tag_assignment`) of which labels were put on which
+   event, artifact, subject, session or project. Current tags are derived from
+   the log by a view (§3.7).
 
 ```mermaid
 erDiagram
@@ -66,6 +70,15 @@ erDiagram
     artifact     |o--o{ artifact         : supersedes
     artifact     ||--o{ artifact_verification : verified_by
     artifact_role||--o{ artifact         : role
+
+    tag_namespace||--o{ tag              : contains
+    tag          ||--o{ tag_assignment   : applied_as
+    person       |o--o{ tag_assignment   : applied_by
+    event        |o--o{ tag_assignment   : tagged
+    artifact     |o--o{ tag_assignment   : tagged
+    subject      |o--o{ tag_assignment   : tagged
+    session      |o--o{ tag_assignment   : tagged
+    project      |o--o{ tag_assignment   : tagged
 ```
 
 ---
@@ -254,7 +267,8 @@ always one row.
 
 **`row_history`** — the previous and new value of every `UPDATE`, and the
 removed row of every `DELETE`, on the mutable tables (the reference tables,
-the project tables, `subject` and `session`). Those tables are edited in place
+the project tables, `subject`, `session` and the tag vocabulary
+`tag_namespace` / `tag`). Those tables are edited in place
 by design; this table is what keeps such an edit from erasing the old value
 and who changed it. It is written by the `SECURITY DEFINER` trigger function
 `fn_log_row_change`, so clients need no privilege on it and cannot write it
@@ -273,14 +287,93 @@ the one they were written for.
 
 All three are append-only (§4).
 
+### 3.7 Tags
+
+Tags are hashtag-style labels — `stage:raw`, `cohort:a`, `qc:fail`, a bare
+`auditory_cortex` — on events, artifacts, subjects, sessions and projects, for
+the ad-hoc categories that neither `artifact.role` nor free-text `notes` can be
+queried by. The user-facing rules (syntax, policy flags, filter grammar,
+per-client usage) are in [tagging.md](tagging.md); this section records why the
+tables look the way they do.
+
+| Table | Purpose |
+|---|---|
+| `tag_namespace` | One row per namespace and the policy its tags obey: `mutability` (`mutable`/`immutable`), `cardinality` (`single`/`multi`), `open_vocabulary`, and `applies_to` (a non-empty `text[]` of the five entity kinds). Mutable reference data, edited in place and recorded in `row_history`. |
+| `tag` | The registered tags. `tag` is the primary key and always equals `namespace || ':' || value` (`tag_parts_ck`); `value` is regex-checked (`tag_value_ck`), the namespace name by `tag_namespace_name_ck`. A tag is never renamed; it is retired via `retired_at`. Mutable, in `row_history`. |
+| `tag_assignment` | The **append-only log** of tags put on (`op = 'add'`) and taken off (`op = 'remove'`) entities. Exactly one of `event_id`, `artifact_id`, `subject_id`, `session_id`, `project_id` is set, matching `entity_kind` (`tag_assignment_entity_ck`, the pattern of `project_artifact_location_ck`); each is a real foreign key. |
+
+**Why a log, and current state as a view.** Tagging is the same shape of
+problem as events: something is true from some time until someone says
+otherwise, and "who changed `stage` from `raw` to `sorted`, and when" is worth
+keeping. So `tag_assignment` follows the schema's own rule — never add a
+mutable column where append would do. It is protected by `fn_forbid_mutation()`
+(§4), and there is no "current tags" column on any entity. The view
+`tag_current` takes the latest row per (entity, tag) by `applied_at DESC,
+assignment_id DESC` (ties are real: the `remove` and `add` of a replace share a
+transaction timestamp) and keeps it if it is an `add`; `entity_tags` aggregates
+that into sorted arrays per entity. `display_tag` strips the `tag:` prefix so
+every client renders bare tags the same way.
+
+**Why there is no stored `entity_id` column.** An entity-id text column
+(`COALESCE(event_id::text, …)`) would be convenient, but renaming a subject
+cascades into `tag_assignment.subject_id` (`ON UPDATE CASCADE`), and the
+subject-rename hatch in `fn_forbid_mutation()` (§4.1) admits that cascade only if
+every column other than the subject-id columns is unchanged. A stored or
+generated copy of the id would change with it, and `fn_rename_subject` would
+fail for every tagged subject. The id is therefore computed in the views and
+functions, and `ix_tag_assignment_entity` is an expression index on that same
+`(entity_kind, COALESCE(…))` so the lookups stay indexed; there is one plain
+index per id column and `ix_tag_assignment_tag (tag, entity_kind)` as well.
+Tags follow a renamed subject for free.
+
+**Policy is enforced in the database, once.** `trg_tag_assignment_policy`
+(`BEFORE INSERT`) rejects a tag that is unregistered or retired, a kind outside
+`applies_to`, a duplicate `add`, a `remove` of something not current or in an
+immutable namespace, and a second value in a `single` namespace.
+`trg_tag_normalize` / `trg_tag_assignment_normalize` canonicalise the tag on
+the way in (`lab.fn_canonical_tag`: lower case, trimmed, `tag:` prefix when
+there is no colon — nothing else is rewritten, the `CHECK`s reject the rest),
+the same policy as checksums and paths. `trg_tag_guard` stops a tag being
+renamed; `trg_tag_namespace_guard` freezes a namespace's `mutability` and
+`cardinality` (and lets `applies_to` only grow) once any of its tags has been
+assigned, and freezes the reserved `tag` namespace from the start. That freeze,
+not an admin gate, is what prevents policy drift: any `lab_rw` member may create
+a namespace, since the flags are editable by members anyway and a gate would be
+theatre. The single-cardinality check is trigger-based, so — like
+`trg_artifact_unique_active` — two concurrent sessions can both pass it
+([tagging.md](tagging.md) §9).
+
+**Write and read functions.** `lab.fn_tag` is the one write path every client
+uses: it canonicalises, auto-registers a new value in an open namespace, and
+replaces the current value in a mutable single-valued namespace as a `remove`
+plus an `add` in one call. `lab.fn_register_tag` registers without applying.
+`lab.fn_tag_match` is the single definition of filter semantics (all / any /
+none, `ns:*` wildcard, bare tokens, empty list = no constraint), shared by the
+MATLAB getters, the GUI and the MCP server; `lab.fn_find_by_tags` wraps it.
+Function ACLs are deliberately not set in `schema.sql`, so `lab_rw` and `lab_ro`
+both keep the default `EXECUTE`, and `lab_ro` is stopped at the `INSERT`.
+
+**Corrections.** Tags belong to a row, so a superseding event or artifact
+starts without its predecessor's tags and would vanish from every tag filter.
+The MATLAB class copies the current tags forward as new `add` rows in the same
+transaction (retired tags are skipped with a warning); a correction written in
+raw SQL must do the same ([tagging.md](tagging.md) §8), and
+`fn_check_integrity()` reports a miss as `tag_not_carried_forward` (§4.2).
+
+**Seed vocabulary.** `tag` (bare tags; reserved), `stage` (closed; `raw`,
+`preprocessed`, `sorted`, `curated`, `analyzed`), `qc` (closed; `pending`,
+`pass`, `fail`), `cohort` and `condition` (immutable, open) and `topic` (multi,
+open). `stage` is where an artifact is in the pipeline and changes;
+`artifact.role` is what the file is and is fixed at registration.
+
 ---
 
 ## 4. Immutability & corrections
 
 Events are facts; facts do not change. The schema forbids `UPDATE` and `DELETE`
 on all event and artifact tables, `event_input`, and the logs
-`artifact_verification`, `maintenance_log`, `row_history` and `schema_version`
-via `fn_forbid_mutation()`. A mistake is fixed
+`artifact_verification`, `maintenance_log`, `row_history`, `schema_version` and
+`tag_assignment` via `fn_forbid_mutation()`. A mistake is fixed
 by **appending a superseding row** whose `supersedes` points at the row it
 replaces. The partial unique index on `supersedes` keeps history *linear* — a
 given row can be corrected by at most one successor, so there are no forks.
@@ -321,7 +414,8 @@ subject-id columns is unchanged, each changed subject-id column went from
 the new one does. That is exactly the cascade of a completed rename. Every
 rename is recorded in `lab.maintenance_log` (and the `subject` and `session`
 row changes in `lab.row_history`). This is a relabelling of *who* a row is about, not a
-change to *what happened*, which is why it is the only exception. The function
+change to *what happened*, which is why it is the only exception. It is also
+why `tag_assignment` has no derived `entity_id` column (§3.7). The function
 is `REVOKE`d from `PUBLIC`; grant it only to an admin role.
 
 ### 4.2 Integrity report
@@ -348,6 +442,7 @@ SELECT * FROM lab.fn_check_integrity();
 | `event_recorded_before_occurred` | warning | `occurred_at` more than a day after `recorded_at` — usually a client timezone bug |
 | `artifact_never_verified` | warning | Active artifact with no verification on record |
 | `artifact_producer_superseded` | warning | Active artifact whose producing event has been corrected; the corrected event lists no files until the artifact is re-pointed |
+| `tag_not_carried_forward` | warning | Active event or artifact whose superseded predecessor has current tags that the successor lacks; the correction drops out of the tag filters the original matched. Reported against the successor, listing the missing tags |
 | `duplicate_active_path` | warning | Two active artifacts at one path; the NAS file can only be one of them |
 
 **Worked example — a recording logged with the wrong sample rate:**
@@ -385,8 +480,11 @@ WHERE produced_by_event_id = '11111111-1111-1111-1111-111111111111';
 ```
 
 `CarasLabDB.supersedeEvent` does all of this in one transaction: the new base
-and detail rows, the event's `event_input` edges, and the re-pointed
-artifacts.
+and detail rows, the event's `event_input` edges, the re-pointed artifacts, and
+the current tags of the event and of each re-pointed artifact. A correction
+written in SQL like the above must carry the tags itself, or
+`tag_not_carried_forward` reports it; the `INSERT … SELECT` is in
+[tagging.md](tagging.md) §8.
 
 ---
 
@@ -433,12 +531,16 @@ createdb lab && psql -d lab -f design_docs/schema.sql
 `schema.sql` creates everything described above, in dependency order: the `lab`
 schema; the reference/lookup tables; the `project` tables; the `subject` /
 `session` dimensions; the base `event` and its eight detail tables; `artifact` /
-`event_input` / `artifact_verification`; all indexes; the immutability
+`event_input` / `artifact_verification`; the tag tables (`tag_namespace`, `tag`,
+`tag_assignment`); all indexes; the immutability
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
 maintenance function, `maintenance_log`, `row_history` and `schema_version`;
 the `event_active` /
-`artifact_active` / `provenance_edge` / `subject_current` views;
-`fn_artifact_lineage()` and `fn_check_integrity()`; and the seed vocabulary. It
+`artifact_active` / `provenance_edge` / `subject_current` / `tag_current` /
+`entity_tags` views; `fn_artifact_lineage()`, the tag functions (`fn_tag()`,
+`fn_register_tag()`, `fn_tag_match()`, `fn_find_by_tags()`,
+`fn_canonical_tag()`) and `fn_check_integrity()`; and the seed vocabulary
+(including the starting tag namespaces). It
 targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
 `pgcrypto` fallback line is included for older servers).
 
@@ -467,7 +569,8 @@ are:
 | Case-insensitive email uniqueness | `UNIQUE INDEX ON (lower(email))` | `COLLATE NOCASE` on the column |
 | `TRUNCATE` protection | statement-level `BEFORE TRUNCATE` trigger | not needed — SQLite has no `TRUNCATE` |
 | Subject-rename escape hatch | transaction-local GUC read by the trigger | a `PRAGMA`-guarded flag, or drop the triggers for the rename |
-| Regex `CHECK`s on paths/checksums | POSIX `~` / `!~` | `GLOB` patterns, or enforce in the client |
+| Regex `CHECK`s on paths/checksums/tags | POSIX `~` / `!~` | `GLOB` patterns, or enforce in the client |
+| `text[]` (`tag_namespace.applies_to`) and array filters (`fn_tag_match`) | native arrays, `<@`, `= ANY` | JSON `text`, or a child table `(namespace, entity_kind)`; the filter functions need rewriting as joins |
 
 The event/artifact/provenance model itself is unchanged; only these
 type/idiom substitutions apply.
@@ -478,6 +581,8 @@ type/idiom substitutions apply.
 
 - [overview.md](overview.md) — purpose, philosophy, and data flow.
 - [schema.sql](schema.sql) — the canonical, runnable DDL.
+- [tagging.md](tagging.md) — the tag system: syntax, policy flags, filter
+  grammar, corrections, and per-client usage.
 - [mcp-server.md](mcp-server.md) — the read-only MCP interface over this schema.
 - [testing-locally.md](testing-locally.md) — how to load and verify the schema
   on a scratch database.

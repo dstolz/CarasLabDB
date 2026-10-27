@@ -199,7 +199,11 @@ NEW_HOWTO = '''  <details class="howto" id="howto">
       <p>Full history is returned — superseded rows included — and active vs.
       superseded state is derived client-side from the <code>supersedes</code> links,
       exactly like the <code>lab.event_active</code> / <code>lab.artifact_active</code> views.
-      Hit <b>↻ Refresh</b> to re-query the database.</p>
+      Tags work the same way: the vocabulary (<code>tagNamespaces</code>, <code>tags</code>)
+      and the whole append-only tag log (<code>tagAssignments</code>) are loaded, and each
+      row's current tags are derived in the browser like <code>lab.tag_current</code>.
+      Type tags such as <code>stage:raw -qc:fail topic:*</code> in the Tags filter
+      (<code>#</code> focuses it). Hit <b>↻ Refresh</b> to re-query the database.</p>
       <p>Run it from the repo root (with the schema applied to database <code>lab</code>):</p>
       <pre>PGDATABASE=lab python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/</pre>

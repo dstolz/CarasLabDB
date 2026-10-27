@@ -146,16 +146,20 @@ ORDER BY 1, 2;
 - **The log:** the `event` base table plus the eight `*_event` detail tables
   (`birth_event` … `analysis_event`).
 - **Provenance:** `artifact`, `event_input`, `artifact_verification`.
+- **Tags:** `tag_namespace`, `tag`, `tag_assignment` (see [tagging.md](tagging.md)).
 - **Audit and versioning:** `maintenance_log` (subject renames), `row_history`
   (edits to the mutable tables) and `schema_version`.
 - **Views:** `event_active`, `artifact_active`, `provenance_edge`,
-  `subject_current`.
+  `subject_current`, `tag_current`, `entity_tags`.
 - **Functions:** the trigger functions `fn_forbid_mutation`,
   `fn_require_session_for_recording`, `fn_fill_subject_from_session`,
   `fn_supersede_same_type`, `fn_normalize_checksum`, `fn_normalize_path`,
   `fn_artifact_unique_active`, `fn_forbid_provenance_cycle`,
-  `fn_log_row_change`; plus `fn_rename_subject`, `fn_artifact_lineage`, and
-  `fn_check_integrity`.
+  `fn_log_row_change`, `fn_normalize_tag`, `fn_tag_guard`,
+  `fn_tag_namespace_guard`, `fn_tag_assignment_policy`; plus `fn_rename_subject`,
+  `fn_artifact_lineage`, `fn_check_integrity`, and the tag functions
+  `fn_canonical_tag`, `fn_register_tag`, `fn_tag`, `fn_tag_match`,
+  `fn_find_by_tags`.
 
 The list grows as the schema does — treat `schema.sql` as the authority and this
 as the "nothing obviously missing" check.
@@ -176,7 +180,7 @@ ORDER BY 1, 2;
 
 **Pass:** every append-only table — `event`, the eight `*_event` detail tables,
 `artifact`, `event_input`, and the logs `artifact_verification`,
-`maintenance_log`, `row_history`, `schema_version` — carries *two*
+`maintenance_log`, `row_history`, `schema_version`, `tag_assignment` — carries *two*
 immutability triggers:
 `trg_immutable_<table>` (row-level, `UPDATE`/`DELETE`) and
 `trg_immutable_truncate_<table>` (statement-level, `TRUNCATE`, which row-level
@@ -185,10 +189,12 @@ triggers cannot see). The validation and normalization triggers
 `trg_artifact_fill_subject`, `trg_event_supersede_same_type`,
 `trg_artifact_normalize`, `trg_verification_normalize`,
 `trg_session_normalize_path`, `trg_artifact_normalize_path`,
-`trg_project_artifact_normalize_path`, `trg_artifact_unique_active` and
-`trg_event_input_acyclic` are there too, as is one `trg_history_<table>` on each
-mutable table (`person`, `subject`, `session`, the project tables and the
-reference tables).
+`trg_project_artifact_normalize_path`, `trg_artifact_unique_active`, `trg_event_input_acyclic`,
+`trg_tag_normalize`, `trg_tag_assignment_normalize`, `trg_tag_guard`,
+`trg_tag_namespace_guard` and `trg_tag_assignment_policy` are there too, as is
+one `trg_history_<table>` on each mutable table (`person`, `subject`, `session`,
+the project tables, the reference tables and the tag vocabulary tables
+`tag_namespace` and `tag`).
 
 The two normalizers are worth knowing about because they *accept* input a
 strict reading of the constraints would reject: a `relative_path` written
@@ -366,8 +372,11 @@ real system depends on:
    produces a spikes artifact — this builds the provenance DAG.
 6. Retrieval via the `get*` methods (defaulting to the `*_active` views).
 7. `artifactLineage(spikesId, Direction="up")` — walks the lineage function.
-8. A **supersede** correction on a husbandry (weight) event, proving append-only
-   corrections work end-to-end.
+8. **Tagging**: `setTag` / `addTag` / `getEntityTags` / `findByTags` and the
+   `Tags=` filter on `getArtifacts` / `getSubjects`.
+9. A **supersede** correction on a husbandry (weight) event, proving append-only
+   corrections work end-to-end; the event's `qc:pass` tag is carried to the
+   correction.
 
 **Pass:** the script runs to completion, the `disp()` outputs show the rows you
 inserted, `lineage` shows the raw file as an ancestor of the spikes file, and the
@@ -434,6 +443,8 @@ Log in against `localhost` / `lab_test` / `lab_rw`, then verify each surface
 - [ ] "Export → WS" copies the visible table into the base workspace.
 - [ ] "Add Event" opens a type-aware form and inserts.
 - [ ] Select a row → "Edit / Supersede" performs an append-only correction.
+- [ ] The Tags field (e.g. `stage:preprocessed`) filters the table; Ctrl+T on a
+      selected row opens the tag editor.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).
 
@@ -479,9 +490,12 @@ Run top to bottom against `lab_test` before you deploy to a server:
 - [ ] `CarasLabDB(...)` connects to `localhost`/`lab_test` and `isOpen()`.
 - [ ] `carasLabDB_demo.m` runs end-to-end; lineage and supersede work.
 - [ ] Every event type inserts and retrieves.
+- [ ] Tags: `setTag` replaces a `stage`, `findByTags` / `Tags=` find it, and a
+      superseded event's correction carries its tags.
 - [ ] Read-only SQL guard rejects a write from both the class and the GUI.
 - [ ] `CarasLabDBApp` browses, filters, exports, adds, and supersedes.
-- [ ] `lab-dashboard.html` renders with no console errors.
+- [ ] `lab-dashboard.html` renders with no console errors; the Tags filter
+      (`#`) narrows the tables.
 
 ---
 

@@ -43,7 +43,8 @@ Read tools mirroring `@CarasLabDB`'s `get*` method surface:
   `get_artifacts`, `get_subjects`, `get_sessions` and `get_projects` also
   take `tags` / `any_tags` / `none_tags` lists (`namespace:value`; a bare tag
   means `tag:<x>`; `namespace:*` matches any tag in that namespace). See
-  [`design_docs/mcp-server.md`](../design_docs/mcp-server.md) §3.
+  [`design_docs/mcp-server.md`](../design_docs/mcp-server.md) §3 and
+  [`design_docs/tagging.md`](../design_docs/tagging.md).
 - **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`; empty
   means healthy).
 

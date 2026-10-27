@@ -39,19 +39,20 @@ reading an analysis event rather than reverse-engineering a folder.
 
 | Component | Role |
 |---|---|
-| PostgreSQL database | Append-only event log, artifact index, provenance graph |
+| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag vocabulary and tag log |
 | NAS storage | Actual data, laid out as `subject/session/...` |
-| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database |
-| MATLAB App Designer GUI (`@CarasLabDBApp`) | Interactive metadata entry and browsing for the lab |
+| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...) |
+| MATLAB App Designer GUI (`@CarasLabDBApp`) | Interactive metadata entry and browsing for the lab, with a tag filter and a per-row tag editor (Ctrl+T) |
 | Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
-| MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema |
+| MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag lookups and tag filters |
 
 MATLAB target: R2024b or newer, with the Database Toolbox. The class connects
 through the toolbox's **native `postgresql()`** interface, so no ODBC DSN and no
 JDBC driver `.jar` need to be installed or configured. See
 [Database design](database-design.md) for the table-by-table model and
-[MCP server](mcp-server.md) for the agent-facing interface.
+[MCP server](mcp-server.md) for the agent-facing interface, and
+[Tagging](tagging.md) for the tag system.
 
 ## Data flow
 
@@ -79,6 +80,14 @@ flowchart LR
   link. The original row is retained; queries filter to the active version.
 - **Provenance DAG.** The graph of `event → artifact → analysis → artifact`.
   See the recursive lineage query in [Database design](database-design.md).
+- **Tag.** A hashtag-style `namespace:value` label (`stage:raw`, `cohort:a`,
+  `qc:fail`; a bare `auditory_cortex` is `tag:auditory_cortex`) on an event,
+  artifact, subject, session or project, for categories that change or cut
+  across the fixed columns. Each namespace declares whether its tags can later
+  change, whether an entity may carry one or several, and where they apply.
+  Like events, tag assignments are an append-only log; an entity's current
+  tags are derived from it, and a correction carries its predecessor's tags
+  forward. See [Tagging](tagging.md).
 
 ## Scope and assumptions
 
