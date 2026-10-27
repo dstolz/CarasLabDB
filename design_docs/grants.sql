@@ -38,8 +38,8 @@ GRANT USAGE ON SCHEMA lab TO lab_rw, lab_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA lab TO lab_rw, lab_ro;
 
 -- Append: lab_rw inserts into every table. UPDATE and DELETE on the event
--- log, artifacts, provenance edges and audit logs are blocked by triggers
--- whatever is granted here.
+-- log, artifacts, provenance edges, tag assignments and audit logs are
+-- blocked by triggers whatever is granted here.
 GRANT INSERT ON ALL TABLES IN SCHEMA lab TO lab_rw;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;
 
@@ -50,12 +50,16 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;
 REVOKE INSERT ON lab.maintenance_log, lab.row_history, lab.schema_version FROM lab_rw;
 
 -- Edit: the descriptive tables the schema leaves mutable, which the MATLAB
--- class (updateSubject, updateSession) and the GUI editors change in place.
+-- class (updateSubject, updateSession) and the GUI editors change in place,
+-- and the tag vocabulary (tag_namespace, tag), which any member may extend,
+-- describe and retire; trg_tag_namespace_guard and trg_tag_guard stop a
+-- namespace's policy drifting once it is in use and a tag being renamed.
 -- Every UPDATE is recorded in lab.row_history with the login that made it.
--- The reference tables (species, probe, storage_root, vocabularies) stay
--- owner-only.
+-- The other reference tables (species, probe, storage_root, vocabularies)
+-- stay owner-only.
 GRANT UPDATE ON lab.subject, lab.session, lab.project, lab.project_member,
-                lab.project_artifact, lab.person TO lab_rw;
+                lab.project_artifact, lab.person,
+                lab.tag_namespace, lab.tag TO lab_rw;
 
 -- Tables and sequences the owner creates later get the same read/append
 -- defaults. A new table that should be editable, or must not be written by
@@ -64,6 +68,11 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT SELECT ON TABLES TO lab_rw, lab_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT INSERT ON TABLES TO lab_rw;
 ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT USAGE, SELECT ON SEQUENCES TO lab_rw;
 
+-- Every function except lab.fn_rename_subject keeps PostgreSQL's default
+-- EXECUTE for PUBLIC. None is SECURITY DEFINER but the row_history trigger,
+-- so lab.fn_tag and lab.fn_register_tag write with the caller's privileges:
+-- lab_rw can tag, and lab_ro calling them is refused at the INSERT.
+--
 -- lab.fn_rename_subject is REVOKEd from PUBLIC in schema.sql. Grant EXECUTE
 -- on it only to the administrator who performs identity maintenance; it is
 -- deliberately not granted here.
