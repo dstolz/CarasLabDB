@@ -415,7 +415,44 @@ end
 
 **Pass:** the `SELECT` returns a count; the `INSERT` is rejected.
 
-### 2.7 Clean up
+### 2.7 Automated tests (`tests/matlab`)
+
+The tagging feature has a `matlab.unittest` suite. `TagTests` covers the class:
+tag syntax, the vocabulary, assigning tags, the tag filters (checked against
+`lab.fn_find_by_tags`), carry-forward on correction, subject rename, argument
+validation, and `examples/carasLabDB_demo.m`. `TagGuiTests` drives
+`CarasLabDBApp`'s Tags field and tag editor with `matlab.uitest`.
+
+It does not use `lab_test`. Its shared fixture, `LabScratchDb`, creates a
+database `lab_mtest`, applies `schema.sql` and `grants.sql`, adds a
+non-superuser login in `lab_rw` (so the grants are exercised), and drops all of
+it again afterwards. That needs a login allowed to create databases and roles,
+so the database tests are opt-in:
+
+```matlab
+setenv("CARASLABDB_MTEST_ADMIN", "postgres")                  % CREATEDB + CREATEROLE
+setenv("CARASLABDB_MTEST_ADMIN_PASSWORD", "...")              % unless trust / pgpass
+setenv("CARASLABDB_MTEST_PGBIN", "C:\Program Files\PostgreSQL\16\bin")  % if psql is not on the PATH
+results = runtests("tests/matlab")
+```
+
+`CARASLABDB_MTEST_HOST` and `CARASLABDB_MTEST_PORT` default to `localhost` and
+`5432`. Use a development server, never the lab's production one; the fixture
+will not touch an existing `lab_mtest` it did not create. Without
+`CARASLABDB_MTEST_ADMIN`, or without Database Toolbox, the database tests are
+reported as Incomplete and only the database-free ones run
+(`runtests("tests/matlab", Tag="NoDatabase")`, which works on any supported
+release). `TagGuiTests` opens and closes the app's windows for about three
+minutes; do not interact with them while it runs. It saves your
+`CarasLabDBApp` preferences first and restores them afterwards.
+
+**Pass:** no failures. The suite cannot press real keys (`matlab.uitest` has
+no key-press gesture), so it tests each shortcut through the window's
+`KeyPressFcn`. Check by hand that Ctrl+T works from the keyboard and, in the
+tag editor, Ctrl+Enter, Ctrl+S, Delete, Ctrl+R, Esc and Ctrl+?, and that
+Enter in the editor's Value box moves focus to Add or Set.
+
+### 2.8 Clean up
 
 ```matlab
 delete(db);   % closes the connection this object opened
@@ -492,6 +529,7 @@ Run top to bottom against `lab_test` before you deploy to a server:
 - [ ] Every event type inserts and retrieves.
 - [ ] Tags: `setTag` replaces a `stage`, `findByTags` / `Tags=` find it, and a
       superseded event's correction carries its tags.
+- [ ] `runtests("tests/matlab")` passes with `CARASLABDB_MTEST_ADMIN` set (§2.7).
 - [ ] Read-only SQL guard rejects a write from both the class and the GUI.
 - [ ] `CarasLabDBApp` browses, filters, exports, adds, and supersedes.
 - [ ] `lab-dashboard.html` renders with no console errors; the Tags filter

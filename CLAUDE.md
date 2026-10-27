@@ -203,8 +203,9 @@ CI (`.github/workflows/tests.yml`) applies the schema to PostgreSQL, runs
 `tests/schema_test.sql`, checks that a v1 database plus the migrations matches
 a fresh install, runs `lab_data.sql` and checks the JSON shape, checks that the
 live dashboard page is up to date with its generator, and runs the MCP
-server's pytest suite. There is no MATLAB test suite and no package.json.
-Practical ways to exercise the code:
+server's pytest suite. CI has no MATLAB, so the MATLAB tests in
+`tests/matlab/` run locally only. There is no package.json. Practical ways to
+exercise the code:
 
 - **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,
   then `psql -X -v ON_ERROR_STOP=1 -d lab -f tests/schema_test.sql` (rolls
@@ -212,6 +213,12 @@ Practical ways to exercise the code:
 - **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
   tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
   integration tests)
+- **MATLAB tests**: `runtests("tests/matlab")` — `TagTests` (the class's
+  tagging feature) and `TagGuiTests` (the app's Tags filter and tag editor,
+  driven with `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
+  creates and drops a scratch `lab_mtest` database; it is opt-in through
+  `CARASLABDB_MTEST_ADMIN` (see its help), and without it only the
+  database-free tests run. See `design_docs/testing-locally.md` §2.7.
 - **MATLAB class**: add the repo root to the MATLAB path (so `@CarasLabDB` is
   visible as a class folder), then adapt `examples/carasLabDB_demo.m` — it
   needs a real reachable Postgres instance with the schema applied.
