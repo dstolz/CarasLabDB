@@ -58,7 +58,7 @@ MAX_LIMIT = 1000
 # (schema_map.py, the per-tool filters) were written against. A database at
 # another version may return incomplete rows rather than an error, so a
 # mismatch is logged and repeated in every list result as `schema_warning`.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # `table` and `order_by` are interpolated as raw SQL text (only *values* are
 # bound), so both are restricted to fixed literals rather than left to the
@@ -72,6 +72,8 @@ ALLOWED_TABLES = frozenset({
     "lab.artifact", "lab.artifact_active",
     "lab.event_input", "lab.artifact_verification",
     "lab.provenance_edge", "lab.subject_current",
+    "lab.tag_namespace", "lab.tag", "lab.tag_assignment",
+    "lab.tag_current", "lab.entity_tags",
 }) | frozenset(schema_map.EVENT_DETAIL_TABLE.values())
 
 # Inclusive lower / exclusive upper bound operators for `time_ranges`.
@@ -83,11 +85,50 @@ _RANGE_OPS = (">=", "<")
 ORDER_BY_EVENT = "occurred_at DESC, event_id"
 ORDER_BY_ARTIFACT = "created_at DESC, artifact_id"
 ORDER_BY_VERIFICATION = "verified_at DESC, verification_id DESC"
+ORDER_BY_TAG_ASSIGNMENT = "applied_at DESC, assignment_id DESC"
+ORDER_BY_TAG_CURRENT = "tag, assignment_id"
 ALLOWED_ORDER_BY = frozenset({
     ORDER_BY_EVENT, ORDER_BY_ARTIFACT, ORDER_BY_VERIFICATION,
+    ORDER_BY_TAG_ASSIGNMENT, ORDER_BY_TAG_CURRENT,
 })
 
+# The taggable entity kinds and the primary-key column of the table each is
+# stored in -- also the id column of lab.tag_assignment / lab.tag_current that
+# holds the entity's id. The pk is interpolated as SQL text, so it comes from
+# this fixed map and never from a caller.
+TAG_PK = {
+    "event": "event_id",
+    "artifact": "artifact_id",
+    "subject": "subject_id",
+    "session": "session_id",
+    "project": "project_id",
+}
+TAG_KINDS = tuple(TAG_PK)
+
 _FILTER_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def tag_pk(kind):
+    """The pk column for a taggable entity kind; ValueError for any other."""
+    if kind not in TAG_PK:
+        raise ValueError(
+            f"Unknown entity kind {kind!r}; expected one of "
+            f"{', '.join(TAG_KINDS)}.")
+    return TAG_PK[kind]
+
+
+def tag_array(tokens):
+    """A tag-token list as a bound array value; empty or None means NULL.
+
+    lab.fn_tag_match treats NULL and an empty array alike (no constraint), so
+    both are sent as NULL.
+    """
+    if tokens is None:
+        return None
+    if isinstance(tokens, str):
+        raise ValueError("Tag filters must be a list of strings, not a string.")
+    tokens = [str(t) for t in tokens]
+    return tokens or None
 
 
 def _driver():
@@ -290,7 +331,7 @@ def fetch_limited(sql, params=(), limit=DEFAULT_LIMIT):
 
 
 def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
-                ci_filters=None, time_ranges=None):
+                ci_filters=None, time_ranges=None, tag_filters=None):
     """SELECT * FROM <table> WHERE <filters ANDed> [ORDER BY ...] LIMIT n.
 
     `table` and the column names in `filters`, `ci_filters` and
@@ -304,6 +345,14 @@ def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
     case-insensitively (lower(col) = lower(value)). `time_ranges` maps a
     column to a (lower, upper) pair of timestamptz bounds, lower inclusive
     and upper exclusive; either may be None.
+
+    `tag_filters` is a (kind, all_of, any_of, none_of) tuple, `kind` one of
+    TAG_KINDS and the rest lists of tag tokens (or None). It adds the one
+    fixed clause `lab.fn_tag_match(%s, <pk>::text, %s::text[], %s::text[],
+    %s::text[])`, where `<pk>` comes from TAG_PK and every other piece is a
+    bound value; the clause is omitted when all three lists are empty. The
+    table must have that kind's pk column. Token syntax and matching rules
+    live in the database (lab.fn_tag_match), not here.
 
     A `None` filter value means "do not filter on this column" -- it is not
     an `IS NULL` test, and there is no way to ask for one through this
@@ -339,6 +388,14 @@ def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
                 continue
             clauses.append(f"{column} {op} %s::timestamptz")
             params.append(value)
+    if tag_filters is not None:
+        kind, all_of, any_of, none_of = tag_filters
+        pk = tag_pk(kind)
+        arrays = [tag_array(all_of), tag_array(any_of), tag_array(none_of)]
+        if any(a is not None for a in arrays):
+            clauses.append(
+                f"lab.fn_tag_match(%s, {pk}::text, %s::text[], %s::text[], %s::text[])")
+            params.extend([kind, *arrays])
     sql = f"SELECT * FROM {table}"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)

@@ -183,10 +183,20 @@ tools. Every list tool also takes `limit: int = 200`.
 |---|---|
 | `reference.py` | `get_species`, `get_storage_roots`, `get_probes`, `get_pipelines`, `get_event_types`, `get_artifact_roles`, `get_acquisition_systems` |
 | `dimensions.py` | `get_persons`, `get_projects`, `get_project_members`, `get_project_artifacts`, `get_subjects`, `get_sessions`, `get_subject_current` |
-| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id` and by `occurred_from` (inclusive) / `occurred_before` (exclusive); `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
-| `artifacts.py` | `get_artifacts` (`created_from` / `created_before` range; `active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
+| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`, by `occurred_from` (inclusive) / `occurred_before` (exclusive), and by `tags`/`any_tags`/`none_tags`; `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
+| `artifacts.py` | `get_artifacts` (`created_from` / `created_before` range and `tags`/`any_tags`/`none_tags`; `active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`), `get_provenance_edges` |
+| `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current`, or the full assignment log), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
 | `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`; errors first; empty means healthy) |
+
+`get_projects`, `get_subjects`, `get_sessions`, `get_events` and `get_artifacts`
+also take `tags` (must have all), `any_tags` (at least one) and `none_tags`
+(none of), each an optional list of tag strings. A tag is `namespace:value`;
+a bare tag means `tag:<x>`; `namespace:*` matches any current tag in that
+namespace; unset or empty lists are not applied. Only *current* tags count
+(`lab.tag_current`), and the matching rules live in the database
+(`lab.fn_tag_match`), so this server only binds the tokens. The full tag
+syntax and policy flags are described in [tagging.md](tagging.md).
 
 `get_persons` compares `email` case-insensitively (`lower(email) = lower(%s)`),
 matching the schema's `uq_person_email_lower` index.
@@ -342,6 +352,14 @@ When adding a new read tool:
 - Put it in the module matching its subject (reference/dimensions/events/
   artifacts/provenance), or add a new module and register it in
   `server.py` if it's a new category.
+- A tag filter on a list tool is not a SQL fragment: pass
+  `tag_filters=(kind, tags, any_tags, none_tags)` to `db.select_from`, which
+  emits the one fixed template `lab.fn_tag_match(%s, <pk>::text, %s::text[],
+  %s::text[], %s::text[])` with `<pk>` taken from `db.TAG_PK` (an unknown
+  `kind` raises `ValueError`) and everything else bound. There is no generic
+  "extra WHERE clause" hook, and there must not be one: it would break the
+  "only values are bound" guarantee that `tests/test_db_unit.py` asserts
+  textually. A new taggable entity kind needs a `db.TAG_PK` entry.
 - Table and column names come from a fixed string literal or
   `schema_map`-style dict in the tool's own code — **never** from a
   parameter value. Only pass caller-supplied values through as bound query
