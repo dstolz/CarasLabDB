@@ -87,8 +87,8 @@ VALUES ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000
 -- ---------------------------------------------------------------------------
 -- Version and baseline behaviour
 -- ---------------------------------------------------------------------------
-SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 2,
-                      'schema_version is 2');
+SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 3,
+                      'schema_version is 3');
 
 SELECT pg_temp.assert(
     (SELECT subject_id FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e1') = 'G1',
@@ -182,6 +182,228 @@ SELECT pg_temp.assert(
     'lineage up from f2 is f2 <- e2 <- f1 <- e1 (two rows)');
 
 -- ---------------------------------------------------------------------------
+-- Tags: syntax, vocabulary policy, assignment log, filters
+-- ---------------------------------------------------------------------------
+-- Fixture namespaces beside the seeded ones: an open multi-valued one and a
+-- closed single-valued one.
+INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, open_vocabulary, applies_to)
+VALUES ('tst_open',   'mutable', 'multi',  true,  ARRAY['subject','event']),
+       ('tst_closed', 'mutable', 'single', false, ARRAY['artifact']);
+
+-- Canonical spelling: only case and surrounding whitespace change, and a bare
+-- tag lands in the reserved 'tag' namespace.
+SELECT pg_temp.assert(lab.fn_canonical_tag(' Stage:Raw ') = 'stage:raw',
+                      'fn_canonical_tag lower-cases and trims');
+SELECT pg_temp.assert(lab.fn_canonical_tag('Auditory_Cortex') = 'tag:auditory_cortex',
+                      'fn_canonical_tag puts a bare tag in the tag namespace');
+SELECT pg_temp.assert(lab.fn_canonical_tag('a b:c d') = 'a b:c d',
+                      'fn_canonical_tag rewrites nothing else');
+INSERT INTO lab.tag (tag) VALUES (' Tst_Closed:Alpha ');
+INSERT INTO lab.tag (namespace, value) VALUES ('tst_closed', 'Beta');
+SELECT pg_temp.assert(
+    (SELECT string_agg(tag || '|' || namespace || '|' || value, ',' ORDER BY tag)
+     FROM lab.tag WHERE namespace = 'tst_closed')
+    = 'tst_closed:alpha|tst_closed|alpha,tst_closed:beta|tst_closed|beta',
+    'lab.tag fills namespace/value from the tag, or the tag from them, canonically');
+SELECT pg_temp.assert(
+    lab.fn_register_tag('Auditory_Cortex') = 'tag:auditory_cortex'
+    AND lab.fn_register_tag(' tag:auditory_cortex') = 'tag:auditory_cortex',
+    'fn_register_tag returns the canonical tag for both spellings');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.tag WHERE value = 'auditory_cortex') = 1,
+    'bare and prefixed spellings of a tag are one row');
+
+-- Malformed tags are rejected, never rewritten.
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('topic:raw data')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('topic:bad!')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('topic:')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('topic:a:b')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('  ')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('topic:-x')$q$, 'tag_value_ck');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_register_tag('nosuch:x')$q$,
+                            'namespace nosuch does not exist');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+       VALUES ('Bad Name', 'mutable', 'multi', ARRAY['event'])$q$,
+    'tag_namespace_name_ck');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+       VALUES ('badkind', 'mutable', 'multi', ARRAY['event','animal'])$q$,
+    'tag_namespace_applies_to_ck');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+       VALUES ('nokind', 'mutable', 'multi', '{}')$q$,
+    'tag_namespace_applies_to_ck');
+
+-- A closed namespace refuses to auto-register a value, but a deliberate
+-- INSERT INTO lab.tag works.
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e1', 'qc:maybe')$q$,
+    'closed vocabulary \(its values: fail, pass, pending\)');
+INSERT INTO lab.tag (tag, description) VALUES ('qc:maybe', 'Deliberately registered');
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e1', 'qc:maybe');
+
+-- Tags on e1, f1 and G1. fn_tag auto-registers open-namespace values.
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e1', 'Topic:Spikes',
+                  p_by => '00000000-0000-0000-0000-0000000000a1');
+SELECT lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', ' Stage:Raw ');
+SELECT lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000F1', 'auditory_cortex');
+SELECT lab.fn_tag('subject', 'G1', 'cohort:a');
+SELECT lab.fn_tag('subject', 'G1', 'tst_open:x');
+SELECT pg_temp.assert(
+    (SELECT created_by FROM lab.tag WHERE tag = 'topic:spikes') = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT applied_by FROM lab.tag_current WHERE tag = 'topic:spikes')
+        = '00000000-0000-0000-0000-0000000000a1',
+    'fn_tag records p_by on the new tag and on the assignment');
+
+-- Policy violations, whether through fn_tag or a raw INSERT.
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G1', 'stage:raw')$q$,
+    'tags of namespace stage apply to artifact only, not to subject');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G1', 'cohort:a', 'remove')$q$,
+    'immutable: cohort:a cannot be removed');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G1', 'cohort:b')$q$,
+    'already has cohort:a, and namespace cohort is immutable and single-valued');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G1', 'cohort:a')$q$,
+    'already has tag cohort:a');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G2', 'tst_open:x', 'remove')$q$,
+    'does not currently have tag tst_open:x');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_assignment (entity_kind, subject_id, tag, op)
+       VALUES ('subject', 'G2', 'tst_open:never', 'add')$q$,
+    'tag tst_open:never is not registered');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_assignment (entity_kind, event_id, tag, op)
+       VALUES ('subject', '00000000-0000-0000-0000-0000000000e1', 'tst_open:x', 'add')$q$,
+    'tag_assignment_entity_ck');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('animal', 'G1', 'topic:x')$q$, 'entity kind must be');
+-- A second value in a single-valued namespace, inserted directly, is
+-- rejected with a HINT pointing at fn_tag.
+DO $$
+DECLARE v_msg text; v_hint text;
+BEGIN
+    BEGIN
+        INSERT INTO lab.tag_assignment (entity_kind, artifact_id, tag, op)
+        VALUES ('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:sorted', 'add');
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT, v_hint = PG_EXCEPTION_HINT;
+    END;
+    PERFORM pg_temp.assert(v_msg ~ 'already has stage:raw, and namespace stage allows one current tag'
+                           AND v_hint ~ 'lab\.fn_tag',
+                           'single-valued direct insert rejected with a fn_tag HINT');
+END;
+$$;
+
+-- fn_tag replaces the current value of a mutable single-valued namespace:
+-- two log rows from one call, one current tag.
+SELECT lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:preprocessed');
+SELECT pg_temp.assert(
+    (SELECT string_agg(tag || ' ' || op, ',' ORDER BY assignment_id) FROM lab.tag_assignment
+      WHERE artifact_id = '00000000-0000-0000-0000-0000000000f1' AND tag LIKE 'stage:%')
+    = 'stage:raw add,stage:raw remove,stage:preprocessed add'
+    AND (SELECT note FROM lab.tag_assignment
+          WHERE artifact_id = '00000000-0000-0000-0000-0000000000f1' AND op = 'remove')
+        = 'replaced by stage:preprocessed'
+    AND (SELECT string_agg(tag, ',') FROM lab.tag_current
+          WHERE artifact_id = '00000000-0000-0000-0000-0000000000f1' AND namespace = 'stage')
+        = 'stage:preprocessed',
+    'fn_tag replace writes remove + add and leaves one current stage tag');
+SELECT pg_temp.assert(
+    (SELECT tags::text || ' ' || display_tags::text FROM lab.entity_tags
+      WHERE entity_kind = 'artifact' AND entity_id = '00000000-0000-0000-0000-0000000000f1')
+    = '{stage:preprocessed,tag:auditory_cortex} {stage:preprocessed,auditory_cortex}',
+    'entity_tags lists sorted tags and their display forms (bare tags bare)');
+
+-- Retired tags cannot be assigned; tags and namespaces are never renamed.
+UPDATE lab.tag SET retired_at = now(), description = 'old' WHERE tag = 'tst_closed:beta';
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f2', 'tst_closed:beta')$q$,
+    'tst_closed:beta was retired');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag SET value = 'gamma', tag = 'tst_closed:gamma' WHERE tag = 'tst_closed:alpha'$q$,
+    'cannot be renamed');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET namespace = 'tst_renamed' WHERE namespace = 'tst_closed'$q$,
+    'cannot be renamed');
+
+-- Policy is editable while a namespace is unused and frozen once it is used;
+-- the reserved 'tag' namespace is frozen from the start.
+UPDATE lab.tag_namespace SET cardinality = 'multi', applies_to = ARRAY['artifact','event']
+WHERE namespace = 'tst_closed';
+UPDATE lab.tag_namespace SET cardinality = 'single', applies_to = ARRAY['artifact']
+WHERE namespace = 'tst_closed';
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET mutability = 'immutable' WHERE namespace = 'tst_open'$q$,
+    'tst_open is in use, so its policy is frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET cardinality = 'single' WHERE namespace = 'tst_open'$q$,
+    'policy is frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET applies_to = ARRAY['subject'] WHERE namespace = 'tst_open'$q$,
+    'policy is frozen');
+UPDATE lab.tag_namespace
+SET applies_to = ARRAY['subject','event','session'], open_vocabulary = false, description = 'edited'
+WHERE namespace = 'tst_open';
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET open_vocabulary = false WHERE namespace = 'tag'$q$,
+    'reserved for bare tags');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET cardinality = 'single' WHERE namespace = 'tag'$q$,
+    'reserved for bare tags');
+UPDATE lab.tag_namespace SET description = 'Bare tags (edited)' WHERE namespace = 'tag';
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.row_history WHERE table_name = 'tag_namespace') = 4
+    AND (SELECT count(*) FROM lab.row_history WHERE table_name = 'tag') = 1
+    AND (SELECT row_key FROM lab.row_history WHERE table_name = 'tag')
+        = '{"tag": "tst_closed:beta"}'::jsonb,
+    'vocabulary edits are recorded in row_history');
+
+-- Filters: all / any / none, wildcards, bare tokens, NULL and empty lists.
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e2', 'topic:spikes');
+SELECT pg_temp.assert(
+        lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                         ARRAY['stage:preprocessed', ' Auditory_Cortex'], NULL, NULL)
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000F1',
+                         ARRAY['tag:auditory_cortex'], NULL, NULL)
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                             ARRAY['stage:preprocessed', 'stage:raw'], NULL, NULL)
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                         NULL, ARRAY['stage:raw', 'auditory_cortex'], NULL)
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                             NULL, ARRAY['stage:raw', 'qc:*'], NULL)
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                             NULL, NULL, ARRAY['stage:*'])
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                         ARRAY['stage:*', '*'], NULL, ARRAY['qc:*'])
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1', NULL, NULL, NULL)
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1', '{}', '{}', '{}')
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                         ARRAY['', NULL], ARRAY[' '], NULL)
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f2')
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f2',
+                             ARRAY['stage:*'], NULL, NULL),
+    'fn_tag_match all/any/none semantics');
+SELECT pg_temp.assert(
+    (SELECT array_agg(entity_id) FROM lab.fn_find_by_tags('event', ARRAY['qc:*']))
+        = ARRAY['00000000-0000-0000-0000-0000000000e1']
+    AND (SELECT array_agg(entity_id)
+         FROM lab.fn_find_by_tags('event', ARRAY['topic:spikes'], NULL, ARRAY['qc:maybe']))
+        = ARRAY['00000000-0000-0000-0000-0000000000e2']
+    AND (SELECT array_agg(entity_id) FROM lab.fn_find_by_tags('event', NULL, NULL, ARRAY['qc:*']))
+        = ARRAY['00000000-0000-0000-0000-0000000000e2']
+    AND (SELECT array_agg(entity_id) FROM lab.fn_find_by_tags('subject', NULL, ARRAY['cohort:a']))
+        = ARRAY['G1']
+    AND (SELECT count(*) FROM lab.fn_find_by_tags('subject')) = 2,
+    'fn_find_by_tags returns the matching entities, untagged ones included');
+SELECT pg_temp.expect_error($q$SELECT * FROM lab.fn_find_by_tags('animal')$q$,
+                            'entity kind must be');
+
+-- ---------------------------------------------------------------------------
 -- Correcting an event re-points its artifacts (finding 2)
 -- ---------------------------------------------------------------------------
 -- Supersede recording e1 with e7 (sample rate corrected).
@@ -198,6 +420,33 @@ SELECT pg_temp.assert(
               AND subject = '00000000-0000-0000-0000-0000000000f1'),
     'integrity check reports f1 stranded on superseded e1');
 
+-- e1's current tags were not copied onto e7.
+SELECT pg_temp.assert(
+    (SELECT detail FROM lab.fn_check_integrity()
+      WHERE check_name = 'tag_not_carried_forward'
+        AND subject = '00000000-0000-0000-0000-0000000000e7')
+    = 'supersedes event 00000000-0000-0000-0000-0000000000e1, whose current tags were '
+      'not carried forward: qc:maybe, topic:spikes',
+    'integrity check reports tags not carried forward to e7');
+-- Carry them forward the way a client does, then change them on purpose: a
+-- tag later removed, or a single-valued namespace given another value, still
+-- counts as carried.
+INSERT INTO lab.tag_assignment (entity_kind, event_id, tag, op, note)
+SELECT 'event', '00000000-0000-0000-0000-0000000000e7', tag, 'add',
+       'carried forward from 00000000-0000-0000-0000-0000000000e1'
+FROM lab.tag_current
+WHERE entity_kind = 'event' AND entity_id = '00000000-0000-0000-0000-0000000000e1';
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e7', 'qc:pass');
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e7', 'topic:spikes', 'remove');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name = 'tag_not_carried_forward'
+                  AND subject = '00000000-0000-0000-0000-0000000000e7')
+    AND (SELECT tags FROM lab.entity_tags
+          WHERE entity_kind = 'event' AND entity_id = '00000000-0000-0000-0000-0000000000e7')
+        = ARRAY['qc:pass'],
+    'carried-forward tags clear the check, and later changes do not re-raise it');
+
 -- Re-point f1 at e7, keeping the same file: allowed.
 INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id,
                           relative_path, checksum, role, session_id, subject_id, supersedes)
@@ -209,6 +458,11 @@ SELECT pg_temp.assert(
     NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
                 WHERE check_name = 'artifact_producer_superseded'),
     'no stranded artifacts after re-pointing');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+            WHERE check_name = 'tag_not_carried_forward'
+              AND subject = '00000000-0000-0000-0000-0000000000f7'),
+    'integrity check reports f1''s tags missing from f7');
 SELECT pg_temp.assert(
     (SELECT count(*) FROM lab.artifact_active
       WHERE produced_by_event_id = '00000000-0000-0000-0000-0000000000e7') = 1,
@@ -274,6 +528,13 @@ SELECT pg_temp.assert(
     AND (SELECT count(*) FROM lab.artifact WHERE subject_id = 'G1-renamed') = 3,
     'rename cascades to session, event and artifact');
 SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.tag_assignment WHERE subject_id = 'G1')
+    AND (SELECT count(*) FROM lab.tag_assignment WHERE subject_id = 'G1-renamed') = 2
+    AND (SELECT tags FROM lab.entity_tags
+          WHERE entity_kind = 'subject' AND entity_id = 'G1-renamed')
+        = ARRAY['cohort:a', 'tst_open:x'],
+    'rename cascades into tag_assignment, and the tags follow the subject');
+SELECT pg_temp.assert(
     current_setting('lab.maintenance', true) = ''
     AND current_setting('lab.rename_from', true) = ''
     AND current_setting('lab.rename_to', true) = '',
@@ -302,7 +563,8 @@ DECLARE t text;
 BEGIN
     FOREACH t IN ARRAY ARRAY[
         'event','recording_event','artifact','event_input',
-        'artifact_verification','maintenance_log','row_history','schema_version'
+        'artifact_verification','maintenance_log','row_history','schema_version',
+        'tag_assignment'
     ] LOOP
         PERFORM pg_temp.expect_error(format('DELETE FROM lab.%I', t), 'not allowed');
         PERFORM pg_temp.expect_error(format('TRUNCATE lab.%I CASCADE', t), 'not allowed');
@@ -314,6 +576,7 @@ BEGIN
     PERFORM pg_temp.expect_error('UPDATE lab.artifact_verification SET status = ''ok''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.maintenance_log SET operation = ''x''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.schema_version SET description = ''x''', 'append-only log');
+    PERFORM pg_temp.expect_error('UPDATE lab.tag_assignment SET op = ''remove''', 'append-only log');
 END;
 $$;
 
@@ -323,7 +586,8 @@ $$;
 SELECT pg_temp.assert(
     NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
                 WHERE check_name IN ('event_missing_detail', 'event_missing_subject',
-                                     'artifact_producer_superseded', 'duplicate_active_path')),
+                                     'artifact_producer_superseded', 'duplicate_active_path',
+                                     'tag_not_carried_forward')),
     'no structural integrity errors in the fixture');
 
 ROLLBACK;
