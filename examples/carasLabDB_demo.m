@@ -88,6 +88,40 @@ rawId = db.addArtifact( ...
     Role              = "raw", ...
     Format            = "dat");
 
+%% Tags: label rows with namespace:value tags
+% Every tag is namespace:value in lower case; a bare tag such as "pilot" is
+% stored as tag:pilot. Each namespace carries a policy that the database
+% enforces: stage is mutable and single-valued (one current stage per
+% artifact, which moves on as the file is processed) with a closed
+% vocabulary; cohort is immutable (set once, permanent); topic is
+% multi-valued and open (new values are registered on first use).
+nsArtifact = db.getTagNamespaces(AppliesTo="artifact");   % what can tag an artifact
+stages     = db.getTags(Namespace="stage");               % raw, preprocessed, ...
+disp(nsArtifact); disp(stages);
+
+db.setTag("artifact", rawId, "stage:raw");
+[~, changed] = db.setTag("artifact", rawId, "stage:raw");   % already set: nothing written
+assert(~changed)
+db.addTag("artifact", rawId, ["topic:tonotopy", "pilot"], Note="first penetration");
+db.setTag("subject", "G-0421", "cohort:a");
+
+% Preprocessing finished: move the file on. stage is single-valued, so
+% setTag replaces stage:raw (the log keeps both the 'remove' and the 'add').
+db.setTag("artifact", rawId, "stage:preprocessed");
+disp(db.getEntityTags("artifact", rawId));                 % current tags
+disp(db.getEntityTags("artifact", rawId, History=true));   % the full log
+
+% Query by tag: the matching ids, or the rows through any get* method.
+% Tags= must all be present, AnyTags= at least one, NotTags= none;
+% "ns:*" means any tag of namespace ns.
+preIds   = db.findByTags("artifact", Tags="stage:preprocessed", NotTags="qc:fail");
+preRows  = db.getArtifacts(SessionId=sid, Tags="stage:preprocessed");
+topical  = db.getArtifacts(Tags="topic:*");
+cohortA  = db.getSubjects(Tags="cohort:a");
+fprintf("preprocessed artifacts: %d (%d in this session); with a topic: %d\n", ...
+    numel(preIds), height(preRows), height(topical));
+disp(cohortA);
+
 %% An analysis run that consumes the raw file and produces spikes
 anId = db.addAnalysisEvent( ...
     SubjectId    = "G-0421", ...
@@ -134,10 +168,15 @@ wEid = db.addHusbandryEvent( ...
     Measure    = "weight", ...
     WeightG    = 72.4);
 
+db.setTag("event", wEid, "qc:pass");
+
 newWEid = db.supersedeEvent(wEid, ...
     DetailOverrides = struct("weight_g", 71.9), ...
     Notes           = "scale recalibrated");
 fprintf("weight event %s superseded by %s\n", wEid, newWEid);
+% The correction carries the event's current tags (qc:pass) forward in the
+% same transaction, so it still matches every tag filter the original did.
+disp(db.getEntityTags("event", newWEid));
 
 %% Ad-hoc SQL escape hatch
 n = db.runQuery("SELECT count(*) AS n FROM lab.event_active;");

@@ -31,9 +31,9 @@ function buildUI(obj)
     root.Padding = [6 6 6 6];
 
     % ---- toolbar ------------------------------------------------------------
-    tb = uigridlayout(root, [1 8]);
+    tb = uigridlayout(root, [1 9]);
     tb.Layout.Row = 1; tb.Layout.Column = 1;
-    tb.ColumnWidth = {90, 120, 100, 110, 110, 150, '1x', 130};
+    tb.ColumnWidth = {90, 120, 100, 110, 110, 150, 80, '1x', 130};
     tb.Padding = [0 0 0 0];
 
     uibutton(tb, "Text", "Refresh", "Tooltip", "Refresh (Ctrl+R)", ...
@@ -48,6 +48,8 @@ function buildUI(obj)
         "ButtonPushedFcn", @(~,~) obj.onAddMenu("session"));
     uibutton(tb, "Text", "Edit / Supersede", "Tooltip", "Edit / Supersede (Ctrl+D)", ...
         "ButtonPushedFcn", @(s,e) obj.onEditSelected(s,e));
+    uibutton(tb, "Text", "Tags…", "Tooltip", "Tags of the selected row (Ctrl+T)", ...
+        "ButtonPushedFcn", @(s,e) obj.onEditTags(s,e));
     uilabel(tb, "Text", "");   % spacer
     obj.UI.ActiveOnly = uicheckbox(tb, "Text", "Active only", ...
         "Value", logical(obj.Prefs.UseActiveViews), ...
@@ -65,8 +67,8 @@ function buildUI(obj)
     panel.Layout.Row = 1; panel.Layout.Column = 1;
 
     nRows = obj.NumFilterRows;
-    fg = uigridlayout(panel, [nRows + 4, 1]);
-    fg.RowHeight = [{28, 30, 22}, repmat({30}, 1, nRows), {34}];
+    fg = uigridlayout(panel, [nRows + 5, 1]);
+    fg.RowHeight = [{28, 30, 30, 22}, repmat({30}, 1, nRows), {34}];
     fg.ColumnWidth = {'1x'};
     fg.RowSpacing = 5;
     fg.Padding = [8 8 8 8];
@@ -80,6 +82,20 @@ function buildUI(obj)
         "Placeholder", "subject_id contains…", ...
         "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
     obj.UI.QuickRegex = uicheckbox(qrow, "Text", "regex", ...
+        "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
+
+    % Tag filter, same grammar as the web dashboard (see buildWhere): all
+    % tokens must hold, -tok must not, ns:* = any tag of ns, a bare word is
+    % tag:<word>. Enter applies it, like the other filter fields.
+    trow = uigridlayout(fg, [1 2]);
+    trow.ColumnWidth = {40, '1x'};
+    trow.Padding = [0 0 0 0];
+    uilabel(trow, "Text", "Tags", "FontWeight", "bold");
+    obj.UI.TagFilter = uieditfield(trow, "text", ...
+        "Value", char(obj.Prefs.LastTagFilter), ...
+        "Placeholder", "stage:raw -qc:fail topic:*", ...
+        "Tooltip", "Space-separated tags that must all be present; -tag excludes; " + ...
+            "ns:* = any tag of ns; a bare word = tag:word. Enter applies.", ...
         "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
 
     uilabel(fg, "Text", "Column filters (all ANDed)", "FontWeight", "bold");

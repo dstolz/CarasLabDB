@@ -23,9 +23,15 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %   you. The database still rejects a second *active* row for one file, so
 %   this cannot be used to register a file twice.
 %
+%   The artifact's current tags are copied onto the new row (new 'add' rows
+%   in lab.tag_assignment, noted "carried forward from <old id>"), in the
+%   same transaction as the insert, so the correction keeps matching the tag
+%   filters the original did. Retired tags cannot be assigned and are skipped
+%   with a CarasLabDB:retiredTagsNotCarried warning.
+%
 %   Returns the new artifact_id (uuid string).
 %
-%   See also CARASLABDB, ADDARTIFACT, SUPERSEDEEVENT.
+%   See also CARASLABDB, ADDARTIFACT, SUPERSEDEEVENT, GETENTITYTAGS.
 
     arguments
         obj (1,1) CarasLabDB
@@ -47,5 +53,6 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
     s = obj.pArtifactSuccessor(A{1});
     s = obj.pMergeOverrides(s, opts.Overrides);
 
-    newArtifactId = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
+    % The new row and its carried-forward tags commit together or not at all.
+    newArtifactId = obj.pTransact(@() obj.pInsertArtifact(s));
 end
