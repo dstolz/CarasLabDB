@@ -87,8 +87,8 @@ VALUES ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000
 -- ---------------------------------------------------------------------------
 -- Version and baseline behaviour
 -- ---------------------------------------------------------------------------
-SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 2,
-                      'schema_version is 2');
+SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 3,
+                      'schema_version is 3');
 
 SELECT pg_temp.assert(
     (SELECT subject_id FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e1') = 'G1',
@@ -263,6 +263,182 @@ SELECT pg_temp.assert(
     'project_member delete recorded with its composite key');
 
 -- ---------------------------------------------------------------------------
+-- Tags: syntax, namespace policy, the log and the derived current state
+-- ---------------------------------------------------------------------------
+-- Canonical form: lower-case, trimmed, bare tags land in the 'tag' namespace.
+SELECT pg_temp.assert(
+    lab.fn_register_tag(' Auditory_Cortex ') = 'tag:auditory_cortex'
+    AND lab.fn_register_tag('Topic:Gerbil') = 'topic:gerbil'
+    AND lab.fn_register_tag('tag:auditory_cortex') = 'tag:auditory_cortex',
+    'fn_register_tag canonicalizes and is idempotent');
+SELECT pg_temp.assert(
+    (SELECT namespace || '|' || value FROM lab.tag WHERE tag = 'tag:auditory_cortex')
+    = 'tag|auditory_cortex',
+    'trg_tag_normalize splits the canonical tag into namespace and value');
+INSERT INTO lab.tag (namespace, value) VALUES ('topic', 'Hearing');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.tag WHERE tag = 'topic:hearing'),
+    'a tag inserted as namespace + value gets its canonical tag string');
+-- Malformed tags are rejected, not rewritten.
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('bad tag')$q$,
+                            'tag_value_format_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('stage:raw/1')$q$,
+                            'tag_value_format_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('a:b:c')$q$,
+                            'tag_value_format_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('stage:')$q$,
+                            'tag_value_format_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag, namespace) VALUES ('qc:pass', 'stage')$q$,
+                            'does not belong to namespace');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.tag (tag) VALUES ('nonexistent:x')$q$,
+                            'tag_namespace_fkey');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+       VALUES ('Bad Name', 'mutable', 'multi', ARRAY['event'])$q$,
+    'tag_namespace_format_ck');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+       VALUES ('region', 'mutable', 'multi', ARRAY['file'])$q$,
+    'tag_namespace_applies_to_ck');
+INSERT INTO lab.tag_namespace (namespace, mutability, cardinality, applies_to)
+VALUES (' Region ', 'immutable', 'multi', ARRAY['event', 'artifact']);
+SELECT pg_temp.assert(EXISTS (SELECT 1 FROM lab.tag_namespace WHERE namespace = 'region'),
+                      'namespace names are canonicalized on insert');
+
+-- fn_tag: the write path. Replacing the value of a single-valued mutable
+-- namespace is one call and two log rows; adding a current tag writes nothing.
+SELECT pg_temp.assert(lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'Stage:Raw') IS NOT NULL,
+                      'write: lab.fn_tag(''artifact'', ''00000000-0000-0000-0000-000000000');
+SELECT pg_temp.assert(
+    lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:raw')
+    = (SELECT assignment_id FROM lab.tag_assignment WHERE tag = 'stage:raw' AND op = 'add'),
+    'adding a tag the entity already carries writes nothing');
+SELECT pg_temp.assert(lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:preprocessed') IS NOT NULL,
+                      'write: lab.fn_tag(''artifact'', ''00000000-0000-0000-0000-000000000');
+SELECT pg_temp.assert(
+    (SELECT string_agg(tag || ':' || op, ',' ORDER BY assignment_id)
+     FROM lab.tag_assignment WHERE artifact_id = '00000000-0000-0000-0000-0000000000f1')
+    = 'stage:raw:add,stage:raw:remove,stage:preprocessed:add',
+    'fn_tag records the removal of the current value, then the addition');
+SELECT pg_temp.assert(
+    (SELECT string_agg(tag, ',') FROM lab.tag_current
+      WHERE entity_kind = 'artifact' AND entity_id = '00000000-0000-0000-0000-0000000000f1')
+    = 'stage:preprocessed',
+    'tag_current shows one stage tag after the replacement');
+-- Closed vocabulary: fn_tag will not invent a value; a deliberate registration works.
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:currated')$q$,
+    'closed vocabulary');
+SELECT pg_temp.assert(lab.fn_register_tag('stage:archived', 'Moved to cold storage') IS NOT NULL,
+                      'write: lab.fn_register_tag(''stage:archived'', ''Moved to cold stor');
+SELECT pg_temp.assert(EXISTS (SELECT 1 FROM lab.tag WHERE tag = 'stage:archived'),
+                      'fn_register_tag registers a value in a closed namespace');
+-- Open vocabulary: a new value is registered on first use.
+SELECT pg_temp.assert(lab.fn_tag('artifact', '00000000-0000-0000-0000-0000000000f1', 'visual_cortex') IS NOT NULL,
+                      'write: lab.fn_tag(''artifact'', ''00000000-0000-0000-0000-000000000');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.tag WHERE tag = 'tag:visual_cortex')
+    AND (SELECT display_tag FROM lab.tag_current WHERE tag = 'tag:visual_cortex') = 'visual_cortex',
+    'a bare tag is auto-registered in the tag namespace and displayed bare');
+-- applies_to
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('subject', 'G1', 'stage:raw')$q$,
+    'does not apply to a subject');
+-- Immutable, single-valued: set once, never replaced or removed.
+SELECT pg_temp.assert(lab.fn_tag('subject', 'G1', 'cohort:a') IS NOT NULL,
+                      'write: lab.fn_tag(''subject'', ''G1'', ''cohort:a'')');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_tag('subject', 'G1', 'cohort:b')$q$,
+                            'immutable and single-valued');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_tag('subject', 'G1', 'cohort:a', 'remove')$q$,
+                            'is immutable');
+-- Mutable, multi-valued: add and remove freely; removing twice is an error.
+SELECT pg_temp.assert(lab.fn_tag('subject', 'G1', 'topic:gerbil') IS NOT NULL,
+                      'write: lab.fn_tag(''subject'', ''G1'', ''topic:gerbil'')');
+SELECT pg_temp.assert(lab.fn_tag('subject', 'G1', 'topic:hearing') IS NOT NULL,
+                      'write: lab.fn_tag(''subject'', ''G1'', ''topic:hearing'')');
+SELECT pg_temp.assert(lab.fn_tag('subject', 'G1', 'topic:gerbil', 'remove') IS NOT NULL,
+                      'write: lab.fn_tag(''subject'', ''G1'', ''topic:gerbil'', ''remove''');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_tag('subject', 'G1', 'topic:gerbil', 'remove')$q$,
+                            'does not currently carry');
+-- A direct INSERT is policed too: a second single-valued tag is refused.
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_assignment (entity_kind, artifact_id, tag, op)
+       VALUES ('artifact', '00000000-0000-0000-0000-0000000000f1', 'stage:sorted', 'add')$q$,
+    'single-valued');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_assignment (entity_kind, artifact_id, subject_id, tag, op)
+       VALUES ('artifact', '00000000-0000-0000-0000-0000000000f1', 'G1', 'topic:gerbil', 'add')$q$,
+    'tag_assignment_entity_ck');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.tag_assignment (entity_kind, artifact_id, tag, op)
+       VALUES ('artifact', '00000000-0000-0000-0000-0000000000f1', 'topic:nope', 'add')$q$,
+    'not registered');
+-- Every kind can be tagged.
+SELECT pg_temp.assert(lab.fn_tag('event',   '00000000-0000-0000-0000-0000000000e1', 'qc:pass') IS NOT NULL,
+                      'write: lab.fn_tag(''event'',   ''00000000-0000-0000-0000-0000000000');
+SELECT pg_temp.assert(lab.fn_tag('session', '00000000-0000-0000-0000-0000000000c1', 'Condition:Noise') IS NOT NULL,
+                      'write: lab.fn_tag(''session'', ''00000000-0000-0000-0000-0000000000');
+SELECT pg_temp.assert(lab.fn_tag('project', '00000000-0000-0000-0000-0000000000b1', 'topic:gerbil') IS NOT NULL,
+                      'write: lab.fn_tag(''project'', ''00000000-0000-0000-0000-0000000000');
+SELECT pg_temp.assert(
+    (SELECT string_agg(entity_kind, ',' ORDER BY entity_kind) FROM lab.entity_tags)
+    = 'artifact,event,project,session,subject',
+    'entity_tags lists every tagged kind');
+SELECT pg_temp.assert(
+    (SELECT tags FROM lab.entity_tags WHERE entity_kind = 'subject' AND entity_id = 'G1')
+    = ARRAY['cohort:a', 'topic:hearing'],
+    'entity_tags aggregates the current tags in order');
+
+-- Filters: all / any / none, wildcards, bare tags, case-insensitive input.
+SELECT pg_temp.assert(
+    lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                     ARRAY['stage:preprocessed', 'Visual_Cortex'])
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1', ARRAY['stage:*'])
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1', ARRAY['stage:raw'])
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                         NULL, ARRAY['qc:fail', 'stage:preprocessed'])
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                             NULL, ARRAY['qc:fail', 'stage:raw'])
+    AND NOT lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1',
+                             NULL, NULL, ARRAY['tag:*'])
+    AND lab.fn_tag_match('artifact', '00000000-0000-0000-0000-0000000000f1', '{}', '{}', '{}')
+    AND lab.fn_tag_match('subject', 'G2', NULL, NULL, ARRAY['cohort:*']),
+    'fn_tag_match semantics');
+SELECT pg_temp.assert(
+    (SELECT string_agg(entity_id, ',') FROM lab.fn_find_by_tags('subject', ARRAY['cohort:*'])) = 'G1'
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_find_by_tags('subject', ARRAY['cohort:*'], NULL, ARRAY['topic:hearing'])),
+    'fn_find_by_tags');
+
+-- Namespace policy is frozen once in use; applies_to may only grow.
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET mutability = 'mutable' WHERE namespace = 'cohort'$q$,
+    'is frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET applies_to = ARRAY['subject'] WHERE namespace = 'cohort'$q$,
+    'is frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET cardinality = 'single' WHERE namespace = 'tag'$q$,
+    'is frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag_namespace SET namespace = 'cohorts' WHERE namespace = 'cohort'$q$,
+    'cannot be renamed');
+UPDATE lab.tag_namespace
+SET description = 'edited', applies_to = applies_to || ARRAY['event']
+WHERE namespace = 'cohort';
+UPDATE lab.tag_namespace SET mutability = 'mutable' WHERE namespace = 'region';   -- unused: allowed
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.tag SET value = 'gerbils' WHERE tag = 'topic:gerbil'$q$,
+    'cannot be renamed');
+UPDATE lab.tag SET retired_at = now() WHERE tag = 'topic:gerbil';
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e1', 'topic:gerbil')$q$,
+    'was retired');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.row_history WHERE table_name = 'tag_namespace') = 2
+    AND (SELECT count(*) FROM lab.row_history WHERE table_name = 'tag') = 1,
+    'edits to the tag vocabulary are recorded in row_history');
+
+-- ---------------------------------------------------------------------------
 -- fn_rename_subject still works end to end, and is recorded
 -- ---------------------------------------------------------------------------
 SELECT lab.fn_rename_subject('G1', 'G1-renamed');
@@ -271,8 +447,12 @@ SELECT pg_temp.assert(
     AND NOT EXISTS (SELECT 1 FROM lab.artifact WHERE subject_id = 'G1')
     AND NOT EXISTS (SELECT 1 FROM lab.session WHERE subject_id = 'G1')
     AND (SELECT count(*) FROM lab.event WHERE subject_id = 'G1-renamed') = 2
-    AND (SELECT count(*) FROM lab.artifact WHERE subject_id = 'G1-renamed') = 3,
-    'rename cascades to session, event and artifact');
+    AND (SELECT count(*) FROM lab.artifact WHERE subject_id = 'G1-renamed') = 3
+    AND NOT EXISTS (SELECT 1 FROM lab.tag_assignment WHERE subject_id = 'G1')
+    AND (SELECT count(*) FROM lab.tag_assignment WHERE subject_id = 'G1-renamed') = 4
+    AND (SELECT tags FROM lab.entity_tags WHERE entity_kind = 'subject' AND entity_id = 'G1-renamed')
+        = ARRAY['cohort:a', 'topic:hearing'],
+    'rename cascades to session, event, artifact and tag_assignment');
 SELECT pg_temp.assert(
     current_setting('lab.maintenance', true) = ''
     AND current_setting('lab.rename_from', true) = ''
@@ -301,7 +481,7 @@ DO $$
 DECLARE t text;
 BEGIN
     FOREACH t IN ARRAY ARRAY[
-        'event','recording_event','artifact','event_input',
+        'event','recording_event','artifact','event_input','tag_assignment',
         'artifact_verification','maintenance_log','row_history','schema_version'
     ] LOOP
         PERFORM pg_temp.expect_error(format('DELETE FROM lab.%I', t), 'not allowed');
@@ -314,6 +494,7 @@ BEGIN
     PERFORM pg_temp.expect_error('UPDATE lab.artifact_verification SET status = ''ok''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.maintenance_log SET operation = ''x''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.schema_version SET description = ''x''', 'append-only log');
+    PERFORM pg_temp.expect_error('UPDATE lab.tag_assignment SET note = ''x''', 'append-only log');
 END;
 $$;
 
@@ -325,6 +506,24 @@ SELECT pg_temp.assert(
                 WHERE check_name IN ('event_missing_detail', 'event_missing_subject',
                                      'artifact_producer_superseded', 'duplicate_active_path')),
     'no structural integrity errors in the fixture');
+
+-- e1 carries qc:pass and is superseded by e7, which does not: reported until
+-- the tag is carried forward (CarasLabDB.supersedeEvent does this itself).
+-- Likewise f1 (two tags) is superseded by f7, which has none.
+SELECT pg_temp.assert(
+    (SELECT string_agg(subject, ',' ORDER BY subject)
+     FROM lab.fn_check_integrity() WHERE check_name = 'tag_not_carried_forward')
+    = '00000000-0000-0000-0000-0000000000e7,'
+      '00000000-0000-0000-0000-0000000000f7,00000000-0000-0000-0000-0000000000f7',
+    'integrity check reports the tags e7 and f7 did not inherit');
+SELECT pg_temp.assert(lab.fn_tag('event', '00000000-0000-0000-0000-0000000000e7', 'qc:pass', 'add',
+                  'carried forward from 00000000-0000-0000-0000-0000000000e1') IS NOT NULL,
+                      'write: lab.fn_tag(''event'', ''00000000-0000-0000-0000-0000000000e7');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name = 'tag_not_carried_forward'
+                  AND subject = '00000000-0000-0000-0000-0000000000e7'),
+    'no lost event tags after carrying forward');
 
 ROLLBACK;
 \echo 'schema_test.sql: all assertions passed'

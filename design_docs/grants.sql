@@ -53,9 +53,12 @@ REVOKE INSERT ON lab.maintenance_log, lab.row_history, lab.schema_version FROM l
 -- class (updateSubject, updateSession) and the GUI editors change in place.
 -- Every UPDATE is recorded in lab.row_history with the login that made it.
 -- The reference tables (species, probe, storage_root, vocabularies) stay
--- owner-only.
+-- owner-only. The tag vocabulary is the exception: any member may create a
+-- namespace or a tag and edit its description or retire it (the policy
+-- columns are frozen by trigger once a namespace is in use).
 GRANT UPDATE ON lab.subject, lab.session, lab.project, lab.project_member,
-                lab.project_artifact, lab.person TO lab_rw;
+                lab.project_artifact, lab.person,
+                lab.tag_namespace, lab.tag TO lab_rw;
 
 -- Tables and sequences the owner creates later get the same read/append
 -- defaults. A new table that should be editable, or must not be written by
