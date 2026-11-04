@@ -2,8 +2,8 @@ function applyFilters(obj)
 %APPLYFILTERS Run the current tab's filtered query and populate its table.
 %
 %   Builds "SELECT * FROM <table><where> ORDER BY <orderby> LIMIT <cap>",
-%   honoring the active-only toggle (events/artifacts read the *_active view),
-%   executes via CarasLabDB.runQuery, and shows the result. Event rows are
+%   honoring the active-only toggle (events/artifacts read the *_active view)
+%   and the tag filter, executes via CarasLabDB.runQuery, and shows the result. Event rows are
 %   color-coded by event_type. Errors (e.g. a bad regex) surface in the status
 %   bar and an alert rather than throwing.
 %
@@ -23,13 +23,15 @@ function applyFilters(obj)
     rows = obj.pReadFilterRows();
     quickText = string(obj.UI.QuickSearch.Value);
     quickRegex = logical(obj.UI.QuickRegex.Value);
-    where = obj.buildWhere(d, rows, quickText, quickRegex);
-
-    sql = "SELECT * FROM " + obj.pQualify(tableName) + where + ...
-        " ORDER BY " + d.OrderBy + " LIMIT " + string(obj.RowLimit) + ";";
+    tagText = string(obj.UI.TagFilter.Value);
 
     tbl = obj.UI.Tables.(d.Key);
     try
+        % buildWhere rejects a malformed tag pattern; report it like a bad
+        % regex rather than letting it escape the callback.
+        where = obj.buildWhere(d, rows, quickText, quickRegex, tagText);
+        sql = "SELECT * FROM " + obj.pQualify(tableName) + where + ...
+            " ORDER BY " + d.OrderBy + " LIMIT " + string(obj.RowLimit) + ";";
         T = obj.Db.runQuery(sql);
     catch ME
         obj.pStatus("Query error: " + string(ME.message));

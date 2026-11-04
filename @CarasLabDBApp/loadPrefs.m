@@ -66,6 +66,7 @@ function d = local_defaults()
                             "Username","", "DatabaseName","lab", "PersonEmail","");
     d.UseActiveViews = true;
     d.LastTab      = "subjects";
+    d.LastTagFilter = "";
     d.SqlHistory   = strings(0,1);
     d.LastSql      = "SELECT * FROM lab.subject_current;";
 end

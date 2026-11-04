@@ -79,6 +79,11 @@ flowchart LR
   link. The original row is retained; queries filter to the active version.
 - **Provenance DAG.** The graph of `event → artifact → analysis → artifact`.
   See the recursive lineage query in [Database design](database-design.md).
+- **Tag.** A hashtag-style label on any event, artifact, subject, session or
+  project: `namespace:value`, lower case (`stage:raw`, `cohort:a`, or a bare
+  `auditory_cortex`). Each namespace declares whether its tags may change
+  over time and how many an entity may carry; assignments are an append-only
+  log and the current tags are derived from it. See [Tags](tagging.md).
 
 ## Scope and assumptions
 

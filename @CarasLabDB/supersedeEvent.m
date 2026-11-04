@@ -35,7 +35,11 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
 %       produced_by_event_id is the new event, so the corrected event lists
 %       its files. Without this the files stay attached to the hidden row
 %       and lab.fn_check_integrity() reports them as
-%       artifact_producer_superseded.
+%       artifact_producer_superseded;
+%     * the event's current tags are copied to the new event, and each
+%       re-pointed artifact inherits the tags of the row it supersedes (as
+%       ordinary tag-log rows noting where they came from). A correction
+%       made without this shows up as tag_not_carried_forward.
 %
 %   Returns the new event_id (uuid string).
 %

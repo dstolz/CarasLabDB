@@ -36,6 +36,8 @@ data. It has five parts:
   script writes CRLF line endings; the repository stores the file with LF.
   `server.py` serves only the page and `/api/data`, caches the export for 5 s
   and gzips it.
+- **`design_docs/tagging.md`** — the tag syntax, namespace policy and filter
+  grammar shared by every client.
 - **`mcp-server/`** — a Python **read-only** Model Context Protocol server
   (`src/caraslabdb_mcp/`) that gives an LLM agent typed `get*` tools mirroring
   `@CarasLabDB`'s read surface (reference tables, subjects/sessions, events and
@@ -83,6 +85,17 @@ records:
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
   (when the row was inserted) — they routinely differ.
+- **Tags** (`design_docs/tagging.md`): `tag_namespace` / `tag` are mutable
+  vocabulary tables; `tag_assignment` is an append-only `add`/`remove` log
+  over the five taggable kinds, and the current tags are *derived*
+  (`tag_current`, `entity_tags`, `fn_current_tags`). A tag is canonical
+  `namespace:value`; a bare tag belongs to the reserved `tag` namespace. The
+  per-namespace policy (`mutability`, `cardinality`, `open_vocabulary`,
+  `applies_to`) is enforced by `trg_tag_assignment_policy` and frozen once in
+  use. `lab.fn_tag` is the write path every client uses and `fn_tag_match`
+  the filter semantics (`ns:*` wildcards); never re-implement either in a
+  client. `tag_assignment` must never gain a stored column derived from
+  `subject_id` (the rename hatch requires every other column unchanged).
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
@@ -132,7 +145,16 @@ Key behaviors baked into the class:
   explicit overrides, set `supersedes`, insert as new. Carried values never
   pass through a MATLAB double or datetime. `supersedeEvent` also copies the
   event's `event_input` edges and supersedes each active artifact it produced
-  with one pointing at the new event, all in one transaction.
+  with one pointing at the new event, all in one transaction (`pTransact`);
+  both carry the old rows' current tags to the successors (`pCopyTags`).
+- Tags: `addTag`/`removeTag`/`registerTag` call `lab.fn_tag` /
+  `lab.fn_register_tag`; `getEntityTags`/`findByTags` read the views and
+  functions; the five getters take `Tags=`/`AnyTags=`/`NotTags=` (built by
+  `pTagClause` around `lab.fn_tag_match`). The entity kind → primary-key map
+  is the fixed `pTagEntity`, like `pDetailTable`. `CarasLabDB.normalizeTag`
+  mirrors `fn_canonical_tag` and the CHECK regexes. `text[]` columns are
+  never `SELECT *`-ed through the native driver (`getTagNamespaces` uses
+  `array_to_string`).
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →

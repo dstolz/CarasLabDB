@@ -28,6 +28,12 @@ app = CarasLabDBApp(db);   %#ok<NASGU>
 %  * Browse Subjects / Sessions / Events / Artifacts in sortable tables.
 %  * Quick subject search (substring or regex) plus up to four column filters
 %    with Exact / Contains / Regex / Range modes (regex uses Postgres ~*).
+%  * Tag filter: hashtag-style patterns such as "stage:raw -qc:fail ?cohort:a
+%    ?cohort:b auditory_cortex" (space-separated; "-" excludes, "?" means any
+%    of, "ns:*" is a wildcard, a bare word is a free-form tag).
+%  * Select a row and press Ctrl+T (or "Tags…") to see, add and remove its
+%    tags; the namespace policy (one per entity, permanent, closed
+%    vocabulary) is shown and enforced by the database.
 %  * Toggle "Active only" to switch between the *_active views and full history.
 %  * "Export → WS" copies the currently displayed table into the base workspace
 %    for further analysis.

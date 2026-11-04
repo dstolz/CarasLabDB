@@ -110,6 +110,24 @@ spikesId = db.addArtifact( ...
     Role              = "spikes", ...
     Format            = "npy");
 
+%% Tags: hashtag-style labels with per-namespace policies
+% "stage" is single-valued and mutable: the second addTag records the
+% removal of stage:raw and the addition of stage:sorted in one call.
+db.addTag("artifact", rawId, "stage:raw");
+db.addTag("artifact", spikesId, "stage:sorted");
+db.addTag("artifact", rawId, "stage:preprocessed", Note="CAR + bandpass");
+% "cohort" is immutable: set once per animal. A bare tag ("auditory_cortex")
+% is shorthand for the free-form "tag:" namespace.
+db.addTag("subject", "G-0421", "cohort:a");
+db.addTag("subject", "G-0421", "auditory_cortex");
+db.addTag("event", eid, "qc:pass");
+
+disp(db.getEntityTags("artifact", rawId));                 % current tags
+disp(db.getEntityTags("artifact", rawId, History=true));   % add/remove log
+disp(db.findByTags("artifact", Tags="stage:*", NotTags="qc:fail"));
+staged = db.getArtifacts(SessionId=sid, Tags="stage:preprocessed");
+disp(staged);
+
 %% Retrieval (defaults to the *_active views)
 projects  = db.getProjects(Name="Gerbil AC plasticity");
 members   = db.getProjectMembers(ProjectId=projId);

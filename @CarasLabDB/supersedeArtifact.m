@@ -23,9 +23,13 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %   you. The database still rejects a second *active* row for one file, so
 %   this cannot be used to register a file twice.
 %
+%   The old artifact's current tags are carried forward to the new row in
+%   the same transaction (tags describe the file, not the row), each as a
+%   normal tag-log entry noting where it came from.
+%
 %   Returns the new artifact_id (uuid string).
 %
-%   See also CARASLABDB, ADDARTIFACT, SUPERSEDEEVENT.
+%   See also CARASLABDB, ADDARTIFACT, SUPERSEDEEVENT, ADDTAG.
 
     arguments
         obj (1,1) CarasLabDB
@@ -47,5 +51,10 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
     s = obj.pArtifactSuccessor(A{1});
     s = obj.pMergeOverrides(s, opts.Overrides);
 
-    newArtifactId = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
+    newArtifactId = obj.pTransact(@insertAndCarryTags);
+
+    function id = insertAndCarryTags()
+        id = obj.pInsertReturning(obj.pT("artifact"), s, "artifact_id");
+        obj.pCopyTags("artifact", oldArtifactId, id);
+    end
 end
