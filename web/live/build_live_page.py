@@ -199,6 +199,9 @@ NEW_HOWTO = '''  <details class="howto" id="howto">
       <p>Full history is returned — superseded rows included — and active vs.
       superseded state is derived client-side from the <code>supersedes</code> links,
       exactly like the <code>lab.event_active</code> / <code>lab.artifact_active</code> views.
+      Tags come as the full <code>lab.tag_assignment</code> log; an entity's current
+      tags are derived from it like <code>lab.tag_current</code>, and the Tags filter
+      mirrors <code>lab.fn_tag_match</code> (see <code>design_docs/tagging.md</code>).
       Hit <b>↻ Refresh</b> to re-query the database.</p>
       <p>Run it from the repo root (with the schema applied to database <code>lab</code>):</p>
       <pre>PGDATABASE=lab python web/live/server.py --port 8778
