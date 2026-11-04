@@ -15,6 +15,9 @@ def register(app):
         occurred_from: Optional[str] = None,
         occurred_before: Optional[str] = None,
         active_only: bool = True,
+        tags: Optional[list[str]] = None,
+        any_tags: Optional[list[str]] = None,
+        none_tags: Optional[list[str]] = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """List base event rows (event_type, subject/session, occurred_at, ...).
@@ -30,6 +33,13 @@ def register(app):
         session's time zone; add one (e.g. "2026-09-01T00:00:00-04:00") to be
         exact.
 
+        tags / any_tags / none_tags filter on the event's current tags: every
+        tag in `tags` must be present, at least one of `any_tags` (when
+        given), none of `none_tags`. Elements are `namespace:value`, a bare
+        tag (`auditory_cortex` == `tag:auditory_cortex`) or a `namespace:*`
+        wildcard; case-insensitive. Untagged events are included whenever
+        they satisfy the filter (e.g. by none_tags alone).
+
         A filter left as None is simply not applied -- it does not mean
         "where this column IS NULL".
 
@@ -42,7 +52,8 @@ def register(app):
             "event_id": event_id, "event_type": event_type,
             "subject_id": subject_id, "session_id": session_id,
         }, limit=limit, order_by=db.ORDER_BY_EVENT,
-            time_ranges={"occurred_at": (occurred_from, occurred_before)})
+            time_ranges={"occurred_at": (occurred_from, occurred_before)},
+            tag_filters=("event", tags, any_tags, none_tags))
 
     @app.tool()
     def get_event_detail(event_id: str, active_only: bool = True) -> dict:

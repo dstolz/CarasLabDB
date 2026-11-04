@@ -17,6 +17,9 @@ def register(app):
         created_from: Optional[str] = None,
         created_before: Optional[str] = None,
         active_only: bool = True,
+        tags: Optional[list[str]] = None,
+        any_tags: Optional[list[str]] = None,
+        none_tags: Optional[list[str]] = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """List artifacts (checksummed files on the NAS produced by an event).
@@ -28,6 +31,13 @@ def register(app):
         created_at, the time the file was registered. Each is an ISO-8601
         date or timestamp; a value without a UTC offset is read in the
         database session's time zone.
+
+        tags / any_tags / none_tags filter on the artifact's current tags:
+        every tag in `tags` must be present, at least one of `any_tags`
+        (when given), none of `none_tags`. Elements are `namespace:value`
+        (e.g. `stage:raw`), a bare tag (`tag:` namespace) or a `namespace:*`
+        wildcard (`qc:*`); case-insensitive. Untagged artifacts are included
+        whenever they satisfy the filter (e.g. by none_tags alone).
 
         A filter left as None is simply not applied -- it does not mean
         "where this column IS NULL".
@@ -42,7 +52,8 @@ def register(app):
             "subject_id": subject_id, "session_id": session_id,
             "role": role, "checksum": checksum,
         }, limit=limit, order_by=db.ORDER_BY_ARTIFACT,
-            time_ranges={"created_at": (created_from, created_before)})
+            time_ranges={"created_at": (created_from, created_before)},
+            tag_filters=("artifact", tags, any_tags, none_tags))
 
     @app.tool()
     def get_event_inputs(

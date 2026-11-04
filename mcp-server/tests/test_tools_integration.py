@@ -69,6 +69,13 @@ def seed():
             "relative_path, checksum) VALUES (%s, %s, %s, %s, %s) RETURNING artifact_id",
             [ids["sep"], sess, root, f"{ids['subject']}/s1/raw.dat",
              uuid.uuid4().hex + uuid.uuid4().hex]).fetchone()[0]
+        ids["session"] = sess
+        ids["project"] = proj
+        # `topic` is an open namespace (the value is created on the fly);
+        # `stage` is closed and stage:raw is seeded by schema.sql.
+        ids["topic_tag"] = f"topic:test-{tag}"
+        q("SELECT lab.fn_tag('event', %s, %s)", [str(ids["sep"]), ids["topic_tag"]])
+        q("SELECT lab.fn_tag('artifact', %s, 'stage:raw')", [str(ids["artifact"])])
     return {k: str(v) for k, v in ids.items()}
 
 
@@ -129,3 +136,87 @@ def test_connection_is_reused_and_replaced_when_it_dies(seed):
 def test_writes_are_refused(seed):
     with pytest.raises(Exception, match="read-only transaction"):
         db.fetch_all("INSERT INTO lab.species (code, common_name) VALUES ('x', 'x') RETURNING code")
+
+
+def test_get_tag_namespaces_lists_seeded(seed):
+    res = call("get_tag_namespaces", limit=1000)
+    names = [r["namespace"] for r in res["rows"]]
+    assert "stage" in names and "tag" in names and names == sorted(names)
+    stage = call("get_tag_namespaces", namespace="stage")["rows"]
+    assert len(stage) == 1 and stage[0]["cardinality"] == "single"
+    assert stage[0]["open_vocabulary"] is False and stage[0]["applies_to"] == ["artifact"]
+
+
+def test_get_tags_by_namespace_and_bare_tag(seed):
+    tags = [r["tag"] for r in call("get_tags", namespace="stage")["rows"]]
+    assert "stage:raw" in tags and tags == sorted(tags)
+    assert all(t.startswith("stage:") for t in tags)
+    # Input is case-insensitive; a bare tag is looked up in the `tag` namespace.
+    assert [r["tag"] for r in call("get_tags", tag="STAGE:RAW")["rows"]] == ["stage:raw"]
+    assert call("get_tags", tag=f"test-{seed['tag']}")["row_count"] == 0
+    assert [r["tag"] for r in call("get_tags", tag=f" Topic:Test-{seed['tag']} ")["rows"]] \
+        == [seed["topic_tag"]]
+
+
+def test_get_entity_tags_current_and_history(seed):
+    cur = call("get_entity_tags", entity_kind="event", entity_id=seed["sep"])
+    assert [(r["tag"], r["namespace"], r["value"]) for r in cur["rows"]] \
+        == [(seed["topic_tag"], "topic", f"test-{seed['tag']}")]
+    assert cur["rows"][0]["entity_id"] == seed["sep"]
+    hist = call("get_entity_tags", entity_kind="event", entity_id=seed["sep"].upper(),
+                include_history=True)
+    assert [(r["tag"], r["op"], r["event_id"]) for r in hist["rows"]] \
+        == [(seed["topic_tag"], "add", seed["sep"])]
+    # An untagged entity has zero rows, not an error.
+    assert call("get_entity_tags", entity_kind="event", entity_id=seed["aug"])["row_count"] == 0
+    art = call("get_entity_tags", entity_kind="artifact", entity_id=seed["artifact"])
+    assert [r["display_tag"] for r in art["rows"]] == ["stage:raw"]
+    with pytest.raises(Exception, match="entity_kind"):
+        call("get_entity_tags", entity_kind="person", entity_id=seed["person"])
+    with pytest.raises(Exception, match="uuid"):
+        call("get_entity_tags", entity_kind="event", entity_id="not-a-uuid")
+
+
+def test_find_by_tags(seed):
+    res = call("find_by_tags", entity_kind="event", all_of=[seed["topic_tag"].upper()])
+    assert [r["entity_id"] for r in res["rows"]] == [seed["sep"]]
+    res = call("find_by_tags", entity_kind="event", any_of=["topic:*"],
+               none_of=[f"test-{seed['tag']}"])
+    assert seed["sep"] in [r["entity_id"] for r in res["rows"]]
+    res = call("find_by_tags", entity_kind="artifact", all_of=["stage:raw"], none_of=["qc:*"])
+    assert seed["artifact"] in [r["entity_id"] for r in res["rows"]]
+    # Only tagged entities are considered: the untagged `aug` event never appears.
+    res = call("find_by_tags", entity_kind="event", none_of=["stage:*"], limit=1000)
+    assert seed["aug"] not in [r["entity_id"] for r in res["rows"]]
+    with pytest.raises(Exception, match="entity_kind"):
+        call("find_by_tags", entity_kind="person", all_of=["x"])
+
+
+def test_list_tools_tag_filters(seed):
+    res = call("get_events", subject_id=seed["subject"], tags=[seed["topic_tag"]])
+    assert [r["event_id"] for r in res["rows"]] == [seed["sep"]]
+    # none_tags keeps untagged rows: the August event has no tags and passes.
+    res = call("get_events", subject_id=seed["subject"], none_tags=[seed["topic_tag"]])
+    assert [r["event_id"] for r in res["rows"]] == [seed["aug"]]
+    res = call("get_events", subject_id=seed["subject"], any_tags=["Topic:*", "qc:fail"])
+    assert [r["event_id"] for r in res["rows"]] == [seed["sep"]]
+    assert call("get_events", subject_id=seed["subject"], tags=[], none_tags=None)["row_count"] == 2
+    res = call("get_artifacts", subject_id=seed["subject"], tags=["stage:raw"])
+    assert [r["artifact_id"] for r in res["rows"]] == [seed["artifact"]]
+    assert call("get_artifacts", subject_id=seed["subject"],
+                none_tags=["stage:raw"])["row_count"] == 0
+    # The untagged subject / session / project pass a none_tags filter and fail a tags one.
+    assert call("get_subjects", subject_id=seed["subject"], none_tags=["cohort:*"])["row_count"] == 1
+    assert call("get_subjects", subject_id=seed["subject"], tags=["cohort:*"])["row_count"] == 0
+    assert call("get_sessions", session_id=seed["session"], none_tags=["qc:fail"])["row_count"] == 1
+    assert call("get_sessions", session_id=seed["session"], tags=["qc:pass"])["row_count"] == 0
+    assert call("get_projects", project_id=seed["project"], none_tags=["topic:*"])["row_count"] == 1
+    assert call("get_projects", project_id=seed["project"], any_tags=["topic:*"])["row_count"] == 0
+
+
+def test_tag_writes_are_refused(seed):
+    # lab.fn_tag is a SELECT-able function that INSERTs; the read-only
+    # transaction stops it like any other write.
+    with pytest.raises(Exception, match="read-only transaction"):
+        db.fetch_all("SELECT lab.fn_tag('event', %s, 'topic:refused')", [seed["aug"]])
+    assert call("get_entity_tags", entity_kind="event", entity_id=seed["aug"])["row_count"] == 0

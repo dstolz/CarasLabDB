@@ -97,3 +97,74 @@ def test_select_from_open_ended_range_and_ci_filter(captured):
     assert captured[0][1] == ["Dan@UMD.edu"]
     assert captured[1][0] == "SELECT * FROM lab.artifact WHERE created_at < %s::timestamptz"
     assert captured[2][0] == "SELECT * FROM lab.artifact"
+
+
+def test_select_from_tag_filters_bind_kind_and_arrays(captured):
+    db.select_from(
+        "lab.event_active", {"subject_id": "G1"}, limit=10, order_by=db.ORDER_BY_EVENT,
+        tag_filters=("event", ["topic:x", "auditory_cortex"], ["qc:*"], ["qc:fail"]),
+    )
+    sql, params, limit = captured[0]
+    assert sql == (
+        "SELECT * FROM lab.event_active WHERE subject_id = %s "
+        "AND lab.fn_tag_match(%s, event_id::text, %s::text[], %s::text[], %s::text[]) "
+        "ORDER BY occurred_at DESC, event_id"
+    )
+    assert params == ["G1", "event", ["topic:x", "auditory_cortex"], ["qc:*"], ["qc:fail"]]
+    assert limit == 10
+
+
+@pytest.mark.parametrize("kind, table", [
+    ("artifact", "lab.artifact_active"), ("subject", "lab.subject"),
+    ("session", "lab.session"), ("project", "lab.project"),
+])
+def test_select_from_tag_filters_pk_comes_from_kind(captured, kind, table):
+    db.select_from(table, {}, tag_filters={"kind": kind, "none_of": ["qc:fail"]})
+    sql, params, _ = captured[0]
+    assert sql == (
+        f"SELECT * FROM {table} WHERE lab.fn_tag_match(%s, {db.TAG_PK[kind]}::text, "
+        "%s::text[], %s::text[], %s::text[])"
+    )
+    assert params == [kind, [], [], ["qc:fail"]]
+
+
+@pytest.mark.parametrize("kind", ["person", "event_id; DROP TABLE x", "", None])
+def test_select_from_tag_filters_reject_bad_kind(captured, kind):
+    with pytest.raises(ValueError, match="entity kind"):
+        db.select_from("lab.event", {}, tag_filters=(kind, ["topic:x"], None, None))
+    assert captured == []
+
+
+def test_select_from_tag_filters_reject_non_string_lists(captured):
+    with pytest.raises(ValueError, match="list of strings"):
+        db.select_from("lab.event", {}, tag_filters=("event", "topic:x", None, None))
+    with pytest.raises(ValueError, match="list of strings"):
+        db.select_from("lab.event", {}, tag_filters=("event", None, [1], None))
+    assert captured == []
+
+
+@pytest.mark.parametrize("tag_filters", [
+    None, ("event", None, None, None), ("event", [], [], []), ("event", None, [], None),
+    {"kind": "event"},
+])
+def test_select_from_empty_tag_filters_add_no_clause(captured, tag_filters):
+    db.select_from("lab.event_active", {"subject_id": "G1"}, tag_filters=tag_filters)
+    sql, params, _ = captured[0]
+    assert sql == "SELECT * FROM lab.event_active WHERE subject_id = %s"
+    assert params == ["G1"]
+
+
+def test_select_from_null_filters(captured):
+    db.select_from("lab.tag", {}, order_by=db.ORDER_BY_TAG,
+                   ci_filters={"namespace": "stage"}, null_filters={"retired_at": True})
+    db.select_from("lab.tag", {}, null_filters={"retired_at": False})
+    db.select_from("lab.tag", {}, null_filters={"retired_at": None})
+    assert captured[0][0] == (
+        "SELECT * FROM lab.tag WHERE lower(namespace) = lower(%s) "
+        "AND retired_at IS NULL ORDER BY tag"
+    )
+    assert captured[0][1] == ["stage"]
+    assert captured[1][0] == "SELECT * FROM lab.tag WHERE retired_at IS NOT NULL"
+    assert captured[2][0] == "SELECT * FROM lab.tag"
+    with pytest.raises(ValueError, match="column name"):
+        db.select_from("lab.tag", {}, null_filters={"retired_at IS NULL OR 1": True})

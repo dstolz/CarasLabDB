@@ -7,9 +7,15 @@
 --
 --   people, probes, pipelines, storageRoots, species, projects,
 --   projectMembers, projectArtifacts, subjects, sessions, events,
---   artifacts, eventInputs, eventTypeMeta, roleMeta, NOW
+--   artifacts, eventInputs, eventTypeMeta, roleMeta,
+--   tagNamespaces, tags, tagAssignments, NOW
 --
 -- Notes on the mapping:
+--   * `tagAssignments` is the full append-only lab.tag_assignment log in
+--     log order, each row with `entity_id` = the tagged entity's key as text
+--     (lab.fn_tag_entity_id). The dashboard derives current tags from it
+--     (newest row per entity+tag wins, 'add' only), exactly like the
+--     lab.tag_current view.
 --   * Full history is returned (superseded rows included). The dashboard
 --     derives active/superseded client-side from the `supersedes` links,
 --     exactly like the lab.event_active / lab.artifact_active views.
@@ -172,6 +178,34 @@ event_type_meta AS (
 role_meta AS (
     SELECT coalesce(json_agg(code ORDER BY code), '[]'::json) AS j
     FROM lab.artifact_role
+),
+tag_namespaces AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'namespace', namespace, 'description', description,
+        'mutability', mutability, 'cardinality', cardinality,
+        'open_vocabulary', open_vocabulary, 'applies_to', to_json(applies_to)
+    ) ORDER BY namespace), '[]'::json) AS j
+    FROM lab.tag_namespace
+),
+tags AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'tag', tag, 'namespace', namespace, 'value', value,
+        'description', description,
+        'retired_at', to_char(retired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+    ) ORDER BY tag), '[]'::json) AS j
+    FROM lab.tag
+),
+tag_assignments AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'assignment_id', assignment_id, 'entity_kind', entity_kind,
+        'entity_id', lab.fn_tag_entity_id(event_id, artifact_id, subject_id,
+                                          session_id, project_id),
+        'tag', tag, 'op', op, 'note', note,
+        'applied_at', to_char(applied_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'applied_by', applied_by
+    ) ORDER BY assignment_id), '[]'::json) AS j
+    FROM lab.tag_assignment
 )
 SELECT json_build_object(
     'NOW',              (extract(epoch FROM now()) * 1000)::bigint,
@@ -189,8 +223,12 @@ SELECT json_build_object(
     'artifacts',        artifacts.j,
     'eventInputs',      event_inputs.j,
     'eventTypeMeta',    event_type_meta.j,
-    'roleMeta',         role_meta.j
+    'roleMeta',         role_meta.j,
+    'tagNamespaces',    tag_namespaces.j,
+    'tags',             tags.j,
+    'tagAssignments',   tag_assignments.j
 ) AS lab_data
 FROM people, probes, pipelines, storage_roots, species, projects,
      project_members, project_artifacts, subjects, sessions, events,
-     artifacts, event_inputs, event_type_meta, role_meta;
+     artifacts, event_inputs, event_type_meta, role_meta,
+     tag_namespaces, tags, tag_assignments;

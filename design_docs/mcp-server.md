@@ -49,6 +49,7 @@ mcp-server/
       events.py                     # get_events, get_event_detail
       artifacts.py                  # get_artifacts, get_event_inputs, ...
       provenance.py                 # get_artifact_lineage, get_provenance_edges
+      tags.py                       # get_tag_namespaces, get_tags, get_entity_tags, find_by_tags
       health.py                     # get_integrity_report
   tests/                            # pytest: unit (no DB) + integration
 ```
@@ -61,17 +62,20 @@ mcp-server/
   `fetch_limited(sql, params, limit)` wraps it with a `LIMIT` and a
   truncation flag. `read_only_cursor()` gives a tool several queries in one
   transaction. `select_from(table, filters, limit, order_by, ci_filters,
-  time_ranges)` builds a `SELECT * FROM <table> WHERE <filters ANDed>` for
-  the common case (`ci_filters` compare case-insensitively; `time_ranges`
-  maps a column to an inclusive lower and exclusive upper timestamptz bound), where
-  `filters` values that are `None` are dropped (i.e. "not filtering on this
-  column", *not* an `IS NULL` test) and every non-`None` value is bound as a
-  query parameter — never interpolated into SQL text. `table`, `order_by`,
-  and the column names in `filters`, `ci_filters` and `time_ranges` *are*
-  interpolated as SQL text, so `db.py` validates them itself: `table` against
-  `ALLOWED_TABLES`, `order_by` against `ALLOWED_ORDER_BY`, column names
-  against `^[a-z_][a-z0-9_]*$`. That is a
-  check, not a convention — a call site can't skip it.
+  time_ranges, null_filters, tag_filters)` builds a `SELECT * FROM <table>
+  WHERE <filters ANDed>` for the common case (`ci_filters` compare
+  case-insensitively; `time_ranges` maps a column to an inclusive lower and
+  exclusive upper timestamptz bound; `null_filters` maps a column to a fixed
+  `IS NULL` / `IS NOT NULL` test chosen by the tool's code; `tag_filters` is
+  described in §8), where `filters` values that are `None` are dropped (i.e.
+  "not filtering on this column", *not* an `IS NULL` test) and every
+  non-`None` value is bound as a query parameter — never interpolated into
+  SQL text. `table`, `order_by`, and the column names in `filters`,
+  `ci_filters`, `time_ranges` and `null_filters` *are* interpolated as SQL
+  text, so `db.py` validates them itself: `table` against `ALLOWED_TABLES`,
+  `order_by` against `ALLOWED_ORDER_BY`, column names against
+  `^[a-z_][a-z0-9_]*$`. That is a check, not a convention — a call site
+  can't skip it.
 - **`schema_map.py`** hardcodes the 8 event types to their detail
   table/columns (built by hand from `schema.sql`, not introspected at
   runtime). This is the one place `get_event_detail` needs a table name that
@@ -163,6 +167,10 @@ bound parameter values) are:
 - `provenance.get_artifact_lineage`, which validates `direction` is exactly
   `"up"` or `"down"` (raising `ValueError` otherwise) before passing it to
   `lab.fn_artifact_lineage(...)`.
+- `tags.get_entity_tags`, which picks the id column to filter
+  `lab.tag_assignment` on from `db.TAG_PK` after validating `entity_kind`
+  against `db.TAG_KINDS` (the same fixed dict `select_from`'s `tag_filters`
+  uses, §8).
 
 Every other tool parameter flows into `select_from`'s `filters` dict as a
 bound value, never as SQL text — and the structural parts `select_from` does
@@ -186,10 +194,25 @@ tools. Every list tool also takes `limit: int = 200`.
 | `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id` and by `occurred_from` (inclusive) / `occurred_before` (exclusive); `active_only` toggles `event_active` vs. `event`), `get_event_detail` (joins base event to its type-specific detail table; `active_only` toggles the same way) |
 | `artifacts.py` | `get_artifacts` (`created_from` / `created_before` range; `active_only` toggles `artifact_active` vs. `artifact`), `get_event_inputs`, `get_artifact_verifications` |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`), `get_provenance_edges` |
+| `tags.py` | `get_tag_namespaces` (`lab.tag_namespace` policies), `get_tags` (the vocabulary; retired tags only with `include_retired=True`), `get_entity_tags` (one entity's current tags from `lab.tag_current`, or its full add/remove log with `include_history=True`), `find_by_tags` (wraps `lab.fn_find_by_tags`; `all_of` / `any_of` / `none_of`) |
 | `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`; errors first; empty means healthy) |
 
 `get_persons` compares `email` case-insensitively (`lower(email) = lower(%s)`),
 matching the schema's `uq_person_email_lower` index.
+
+**Tag filters.** `get_events`, `get_artifacts`, `get_subjects`, `get_sessions`
+and `get_projects` each take `tags` (all of), `any_tags` (at least one of)
+and `none_tags` (none of): lists of tag patterns applied to the entity's
+*current* tags through `lab.fn_tag_match`, the schema's single definition of
+the filter semantics (see [tagging.md](tagging.md)). A pattern is a canonical
+`namespace:value`, a bare tag — which means the reserved `tag` namespace, so
+`auditory_cortex` is `tag:auditory_cortex` — or a `namespace:*` wildcard
+matching any current tag of that namespace; input is case-insensitive. These
+per-table filters include untagged rows whenever they satisfy the filter
+(`none_tags` alone keeps every untagged row), whereas `find_by_tags` only ever
+returns entities that carry (or once carried) a tag. `get_entity_tags`
+validates `entity_kind` against `db.TAG_KINDS` and, for every kind but
+`subject`, parses `entity_id` as a uuid before any SQL runs.
 
 `active_only` defaults to `True` everywhere it appears, so queries read the
 `*_active` views (non-superseded rows) by default — same default as
@@ -348,6 +371,17 @@ When adding a new read tool:
   parameters (via `db.select_from`'s `filters` or `db.fetch_all`'s `params`).
   A new table also has to be added to `db.ALLOWED_TABLES`, and a new sort
   order to `db.ALLOWED_ORDER_BY`, or `select_from` will reject it.
+- To filter a table by tags, pass `select_from` a
+  `tag_filters=(kind, all_of, any_of, none_of)` tuple rather than building a
+  clause. `kind` must be in `db.TAG_KINDS` (`ValueError` otherwise), the
+  primary-key column comes from `db.TAG_PK` — never from the caller — and
+  the three lists are bound as `text[]` parameters to the one fixed clause
+  `lab.fn_tag_match(%s, <pk>::text, %s::text[], %s::text[], %s::text[])`.
+  When every list is `None`/empty no clause is added. There is deliberately
+  no generic "raw clause" hook on `select_from`; a filter that `filters`,
+  `ci_filters`, `time_ranges`, `null_filters` and `tag_filters` cannot express
+  gets its own fixed SQL string through `db.fetch_limited`, as `health.py`
+  and `find_by_tags` do.
 - Give the tool a `limit: int = db.DEFAULT_LIMIT` parameter and route it
   through `db.select_from` or `db.fetch_limited` — never `db.fetch_all`
   directly, which is unbounded — so it returns the truncation envelope like
