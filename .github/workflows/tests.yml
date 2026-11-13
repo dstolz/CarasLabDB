@@ -136,3 +136,22 @@ jobs:
           # The generator writes CRLF; the repository stores LF.
           sed -i 's/\r$//' web/live/lab-dashboard-live.html
           git diff --exit-code web/live/lab-dashboard-live.html
+
+  # CI has no MATLAB, and Octave cannot run this code (no string type,
+  # datetime, table, Database Toolbox or matlab.unittest). It can parse it,
+  # so this is a syntax check only; see tests/check_matlab_syntax.py for what
+  # is and is not covered.
+  matlab-syntax:
+    name: MATLAB syntax (Octave)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Octave
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends octave
+
+      - name: Parse every MATLAB file
+        run: python3 tests/check_matlab_syntax.py

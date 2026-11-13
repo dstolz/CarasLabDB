@@ -7,6 +7,20 @@ reading and by a structural check (balanced blocks, declared methods), but
 **none of the MATLAB code has been executed**. Work through this list on a
 workstation, against a scratch database, before anyone relies on it.
 
+**What GNU Octave could and could not tell us.** Octave cannot run this code:
+it has no `string` type, `datetime`, `table`, Database Toolbox, `uifigure`
+components or `matlab.unittest`, all of which the class, the GUI and the tests
+are built on. It can parse it. `python tests/check_matlab_syntax.py` (run in
+CI) parses every MATLAB file with Octave and so catches syntax errors -- a
+malformed statement, an unbalanced bracket, an unterminated string -- but
+nothing about behaviour, nothing inside `arguments` blocks, and not reliably a
+missing `end` inside a `classdef` file. One piece of logic was also run under
+Octave's Java bridge: the body of `fileChecksum` (with Octave's spelling of
+the one Java static call) gave the same SHA-256 and MD5 as `sha256sum` and
+`md5sum` for a 3-byte file, an empty file, a file of every byte value and an
+8 MiB + 5 byte file. MATLAB converts arrays to Java differently, so the
+`fileChecksum` item below still has to be done in MATLAB.
+
 Set up the scratch database as in [testing-locally.md](testing-locally.md),
 then:
 

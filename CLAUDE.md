@@ -321,7 +321,9 @@ database that holds rows (`tests/seed_v1.sql`,
 (`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
 and runs the MCP server's pytest suite. CI has no MATLAB, so the MATLAB tests
-in `tests/matlab/` run locally only. There is no package.json. Practical ways
+in `tests/matlab/` run locally only; a separate job parses every MATLAB file
+with GNU Octave (`tests/check_matlab_syntax.py`), which is a syntax check and
+nothing more -- Octave cannot run this code. There is no package.json. Practical ways
 to exercise the code:
 
 - **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,
