@@ -168,7 +168,7 @@ jobs:
     # Pinned: MathWorks lists the Ubuntu versions each release supports, and
     # ubuntu-latest moves ahead of them.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

@@ -298,6 +298,9 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
             fx.CreatedDb = true;
             fx.psql("postgres", "COMMENT ON DATABASE " + fx.DbName + " IS " + ...
                 LabScratchDb.quote(fx.Marker) + ";");
+            % The tests use two sessions. If one ever waits on a lock the
+            % other holds, fail that statement instead of waiting for ever.
+            fx.psql("postgres", "ALTER DATABASE " + fx.DbName + " SET lock_timeout = '30s';");
             fx.psqlFile(fx.DbName, fullfile(fx.RepoRoot, "design_docs", "schema.sql"));
             fx.psqlFile(fx.DbName, fullfile(fx.RepoRoot, "design_docs", "grants.sql"));
 

@@ -36,6 +36,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
         App     % the CarasLabDBApp under test
     end
 
+    properties (Constant)
+        TimeLimit = 150     % seconds one test may run before its windows are closed
+    end
+
     methods (TestClassSetup)
         function setupClass(tc)
             import matlab.unittest.fixtures.PathFixture
@@ -66,6 +70,12 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 rmpref("CarasLabDBApp", "Prefs");
             end
             setappdata(groot, "TagGuiTests_alerts", []);
+            % A window that nothing answers (a modal dialog the test did not
+            % expect) would otherwise block the whole run.
+            watchdog = timer("StartDelay", TagGuiTests.TimeLimit, ...
+                "TimerFcn", @(~, ~) TagGuiTests.closeEverything());
+            start(watchdog);
+            tc.addTeardown(@() tc.endWatchdog(watchdog));
             tc.App = CarasLabDBApp(tc.Fx.Db);
             tc.addTeardown(@() tc.closeAll());
         end
@@ -882,6 +892,19 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.assertTrue(isKey(obs, "__ran"), "the window '" + prefix + "...' did not open");
         end
 
+        function endWatchdog(tc, watchdog)
+            %ENDWATCHDOG Stop the test's time limit, and fail the test if it was reached.
+            if isvalid(watchdog)
+                stop(watchdog);
+                delete(watchdog);
+            end
+            if isappdata(groot, "TagGuiTests_timedOut")
+                msg = getappdata(groot, "TagGuiTests_timedOut");
+                rmappdata(groot, "TagGuiTests_timedOut");
+                tc.verifyFail(msg);
+            end
+        end
+
         function closeAll(tc)
             TagGuiTests.closeEditors();
             TagGuiTests.closeWindows("Variables ");
@@ -924,6 +947,28 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("__error") = ME;
             end
             TagGuiTests.closeWindows(prefix);
+        end
+
+        function closeEverything()
+            %CLOSEEVERYTHING Timer callback of the time limit: delete every window.
+            %   Deleting a window ends whatever waits on it (uiwait, or a
+            %   uiconfirm nobody answers); ENDWATCHDOG then fails the test
+            %   with the names of the windows that were open.
+            figs = reshape(findall(groot, "Type", "figure"), 1, []);
+            names = strings(1, 0);
+            for f = figs
+                state = "";
+                try
+                    state = " [" + string(get(f, "WaitStatus")) + "]";
+                catch
+                end
+                names(end+1) = "'" + string(f.Name) + "'" + state; %#ok<AGROW>
+            end
+            msg = "The test was still running after " + TagGuiTests.TimeLimit + ...
+                " s. Open windows, now closed: " + strjoin(names, ", ");
+            setappdata(groot, "TagGuiTests_timedOut", msg);
+            fprintf("%s\n", msg);
+            delete(figs);
         end
 
         function f = findWindow(prefix)
