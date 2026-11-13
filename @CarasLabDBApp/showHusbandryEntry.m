@@ -61,9 +61,8 @@ function showHusbandryEntry(obj)
     end
     baseG = local_baselines(db, obj.pQualify("variable_current"), subj);   % NaN = none
 
-    % Column positions in the table (fixed).
+    % Position of the Weight (g) column in the table (fixed; see local_parse).
     COL_WEIGHT = 5;
-    COL_WATER  = 6;
 
     nSubj = numel(subj);
     cells = cell(nSubj, 8);
@@ -133,7 +132,7 @@ function showHusbandryEntry(obj)
     foot = uigridlayout(g, [1 4]);
     foot.ColumnWidth = {'1x', 80, 90, 90};
     foot.Padding = [0 0 0 0];
-    summary = uilabel(foot, "Text", "");
+    countLbl = uilabel(foot, "Text", "");
     uibutton(foot, "Text", "Help", "Tooltip", "Keyboard shortcuts (Ctrl+?)", ...
         "ButtonPushedFcn", @(~,~) CarasLabDBApp.showShortcutHelp(f, "husbandry"));
     uibutton(foot, "Text", "Cancel", "Tooltip", "Close without saving (Esc)", ...
@@ -194,7 +193,7 @@ function showHusbandryEntry(obj)
             note = note + " · " + string(numel(low)) + " weight(s) below " + ...
                 local_numText(pct) + "% of baseline (amber)";
         end
-        summary.Text = note;
+        countLbl.Text = note;
     end
 
     function onThreshold()
@@ -285,10 +284,10 @@ function showHusbandryEntry(obj)
             return
         end
 
-        batch = local_batchTable(subj, entries, rows);
+        batchTbl = local_batchTable(subj, entries, rows);
         busy = true;
         try
-            newIds = db.addHusbandryBatch(batch, OccurredAt=when, Measure=measure);
+            newIds = db.addHusbandryBatch(batchTbl, OccurredAt=when, Measure=measure);
         catch saveErr
             busy = false;
             uialert(f, "Nothing was saved: " + string(saveErr.message), "Save failed");
