@@ -18,6 +18,8 @@ PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
 because CI has no MATLAB; beyond it, "testing" them here means a disciplined
 manual walkthrough with explicit pass/fail checks.
 
+Before the first real use of the MATLAB class and GUI, also work through [matlab-first-run-checklist.md](matlab-first-run-checklist.md): that code was written without MATLAB to run it.
+
 The parts this guide covers and how each is tested:
 
 | Part | What you verify | Needs a live DB? |

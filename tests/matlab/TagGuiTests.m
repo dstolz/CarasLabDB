@@ -1,6 +1,10 @@
 classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestCase
 %TAGGUITESTS Tests of the Tags filter and the tag editor of CarasLabDBApp.
 %
+%   The class also holds the app's other GUI tests that share this fixture:
+%   the browse filters and columns, the toolbar and shortcut list, the typed
+%   number rule (CarasLabDBApp.parseNumber) and the variables editor.
+%
 %   results = runtests("tests/matlab/TagGuiTests.m")
 %
 %   Needs the scratch database of LABSCRATCHDB (see its help) and a display:
@@ -127,6 +131,37 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyNumElements(TagGuiTests.alerts(), 1, "no further alerts");
             tc.verifyEqual(sort(LabScratchDb.column(m.Tables.artifacts.Data, "artifact_id")), ...
                 sort(tc.Fx.findByTagsSql("artifact", "stage:raw")));
+        end
+
+        function unknownTagInTheFilterIsReported(tc)
+            % A tag that is not registered is refused with the database's
+            % explanation and the table is left as it was: lab.fn_tag_match
+            % would treat the typo in "-qc:fial" as "excludes nothing". A
+            % tag whose namespace does not apply to the tab's rows is not a
+            % typo (the Tags field is shared by all tabs): no alert, and the
+            % status line says why it cannot match here.
+            tc.guiWorld();
+            m = tc.mainParts();
+            tc.chooseTab("artifacts");
+            tc.type(m.TagField, "stage:raw");
+            before = LabScratchDb.column(m.Tables.artifacts.Data, "artifact_id");
+            tc.assertEmpty(TagGuiTests.alerts());
+
+            tc.type(m.TagField, "stage:raw -qc:fial");
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifyEqual(a.Title, "Invalid filter");
+            tc.verifySubstring(a.Message, "qc:fial");
+            tc.verifySubstring(a.Message, "is not registered");
+            tc.verifySubstring(string(m.Status.Text), "Filter error:");
+            tc.verifyEqual(LabScratchDb.column(m.Tables.artifacts.Data, "artifact_id"), before, ...
+                "the table is left as it was");
+            tc.dismissAlertDialog(m.Fig);
+
+            setappdata(groot, "TagGuiTests_alerts", []);
+            tc.type(m.TagField, "cohort:a");
+            tc.verifyEmpty(TagGuiTests.alerts(), "a tag for another kind of row is not an error");
+            tc.verifySubstring(string(m.Status.Text), "tags of namespace cohort apply to");
         end
 
         function clearEmptiesTheTagsField(tc)
@@ -512,6 +547,48 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.dismissAlertDialog(m.Fig);
         end
 
+        function newActionsAreOnTheToolbarAndInTheShortcutList(tc)
+            % Variables, Retract, Husbandry and Integrity each have a toolbar
+            % button, and Ctrl+? lists their shortcuts.
+            m = tc.mainParts();
+            for txt = ["Variables…", "Retract…", "Husbandry…", "Integrity…"]
+                tc.verifyNumElements(findall(m.Fig, "Type", "uibutton", "Text", txt), 1, txt);
+            end
+            TagGuiTests.key(m.Fig, "slash", {'control'}, '?');
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            for shortcut = ["Ctrl+L ", "Ctrl+Delete ", "Ctrl+H ", "Ctrl+I ", "Ctrl+D ", "Ctrl+E "]
+                tc.verifySubstring(a.Message, shortcut);
+            end
+            tc.dismissAlertDialog(m.Fig);
+        end
+
+        function rowActionsNeedASelectedRow(tc)
+            % Ctrl+L (variables) and Ctrl+Delete (retract) act on the
+            % selected row only; without one a message says so. Retraction
+            % is offered for events and artifacts only.
+            m = tc.mainParts();
+            tc.chooseTab("events");
+            m.Tables.events.Selection = [];
+            TagGuiTests.key(m.Fig, "l", {'control'}, char(12));
+            tc.dismissAlertDialog(m.Fig);
+            TagGuiTests.key(m.Fig, "delete", {'control'});
+            tc.dismissAlertDialog(m.Fig);
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 2);
+            tc.verifyEqual([a.Title], ["Variables", "Retract"]);
+            tc.verifyEqual([a.Message], ["Select a row first.", "Select a row first."]);
+
+            setappdata(groot, "TagGuiTests_alerts", []);
+            tc.chooseTab("subjects");
+            TagGuiTests.key(m.Fig, "delete", {'control'});
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifyEqual(a.Title, "Retract");
+            tc.verifySubstring(a.Message, "Only events and artifacts can be retracted");
+            tc.dismissAlertDialog(m.Fig);
+        end
+
         function tableRefreshesAfterAnEdit(tc)
             % Section 9: after an edit in the editor the main table is re-queried.
             w = tc.Fx.makeWorld("gui-refresh", 1);
@@ -610,6 +687,93 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
     end
 
     % =====================================================================
+    % Typed numbers and the variables editor
+    % =====================================================================
+    methods (Test)
+        function typedNumbersNeverPassACommaOn(tc)
+            % CarasLabDBApp.parseNumber is the one reading of a number typed
+            % into the app (forms, variables, the husbandry table): plain
+            % decimal notation, and text with a comma is refused rather than
+            % handed to str2double, which would read "71,9" as 719.
+            [v, err] = CarasLabDBApp.parseNumber("71.9");
+            tc.verifyEqual(v, 71.9);
+            tc.verifyEqual(err, "");
+            [v, err] = CarasLabDBApp.parseNumber("  1.5e3 ");
+            tc.verifyEqual(v, 1500);
+            tc.verifyEqual(err, "");
+            [v, err] = CarasLabDBApp.parseNumber("");
+            tc.verifyTrue(isnan(v));
+            tc.verifyEqual(err, "", "blank means 'not provided', which is not an error");
+            for bad = ["71,9", "1,000", "3i", "inf", "nan", "1d3", "12 g", "0x10"]
+                [v, err] = CarasLabDBApp.parseNumber(bad);
+                tc.verifyTrue(isnan(v), bad);
+                tc.verifyGreaterThan(strlength(err), 0, bad);
+            end
+            [~, err] = CarasLabDBApp.parseNumber("71,9");
+            tc.verifySubstring(err, "comma");
+        end
+
+        function variablesEditorWritesOnlyOnSave(tc)
+            % Ctrl+L opens the variables editor for the selected row. It
+            % lists the row's variables; selecting one shows its current
+            % value; typing writes nothing; a number with a comma is
+            % refused; Save writes the value; saving the value the row
+            % already has writes nothing; Esc closes.
+            db = tc.Fx.Db;
+            w = tc.Fx.makeWorld("gui-vars", 0);
+            db.setVariable("subject", w.SubjectId, "gui probe depth", 1200, Units="um");
+            m = tc.mainParts();
+            tc.chooseTab("subjects");
+            tc.press(m.Clear);                  % re-query: the subject was added after the app opened
+            tc.selectRow("subjects", w.SubjectId);
+            obs = tc.withWindow("Variables ", ...
+                @() TagGuiTests.key(tc.App.Fig, "l", {'control'}, char(12)), ...
+                @(f, obs) local_steps(tc, f, obs));
+
+            tc.verifySubstring(obs("name"), "subject " + w.SubjectId);
+            tc.verifyTrue(ismember("gui probe depth", obs("listed")), "lists the row's variables");
+            tc.verifyEqual(obs("prefilled"), "1200", "selecting a row shows its current value");
+            tc.verifyEqual(obs("afterTyping"), 1200, "typing a value writes nothing");
+            tc.verifySubstring(obs("commaAlert"), "comma");
+            tc.verifyEqual(obs("afterComma"), 1200, "a number with a comma is refused, not parsed");
+            tc.verifyEqual(obs("afterSave"), 1300.5);
+            tc.verifyEqual(obs("rowsAfterSameValue"), obs("rowsAfterSave"), ...
+                "saving the value the row already has writes nothing");
+            tc.verifyTrue(obs("escResumed"), "Esc closes the editor");
+
+            function local_steps(tc, f, obs)
+                value = @() TagGuiTests.variableValue(db, "subject", w.SubjectId, "gui probe depth");
+                logRows = @() height(db.getVariables("subject", w.SubjectId, History=true));
+                obs("name") = string(f.Name);
+                list = findall(f, "Type", "uitable");
+                names = reshape(string(list.Data.Name), [], 1);
+                obs("listed") = names;
+                tc.choose(list, [find(names == "gui probe depth", 1), 1]);
+                box = findall(f, "Type", "uieditfield", "Placeholder", "value");
+                saveBtn = findall(f, "Type", "uibutton", "Text", "Save");
+                obs("prefilled") = string(box.Value);
+                tc.type(box, "1300,5");
+                obs("afterTyping") = value();
+                setappdata(groot, "TagGuiTests_alerts", []);
+                tc.press(saveBtn);
+                a = TagGuiTests.alerts();
+                obs("commaAlert") = strjoin([a.Message], newline);
+                tc.dismissAlertDialog(f);
+                obs("afterComma") = value();
+                tc.type(box, "1300.5");
+                tc.press(saveBtn);
+                obs("afterSave") = value();
+                obs("rowsAfterSave") = logRows();
+                tc.press(saveBtn);              % the box now shows the saved value
+                tc.dismissAlertDialog(f);       % "... is already ...: nothing was written"
+                obs("rowsAfterSameValue") = logRows();
+                TagGuiTests.key(f, "escape", {});
+                obs("escResumed") = TagGuiTests.resumed(f);
+            end
+        end
+    end
+
+    % =====================================================================
     % Helpers
     % =====================================================================
     methods (Access = private)
@@ -691,8 +855,36 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.assertTrue(isKey(obs, "__ran"), "the tag editor did not open");
         end
 
+        function obs = withWindow(tc, prefix, openFcn, steps)
+            %WITHWINDOW WITHEDITOR for another modal window of the app.
+            %   The window is found by the start of its name (PREFIX, for
+            %   example "Variables "), and STEPS(f, obs) is given the window
+            %   itself rather than the tag editor's controls.
+            obs = containers.Map();
+            drive = timer("StartDelay", 0.5, "Period", 0.5, "ExecutionMode", "fixedSpacing", ...
+                "TasksToExecute", 120, ...
+                "TimerFcn", @(t, ~) TagGuiTests.driveWindow(t, prefix, steps, obs));
+            safety = timer("StartDelay", 90, "TimerFcn", @(~, ~) TagGuiTests.closeWindows(prefix));
+            start(drive);
+            start(safety);
+            try
+                openFcn();
+            catch ME
+                TagGuiTests.stopTimers([drive, safety]);
+                TagGuiTests.closeWindows(prefix);
+                rethrow(ME);
+            end
+            TagGuiTests.stopTimers([drive, safety]);
+            TagGuiTests.closeWindows(prefix);
+            if isKey(obs, "__error")
+                rethrow(obs("__error"));
+            end
+            tc.assertTrue(isKey(obs, "__ran"), "the window '" + prefix + "...' did not open");
+        end
+
         function closeAll(tc)
             TagGuiTests.closeEditors();
+            TagGuiTests.closeWindows("Variables ");
             if ~isempty(tc.App) && isvalid(tc.App)
                 delete(tc.App);
             end
@@ -715,6 +907,48 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("__error") = ME;
             end
             TagGuiTests.closeEditors();
+        end
+
+        function driveWindow(t, prefix, steps, obs)
+            %DRIVEWINDOW Timer callback of WITHWINDOW: once the window waits, run STEPS on it.
+            f = TagGuiTests.findWindow(prefix);
+            f = f(arrayfun(@(x) strcmp(get(x, "WaitStatus"), "waiting"), f));
+            if isempty(f)
+                return      % not open yet, or still being built
+            end
+            stop(t);
+            obs("__ran") = true;
+            try
+                steps(f(1), obs);
+            catch ME
+                obs("__error") = ME;
+            end
+            TagGuiTests.closeWindows(prefix);
+        end
+
+        function f = findWindow(prefix)
+            %FINDWINDOW The open figures whose name starts with PREFIX.
+            f = findall(groot, "Type", "figure");
+            f = f(startsWith(string({f.Name}), prefix));
+        end
+
+        function closeWindows(prefix)
+            for f = reshape(TagGuiTests.findWindow(prefix), 1, [])
+                uiresume(f);
+            end
+        end
+
+        function v = variableValue(db, kind, id, name)
+            %VARIABLEVALUE The current numeric value of variable NAME on a row (NaN if none).
+            v = NaN;
+            T = db.getVariables(kind, id);
+            if height(T) == 0
+                return
+            end
+            r = find(string(T.variable) == name, 1);
+            if ~isempty(r)
+                v = double(T.value_num(r));
+            end
         end
 
         function ed = editorParts(f)

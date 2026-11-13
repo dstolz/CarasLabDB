@@ -169,6 +169,8 @@ file verifier, `tests/check_lab_data.py` the live dashboard's export, and
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
 run locally only (`design_docs/testing-locally.md` §2.7).
 
+The MATLAB class and GUI were extended for schema versions 4 and 5 without MATLAB to run them: work through [design_docs/matlab-first-run-checklist.md](design_docs/matlab-first-run-checklist.md) on a workstation before relying on them.
+
 ```sh
 psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/schema_test.sql
 psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/roles_test.sql

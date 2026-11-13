@@ -79,7 +79,9 @@ function showRetractDialog(obj, kind, entityId)
     g.RowSpacing = 6;
 
     uilabel(g, "Text", char(rowText), "FontWeight", "bold", "Tooltip", char(rowText));
-    uilabel(g, "Text", char(explain), "WordWrap", "on", "VerticalAlignment", "top");
+    % One cell per line: the documented way to give a label several lines.
+    uilabel(g, "Text", cellstr(splitlines(explain)), "WordWrap", "on", ...
+        "VerticalAlignment", "top");
     uilabel(g, "Text", "Reason (required)", "FontWeight", "bold");
     reasonTa = uitextarea(g, "Value", {''}, ...
         "Placeholder", "Why this " + kind + " should never have been recorded", ...
