@@ -1,5 +1,6 @@
-# Schema, migration, live-dashboard and MCP server checks against PostgreSQL 16.
-# Nothing here needs MATLAB; the MATLAB class and GUI are still tested by hand
+# Schema, privilege, migration, live-dashboard, verifier and MCP server checks
+# against every supported PostgreSQL major version. Nothing here needs MATLAB:
+# the MATLAB tests in tests/matlab/ run locally only
 # (design_docs/testing-locally.md).
 
 name: tests
@@ -13,11 +14,16 @@ permissions:
 
 jobs:
   tests:
+    name: tests (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
         ports: ["5432:5432"]
@@ -51,7 +57,7 @@ jobs:
           python -m pip install -e "mcp-server[test]" "ruff==0.15.20"
 
       - name: Lint Python
-        run: ruff check mcp-server web/live tests
+        run: ruff check mcp-server web/live tests tools
 
       - name: Apply schema.sql to a fresh database
         run: |
@@ -65,6 +71,11 @@ jobs:
         run: |
           psql -X -q -v ON_ERROR_STOP=1 -d lab_test -f design_docs/grants.sql
           psql -X -q -v ON_ERROR_STOP=1 -d lab_test -f design_docs/grants.sql
+
+      # schema_test.sql runs as the owner; this acts as members of lab_rw and
+      # lab_ro, which is the only way to see what the grants actually allow.
+      - name: Role and privilege assertions
+        run: psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/roles_test.sql
 
       - name: v1 plus migrations matches a fresh install
         run: |
@@ -87,6 +98,27 @@ jobs:
           dump lab_migrated > "$RUNNER_TEMP/migrated.sql"
           diff -u "$RUNNER_TEMP/fresh.sql" "$RUNNER_TEMP/migrated.sql"
           psql -X -v ON_ERROR_STOP=1 -d lab_migrated -f tests/schema_test.sql
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated -f design_docs/grants.sql
+          psql -X -v ON_ERROR_STOP=1 -d lab_migrated -f tests/roles_test.sql
+
+      # The comparison above upgrades an empty database. This upgrades one
+      # that holds version-1 rows, including ones later versions would reject.
+      - name: Migrations on a version-1 database with data
+        run: |
+          createdb lab_migrated_data
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated_data -f "$RUNNER_TEMP/schema_v1.sql"
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated_data -f tests/seed_v1.sql
+          for m in design_docs/migrations/*.sql; do
+            echo "applying $m"
+            psql -X -q -v ON_ERROR_STOP=1 -1 -d lab_migrated_data -f "$m"
+          done
+          psql -X -v ON_ERROR_STOP=1 -d lab_migrated_data -f tests/migrated_data_test.sql
+
+      - name: Artifact verifier, end to end
+        run: |
+          createdb lab_verify
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_verify -f design_docs/schema.sql
+          PGDATABASE=lab_verify python tests/check_verify_artifacts.py
 
       - name: MCP server tests (unit and integration)
         env:

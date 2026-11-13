@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 A metadata/provenance system for the Caras Lab's extracellular electrophysiology
-data. It has five parts:
+data. It has five parts, plus `tools/verify_artifacts.py`, the scheduled job
+that hashes the files on the NAS and writes `lab.artifact_verification`:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
@@ -90,6 +91,36 @@ records:
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
   (when the row was inserted) — they routinely differ.
+- **Who wrote a row.** `recorded_by` / `created_by` / `verified_by` /
+  `applied_by` name a person and come from the client. The database also
+  stamps the login: `event.recorded_login`, `artifact.created_login`,
+  `artifact_verification.verified_login`, `tag_assignment.applied_login` are
+  set to `session_user` by the `trg_*_stamp_login` triggers whatever the
+  client sends (NULL on rows older than schema version 4). Clients never send
+  them and do not carry them forward in a correction.
+- **Corrections and the graph.** Provenance edges are immutable, so after a
+  correction they still name superseded rows. `fn_artifact_lineage(id, dir,
+  follow_corrections := true)` therefore resolves every node to its current
+  version by default (`fn_event_current` / `fn_artifact_current`,
+  `fn_event_versions` / `fn_artifact_versions`); pass `false` for the rows as
+  recorded. `event_version` / `artifact_version` are the full-history views
+  with `superseded_by` and `is_current`. Verification belongs to the *file*:
+  `artifact_verification_latest` gives each artifact row the latest check of
+  its (root, path, checksum) across every row describing it, so a correction
+  does not lose a failed check. `trg_artifact_matches_event` requires an
+  artifact's subject/session to agree with its producing event's.
+- **Trigger functions pin `search_path`** (`SET search_path = pg_catalog,
+  pg_temp`) and refer to `lab` objects by qualified name. This is a security
+  boundary: a subject rename cascades into the append-only tables as their
+  owner, and an unpinned trigger function would resolve names with the
+  caller's search path. Any new trigger function must do the same
+  (`tests/roles_test.sql` asserts it). Checks that are triggers rather than
+  constraints (tag policy, one active row per file, acyclic provenance) take
+  a transaction-level advisory lock so they hold under concurrent writers.
+- **Renaming a subject** is `lab.fn_rename_subject` only. `grants.sql` gives
+  `lab_rw` column-level `UPDATE` on `lab.subject` without `subject_id`, and
+  `trg_subject_id_guard` refuses the change for any role that may not execute
+  that function.
 - **Tags** (`namespace:value`, e.g. `stage:raw`; a colon-less *bare* tag is
   stored as `tag:<x>` in the reserved `tag` namespace) follow the same pattern:
   `tag_assignment` is an append-only log of `add`/`remove` rows, and current
@@ -100,7 +131,10 @@ records:
   it is in use. **`lab.fn_tag` is the write path** (it canonicalises,
   auto-registers in open namespaces, and replaces the value of a mutable
   single-valued namespace); `fn_tag_match` is the one definition of filter
-  semantics. **No derived `entity_id` column on `tag_assignment`:** the
+  semantics, and `fn_tag_filter_problems` the check every client runs first
+  so a mistyped token is an error rather than a silently wrong result.
+  "Latest" in `tag_current` is insertion order (`assignment_id`), never
+  `applied_at`. **No derived `entity_id` column on `tag_assignment`:** the
   subject-rename hatch in `fn_forbid_mutation` passes only if every column
   except `subject_id` is unchanged under the cascade, so a stored copy of the
   id would make `fn_rename_subject` fail for tagged subjects — `entity_id` is
@@ -114,9 +148,14 @@ where append + supersede would do, and never let a new detail table skip the
 numbered script in `design_docs/migrations/` that inserts its
 `lab.schema_version` row; the same change in `schema.sql` with its seeded
 version bumped (a fresh install and an upgraded database must give identical
-`pg_dump --schema-only` output); `CarasLabDB.SchemaVersionExpected` and the MCP
-server's `db.SCHEMA_VERSION` bumped; `grants.sql` updated if the new table
-needs anything beyond read/insert; and assertions in `tests/schema_test.sql`.
+`pg_dump --schema-only` output — so a column added to an existing table goes
+last in its `CREATE TABLE`, where `ALTER TABLE ADD COLUMN` puts it, and a
+`SELECT *` view over that table is re-created in the migration);
+`CarasLabDB.SchemaVersionExpected` and the MCP server's `db.SCHEMA_VERSION`
+bumped; `grants.sql` updated if the new table needs anything beyond
+read/insert; assertions in `tests/schema_test.sql`; and, for anything a role
+may or may not do, in `tests/roles_test.sql`. Function and view bodies in a
+migration must be byte-identical to `schema.sql`.
 
 ## The MATLAB interface (`@CarasLabDB`)
 
@@ -149,7 +188,8 @@ Key behaviors baked into the class:
   schema's paired base+detail design.
 - At connection the class sets the session time zone to the workstation's
   zone (unzoned datetimes read back are then local) and reads the schema
-  version, warning on a mismatch.
+  version; a mismatch is an error unless `AllowSchemaMismatch=true`. It warns
+  when no current person resolves.
 - Tags: `addTag`/`removeTag`/`setTag`/`registerTag`/`addTagNamespace`/
   `getEntityTags`/`findByTags` (own files) and `getTagNamespaces`/`getTags`/
   `updateTagNamespace`/`retireTag` (inline) write through `lab.fn_tag` or the
@@ -167,11 +207,13 @@ Key behaviors baked into the class:
   `jsonb_each_text(to_jsonb(row))`), carry every column forward except
   explicit overrides, set `supersedes`, insert as new. Carried values never
   pass through a MATLAB double or datetime. `supersedeEvent` also copies the
-  event's `event_input` edges and supersedes each active artifact it produced
-  with one pointing at the new event, all in one transaction. Any insert that
-  sets `supersedes` (those two, and `Supersedes=` on the add methods) also
-  copies the predecessor's current tags onto the successor (`pCarryTags`),
-  skipping retired tags with a warning.
+  event's `event_input` edges (unless `CarryInputs=false`) and supersedes each
+  active artifact it produced with one pointing at the new event — moved to
+  the new subject/session when the correction changes them — all in one
+  transaction. `Supersedes=` on an `add*Event` method carries provenance the
+  same way. Any insert that sets `supersedes` also copies the predecessor's
+  current tags onto the successor (`pCarryTags`), skipping retired tags with
+  a warning. The database-stamped `*_login` columns are never carried.
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →
@@ -199,17 +241,26 @@ walkthrough script, not an automated test, and assumes a reachable database.
 
 ## Running things
 
-CI (`.github/workflows/tests.yml`) applies the schema to PostgreSQL, runs
-`tests/schema_test.sql`, checks that a v1 database plus the migrations matches
-a fresh install, runs `lab_data.sql` and checks the JSON shape, checks that the
-live dashboard page is up to date with its generator, and runs the MCP
-server's pytest suite. CI has no MATLAB, so the MATLAB tests in
-`tests/matlab/` run locally only. There is no package.json. Practical ways to
-exercise the code:
+CI (`.github/workflows/tests.yml`) runs on PostgreSQL 14, 15, 16 and 17. It
+applies the schema, runs `tests/schema_test.sql`, applies `grants.sql` twice
+and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), checks
+that a v1 database plus the migrations matches a fresh install, upgrades a v1
+database that holds rows (`tests/seed_v1.sql`,
+`tests/migrated_data_test.sql`), runs the artifact verifier end to end
+(`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
+shape, checks that the live dashboard page is up to date with its generator,
+and runs the MCP server's pytest suite. CI has no MATLAB, so the MATLAB tests
+in `tests/matlab/` run locally only. There is no package.json. Practical ways
+to exercise the code:
 
 - **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,
   then `psql -X -v ON_ERROR_STOP=1 -d lab -f tests/schema_test.sql` (rolls
-  itself back)
+  itself back). After `psql -d lab -f design_docs/grants.sql`, run
+  `tests/roles_test.sql` the same way, as a superuser (it creates and rolls
+  back throw-away logins).
+- **Artifact verifier**: `python tools/verify_artifacts.py --root
+  <storage_root name>=<mount path>` (connection from the `PG*` environment;
+  needs psycopg). It only reads files and appends verification rows.
 - **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
   tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
   integration tests)
