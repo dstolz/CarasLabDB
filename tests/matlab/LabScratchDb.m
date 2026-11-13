@@ -380,6 +380,12 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
                 setenv("PATH", fx.PgBin + pathsep + saved(end));
             end
             cmd = "psql -X -q -A -t -w -v ON_ERROR_STOP=1 -d " + db + " -f """ + file + """ 2>&1";
+            if isunix
+                % MATLAB starts with its own library folders on the loader
+                % path, and they hold a libpq that the system's psql cannot
+                % use ("undefined symbol"). Run psql without them.
+                cmd = "env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH " + cmd;
+            end
             [status, out] = system(cmd);
             if status ~= 0
                 error("LabScratchDb:psqlFailed", "psql failed (exit %d) on %s:\n%s", ...

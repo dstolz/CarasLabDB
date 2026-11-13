@@ -165,7 +165,9 @@ jobs:
   # provides one.
   matlab:
     name: MATLAB tests (${{ matrix.release }})
-    runs-on: ubuntu-latest
+    # Pinned: MathWorks lists the Ubuntu versions each release supports, and
+    # ubuntu-latest moves ahead of them.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
