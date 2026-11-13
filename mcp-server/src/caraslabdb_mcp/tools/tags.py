@@ -7,7 +7,8 @@ lowercase (e.g. `stage:raw`, `cohort:a`, `qc:fail`). A bare tag with no colon
 is shorthand for `tag:<x>`, so `auditory_cortex` and `tag:auditory_cortex`
 are the same tag. In a filter, `namespace:*` matches any current tag in that
 namespace. Case and surrounding whitespace are ignored; the database does the
-matching (lab.fn_tag_match), so these tools only bind the tokens.
+matching (lab.fn_tag_match) and the vocabulary check
+(lab.fn_tag_filter_problems), so these tools only bind the tokens.
 
 Only the per-tool docstrings reach the calling LLM, so the syntax note is
 repeated in each one rather than stated once here.
@@ -16,6 +17,7 @@ repeated in each one rather than stated once here.
 from typing import Optional
 
 from .. import db
+from . import OptText
 
 
 def register(app):
@@ -34,7 +36,7 @@ def register(app):
         of entity kinds it may be put on (event, artifact, subject, session,
         project). Ordered by namespace.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         return db.fetch_limited(
@@ -45,7 +47,7 @@ def register(app):
 
     @app.tool()
     def get_tags(
-        namespace: Optional[str] = None,
+        namespace: OptText = None,
         include_retired: bool = False,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
@@ -57,15 +59,17 @@ def register(app):
         tags (retired_at set) can no longer be applied to new entities but
         stay on the ones that have them; they are left out unless
         include_retired=True. This lists the vocabulary, not what is applied
-        to what -- use get_entity_tags or find_by_tags for that. Open
-        namespaces (see get_tag_namespaces) may hold values nobody has
-        registered yet, so absence here is not proof a tag is unused.
-        Ordered by tag.
+        to what -- use get_entity_tags or find_by_tags for that. Every tag
+        that is on anything is registered (an open namespace registers a new
+        value the first time it is applied), so a tag absent from this list
+        with include_retired=True is on nothing -- and the tag filters
+        reject it rather than match nothing. Ordered by tag.
 
-        namespace is the namespace name without a colon (e.g. "stage"). A
-        namespace left as None is not applied -- it never means "IS NULL".
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        namespace is the namespace name without a colon (e.g. "stage"),
+        matched exactly. A namespace left out (or null) is not applied -- it
+        never means "IS NULL". Returns {"row_count", "limit", "truncated",
+        "rows"}; `truncated` true means more rows matched than were returned
+        (raise `limit`, max 1000).
         """
         return db.fetch_limited(
             "SELECT tag, namespace, value, description, retired_at, "
@@ -91,15 +95,19 @@ def register(app):
 
         By default returns the entity's current tags (lab.tag_current), one
         row per tag with `tag`, `namespace`, `value`, `display_tag`, `note`,
-        `applied_at`, `applied_by`, ordered by tag. With include_history=True
-        returns the full assignment log (lab.tag_assignment) instead, newest
-        first: every `op` 'add' and 'remove', including tags since removed or
-        replaced, so you can see when and why a tag changed.
+        `applied_at`, `applied_by`, `applied_login`, ordered by tag. With
+        include_history=True returns the full assignment log
+        (lab.tag_assignment) instead, latest first by assignment_id (the
+        order the database uses to decide which row is current): every `op`
+        'add' and 'remove', including tags since removed or replaced, so you
+        can see when and why a tag changed.
 
         Tags are put on specific rows: a superseded event or artifact keeps
-        the tags it had, and its correction is tagged separately.
+        the tags it had, and its correction is tagged separately. No rows
+        means no tags -- or no such entity; this tool does not tell the two
+        apart.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         pk = db.tag_pk(entity_kind)
@@ -138,27 +146,31 @@ def register(app):
         any current tag in that namespace (none_of=["qc:*"] = never
         QC-checked). Example: artifacts that are raw, tagged topic:tonotopy,
         and not failed -- all_of=["stage:raw", "topic:tonotopy"],
-        none_of=["qc:fail"]. Each namespace applies only to some kinds
-        (see get_tag_namespaces): cohort, for instance, is on subjects and
-        sessions, never on artifacts.
+        none_of=["qc:fail"].
+
+        Every tag is checked against the vocabulary first, and a tag that
+        cannot match is an error naming it, never an empty or unfiltered
+        result: a tag that is not registered (a typo such as "qc:fial"), a
+        namespace that does not exist, or a namespace that does not apply to
+        entity_kind (see get_tag_namespaces: cohort, for instance, is on
+        subjects and sessions, never on artifacts).
 
         active_only (default True) skips superseded events and artifacts,
         like get_events / get_artifacts; it has no effect on other kinds.
 
-        Returns {"rows": [{"entity_id": ...}, ...], "row_count", "limit",
-        "truncated"}, ordered by entity_id. Look the rows up with get_events,
+        Returns {"row_count", "limit", "truncated", "rows": [{"entity_id":
+        ...}, ...]}, ordered by entity_id. Look the rows up with get_events,
         get_artifacts, get_subjects, get_sessions or get_projects, or pass
         the same tags to those tools directly to get full rows. `truncated`
         true means more entities matched than were returned (raise `limit`,
         max 1000).
         """
         db.tag_pk(entity_kind)
+        arrays = [db.tag_array(all_of), db.tag_array(any_of), db.tag_array(none_of)]
         sql = (
             "SELECT entity_id FROM lab.fn_find_by_tags("
             "%s, %s::text[], %s::text[], %s::text[], %s) ORDER BY entity_id"
         )
         return db.fetch_limited(
-            sql,
-            [entity_kind, db.tag_array(all_of), db.tag_array(any_of),
-             db.tag_array(none_of), active_only],
-            limit=limit)
+            sql, [entity_kind, *arrays, active_only], limit=limit,
+            tag_check=(entity_kind, db.tag_tokens(*arrays)))

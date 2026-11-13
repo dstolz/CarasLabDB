@@ -62,7 +62,7 @@ MAX_LIMIT = 1000
 # (schema_map.py, the per-tool filters) were written against. A database at
 # another version may return incomplete rows rather than an error, so a
 # mismatch is logged and repeated in every result as `schema_warning`.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Inclusive lower / exclusive upper bound operators for `time_ranges`.
 _RANGE_OPS = (">=", "<")
