@@ -263,3 +263,12 @@ tests/               Schema, role and migration assertions (psql), tool checks (
   matlab/              MATLAB unit and GUI tests (run locally)
 CLAUDE.md            Repo conventions for Claude Code / coding agents
 ```
+
+## License
+
+BSD 3-Clause; see [LICENSE](LICENSE).
+
+The software is provided as is, without warranty of any kind. The authors
+accept no liability for its use, including for loss of data, and offer no
+support, maintenance or updates. Their names may not be used to endorse or
+promote anything derived from it.
