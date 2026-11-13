@@ -382,12 +382,17 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
             if strlength(fx.PgBin) > 0
                 setenv("PATH", fx.PgBin + pathsep + saved(end));
             end
-            cmd = "psql -X -q -A -t -w -v ON_ERROR_STOP=1 -d " + db + " -f """ + file + """ 2>&1";
-            if isunix
+            % Nothing here may wait for a person: no password prompt (-w),
+            % no pager, and no input from MATLAB's own standard input.
+            cmd = "psql -X -q -A -t -w -P pager=off -v ON_ERROR_STOP=1 -d " + db + ...
+                " -f """ + file + """";
+            if ispc
+                cmd = cmd + " < NUL 2>&1";
+            else
                 % MATLAB starts with its own library folders on the loader
                 % path, and they hold a libpq that the system's psql cannot
                 % use ("undefined symbol"). Run psql without them.
-                cmd = "env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH " + cmd;
+                cmd = "env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH " + cmd + " < /dev/null 2>&1";
             end
             [status, out] = system(cmd);
             if status ~= 0
