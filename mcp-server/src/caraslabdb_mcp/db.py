@@ -28,10 +28,14 @@ set; otherwise it is the server's default. Timestamp outputs always carry
 their offset.
 """
 
+import base64
+import datetime
+import json
 import logging
 import os
 import re
 import threading
+import uuid
 from contextlib import contextmanager
 
 from . import schema_map
@@ -78,6 +82,15 @@ ORDER_BY_VERIFICATION = "verified_at DESC, verification_id DESC"
 # decide which row of the log is the latest.
 ORDER_BY_TAG_ASSIGNMENT = "assignment_id DESC"
 ORDER_BY_TAG_CURRENT = "tag, assignment_id"
+# value_id, oldest first: insertion order, which is also the order
+# lab.variable_current uses to decide which row of the log is the latest.
+ORDER_BY_VARIABLE_VALUE = "value_id"
+# Unique: one current value per (entity, variable).
+ORDER_BY_VARIABLE_CURRENT = "entity_kind, entity_id, variable"
+ORDER_BY_RETRACTION = "retracted_at DESC, retraction_id DESC"
+ORDER_BY_SUBJECT = "subject_id"
+ORDER_BY_SESSION = "subject_id, label"
+ORDER_BY_VERIFICATION_LATEST = "artifact_id"
 
 # Every table or view `select_from` may read, with the ordering it gets when
 # the caller passes none. `table` and `order_by` are interpolated as raw SQL
@@ -97,9 +110,9 @@ DEFAULT_ORDER_BY = {
     "lab.project": "name",
     "lab.project_member": "project_id, person_id",
     "lab.project_artifact": "project_id, title, project_artifact_id",
-    "lab.subject": "subject_id",
-    "lab.session": "subject_id, label",
-    "lab.subject_current": "subject_id",
+    "lab.subject": ORDER_BY_SUBJECT,
+    "lab.session": ORDER_BY_SESSION,
+    "lab.subject_current": ORDER_BY_SUBJECT,
     "lab.event": ORDER_BY_EVENT,
     "lab.event_active": ORDER_BY_EVENT,
     "lab.event_version": ORDER_BY_EVENT,
@@ -108,18 +121,52 @@ DEFAULT_ORDER_BY = {
     "lab.artifact_version": ORDER_BY_ARTIFACT,
     "lab.event_input": "event_id, artifact_id",
     "lab.artifact_verification": ORDER_BY_VERIFICATION,
-    "lab.artifact_verification_latest": "artifact_id",
+    "lab.artifact_verification_latest": ORDER_BY_VERIFICATION_LATEST,
     "lab.provenance_edge": "edge_type, from_id, to_id",
     "lab.tag_namespace": "namespace",
     "lab.tag": "tag",
     "lab.tag_assignment": ORDER_BY_TAG_ASSIGNMENT,
     "lab.tag_current": ORDER_BY_TAG_CURRENT,
     "lab.entity_tags": "entity_kind, entity_id",
+    "lab.variable": "name",
+    "lab.variable_value": ORDER_BY_VARIABLE_VALUE,
+    "lab.variable_current": ORDER_BY_VARIABLE_CURRENT,
+    "lab.retraction": ORDER_BY_RETRACTION,
 }
 DEFAULT_ORDER_BY.update({t: "event_id" for t in schema_map.EVENT_DETAIL_TABLE.values()})
 
 ALLOWED_TABLES = frozenset(DEFAULT_ORDER_BY)
 ALLOWED_ORDER_BY = frozenset(DEFAULT_ORDER_BY.values())
+
+# The orderings a caller can page through with a `cursor`, as the ordered
+# (column, descending, SQL type) keys of each. A cursor holds the last row's
+# values of exactly these columns, and the next page is the keyset predicate
+# "after that row in this order" -- so every column here must be NOT NULL in
+# the tables that use the ordering, and the set must be unique (the ORDER BY
+# is total), or a page boundary could skip or repeat rows. The SQL type is
+# the cast applied to the bound cursor value; like the column, it is a fixed
+# literal from this map.
+PAGE_KEYS = {
+    ORDER_BY_EVENT: (("occurred_at", True, "timestamptz"), ("event_id", False, "uuid")),
+    ORDER_BY_ARTIFACT: (("created_at", True, "timestamptz"), ("artifact_id", False, "uuid")),
+    ORDER_BY_VERIFICATION: (("verified_at", True, "timestamptz"),
+                            ("verification_id", True, "bigint")),
+    ORDER_BY_VERIFICATION_LATEST: (("artifact_id", False, "uuid"),),
+    ORDER_BY_TAG_ASSIGNMENT: (("assignment_id", True, "bigint"),),
+    ORDER_BY_TAG_CURRENT: (("tag", False, "text"), ("assignment_id", False, "bigint")),
+    ORDER_BY_SUBJECT: (("subject_id", False, "text"),),
+    ORDER_BY_SESSION: (("subject_id", False, "text"), ("label", False, "text")),
+    ORDER_BY_VARIABLE_VALUE: (("value_id", False, "bigint"),),
+    ORDER_BY_VARIABLE_CURRENT: (("entity_kind", False, "text"), ("entity_id", False, "text"),
+                                ("variable", False, "text")),
+}
+
+# The clause that keeps only active (not superseded, not retracted) events or
+# artifacts in a table that refers to them by id -- fixed text per kind.
+ACTIVE_ENTITY_CLAUSE = {
+    "event": "event_id IN (SELECT x.event_id FROM lab.event_active x)",
+    "artifact": "artifact_id IN (SELECT x.artifact_id FROM lab.artifact_active x)",
+}
 
 # The taggable entity kinds and the primary-key column of the table each is
 # stored in -- also the id column of lab.tag_assignment / lab.tag_current that
@@ -193,6 +240,101 @@ def check_tag_filter(cur, kind, tokens):
             "Tag filter rejected (nothing was queried): "
             + "; ".join(f"{token!r}: {problem}" for token, problem in problems)
             + ". See get_tag_namespaces and get_tags for the vocabulary.")
+
+
+def entity_id_value(kind, entity_id):
+    """An entity id as the text lab.*_current views hold it, checked first.
+
+    The uuid kinds are normalised to the canonical lower-case hyphenated form
+    (entity_id in lab.tag_current / lab.variable_current is uuid::text), and
+    a malformed uuid is a ValueError rather than a database cast error; a
+    subject id is text and is returned exactly as given.
+    """
+    tag_pk(kind)
+    if entity_id is None:
+        return None
+    if kind == "subject":
+        return entity_id
+    try:
+        return str(uuid.UUID(str(entity_id).strip()))
+    except ValueError:
+        raise ValueError(f"{kind} ids are uuids; {entity_id!r} is not one.") from None
+
+
+def _cursor_value(value):
+    """One keyset value as JSON: exact, and castable back by PAGE_KEYS' type."""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            raise ValueError("cannot page on a timestamp without a time zone")
+        return value.isoformat()     # microseconds and offset kept: exact
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"cannot page on a {type(value).__name__} value")
+    return value
+
+
+def encode_cursor(order_by, row):
+    """The opaque cursor that continues after `row` in `order_by` order."""
+    keys = PAGE_KEYS[order_by]
+    payload = {"o": order_by, "k": [_cursor_value(row[col]) for col, _, _ in keys]}
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(order_by, cursor):
+    """The keyset values a cursor carries; ValueError for anything else.
+
+    A cursor is only valid for the ordering it was issued for (so one from
+    get_events cannot be replayed against get_artifacts), and must hold one
+    scalar per key column. Its values are only ever bound as parameters.
+    """
+    if order_by not in PAGE_KEYS:
+        raise ValueError("this listing cannot be paged with a cursor")
+    bad = ValueError(
+        "Invalid cursor: pass back the next_cursor of the previous page of the "
+        "same tool, unchanged.")
+    try:
+        text = str(cursor).strip()
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        raise bad from None
+    if not isinstance(payload, dict) or payload.get("o") != order_by:
+        raise bad
+    values = payload.get("k")
+    if (not isinstance(values, list) or len(values) != len(PAGE_KEYS[order_by])
+            or any(isinstance(v, bool) or not isinstance(v, (int, str)) for v in values)):
+        raise bad
+    return values
+
+
+def keyset_clause(order_by, values):
+    """The predicate "comes after `values` in `order_by` order", and its params.
+
+    For keys (k1, k2, ...) it is (k1 > v1) OR (k1 = v1 AND k2 > v2) OR ...,
+    with < for a descending key: a row comparison (k1, k2) > (v1, v2) would
+    be shorter but cannot mix ascending and descending keys. Columns,
+    directions and casts all come from PAGE_KEYS; only the values are bound.
+    """
+    keys = PAGE_KEYS[order_by]
+    terms, params = [], []
+    for i, (column, descending, cast) in enumerate(keys):
+        parts = [f"{c} = %s::{t}" for c, _, t in keys[:i]]
+        parts.append(f"{column} {'<' if descending else '>'} %s::{cast}")
+        terms.append("(" + " AND ".join(parts) + ")")
+        params.extend(values[:i + 1])
+    return "(" + " OR ".join(terms) + ")", params
+
+
+def like_prefix(prefix):
+    r"""A LIKE pattern matching strings that start with `prefix`, literally.
+
+    `%`, `_` and the escape character itself are escaped (ESCAPE '\'), so a
+    path such as "G_0421/" matches that text and not "GX0421/".
+    """
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "%"
 
 
 def _driver():
@@ -401,22 +543,33 @@ def _effective_limit(limit):
     return min(limit, MAX_LIMIT)
 
 
-def _envelope(rows, limit):
+def _envelope(rows, limit, page_order=None, extra=None):
     """Wrap rows with the truncation flag callers need to see.
 
     The flags come *before* the rows: a client that caps a long tool result
     cuts it at the end, and what it cuts must not be the one field that says
     the answer is incomplete.
+
+    `page_order` is the ordering of a pageable listing (a PAGE_KEYS key): the
+    envelope then carries `next_cursor`, the cursor that continues after the
+    last row returned when the result was truncated, and None when it was
+    not. `extra` is a dict of further keys, placed before the rows too.
     """
+    truncated = len(rows) > limit
     result = {
         "row_count": min(len(rows), limit),
         "limit": limit,
         # True means the database had more matching rows than were returned;
-        # narrow the filters or raise `limit` (up to MAX_LIMIT) to see them.
-        "truncated": len(rows) > limit,
+        # narrow the filters, raise `limit` (up to MAX_LIMIT) or, where the
+        # tool takes one, pass next_cursor back as `cursor` to see them.
+        "truncated": truncated,
     }
+    if page_order is not None:
+        result["next_cursor"] = (
+            encode_cursor(page_order, rows[limit - 1]) if truncated and limit else None)
     if schema_warning:
         result["schema_warning"] = schema_warning
+    result.update(extra or {})
     result["rows"] = rows[:limit]
     return result
 
@@ -432,7 +585,18 @@ def fetch_all(sql, params=()):
         return rows(cur)
 
 
-def fetch_limited(sql, params=(), limit=DEFAULT_LIMIT, tag_check=None):
+def run_limited(cur, sql, params=(), limit=DEFAULT_LIMIT, tag_check=None,
+                page_order=None, extra=None):
+    """`fetch_limited` on a cursor the caller already holds (one transaction)."""
+    limit = _effective_limit(limit)
+    if tag_check is not None:
+        check_tag_filter(cur, *tag_check)
+    cur.execute(f"{sql} LIMIT %s", tuple(params) + (limit + 1,))
+    return _envelope(rows(cur), limit, page_order=page_order, extra=extra)
+
+
+def fetch_limited(sql, params=(), limit=DEFAULT_LIMIT, tag_check=None,
+                  page_order=None, extra=None):
     """Run a SELECT with a LIMIT appended, returning an `_envelope` dict.
 
     `sql` must not already carry its own LIMIT clause, and must carry an
@@ -441,33 +605,40 @@ def fetch_limited(sql, params=(), limit=DEFAULT_LIMIT, tag_check=None):
 
     `tag_check` is a (kind, tokens) pair for a query that filters by tags:
     the tokens are validated with `check_tag_filter` in the same transaction,
-    before the query runs.
+    before the query runs. `page_order` makes the envelope carry
+    `next_cursor` (see `_envelope`); the SQL must then be ordered by exactly
+    that PAGE_KEYS ordering, and must apply `keyset_clause` itself when the
+    caller passed a cursor.
     """
     limit = _effective_limit(limit)
     with read_only_cursor() as cur:
-        if tag_check is not None:
-            check_tag_filter(cur, *tag_check)
-        cur.execute(f"{sql} LIMIT %s", tuple(params) + (limit + 1,))
-        found = rows(cur)
-    return _envelope(found, limit)
+        return run_limited(cur, sql, params, limit, tag_check=tag_check,
+                           page_order=page_order, extra=extra)
 
 
 def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
-                ci_filters=None, time_ranges=None, tag_filters=None):
+                ci_filters=None, time_ranges=None, tag_filters=None,
+                prefix_filters=None, num_ranges=None, active_entities=None,
+                paged=False, cursor=None, resolve=None):
     """SELECT * FROM <table> WHERE <filters ANDed> ORDER BY ... LIMIT n.
 
-    `table` and the column names in `filters`, `ci_filters` and
-    `time_ranges` are interpolated as raw SQL text, so all are validated
-    here (allowlist / identifier pattern) rather than trusted to come from
-    fixed internal call sites. `order_by` likewise accepts only the literals
-    in ALLOWED_ORDER_BY, and defaults to the table's entry in
-    DEFAULT_ORDER_BY, so every query is ordered. Only *values* may originate
-    from tool arguments, and those are always bound as query parameters.
+    `table` and the column names in `filters`, `ci_filters`, `time_ranges`,
+    `prefix_filters` and `num_ranges` are interpolated as raw SQL text, so
+    all are validated here (allowlist / identifier pattern) rather than
+    trusted to come from fixed internal call sites. `order_by` likewise
+    accepts only the literals in ALLOWED_ORDER_BY, and defaults to the
+    table's entry in DEFAULT_ORDER_BY, so every query is ordered. Only
+    *values* may originate from tool arguments, and those are always bound
+    as query parameters.
 
     `filters` are equality tests; `ci_filters` are equality tests compared
     case-insensitively (lower(col) = lower(value)). `time_ranges` maps a
     column to a (lower, upper) pair of timestamptz bounds, lower inclusive
-    and upper exclusive; either may be None.
+    and upper exclusive; either may be None. `num_ranges` maps a column to a
+    (lower, upper) pair of numeric bounds, both inclusive, each bound as
+    text cast to numeric (so it is compared exactly). `prefix_filters` maps a
+    column to a prefix the value must start with, matched literally
+    (`like_prefix`: LIKE wildcards in it are escaped).
 
     `tag_filters` is a (kind, all_of, any_of, none_of) tuple, `kind` one of
     TAG_KINDS and the rest lists of tag tokens (or None). It adds the one
@@ -479,6 +650,20 @@ def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
     against the vocabulary first (`check_tag_filter`), and a token that
     cannot match raises ValueError instead of quietly matching nothing.
 
+    `active_entities` is "event" or "artifact" (or None): it adds the fixed
+    ACTIVE_ENTITY_CLAUSE for that kind, keeping only rows that refer to a
+    current (not superseded, not retracted) event or artifact.
+
+    `paged=True` makes the result pageable: the ordering must be in
+    PAGE_KEYS, the envelope carries `next_cursor`, and `cursor` (a
+    next_cursor from an earlier page) adds the keyset predicate that starts
+    the page after it. A cursor on a listing that is not paged is an error.
+
+    `resolve` is a callable run on the query's own cursor, inside the same
+    read-only transaction, before the SQL is built; it returns a dict of
+    further equality filters (e.g. a name canonicalised by a database
+    function) or raises ValueError to refuse the query.
+
     A `None` filter value means "do not filter on this column" -- it is not
     an `IS NULL` test, and there is no way to ask for one through this
     helper. Returns an `_envelope` dict, not a bare list.
@@ -489,44 +674,81 @@ def select_from(table, filters, limit=DEFAULT_LIMIT, order_by=None,
         order_by = DEFAULT_ORDER_BY[table]
     elif order_by not in ALLOWED_ORDER_BY:
         raise ValueError(f"Unsupported order_by {order_by!r}.")
-    clauses, params = [], []
-    tag_check = None
+    if paged and order_by not in PAGE_KEYS:
+        raise ValueError(f"Ordering {order_by!r} cannot be paged.")
+    if cursor is not None and not paged:
+        raise ValueError("This listing does not take a cursor.")
+    if active_entities is not None and active_entities not in ACTIVE_ENTITY_CLAUSE:
+        raise ValueError(f"Unknown active_entities kind {active_entities!r}.")
+    after = decode_cursor(order_by, cursor) if cursor is not None else None
+    page_order = order_by if paged else None
 
     def column_ok(column):
         if not _FILTER_KEY_RE.match(column):
             raise ValueError(f"Invalid filter column name {column!r}.")
         return column
 
-    for column, value in filters.items():
-        column_ok(column)
-        if value is None:
-            continue
-        clauses.append(f"{column} = %s")
-        params.append(value)
-    for column, value in (ci_filters or {}).items():
-        column_ok(column)
-        if value is None:
-            continue
-        clauses.append(f"lower({column}) = lower(%s)")
-        params.append(value)
-    for column, bounds in (time_ranges or {}).items():
-        column_ok(column)
-        for op, value in zip(_RANGE_OPS, bounds):
+    def build(all_filters):
+        clauses, params = [], []
+        tag_check = None
+        for column, value in all_filters.items():
+            column_ok(column)
             if value is None:
                 continue
-            clauses.append(f"{column} {op} %s::timestamptz")
+            clauses.append(f"{column} = %s")
             params.append(value)
-    if tag_filters is not None:
-        kind, all_of, any_of, none_of = tag_filters
-        pk = tag_pk(kind)
-        arrays = [tag_array(all_of), tag_array(any_of), tag_array(none_of)]
-        if any(a is not None for a in arrays):
-            clauses.append(
-                f"lab.fn_tag_match(%s, {pk}::text, %s::text[], %s::text[], %s::text[])")
-            params.extend([kind, *arrays])
-            tag_check = (kind, tag_tokens(*arrays))
-    sql = f"SELECT * FROM {table}"
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += f" ORDER BY {order_by}"
-    return fetch_limited(sql, params, limit, tag_check=tag_check)
+        for column, value in (ci_filters or {}).items():
+            column_ok(column)
+            if value is None:
+                continue
+            clauses.append(f"lower({column}) = lower(%s)")
+            params.append(value)
+        for column, bounds in (time_ranges or {}).items():
+            column_ok(column)
+            for op, value in zip(_RANGE_OPS, bounds):
+                if value is None:
+                    continue
+                clauses.append(f"{column} {op} %s::timestamptz")
+                params.append(value)
+        for column, bounds in (num_ranges or {}).items():
+            column_ok(column)
+            for op, value in zip((">=", "<="), bounds):
+                if value is None:
+                    continue
+                clauses.append(f"{column} {op} %s::numeric")
+                params.append(value)
+        for column, prefix in (prefix_filters or {}).items():
+            column_ok(column)
+            if prefix is None:
+                continue
+            clauses.append(f"{column} LIKE %s ESCAPE '\\'")
+            params.append(like_prefix(prefix))
+        if active_entities is not None:
+            clauses.append(ACTIVE_ENTITY_CLAUSE[active_entities])
+        if tag_filters is not None:
+            kind, all_of, any_of, none_of = tag_filters
+            pk = tag_pk(kind)
+            arrays = [tag_array(all_of), tag_array(any_of), tag_array(none_of)]
+            if any(a is not None for a in arrays):
+                clauses.append(
+                    f"lab.fn_tag_match(%s, {pk}::text, %s::text[], %s::text[], %s::text[])")
+                params.extend([kind, *arrays])
+                tag_check = (kind, tag_tokens(*arrays))
+        if after is not None:
+            clause, keyset_params = keyset_clause(order_by, after)
+            clauses.append(clause)
+            params.extend(keyset_params)
+        sql = f"SELECT * FROM {table}"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += f" ORDER BY {order_by}"
+        return sql, params, tag_check
+
+    if resolve is None:
+        sql, params, tag_check = build(filters)
+        return fetch_limited(sql, params, limit, tag_check=tag_check, page_order=page_order)
+    limit = _effective_limit(limit)
+    with read_only_cursor() as cur:
+        sql, params, tag_check = build({**filters, **resolve(cur)})
+        return run_limited(cur, sql, params, limit, tag_check=tag_check,
+                           page_order=page_order)

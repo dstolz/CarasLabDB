@@ -10,11 +10,18 @@ function showSessionEditor(obj, mode, sessionId)
 %
 %   Editing writes only what the user changed. Started at, Ended at, Rig and
 %   Notes are cleared (updateSession's Clear=) when emptied; Label, Storage
-%   root id and Relative path are required. If nothing was changed, nothing
-%   is written.
+%   root id and Relative path are required. Before anything is written the
+%   form shows one confirmation that lists each changed field with its old
+%   and its new value (CarasLabDBApp.confirmChanges); "Go back" returns to
+%   the form. If nothing was changed, nothing is written.
+%
+%   The entries are checked, confirmed and written while the form is still
+%   open (pFormDialog's accept hook), so a value refused here or by the
+%   database does not lose what was typed.
 %
 %   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
-%   CARASLABDB/ADDSESSION, CARASLABDB/UPDATESESSION.
+%   CARASLABDBAPP/CONFIRMCHANGES, CARASLABDB/ADDSESSION,
+%   CARASLABDB/UPDATESESSION.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -57,6 +64,7 @@ function showSessionEditor(obj, mode, sessionId)
         local_spec("Rig","rig","Rig","text", strings(1,0)), ...
         local_spec("Notes","notes","Notes","textarea", strings(1,0))];
 
+    headerText = "";
     if isEdit
         vars = string(row.Properties.VariableNames);
         for i = 1:numel(fields)
@@ -68,72 +76,114 @@ function showSessionEditor(obj, mode, sessionId)
             end
         end
         titleText = "Edit session " + sessionId;
+        % Names the session by what a person knows it by, not only its uuid.
+        headerText = CarasLabDBApp.describeRow(obj.Db, "session", sessionId);
     else
         titleText = "Add session";
     end
 
-    res = CarasLabDBApp.pFormDialog(titleText, fields);
+    % Set by the accept hook, which does the write while the form is open.
+    saved = "";                 % "" (nothing to write), "added" or "updated"
+    savedId = sessionId;
+
+    res = CarasLabDBApp.pFormDialog(titleText, fields, headerText, @accept);
     if ~res.OK, return; end
 
-    try
-        [args, clearCols] = local_args(fields, res.Values, isEdit);
-    catch ME
-        uialert(obj.Fig, string(ME.message), "Invalid input");
+    if saved == ""
+        obj.pStatus("No changes to save for session " + savedId + ".");
         return
     end
-
-    try
-        if isEdit
-            if isempty(args) && isempty(clearCols)
-                obj.pStatus("No changes to save for session " + sessionId + ".");
-                return
-            end
-            if ~isempty(clearCols)
-                args = [args, {"Clear", clearCols}];
-            end
-            obj.Db.updateSession(sessionId, args{:});
-            obj.pStatus("Updated session " + sessionId);
-        else
-            missingReq = local_missingRequired(fields, res.Values);
-            if ~isempty(missingReq)
-                uialert(obj.Fig, "Required: " + strjoin(missingReq, ", "), "Add session");
-                return
-            end
-            newId = obj.Db.addSession(args{:});
-            obj.pStatus("Added session " + newId);
-        end
-    catch ME
-        uialert(obj.Fig, string(ME.message), "Save session failed");
-        return
+    if saved == "added"
+        obj.pStatus("Added session " + savedId);
+    else
+        obj.pStatus("Updated session " + savedId);
     end
     obj.refreshActiveTab();
+
+    % ---- nested: pFormDialog's accept hook ----------------------------------
+    function accepted = accept(formValues, formFig)
+        %ACCEPT Check the entries, show what will change, and write.
+        %   Runs when OK is pressed, while the form is open; the form closes
+        %   only if this returns true. An error thrown here (a required
+        %   field emptied) is shown by pFormDialog as an alert on the form,
+        %   and a refusal by the database is shown here, so in both cases
+        %   the user keeps what they typed.
+        accepted = false;
+        [accArgs, accClear, accChanges] = local_args(fields, formValues, isEdit);
+        if isEdit
+            if isempty(accArgs) && isempty(accClear)
+                accepted = true;            % untouched: close, write nothing
+                return
+            end
+            % Nothing is written until this is confirmed.
+            if ~CarasLabDBApp.confirmChanges(formFig, headerText + ".", accChanges)
+                return
+            end
+            if ~isempty(accClear)
+                accArgs = [accArgs, {"Clear", accClear}];
+            end
+            try
+                obj.Db.updateSession(sessionId, accArgs{:});
+            catch accErr
+                uialert(formFig, string(accErr.message), "Save session failed");
+                return
+            end
+            saved = "updated";
+        else
+            missingReq = local_missingRequired(fields, formValues);
+            if ~isempty(missingReq)
+                uialert(formFig, "Required: " + strjoin(missingReq, ", "), "Add session");
+                return
+            end
+            try
+                savedId = string(obj.Db.addSession(accArgs{:}));
+            catch accErr
+                uialert(formFig, string(accErr.message), "Save session failed");
+                return
+            end
+            saved = "added";
+        end
+        accepted = true;
+    end
 end
 
 % =============================================================================
-function [args, clearCols] = local_args(fields, values, isEdit)
+function [args, clearCols, changes] = local_args(fields, values, isEdit)
     %LOCAL_ARGS Name=Value arguments for addSession / updateSession.
     %   Adding: every non-blank field. Editing: only the fields the user
     %   changed (ARGS), plus the columns of fields that were prefilled and
     %   are now blank (CLEARCOLS, for updateSession's Clear=). An untouched
     %   field is never written back. Emptying a field the database requires
-    %   is an error that names the field.
+    %   is an error that names the field. CHANGES lists what an edit alters,
+    %   as shown to the user: Label, Old and New (text; New is "(cleared)"
+    %   for a clear).
     args = {};
     clearCols = strings(1, 0);
+    changes = struct("Label", {}, "Old", {}, "New", {});
     clearable = ["started_at","ended_at","rig","notes"];
     for i = 1:numel(fields)
         f = fields(i);
         if isEdit && f.Key == "SubjectId"
             continue   % subject is fixed for an existing session
         end
-        [action, v] = CarasLabDBApp.fieldChange(f, values.(char(f.Key)), isEdit);
+        raw = values.(char(f.Key));
+        [action, v] = CarasLabDBApp.fieldChange(f, raw, isEdit);
         if action == "set"
             args(end+1:end+2) = {f.Arg, v};
+            newText = CarasLabDBApp.formatValue(raw);
         elseif action == "clear"
             if ~ismember(f.Col, clearable)
                 error("CarasLabDBApp:requiredField", ...
                     "%s is required and cannot be cleared.", f.Label);
             end
-            clearCols(end+1) = f.Col;
+            clearCols(end+1) = f.Col; %#ok<AGROW>
+            newText = "(cleared)";
+        else
+            continue
+        end
+        if isEdit
+            changes(end+1) = struct("Label", f.Label, ...
+                "Old", CarasLabDBApp.formatValue(f.Value), "New", newText); %#ok<AGROW>
         end
     end
 end

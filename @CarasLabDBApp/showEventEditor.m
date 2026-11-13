@@ -13,11 +13,24 @@ function showEventEditor(obj, mode, eventType, eventId)
 %   The supersede form names the event it corrects (id, type, subject,
 %   occurred_at) in its first line. Only the fields the user changed are sent
 %   as overrides; a prefilled field that is emptied is cleared (written as
-%   NULL) unless the database requires it, in which case the form says so. If
-%   nothing was changed, nothing is written.
+%   NULL) unless the database requires it, in which case the form says so.
+%   Before the correction is written the form shows one confirmation listing
+%   each changed field with its old and its new value
+%   (CarasLabDBApp.confirmChanges); "Go back" returns to the form. If nothing
+%   was changed, nothing is written.
+%
+%   An event that has already been superseded cannot be corrected again (its
+%   successor is the current version); the editor says so instead of opening.
+%   A retracted event can be: the correction is an ordinary current event,
+%   which is how a retraction is undone. For a retracted event an untouched
+%   form offers to restore it unchanged.
+%
+%   The entries are checked, confirmed and written while the form is still
+%   open (pFormDialog's accept hook), so a value refused here or by the
+%   database does not lose what was typed.
 %
 %   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
-%   CARASLABDB/SUPERSEDEEVENT.
+%   CARASLABDBAPP/CONFIRMCHANGES, CARASLABDB/SUPERSEDEEVENT.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -28,6 +41,12 @@ function showEventEditor(obj, mode, eventType, eventId)
 
     types = ["birth","surgery","recording","behavior", ...
              "husbandry","endpoint","histology","analysis"];
+
+    % Shared with the accept hooks below, which do the write.
+    fields = struct([]);
+    headerText = "";
+    retracted = false;
+    savedId = "";               % id of the event the hook inserted ("" if none)
 
     if mode == "add"
         % Step 1: choose the event type.
@@ -45,36 +64,44 @@ function showEventEditor(obj, mode, eventType, eventId)
         idx = find([fields.Key] == "OccurredAt", 1);
         fields(idx).Value = datetime("now", "TimeZone", "local");
 
-        res = CarasLabDBApp.pFormDialog("Add " + eventType + " event", fields);
+        res = CarasLabDBApp.pFormDialog("Add " + eventType + " event", fields, "", @acceptNew);
         if ~res.OK, return; end
 
-        try
-            args = local_addArgs(fields, res.Values);
-        catch ME
-            uialert(obj.Fig, string(ME.message), "Invalid input");
-            return
-        end
-        if ~any(string(args(1:2:end)) == "OccurredAt")
-            uialert(obj.Fig, "Occurred at is required.", "Add event");
-            return
-        end
-
-        methodName = "add" + local_cap(eventType) + "Event";
-        try
-            newId = feval(char(methodName), obj.Db, args{:});
-        catch ME
-            uialert(obj.Fig, string(ME.message), "Add event failed");
-            return
-        end
-        obj.pStatus("Added " + eventType + " event " + newId);
+        obj.pStatus("Added " + eventType + " event " + savedId);
         obj.refreshActiveTab();
 
     elseif mode == "supersede"
         if strlength(eventId) == 0
             return
         end
+
+        % Where this row stands in its correction chain. Only the current
+        % version of an event can be corrected (the chain may not fork); a
+        % retracted one can, and the correction then restores it.
         try
-            D = obj.Db.getEventDetail(EventId = eventId);
+            V = obj.Db.runQuery( ...
+                "SELECT coalesce(superseded_by::text, '') AS superseded_by, " + ...
+                "CASE WHEN is_retracted THEN 1 ELSE 0 END AS is_retracted FROM " + ...
+                obj.pQualify("event_version") + " WHERE event_id = " + ...
+                CarasLabDB.sqlLiteral(eventId) + ";");
+            if height(V) > 0
+                nextId = string(V.superseded_by(1));
+                if isscalar(nextId) && ~ismissing(nextId) && strlength(nextId) > 0
+                    uialert(obj.Fig, "Event " + eventId + " has already been corrected: " + ...
+                        "it was superseded by " + nextId + ". Correct that event " + ...
+                        "instead (tick Active only to list current rows only).", "Supersede");
+                    return
+                end
+                retracted = double(V.is_retracted(1)) ~= 0;
+            end
+        catch
+            % The state could not be read. The form still opens; the database
+            % itself refuses a second correction of the same row.
+            retracted = false;
+        end
+
+        try
+            D = obj.Db.getEventDetail(EventId = eventId, ActiveOnly = false);
         catch ME
             uialert(obj.Fig, string(ME.message), "Load event failed");
             return
@@ -88,39 +115,96 @@ function showEventEditor(obj, mode, eventType, eventId)
 
         % The form names the row it corrects (id, type, subject, time), so
         % the user can see that it is the one they selected.
+        headerText = local_header(eventId, eventType, D);
+        if retracted
+            headerText = headerText + "  ·  RETRACTED (a correction restores it)";
+        end
         res = CarasLabDBApp.pFormDialog("Supersede " + eventType + " event (correction)", ...
-            fields, local_header(eventId, eventType, D));
+            fields, headerText, @acceptCorrection);
         if ~res.OK, return; end
 
-        try
-            [occ, eventOv, detailOv] = local_overrides(fields, res.Values, eventType);
-        catch ME
-            uialert(obj.Fig, string(ME.message), "Invalid input");
-            return
-        end
-
-        % supersedeEvent inserts a correction even when nothing differs, so
-        % an untouched form must not reach it.
-        if isnat(occ) && isempty(fieldnames(eventOv)) && isempty(fieldnames(detailOv))
+        if savedId == ""
+            % supersedeEvent inserts a correction even when nothing differs,
+            % so an untouched form never reaches it.
             obj.pStatus("No changes to save: event " + eventId + " was not superseded.");
             uialert(obj.Fig, "No changes to save. Nothing was written.", ...
                 "Supersede", "Icon", "info");
             return
         end
+        obj.pStatus("Superseded " + eventId + " → " + savedId + " (original retained)");
+        obj.refreshActiveTab();
+    end
 
-        opts = {"EventOverrides", eventOv, "DetailOverrides", detailOv};
-        if ~isnat(occ)
-            opts = [{"OccurredAt", occ}, opts];
-        end
-
-        try
-            newId = obj.Db.supersedeEvent(eventId, opts{:});
-        catch ME
-            uialert(obj.Fig, string(ME.message), "Supersede failed");
+    % ---- nested: pFormDialog's accept hooks ---------------------------------
+    % Each runs when OK is pressed, while the form is open; the form closes
+    % only if it returns true. An error thrown (invalid JSON, a required
+    % field emptied) is shown by pFormDialog as an alert on the form, and a
+    % refusal by the database is shown here, so the user keeps what they typed.
+    function accepted = acceptNew(formValues, formFig)
+        %ACCEPTNEW Check the entries of an "add" form and insert the event.
+        accepted = false;
+        accArgs = local_addArgs(fields, formValues);
+        if ~any(string(accArgs(1:2:end)) == "OccurredAt")
+            uialert(formFig, "Occurred at is required.", "Add event");
             return
         end
-        obj.pStatus("Superseded " + eventId + " → " + newId + " (original retained)");
-        obj.refreshActiveTab();
+        methodName = "add" + local_cap(eventType) + "Event";
+        try
+            savedId = string(feval(char(methodName), obj.Db, accArgs{:}));
+        catch accErr
+            uialert(formFig, string(accErr.message), "Add event failed");
+            return
+        end
+        accepted = true;
+    end
+
+    function accepted = acceptCorrection(formValues, formFig)
+        %ACCEPTCORRECTION Show what a correction changes, then insert it.
+        accepted = false;
+        [accOcc, accEventOv, accDetailOv, accChanges] = ...
+            local_overrides(fields, formValues, eventType);
+
+        if isempty(accChanges)
+            if ~retracted
+                accepted = true;            % untouched: close, write nothing
+                return
+            end
+            % Untouched, but the event is retracted: an identical correction
+            % is the way to restore it, so offer exactly that.
+            answer = uiconfirm(formFig, ...
+                "Nothing was changed. This event is retracted: saving a correction " + ...
+                "with the same contents restores it as a current event." + ...
+                newline + newline + "Restore it unchanged?", "Restore retracted event", ...
+                "Options", {'Restore', 'Go back'}, ...
+                "DefaultOption", 2, "CancelOption", 2, "Icon", "question");
+            if ~strcmp(answer, 'Restore')
+                return
+            end
+        else
+            note = "Saving inserts a correction as a new event. The original stays " + ...
+                "in the database and is hidden from the active views; its inputs, " + ...
+                "files, tags and variables are carried over to the correction.";
+            if retracted
+                note = note + " The original is retracted; the correction is a " + ...
+                    "current event again.";
+            end
+            % Nothing is written until this is confirmed.
+            if ~CarasLabDBApp.confirmChanges(formFig, headerText + ".", accChanges, note)
+                return
+            end
+        end
+
+        accOpts = {"EventOverrides", accEventOv, "DetailOverrides", accDetailOv};
+        if ~isnat(accOcc)
+            accOpts = [{"OccurredAt", accOcc}, accOpts];
+        end
+        try
+            savedId = string(obj.Db.supersedeEvent(eventId, accOpts{:}));
+        catch accErr
+            uialert(formFig, string(accErr.message), "Supersede failed");
+            return
+        end
+        accepted = true;
     end
 end
 
@@ -162,7 +246,7 @@ function args = local_addArgs(fields, values)
     end
 end
 
-function [occ, eventOv, detailOv] = local_overrides(fields, values, eventType)
+function [occ, eventOv, detailOv, changes] = local_overrides(fields, values, eventType)
     %LOCAL_OVERRIDES Turn the edited form into supersedeEvent overrides.
     %   Only what the user altered is returned: OCC (NaT unless Occurred at
     %   was changed), EVENTOV for lab.event columns and DETAILOV for the
@@ -175,18 +259,25 @@ function [occ, eventOv, detailOv] = local_overrides(fields, values, eventType)
     %   it: its override is string(missing), which supersedeEvent writes as
     %   NULL. Clearing a column the database requires is refused here, with
     %   the field's name, rather than surfacing as a constraint violation.
+    %
+    %   CHANGES lists what was altered, as shown to the user before the
+    %   correction is written: Label, Old and New (text; New is "(cleared)"
+    %   for a clear). It is empty exactly when there is nothing to write.
     occ = NaT;
     eventOv = struct();
     detailOv = struct();
+    changes = struct("Label", {}, "Old", {}, "New", {});
     baseCols = ["subject_id","session_id","notes","attributes"];
     required = local_requiredCols(eventType);
 
     for i = 1:numel(fields)
         f = fields(i);
-        [action, v] = local_convert(f, values.(char(f.Key)), true);
+        raw = values.(char(f.Key));
+        [action, v] = local_convert(f, raw, true);
         if action == "keep"
             continue
         end
+        newText = CarasLabDBApp.formatValue(raw);
         if action == "clear"
             if ismember(f.Col, required)
                 error("CarasLabDBApp:requiredField", ...
@@ -194,6 +285,7 @@ function [occ, eventOv, detailOv] = local_overrides(fields, values, eventType)
                     f.Label, eventType);
             end
             v = string(missing);          % supersedeEvent writes NULL
+            newText = "(cleared)";
         end
         if f.Key == "OccurredAt"
             occ = v;                      % never a clear: occurred_at is required
@@ -202,6 +294,8 @@ function [occ, eventOv, detailOv] = local_overrides(fields, values, eventType)
         else
             detailOv.(char(f.Col)) = v;
         end
+        changes(end+1) = struct("Label", f.Label, ...
+            "Old", CarasLabDBApp.formatValue(f.Value), "New", newText); %#ok<AGROW>
     end
 end
 

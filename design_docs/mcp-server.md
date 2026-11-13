@@ -50,13 +50,15 @@ mcp-server/
     db.py                           # connection + READ ONLY transaction wrapper
     schema_map.py                   # fixed event_type -> detail table/columns map
     tools/
-      __init__.py                   # OptText, the optional-text-filter parameter type
+      __init__.py                   # OptText / OptNumber, the optional-filter parameter types
       reference.py                  # get_species, get_probes, get_pipelines, ...
       dimensions.py                 # get_persons, get_projects, get_subjects, ...
-      events.py                     # get_events, get_event_detail
+      events.py                     # get_events, get_event_detail, get_retractions
       artifacts.py                  # get_artifacts, get_event_inputs, ...
       provenance.py                 # get_artifact_lineage, get_provenance_edges
       tags.py                       # get_tag_namespaces, get_tags, get_entity_tags, find_by_tags
+      variables.py                  # get_variable_definitions, get_variables, find_by_variable
+      summary.py                    # get_counts (fixed aggregate questions)
       health.py                     # get_integrity_report
   tests/                            # pytest: unit (no DB) + integration
 ```
@@ -69,9 +71,12 @@ mcp-server/
   `fetch_limited(sql, params, limit, tag_check)` appends a `LIMIT`, returns
   the truncation envelope and, for a query that filters by tags, first
   validates the tokens in the same transaction (`check_tag_filter`).
-  `read_only_cursor()` gives a tool several queries in one transaction.
+  `read_only_cursor()` gives a tool several queries in one transaction, and
+  `run_limited(cur, ...)` is `fetch_limited` on a cursor the tool already
+  holds.
   `select_from(table, filters, limit, order_by, ci_filters, time_ranges,
-  tag_filters)` builds a `SELECT * FROM <table> WHERE <filters ANDed> ORDER BY
+  tag_filters, prefix_filters, num_ranges, active_entities, paged, cursor,
+  resolve)` builds a `SELECT * FROM <table> WHERE <filters ANDed> ORDER BY
   <order>` for the common case (`ci_filters` compare case-insensitively;
   `time_ranges` maps a column to an inclusive lower and exclusive upper
   timestamptz bound; `tag_filters` is a `(kind, all_of, any_of, none_of)`
@@ -81,8 +86,18 @@ mcp-server/
   for the tag syntax), where `filters` values that are `None` are dropped
   (i.e. "not filtering on this column", *not* an `IS NULL` test) and every
   non-`None` value is bound as a query parameter — never interpolated into
-  SQL text. `table`, `order_by`, and the column names in `filters`,
-  `ci_filters` and `time_ranges` *are* interpolated as SQL text, so `db.py`
+  SQL text. `prefix_filters` is a literal starts-with test (`col LIKE %s
+  ESCAPE '\'`, with `%`, `_` and `\` in the bound prefix escaped by
+  `db.like_prefix`); `num_ranges` are inclusive numeric bounds bound as text
+  cast to `numeric`; `active_entities` (`"event"` / `"artifact"`) adds the
+  fixed `db.ACTIVE_ENTITY_CLAUSE` that keeps rows referring to a current
+  event or artifact; `paged`/`cursor` add keyset paging (§2, Bounded,
+  ordered results); `resolve(cur)` runs on the query's own cursor before the
+  SQL is built and returns further equality filters (how `get_variables`
+  canonicalises a variable name with the database function in the same
+  transaction). `table`, `order_by`, and the column names in `filters`,
+  `ci_filters`, `time_ranges`, `prefix_filters` and `num_ranges` *are*
+  interpolated as SQL text, so `db.py`
   validates them itself: `table` against `ALLOWED_TABLES`, `order_by` against
   `ALLOWED_ORDER_BY`, column names against `^[a-z_][a-z0-9_]*$`. That is a
   check, not a convention — a call site can't skip it. Both allowlists are
@@ -136,7 +151,7 @@ PostgreSQL property, and `SET TRANSACTION READ WRITE` before a transaction's
 first query (or `SET default_transaction_read_only = off`) sets it back. They
 stop an accidental write from a future bug; they would not stop a tool that
 executed caller-written SQL, which is why there is none and why the role is
-not optional. (Before schema-version-4 of this server the driver flag was the
+not optional. (In earlier versions of this server the driver flag was the
 whole of layer 3. It is not a server-side session default: a statement that
 committed and began its own transaction got a writable one.)
 
@@ -165,7 +180,7 @@ connection, and a connection found dead at the start of a call is replaced
 once, so a server restart costs the caller nothing. `get_event_detail` makes
 its queries through one cursor, so they see the same snapshot. On each new
 connection `db.py` reads `lab.schema_version`; if it is not the version the
-server was written for (`db.SCHEMA_VERSION`, currently 4), it logs a warning
+server was written for (`db.SCHEMA_VERSION`, currently 5), it logs a warning
 and every result carries a `schema_warning` string — list envelopes before
 their rows, and `get_event_detail`'s row as its first key.
 
@@ -189,7 +204,9 @@ JSON, and 1000 rows several times that; an MCP client that caps a long tool
 result cuts it at the end, and the part it cuts must not be the field that
 says the answer is incomplete.
 
-Every list tool takes `limit: int = 200` and returns that envelope (only
+Every list tool takes `limit: int = 200` and returns that envelope — with
+`next_cursor` after `truncated` on the pageable tools, and `question` on
+`get_counts` (only
 `get_event_detail`, which is single-row by construction, returns a bare dict;
 it selects on a primary key). A negative `limit` raises `ValueError`;
 `limit=0` — which used to mean "no limit" — is now treated as the default, so
@@ -213,8 +230,34 @@ subject and detail.
 The `truncated` flag exists because the alternative — an LLM reading a
 silently clipped result as the complete answer and telling a researcher
 "there are 200 recordings for this subject" — is a wrong answer, not a slow
-one. There is no pagination cursor: to see more than 1000 rows, narrow the
-filters (a time range, a subject, a session).
+one.
+
+**Paging.** The listings that grow without bound — `get_events`,
+`get_artifacts`, `get_subjects`, `get_sessions`, `get_entity_tags` (current
+tags and the assignment log), `get_variables`, `find_by_variable` and
+`get_artifact_verifications` — take an opaque `cursor` and return
+`next_cursor`: the cursor that continues after the last row of a truncated
+page, `null` when nothing is left. Calling again with the same arguments and
+`cursor=<next_cursor>` returns the next page; `limit` still caps each page
+at 1000. The cursor is keyset, not offset: it holds the last row's values of
+the ordering's columns (`db.PAGE_KEYS`, which spells out each pageable
+`ORDER BY` as `(column, descending, cast)` keys — a unit test checks that it
+matches the ordering column for column), and the next page is the predicate
+`(k1 > v1) OR (k1 = v1 AND k2 > v2) ...` (`<` for a descending key; a row
+comparison cannot mix directions). So a page boundary neither skips nor
+repeats a row when rows are added between calls, ties on `occurred_at` are
+broken by `event_id`, and timestamps in the cursor keep their microseconds
+and offset. A cursor is tied to the ordering that issued it (one from
+`get_events` is refused by `get_artifacts`) and must hold one scalar per key;
+anything else is `Invalid cursor`. Its values are only ever bound as
+parameters, cast with the fixed type from `PAGE_KEYS`, so a forged cursor can
+at worst fail a cast. Every key column is `NOT NULL` in the base tables that
+use it (an integration test checks the catalog), since a NULL would make the
+predicate skip rows.
+
+**Counting.** Listing cannot answer "how many", so `get_counts` (§3) runs
+fixed aggregate SQL for an allowlisted set of questions and returns exact
+counts however many rows they cover.
 
 ### Where SQL has dynamic structure
 
@@ -234,7 +277,17 @@ bound parameter values) are:
   tag filters on the list tools and `find_by_tags` use fixed templates with
   every value bound.)
 - `events.get_events` / `artifacts.get_artifacts`, which choose between two
-  fixed view names (`*_active` or `*_version`) on the `active_only` boolean.
+  fixed view names (`*_active` or `*_version`) on the `active_only` boolean,
+  and `variables.get_variables`, which chooses `lab.variable_current` or
+  `lab.variable_value` on `current_only` and the id column from `db.TAG_PK`.
+- `summary.get_counts`, whose `question` selects one of six SQL builders in
+  `summary.QUESTIONS` (an unknown question is a `ValueError`); each builder's
+  SQL is a literal, with `lab.event_active` / `lab.event` (and the artifact
+  pair) chosen on the `active_only` boolean. A unit test feeds every builder
+  hostile strings and checks that none reaches the SQL text.
+- The keyset predicate of a paged listing (`db.keyset_clause`), whose
+  columns, directions and casts come from `db.PAGE_KEYS`; only the cursor's
+  values are bound.
 
 Every other tool parameter flows into `select_from`'s `filters` dict as a
 bound value, never as SQL text — and the structural parts `select_from` does
@@ -255,28 +308,42 @@ through these tools. Every list tool also takes `limit: int = 200`.
 |---|---|
 | `reference.py` | `get_species`, `get_storage_roots`, `get_probes`, `get_pipelines`, `get_event_types`, `get_artifact_roles`, `get_acquisition_systems` |
 | `dimensions.py` | `get_persons`, `get_projects`, `get_project_members`, `get_project_artifacts`, `get_subjects`, `get_sessions`, `get_subject_current` |
-| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`/`supersedes`, by `occurred_from` (inclusive) / `occurred_before` (exclusive), and by `tags`/`any_tags`/`none_tags`; `active_only` chooses `event_active` or, for full history, `event_version`), `get_event_detail` (joins the event to its type-specific detail table; always carries `is_current` / `superseded_by`; refuses a superseded event unless `active_only=False`) |
-| `artifacts.py` | `get_artifacts` (filters incl. `checksum`, `supersedes`, a `created_from` / `created_before` range and `tags`/`any_tags`/`none_tags`; `active_only` chooses `artifact_active` or `artifact_version`), `get_event_inputs` (rows as recorded), `get_artifact_verifications` (the log, or with `latest_per_file=True` the latest check of each artifact's file from `lab.artifact_verification_latest`) |
+| `events.py` | `get_events` (filter by `event_type`/`subject_id`/`session_id`/`supersedes`, by `occurred_from` (inclusive) / `occurred_before` (exclusive), and by `tags`/`any_tags`/`none_tags`; `active_only` chooses `event_active` or, for full history, `event_version`; pageable), `get_event_detail` (joins the event to its type-specific detail table; always carries `is_current` / `superseded_by` / `is_retracted` and the retraction's reason; refuses a superseded or retracted event unless `active_only=False`), `get_retractions(entity_kind, event_id, artifact_id)` (`lab.retraction`, newest first) |
+| `artifacts.py` | `get_artifacts` (filters incl. `checksum`, `supersedes`, the file lookup `storage_root_id` / `relative_path` / `relative_path_prefix` / `format`, a `created_from` / `created_before` range and `tags`/`any_tags`/`none_tags`; `active_only` chooses `artifact_active` or `artifact_version`; pageable), `get_event_inputs` (rows as recorded), `get_artifact_verifications` (the log, or with `latest_per_file=True` the latest check of each artifact's file from `lab.artifact_verification_latest`; pageable) |
 | `provenance.py` | `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`, `direction="up"\|"down"`, `follow_corrections=True`), `get_provenance_edges` (rows as recorded) |
-| `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current` ordered by tag, or with `include_history` the full assignment log, latest first by `assignment_id`), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
-| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 11 checks described in the docstring; errors first; empty means healthy) |
+| `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current` ordered by tag, or with `include_history` the full assignment log, latest first by `assignment_id`; pageable), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
+| `variables.py` | `get_variable_definitions(entity_kind, include_retired)` (`lab.variable`), `get_variables(entity_kind, entity_id, name, current_only, active_only)` (current values from `lab.variable_current`, or with `current_only=False` the `lab.variable_value` log oldest first; pageable), `find_by_variable(entity_kind, name, equals, at_least, at_most, text_equals, active_only)` (entities by current value; pageable) |
+| `summary.py` | `get_counts(question, subject_id, project_id, entity_kind, active_only)` — exact counts: `events_by_type`, `artifacts_by_role` (with `total_size_bytes`), `subjects_by_project_species`, `sessions_per_subject`, `current_tags_by_tag`, `current_variables_by_variable` |
+| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 13 checks described in the docstring — an integration test compares the list with the function; errors first; empty means healthy) |
 
 ### Corrections: current rows, history, and lineage
 
 `active_only` defaults to `True` everywhere it appears, so queries read the
-`*_active` views (non-superseded rows) by default — same default as
-`@CarasLabDB`'s `UseActiveViews`.
+`*_active` views (rows neither superseded nor retracted) by default — same
+default as `@CarasLabDB`'s `UseActiveViews`.
 
 With `active_only=False`, `get_events` and `get_artifacts` read
 `lab.event_version` / `lab.artifact_version` rather than the base tables, so
-every row of the history carries `is_current` and `superseded_by` (the id of
-the correction that replaced it). A superseded row can then not be mistaken
-for a current one, and the `supersedes` filter finds the correction of a
+every row of the history carries `is_current`, `superseded_by` (the id of
+the correction that replaced it) and `is_retracted`. A superseded or
+retracted row can then not be mistaken for a current one, and the `supersedes` filter finds the correction of a
 given row directly (`get_events(supersedes=X, active_only=False)`).
 `get_event_detail` reads `lab.event_version` in both modes: by default it
 refuses a superseded event with an error that names the event which
-superseded it; with `active_only=False` it returns the row as recorded,
-marked `is_current: false`.
+superseded it, and a retracted one with an error that says so and quotes the
+reason; with `active_only=False` it returns the row as recorded, marked
+`is_current: false`, with `retraction_reason` / `retracted_at` /
+`retracted_by` filled in for a retracted event.
+
+**Retraction** (`lab.retraction`, schema version 5) withdraws an event or
+artifact that should never have been written, with a reason; nothing
+replaces it. The `*_active` views leave retracted rows out, so every default
+read does too (`get_events`, `get_artifacts`, `find_by_tags`, the
+across-entity reads of `get_variables` / `find_by_variable`, `get_counts`).
+`get_retractions` lists the retractions themselves. A "down" lineage walk
+that follows corrections skips retracted consumers and products; an "up" walk
+still returns a retracted ancestor (it is what the file was made from), and
+`get_integrity_report` flags it as `input_retracted`.
 
 `get_artifact_lineage` follows corrections by default
 (`follow_corrections=True`, passed to `lab.fn_artifact_lineage`): the walk is
@@ -340,10 +407,59 @@ says "string or null", so `"null"`, `"true"`, `"123"` are matched as the
 strings they are, while `null` and omission both mean "no filter". An
 integration test pins this against the installed FastMCP.
 
+Number filters (`find_by_variable`'s `equals` / `at_least` / `at_most`) are
+annotated `OptNumber`, also `str`-based: a JSON number or a numeric string,
+turned into decimal text (a float by its shortest round-tripping `repr`, so
+`0.1` is `"0.1"`) and cast to `numeric` in SQL, so `1200.5` matches a stored
+`1200.50` exactly. `"null"`, `"NaN"`, `"inf"` and other non-numbers are
+refused, never dropped.
+
+### File lookup
+
+`get_artifacts` answers "which artifact is this file?": `storage_root_id`
+plus `relative_path` identify a file (`lab.artifact` keeps paths relative to
+the storage root, forward slashes). `relative_path` and
+`relative_path_prefix` are normalised as the schema's
+`lab.fn_normalize_path` normalises a path on insert — backslashes to `/`,
+surrounding whitespace trimmed — so a Windows path can be passed as is once
+the storage root's own part (drive, share) is removed. The prefix is matched
+literally: `LIKE` wildcards in it are escaped, so `G_0421/` does not match
+`GX0421/`. A blank path or prefix is an error (a blank prefix would match
+every file). `format` is matched exactly.
+
+### User-defined variables
+
+Schema version 5 adds variables: named values on events, artifacts,
+subjects, sessions and projects (`lab.variable` the definitions,
+`lab.variable_value` the append-only log of `set` / `unset`,
+`lab.variable_current` the latest `set` per entity and variable).
+`get_variable_definitions` lists the definitions; `get_variables` reads the
+current values of one entity, of one variable across entities, or both, or
+with `current_only=False` the whole log oldest first; `find_by_variable`
+finds entities by a current number (`equals`, inclusive `at_least` /
+`at_most`) or text (`text_equals`). Names are canonicalised by
+`lab.fn_canonical_variable` in the query's own transaction (`'Probe  Depth'`
+= `'probe depth'`), and a name that is not defined, or does not apply to the
+entity kind, is an error listing the defined variables — never an empty
+result. A filter of the wrong kind for the variable's `value_type` is an
+error too. `value_num` is `numeric` and comes back as an exact decimal
+string. Across entities, `active_only` skips values on superseded or
+retracted events and artifacts (a correction carries its predecessor's
+values forward, so they would otherwise count twice); a named `entity_id` is
+always read as named.
+
+### Persons and logins
+
+`get_persons` returns `lab.person` with `SELECT *`, which since schema
+version 5 includes `db_login`, the PostgreSQL login a person connects with —
+what the `*_login` audit columns record. It is a role name, not a
+credential; the docstring says so.
+
 ### Known limits
 
-- No pagination and no count tool: more than 1000 matching rows can only be
-  reached by narrowing the filters.
+- `find_by_tags` and the lineage walk are bounded but not pageable; the
+  reference tables, provenance edges and the integrity report are bounded
+  and not pageable either (narrow the filters, or count with `get_counts`).
 - Typed columns are exact (`numeric` is returned as a string, `timestamptz`
   with its offset and microseconds), but numbers inside `jsonb` values pass
   through a Python float.
@@ -409,16 +525,22 @@ between a bug and the database.
 [`grants.sql`](grants.sql) creates `lab_ro` as a group role (`NOLOGIN`) and
 gives it `SELECT` on every table and view, including tables added later
 (default privileges). Apply it, then create a dedicated login that inherits
-it:
+it. On the Windows 11 deployment machine, in PowerShell (if `psql` is not on
+`PATH`, use its full path, e.g. `& "C:\Program Files\PostgreSQL\16\bin\psql.exe"`):
 
 ```powershell
-psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs/grants.sql
+psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs\grants.sql
 psql -U postgres -d lab_test -c "CREATE ROLE lab_mcp LOGIN PASSWORD 'choose-one' IN ROLE lab_ro;"
 ```
 
-(Do not `CREATE ROLE lab_ro LOGIN ...`: once `grants.sql` has run the role
-exists and the statement fails, and a login per service is what shows up in
-`pg_stat_activity` and in the `*_login` audit columns.) Point `PGUSER` at
+On Linux or macOS the same commands work with `/` in the path (add
+`sudo -u postgres` where the local login is by peer authentication).
+
+Never make `lab_ro` itself a login (`CREATE ROLE lab_ro LOGIN ...` or
+`ALTER ROLE lab_ro LOGIN`): it is the group every read-only service shares,
+and once `grants.sql` has run it exists, so the `CREATE` fails anyway. A
+login per service, inheriting the group, is what shows up in
+`pg_stat_activity` and in the `*_login` audit columns. Point `PGUSER` at
 `lab_mcp` and do the same on the production `lab` database. Roles are
 cluster-wide, so the login is created once; `grants.sql` is per database.
 
@@ -452,8 +574,8 @@ subprocess. Setting `$env:PGDATABASE` in the shell you run `claude mcp add`
 from does **not** reach that subprocess — a server registered that way silently
 connects to production `lab`, which is exactly the mistake §5's warning is
 there to catch. Switch to `-e PGDATABASE=lab` once you're happy with it. Keep
-the password in `~/.pgpass` (`%APPDATA%\postgresql\pgpass.conf` on Windows)
-rather than in the registration.
+the password in `%APPDATA%\postgresql\pgpass.conf` on Windows (`~/.pgpass`
+elsewhere) rather than in the registration.
 
 Run this from inside the activated `.venv`, or use the venv's absolute
 `python.exe` path (e.g. `C:\src\CarasLabDB\mcp-server\.venv\Scripts\python.exe`)
@@ -508,11 +630,18 @@ there's nothing Claude-specific in the server itself.
    `"truncated": true` rather than holding the whole table. `limit=-1` should
    raise a `ValueError`.
 7. Confirm a mistyped tag is refused: `get_artifacts(none_tags=["qc:fial"])`
-   should raise an error naming `qc:fial`, not return rows.
+   should raise an error naming `qc:fial`, not return rows; likewise
+   `get_variables(entity_kind="session", name="no such variable")` should
+   raise an error listing the defined variables.
+8. Confirm paging and counting: `get_events(limit=5)` on a database with more
+   than five events returns a `next_cursor`; passing it back as `cursor`
+   returns the next five, and `get_counts(question="events_by_type")` gives
+   the exact totals.
 
 The automated equivalents are in `mcp-server/tests/`
 (`python -m pytest tests`, with `CARASLABDB_TEST_DB` naming a scratch
-database for the integration tests; see `mcp-server/README.md`).
+database for the integration tests — `$env:CARASLABDB_TEST_DB = "lab_test"`
+in PowerShell; see `mcp-server/README.md`).
 
 ## 8. Extending the tool surface
 
@@ -543,10 +672,19 @@ When adding a new read tool:
   directly, which is unbounded — so it returns the truncation envelope like
   every other tool. SQL handed to `fetch_limited` must carry its own total
   `ORDER BY`.
+- A listing that can grow without bound should be pageable: give it
+  `cursor: OptText = None` and pass `paged=True, cursor=cursor` to
+  `db.select_from`. Its ordering must be in `db.PAGE_KEYS`, spelled key for
+  key, with every key column `NOT NULL`; add the entry (and extend the
+  catalog test) for a new ordering.
+- A count is a new entry in `summary.QUESTIONS`: a builder returning a
+  literal SQL string and its bound parameters, plus the optional arguments it
+  accepts. Never a caller-chosen column to group by.
 - Give every filter parameter a real column name and a type so the tool's
   schema stays a source of truth for field names, matching the "no generic
   SQL/JSON blob" rule in §2. An optional text filter is `OptText = None`,
-  never `Optional[str] = None` (§3, Filters).
+  never `Optional[str] = None`, and an optional number filter that must be
+  exact is `OptNumber = None` (§3, Filters).
 - If a tool must validate a small fixed vocabulary (like `direction` in
   `get_artifact_lineage`), validate with an explicit allowlist check and
   raise `ValueError` before the value reaches SQL — don't rely on the

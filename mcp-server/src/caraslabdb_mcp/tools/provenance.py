@@ -47,6 +47,13 @@ def register(app):
         it replaced), and ids it returns may be superseded (check with
         get_artifacts(active_only=False) -> is_current).
 
+        Retracted rows (see get_retractions): with follow_corrections=True a
+        "down" walk skips retracted consumers and products, but an "up" walk
+        still returns a retracted ancestor -- it is what the artifact was in
+        fact made from; get_artifacts(artifact_id=..., active_only=False)
+        shows is_retracted, and get_integrity_report flags such inputs
+        (input_retracted).
+
         An unknown artifact_id returns no rows (an existing one always has
         its depth-0 row). The walk stops at depth 64.
 
@@ -76,7 +83,7 @@ def register(app):
 
         edge_type is "produces" (from an event to an artifact) or "consumes"
         (from an artifact to an event). The view reads the rows exactly as
-        recorded, superseded ones included: edges to and from superseded
+        recorded, superseded and retracted ones included: edges to and from superseded
         events and artifacts are all here, a corrected event and its
         correction each have their own edges, and there is no active_only
         toggle -- this is the full recorded graph, not the current one. Use

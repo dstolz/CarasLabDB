@@ -8,7 +8,13 @@
 --   people, probes, pipelines, storageRoots, species, projects,
 --   projectMembers, projectArtifacts, subjects, sessions, events,
 --   artifacts, eventInputs, eventTypeMeta, roleMeta, tagNamespaces, tags,
---   tagAssignments, NOW
+--   tagAssignments, variables, variableValues, retractions, NOW
+--
+-- The integrity summary (`integrity`) is NOT computed here: it is
+-- lab_integrity.sql, which server.py runs on its own, longer-lived cache
+-- (lab.fn_check_integrity() costs about as much as this whole export) and
+-- splices into the payload. `python web/live/server.py --dump` writes the
+-- combined payload to stdout.
 --
 -- Notes on the mapping:
 --   * Full history is returned (superseded rows included). The dashboard
@@ -38,9 +44,22 @@
 --     does the same for psql.
 --   * recorded_login / created_login are the database logins that inserted
 --     the row (NULL on rows older than schema version 4).
+--   * Variables: `variables` are the definitions (lab.variable, applies_to as
+--     a JSON array); `variableValues` is the whole append-only log
+--     (lab.variable_value) in value_id order, each row naming its entity as
+--     (entity_kind, entity_id) like the tag log. `value` is the value as TEXT
+--     exactly as stored -- coalesce(value_text, value_num::text), the same
+--     expression as lab.variable_current.value -- never a JSON number, so
+--     1350.50 stays 1350.50 and a 20-digit number keeps every digit;
+--     value_type says how to read it. The dashboard derives current values
+--     like lab.variable_current: the latest row per entity and variable by
+--     value_id, kept if it is a 'set'.
+--   * Retractions: `retractions` is lab.retraction. A retracted event or
+--     artifact is not active, exactly as in lab.event_active /
+--     lab.artifact_active; the dashboard applies that client-side.
 --
 -- This file is a single statement. Run it standalone to produce a static
--- export:
+-- export (without the integrity summary):
 --   PGTZ=UTC psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
 -- The bundled server (web/live/server.py) runs it on demand instead.
 -- ============================================================================
@@ -223,6 +242,40 @@ tag_assignments AS (
         'applied_by', applied_by
     ) ORDER BY assignment_id), '[]'::json) AS j
     FROM lab.tag_assignment
+),
+variables AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'name', name, 'label', label, 'description', description,
+        'units', units, 'value_type', value_type, 'applies_to', applies_to,
+        'retired_at', to_char(retired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'created_by', created_by
+    ) ORDER BY name), '[]'::json) AS j
+    FROM lab.variable
+),
+variable_values AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'value_id', vv.value_id, 'entity_kind', vv.entity_kind,
+        'entity_id', coalesce(vv.event_id::text, vv.artifact_id::text, vv.subject_id,
+                              vv.session_id::text, vv.project_id::text),
+        'variable', vv.variable, 'op', vv.op,
+        'value', coalesce(vv.value_text, vv.value_num::text),
+        'value_type', v.value_type, 'note', vv.note,
+        'set_at', to_char(vv.set_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'set_by', vv.set_by, 'set_login', vv.set_login
+    ) ORDER BY vv.value_id), '[]'::json) AS j
+    FROM lab.variable_value vv
+    JOIN lab.variable v ON v.name = vv.variable
+),
+retractions AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'retraction_id', retraction_id, 'entity_kind', entity_kind,
+        'entity_id', coalesce(event_id::text, artifact_id::text),
+        'reason', reason,
+        'retracted_at', to_char(retracted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'retracted_by', retracted_by, 'retracted_login', retracted_login
+    ) ORDER BY retraction_id), '[]'::json) AS j
+    FROM lab.retraction
 )
 SELECT json_build_object(
     'NOW',              (extract(epoch FROM now()) * 1000)::bigint,
@@ -243,9 +296,12 @@ SELECT json_build_object(
     'roleMeta',         role_meta.j,
     'tagNamespaces',    tag_namespaces.j,
     'tags',             tags.j,
-    'tagAssignments',   tag_assignments.j
+    'tagAssignments',   tag_assignments.j,
+    'variables',        variables.j,
+    'variableValues',   variable_values.j,
+    'retractions',      retractions.j
 ) AS lab_data
 FROM people, probes, pipelines, storage_roots, species, projects,
      project_members, project_artifacts, subjects, sessions, events,
      artifacts, event_inputs, event_type_meta, role_meta, tag_namespaces,
-     tags, tag_assignments;
+     tags, tag_assignments, variables, variable_values, retractions;

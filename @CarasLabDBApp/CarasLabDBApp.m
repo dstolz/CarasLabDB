@@ -4,16 +4,20 @@ classdef CarasLabDBApp < handle
 %   CarasLabDBApp is a uifigure-based front end over the CarasLabDB class. It
 %   lets you search and browse subjects, sessions, events and artifacts
 %   (including by tag: stage:raw -qc:fail topic:*); add and correct events;
-%   add/edit subjects and sessions; view and edit the tags of any row
-%   (Ctrl+T); export any filtered
-%   table to the base workspace; and run vetted read-only custom SQL with
-%   history recall. Window geometry, connection (minus password), the active
-%   view toggle, and SQL history persist between sessions.
+%   add/edit subjects and sessions; view and edit the tags (Ctrl+T) and the
+%   user-defined variables (Ctrl+L) of any row; retract an event or artifact
+%   that should never have been recorded (Ctrl+Delete); enter the day's
+%   weights and water for all animals at once (Ctrl+H); show the database's
+%   integrity report (Ctrl+I); export any filtered table to the base
+%   workspace; and run vetted read-only custom SQL with history recall.
+%   Window geometry, connection (minus password), the active view toggle,
+%   and SQL history persist between sessions.
 %
 %   Because the lab schema is append-only, "editing" an event creates a
 %   *superseding correction* (the original is retained and hidden by the
 %   *_active views). Subjects and sessions are mutable dimensions and are
-%   edited in place.
+%   edited in place. Every edit and correction first shows what will change
+%   (old value and new value) and writes nothing until that is confirmed.
 %
 %   Launch:
 %       app = CarasLabDBApp();          % opens a login dialog
@@ -55,6 +59,10 @@ classdef CarasLabDBApp < handle
         showSubjectEditor(obj, mode, subjectId)
         showSessionEditor(obj, mode, sessionId)
         showTagEditor(obj, kind, entityId)
+        showVariableEditor(obj, kind, entityId)
+        showRetractDialog(obj, kind, entityId)
+        showHusbandryEntry(obj)
+        showIntegrityReport(obj)
         runCustomSQL(obj)
     end
 
@@ -66,13 +74,17 @@ classdef CarasLabDBApp < handle
     end
 
     methods (Static, Access = private)
-        out = pFormDialog(titleText, specs, headerText)
+        out = pFormDialog(titleText, specs, headerText, acceptFcn)
     end
 
     methods (Static)
         specs = eventFieldSpecs(eventType)
         showShortcutHelp(fig, context)
         [action, v] = fieldChange(f, raw, isEdit, opts)
+        [v, err] = parseNumber(txt)
+        s = formatValue(v)
+        tf = confirmChanges(fig, what, changes, note)
+        s = describeRow(db, kind, entityId)
     end
 
     % ==================================================================
@@ -127,9 +139,17 @@ classdef CarasLabDBApp < handle
     methods (Access = ?CarasLabDBApp)
         function defs = pTabDefs(~)
             %PTABDEFS Struct array describing each browse tab.
-            %   Fields: Key, Title, Table (base), ActiveTable ("" if none),
-            %   Columns, DateCols, NumCols, HasSubject, OrderBy, Entity
+            %   Fields: Key, Title, Table (full history), ActiveTable ("" if
+            %   none), Columns, DateCols, NumCols, HasSubject, OrderBy, Entity
             %   (subject|session|event|artifact for editor dispatch).
+            %
+            %   Full history of events and artifacts is read from the
+            %   event_version / artifact_version views, which add
+            %   superseded_by, is_current and is_retracted to every row, so a
+            %   superseded or retracted row cannot be mistaken for a current
+            %   one. Columns lists the columns offered in the filter
+            %   dropdowns; it holds only columns that both views of a tab
+            %   have.
             defs = struct( ...
                 "Key", {}, "Title", {}, "Table", {}, "ActiveTable", {}, ...
                 "Columns", {}, "DateCols", {}, "NumCols", {}, ...
@@ -154,7 +174,7 @@ classdef CarasLabDBApp < handle
 
             defs(end+1) = struct( ...
                 "Key", "events", "Title", "Events", ...
-                "Table", "event", "ActiveTable", "event_active", ...
+                "Table", "event_version", "ActiveTable", "event_active", ...
                 "Columns", ["event_id","event_type","subject_id","session_id", ...
                             "occurred_at","recorded_at","recorded_by","recorded_login", ...
                             "supersedes","notes"], ...
@@ -163,7 +183,7 @@ classdef CarasLabDBApp < handle
 
             defs(end+1) = struct( ...
                 "Key", "artifacts", "Title", "Artifacts", ...
-                "Table", "artifact", "ActiveTable", "artifact_active", ...
+                "Table", "artifact_version", "ActiveTable", "artifact_active", ...
                 "Columns", ["artifact_id","produced_by_event_id","storage_root_id", ...
                             "relative_path","checksum","checksum_algo","size_bytes", ...
                             "role","format","subject_id","session_id","supersedes","created_at"], ...
@@ -214,10 +234,13 @@ classdef CarasLabDBApp < handle
             %ONKEYPRESS Keyboard shortcuts mirroring the toolbar/filter buttons.
             %   Ctrl+R Refresh · Ctrl+E Export→WS · Ctrl+Shift+E Add Event ·
             %   Ctrl+Shift+S Add Subject · Ctrl+Shift+N Add Session ·
-            %   Ctrl+D Edit/Supersede · Ctrl+T Tags of the selected row ·
+            %   Ctrl+D Edit/Supersede · Ctrl+T Tags, Ctrl+L Variables and
+            %   Ctrl+Delete Retract for the selected row ·
+            %   Ctrl+H Daily husbandry · Ctrl+I Integrity report ·
             %   Enter Apply filters (browse tabs) ·
             %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters ·
-            %   Ctrl+? Shortcut list.
+            %   Ctrl+? Shortcut list. Keep CarasLabDBApp.showShortcutHelp
+            %   ("main") in step with this list.
             mods  = string(evt.Modifier);
             ctrl  = any(mods == "control") || any(mods == "command");
             shift = any(mods == "shift");
@@ -249,6 +272,14 @@ classdef CarasLabDBApp < handle
                 obj.onEditSelected();
             elseif key == "t" && ctrl
                 obj.onEditTags();
+            elseif key == "l" && ctrl
+                obj.onEditVariables();
+            elseif key == "delete" && ctrl
+                obj.onRetract();
+            elseif key == "h" && ctrl
+                obj.onHusbandry();
+            elseif key == "i" && ctrl
+                obj.onIntegrity();
             elseif key == "r" && ctrl
                 obj.onRefresh();
             end
@@ -268,17 +299,9 @@ classdef CarasLabDBApp < handle
         end
 
         function onEditSelected(obj, ~, ~)
-            d = obj.pCurrentTabDef();
-            if isempty(d)
-                uialert(obj.Fig, "Editing is not available on this tab.", "Edit");
-                return
-            end
-            [id, problem] = obj.pSelectedId(d);
+            %ONEDITSELECTED Edit (subject, session) or supersede (event) the selected row.
+            [d, id] = obj.pRequireSelection("Edit", "Editing is not available on this tab.");
             if ismissing(id)
-                if strlength(problem) == 0
-                    problem = "Select a row first.";
-                end
-                uialert(obj.Fig, problem, "Edit");
                 return
             end
             switch d.Entity
@@ -286,15 +309,70 @@ classdef CarasLabDBApp < handle
                 case "subject", obj.showSubjectEditor("edit", id);
                 case "session", obj.showSessionEditor("edit", id);
                 otherwise
-                    uialert(obj.Fig, "This entity is read-only in the GUI.", "Edit");
+                    uialert(obj.Fig, "Artifacts cannot be edited here. To withdraw one " + ...
+                        "that should not have been registered, use Retract (Ctrl+Delete).", "Edit");
             end
         end
 
         function onEditTags(obj, ~, ~)
             %ONEDITTAGS Open the tag editor for the selected row (Ctrl+T).
+            [d, id] = obj.pRequireSelection("Tags", "Tags are edited on the browse tabs.");
+            if ismissing(id)
+                return
+            end
+            obj.showTagEditor(d.Entity, id);
+        end
+
+        function onEditVariables(obj, ~, ~)
+            %ONEDITVARIABLES Open the variables editor for the selected row (Ctrl+L).
+            [d, id] = obj.pRequireSelection("Variables", ...
+                "Variables are edited on the browse tabs.");
+            if ismissing(id)
+                return
+            end
+            obj.showVariableEditor(d.Entity, id);
+        end
+
+        function onRetract(obj, ~, ~)
+            %ONRETRACT Retract the selected event or artifact (Ctrl+Delete).
+            %   Only events and artifacts can be retracted; the dialog asks
+            %   for the reason and writes nothing until it is confirmed.
+            d = obj.pCurrentTabDef();
+            if isempty(d) || ~ismember(d.Entity, ["event", "artifact"])
+                uialert(obj.Fig, "Only events and artifacts can be retracted: select a " + ...
+                    "row on the Events or Artifacts tab. Subjects and sessions are " + ...
+                    "edited in place.", "Retract");
+                return
+            end
+            [d, id] = obj.pRequireSelection("Retract", "Select a row first.");
+            if ismissing(id)
+                return
+            end
+            obj.showRetractDialog(d.Entity, id);
+        end
+
+        function onHusbandry(obj, ~, ~)
+            %ONHUSBANDRY Open the daily husbandry entry table (Ctrl+H).
+            obj.showHusbandryEntry();
+        end
+
+        function onIntegrity(obj, ~, ~)
+            %ONINTEGRITY Show the database integrity report (Ctrl+I).
+            obj.showIntegrityReport();
+        end
+
+        function [d, id] = pRequireSelection(obj, alertTitle, noTabMessage)
+            %PREQUIRESELECTION The browse tab and the id of its selected row, or an alert.
+            %   [d, id] = pRequireSelection(obj, alertTitle, noTabMessage).
+            %   ID is <missing> when there is nothing to act on, and the user
+            %   has then been told why in an alert titled ALERTTITLE: this is
+            %   not a browse tab (NOTABMESSAGE), no row is selected, or the
+            %   selected row could not be identified (see PSELECTEDID). D is
+            %   the tab definition ([] off the browse tabs).
+            id = string(missing);
             d = obj.pCurrentTabDef();
             if isempty(d)
-                uialert(obj.Fig, "Tags are edited on the browse tabs.", "Tags");
+                uialert(obj.Fig, noTabMessage, alertTitle);
                 return
             end
             [id, problem] = obj.pSelectedId(d);
@@ -302,10 +380,8 @@ classdef CarasLabDBApp < handle
                 if strlength(problem) == 0
                     problem = "Select a row first.";
                 end
-                uialert(obj.Fig, problem, "Tags");
-                return
+                uialert(obj.Fig, problem, alertTitle);
             end
-            obj.showTagEditor(d.Entity, id);
         end
 
         function onTableSelection(obj, key, evt)
@@ -316,7 +392,8 @@ classdef CarasLabDBApp < handle
             %   it is about to act on. [] when the event carries none.
             ds = [];
             try
-                if isprop(evt, "DisplaySelection")
+                if (isstruct(evt) && isfield(evt, "DisplaySelection")) ...
+                        || (isobject(evt) && isprop(evt, "DisplaySelection"))
                     ds = evt.DisplaySelection;
                 end
             catch

@@ -5,8 +5,9 @@ function showTagEditor(obj, kind, entityId)
 %
 %   KIND is "subject", "session", "event", "artifact" or "project" and
 %   ENTITYID the row's id. The first line names the row (an event's type,
-%   subject and time, an artifact's path, a session's subject and label) so
-%   it can be checked against the row selected in the main window. The window lists the row's current tags (tick
+%   subject and time, an artifact's path, a session's subject and label; see
+%   CarasLabDBApp.describeRow) so it can be checked against the row selected
+%   in the main window. The window lists the row's current tags (tick
 %   History for the full add/remove log) and edits them through the
 %   CarasLabDB tag methods, i.e. through lab.fn_tag, so every namespace
 %   policy is the database's:
@@ -83,7 +84,7 @@ function showTagEditor(obj, kind, entityId)
     % The first line names the row in a way a person can check against what
     % they selected (an event's type, subject and time; an artifact's path),
     % not only by its id.
-    rowText = local_describe(db, kind, entityId);
+    rowText = CarasLabDBApp.describeRow(db, kind, entityId);
     uilabel(hdr, "Text", char(rowText), "FontWeight", "bold", "Tooltip", char(rowText));
     histCb = uicheckbox(hdr, "Text", "History", ...
         "Tooltip", "Show the full add/remove log instead of the current tags", ...
@@ -391,42 +392,6 @@ function showTagEditor(obj, kind, entityId)
 end
 
 % =============================================================================
-function s = local_describe(db, kind, entityId)
-    %LOCAL_DESCRIBE "kind id" plus what identifies the row to a person.
-    %   event:    type, subject, occurred_at      artifact: relative path
-    %   session:  subject, label
-    %   A lookup that fails or finds nothing leaves the plain "kind id".
-    s = kind + " " + entityId;
-    extra = strings(0, 1);
-    try
-        switch kind
-            case "event"
-                R = db.getEvents(EventId=entityId, ActiveOnly=false);
-                if height(R) > 0
-                    extra = [local_text(R.event_type(1)); local_text(R.subject_id(1)); ...
-                             local_when(R.occurred_at(1))];
-                end
-            case "artifact"
-                R = db.getArtifacts(ArtifactId=entityId, ActiveOnly=false);
-                if height(R) > 0
-                    extra = local_text(R.relative_path(1));
-                end
-            case "session"
-                R = db.getSessions(SessionId=entityId);
-                if height(R) > 0
-                    extra = [local_text(R.subject_id(1)); local_text(R.label(1))];
-                end
-        end
-    catch
-        extra = strings(0, 1);
-    end
-    extra = extra(~ismissing(extra));
-    extra = extra(strlength(extra) > 0);
-    if ~isempty(extra)
-        s = s + "  ·  " + strjoin(reshape(extra, 1, []), "  ·  ");
-    end
-end
-
 function s = local_text(col)
     %LOCAL_TEXT A fetched text column as a string column vector (NULL -> missing).
     if iscell(col)

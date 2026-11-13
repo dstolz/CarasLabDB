@@ -6,14 +6,23 @@ function showSubjectEditor(obj, mode, subjectId)
 %
 %   Subjects are a mutable dimension (not append-only), so "edit" is a true
 %   in-place UPDATE via CarasLabDB.updateSubject. The natural key subject_id is
-%   set only on add and is read-only when editing.
+%   set only on add and is read-only when editing (renaming an animal is done
+%   by an administrator with lab.fn_rename_subject).
 %
 %   Editing writes only what the user changed. A field that held a value and
-%   is emptied is cleared (updateSubject's Clear=); Sex cannot be cleared.
-%   If nothing was changed, nothing is written.
+%   is emptied is cleared (updateSubject's Clear=); Project and Sex cannot be
+%   cleared. Before anything is written the form shows one confirmation that
+%   lists each changed field with its old and its new value
+%   (CarasLabDBApp.confirmChanges); "Go back" returns to the form. If nothing
+%   was changed, nothing is written.
+%
+%   The entries are checked, confirmed and written while the form is still
+%   open (pFormDialog's accept hook), so a value refused here or by the
+%   database does not lose what was typed.
 %
 %   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
-%   CARASLABDB/ADDSUBJECT, CARASLABDB/UPDATESUBJECT.
+%   CARASLABDBAPP/CONFIRMCHANGES, CARASLABDB/ADDSUBJECT,
+%   CARASLABDB/UPDATESUBJECT.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -61,15 +70,16 @@ function showSubjectEditor(obj, mode, subjectId)
 
     fields = [ ...
         local_spec("SubjectId","subject_id","Subject id","text", strings(1,0)), ...
-        local_espec("ProjectId","project_id","Project","enum", projects.Choices), ...
-        local_espec("SpeciesCode","species_code","Species","enum", speciesChoices), ...
-        local_espec("Sex","sex","Sex","enum", ["M","F","U"]), ...
+        local_spec("ProjectId","project_id","Project","enum", projects.Choices), ...
+        local_spec("SpeciesCode","species_code","Species","enum", speciesChoices), ...
+        local_spec("Sex","sex","Sex","enum", ["M","F","U"]), ...
         local_spec("Strain","strain","Strain","text", strings(1,0)), ...
         local_spec("Genotype","genotype","Genotype","text", strings(1,0)), ...
         local_spec("Source","source","Source","text", strings(1,0)), ...
         local_spec("DateOfBirth","date_of_birth","Date of birth","datetime", strings(1,0)), ...
         local_spec("Notes","notes","Notes","textarea", strings(1,0))];
 
+    headerText = "";
     if isEdit
         vars = string(row.Properties.VariableNames);
         for i = 1:numel(fields)
@@ -78,17 +88,20 @@ function showSubjectEditor(obj, mode, subjectId)
                 if fields(i).Key == "SpeciesCode"
                     val = local_lookup(val, speciesCodes, speciesChoices);
                 elseif fields(i).Key == "ProjectId"
+                    % A project that is no longer active is not among the
+                    % choices; the dropdown then shows blank, which the form
+                    % treats as "untouched" (see CarasLabDBApp.fieldChange).
                     val = local_lookup(val, projects.Ids, projects.Choices);
                 end
                 fields(i).Value = val;
             end
-            if ismember(fields(i).Key, ["SubjectId", "ProjectId"])
-                % The key is immutable, and updateSubject takes no ProjectId —
-                % both are shown for context only.
+            if fields(i).Key == "SubjectId"
+                % The key is immutable here: shown for context only.
                 fields(i).Editable = false;
             end
         end
         titleText = "Edit subject " + subjectId;
+        headerText = "subject " + subjectId;
     else
         idx = find([fields.Key] == "Sex", 1);
         fields(idx).Value = "U";
@@ -108,49 +121,78 @@ function showSubjectEditor(obj, mode, subjectId)
         titleText = "Add subject";
     end
 
-    res = CarasLabDBApp.pFormDialog(titleText, fields);
+    % Set by the accept hook, which does the write while the form is open.
+    saved = "";                 % "" (nothing to write), "added" or "updated"
+    savedId = subjectId;
+
+    res = CarasLabDBApp.pFormDialog(titleText, fields, headerText, @accept);
     if ~res.OK, return; end
 
-    try
-        [args, subjId, clearCols] = local_args(fields, res.Values, isEdit, subjectId, ...
-            speciesCodes, speciesChoices, projects);
-    catch ME
-        uialert(obj.Fig, string(ME.message), "Invalid input");
+    if saved == ""
+        obj.pStatus("No changes to save for subject " + savedId + ".");
         return
     end
-
-    try
-        if isEdit
-            if isempty(args) && isempty(clearCols)
-                obj.pStatus("No changes to save for subject " + subjId + ".");
-                return
-            end
-            if ~isempty(clearCols)
-                args = [args, {"Clear", clearCols}];
-            end
-            obj.Db.updateSubject(subjId, args{:});
-            obj.pStatus("Updated subject " + subjId);
-        else
-            if strlength(subjId) == 0
-                uialert(obj.Fig, "Subject id is required.", "Add subject");
-                return
-            end
-            if ~any(string(args(1:2:end)) == "ProjectId")
-                uialert(obj.Fig, "Project is required.", "Add subject");
-                return
-            end
-            obj.Db.addSubject("SubjectId", subjId, args{:});
-            obj.pStatus("Added subject " + subjId);
-        end
-    catch ME
-        uialert(obj.Fig, string(ME.message), "Save subject failed");
-        return
+    if saved == "added"
+        obj.pStatus("Added subject " + savedId);
+    else
+        obj.pStatus("Updated subject " + savedId);
     end
     obj.refreshActiveTab();
+
+    % ---- nested: pFormDialog's accept hook ----------------------------------
+    function accepted = accept(formValues, formFig)
+        %ACCEPT Check the entries, show what will change, and write.
+        %   Runs when OK is pressed, while the form is open; the form closes
+        %   only if this returns true. An error thrown here (a required
+        %   field emptied) is shown by pFormDialog as an alert on the form,
+        %   and a refusal by the database is shown here, so in both cases
+        %   the user keeps what they typed.
+        accepted = false;
+        [accArgs, accId, accClear, accChanges] = local_args(fields, formValues, isEdit, ...
+            subjectId, speciesCodes, speciesChoices, projects);
+        if isEdit
+            if isempty(accArgs) && isempty(accClear)
+                accepted = true;            % untouched: close, write nothing
+                return
+            end
+            % Nothing is written until this is confirmed.
+            if ~CarasLabDBApp.confirmChanges(formFig, "Subject " + accId + ".", accChanges)
+                return
+            end
+            if ~isempty(accClear)
+                accArgs = [accArgs, {"Clear", accClear}];
+            end
+            try
+                obj.Db.updateSubject(accId, accArgs{:});
+            catch accErr
+                uialert(formFig, string(accErr.message), "Save subject failed");
+                return
+            end
+            saved = "updated";
+        else
+            if strlength(accId) == 0
+                uialert(formFig, "Subject id is required.", "Add subject");
+                return
+            end
+            if ~any(string(accArgs(1:2:end)) == "ProjectId")
+                uialert(formFig, "Project is required.", "Add subject");
+                return
+            end
+            try
+                obj.Db.addSubject("SubjectId", accId, accArgs{:});
+            catch accErr
+                uialert(formFig, string(accErr.message), "Save subject failed");
+                return
+            end
+            saved = "added";
+        end
+        savedId = accId;
+        accepted = true;
+    end
 end
 
 % =============================================================================
-function [args, subjId, clearCols] = local_args(fields, values, isEdit, subjectId, ...
+function [args, subjId, clearCols, changes] = local_args(fields, values, isEdit, subjectId, ...
         speciesCodes, speciesChoices, projects)
     %LOCAL_ARGS Name=Value arguments for addSubject / updateSubject.
     %   Adding: every non-blank field. Editing: only the fields the user
@@ -158,17 +200,20 @@ function [args, subjId, clearCols] = local_args(fields, values, isEdit, subjectI
     %   are now blank (CLEARCOLS, for updateSubject's Clear=). An untouched
     %   field is never written back, so it cannot be altered by the form's
     %   rendering of it. Emptying a field the database requires is an error
-    %   that names the field.
+    %   that names the field. CHANGES lists what an edit alters, as shown to
+    %   the user: Label, Old and New (text; New is "(cleared)" for a clear).
     args = {};
     clearCols = strings(1, 0);
+    changes = struct("Label", {}, "Old", {}, "New", {});
     subjId = subjectId;
     clearable = ["species_code","strain","genotype","source","date_of_birth","notes"];
     for i = 1:numel(fields)
         f = fields(i);
-        if isEdit && ismember(f.Key, ["SubjectId", "ProjectId"])
+        if isEdit && f.Key == "SubjectId"
             continue   % read-only when editing: shown for context only
         end
-        [action, v] = local_convert(f, values.(char(f.Key)), isEdit, ...
+        raw = values.(char(f.Key));
+        [action, v] = local_convert(f, raw, isEdit, ...
             speciesCodes, speciesChoices, projects);
         if f.Key == "SubjectId"
             if action == "set"
@@ -178,12 +223,20 @@ function [args, subjId, clearCols] = local_args(fields, values, isEdit, subjectI
         end
         if action == "set"
             args(end+1:end+2) = {f.Arg, v};
+            newText = CarasLabDBApp.formatValue(raw);
         elseif action == "clear"
             if ~ismember(f.Col, clearable)
                 error("CarasLabDBApp:requiredField", ...
                     "%s is required and cannot be cleared.", f.Label);
             end
-            clearCols(end+1) = f.Col;
+            clearCols(end+1) = f.Col; %#ok<AGROW>
+            newText = "(cleared)";
+        else
+            continue
+        end
+        if isEdit
+            changes(end+1) = struct("Label", f.Label, ...
+                "Old", CarasLabDBApp.formatValue(f.Value), "New", newText); %#ok<AGROW>
         end
     end
 end
@@ -210,10 +263,6 @@ function s = local_spec(key, col, label, type, choices)
         "Label", string(label), "Type", string(type), ...
         "Choices", string(choices), "Value", string(missing), "Editable", true, ...
         "Placeholder", "");
-end
-
-function s = local_espec(key, col, label, type, choices)
-    s = local_spec(key, col, label, type, choices);
 end
 
 % ---- dropdown label <-> key mapping ------------------------------------------

@@ -1,19 +1,19 @@
-# CarasLabDB MCP server (read-only, v1)
+# CarasLabDB MCP server (read-only)
 
 A small Model Context Protocol (MCP) server that lets an LLM agent (e.g.
 Claude Code/Desktop) query the CarasLabDB `lab` Postgres schema directly
 during a conversation — "what recordings exist for subject G-0421", "walk
-the lineage of this artifact", "list superseded husbandry events for this
-animal" — without opening MATLAB or the dashboard.
+the lineage of this artifact", "which artifact is this file", "how many
+sessions does each animal have" — without opening MATLAB or the dashboard.
 
 **This is a read-only tool.** There is no insert/update/supersede surface,
-and writes are blocked in layers rather than by any single mechanism: the
-connection is opened read-only at the session level, every query runs inside
-a rolled-back `SET TRANSACTION READ ONLY` transaction (same defense pattern
-as `@CarasLabDB/runReadOnlyQuery.m`), and the server should connect as a
-`SELECT`-only role (see [`design_docs/mcp-server.md`](../design_docs/mcp-server.md)
-§5). Write tools (event/artifact inserts, supersede corrections) are an
-intentional future phase, not included here.
+and writes are blocked in layers rather than by any single mechanism: no tool
+writes or accepts SQL, the connection is opened read-only at the session
+level, every query runs inside a rolled-back `SET TRANSACTION READ ONLY`
+transaction (same defense pattern as `@CarasLabDB/runReadOnlyQuery.m`), and
+the server should connect as a login that inherits the `SELECT`-only group
+role `lab_ro` (see [`design_docs/mcp-server.md`](../design_docs/mcp-server.md)
+§2 and §5). On connecting it warns on stderr if its role can write.
 
 It is a fourth, independent interface to the same `lab` schema, alongside
 `@CarasLabDB/` (MATLAB class), `@CarasLabDBApp/` (MATLAB GUI), and `web/`
@@ -27,45 +27,75 @@ Read tools mirroring `@CarasLabDB`'s `get*` method surface:
 - **Reference/lookup**: `get_species`, `get_storage_roots`, `get_probes`,
   `get_pipelines`, `get_event_types`, `get_artifact_roles`,
   `get_acquisition_systems`.
-- **Dimensions**: `get_persons`, `get_projects`, `get_project_members`,
+- **Dimensions**: `get_persons` (includes `db_login`, the database login a
+  person connects with), `get_projects`, `get_project_members`,
   `get_project_artifacts`, `get_subjects`, `get_sessions`,
   `get_subject_current`.
-- **Events**: `get_events` (filterable by type/subject/session and by an
-  `occurred_from` / `occurred_before` time range; toggles
-  `event`/`event_active` via `active_only`), `get_event_detail` (joins a
-  base event to its type-specific detail table; same `active_only` toggle).
-- **Artifacts/provenance**: `get_artifacts` (also filterable by a
-  `created_from` / `created_before` range), `get_event_inputs`,
-  `get_artifact_verifications`, `get_artifact_lineage` (wraps
-  `lab.fn_artifact_lineage`), `get_provenance_edges`.
+- **Events**: `get_events` (filterable by type/subject/session/`supersedes`
+  and an `occurred_from` / `occurred_before` range), `get_event_detail`
+  (joins an event to its type-specific detail table), `get_retractions`
+  (events and artifacts withdrawn as entered in error, with the reason).
+- **Artifacts/provenance**: `get_artifacts` (also a `created_from` /
+  `created_before` range, `checksum`, and file lookup by `storage_root_id`,
+  `relative_path`, `relative_path_prefix` and `format`), `get_event_inputs`,
+  `get_artifact_verifications` (the log, or `latest_per_file=True`),
+  `get_artifact_lineage` (wraps `lab.fn_artifact_lineage`; follows
+  corrections by default), `get_provenance_edges`.
 - **Tags**: `get_tag_namespaces`, `get_tags`, `get_entity_tags`,
   `find_by_tags` (wraps `lab.fn_find_by_tags`). `get_events`,
   `get_artifacts`, `get_subjects`, `get_sessions` and `get_projects` also
   take `tags` / `any_tags` / `none_tags` lists (`namespace:value`; a bare tag
-  means `tag:<x>`; `namespace:*` matches any tag in that namespace). See
-  [`design_docs/mcp-server.md`](../design_docs/mcp-server.md) §3 and
-  [`design_docs/tagging.md`](../design_docs/tagging.md).
-- **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`; empty
-  means healthy).
+  means `tag:<x>`; `namespace:*` matches any tag in that namespace). A tag
+  that cannot match (unknown, or not applicable to that kind) is an error.
+  See [`design_docs/tagging.md`](../design_docs/tagging.md).
+- **User-defined variables**: `get_variable_definitions`, `get_variables`
+  (current values of an entity or of a variable across entities, or with
+  `current_only=False` the full set/unset log), `find_by_variable` (entities
+  by a current number — `equals`, `at_least`, `at_most` — or text value).
+  Names are canonicalised by the database (`'Probe  Depth'` =
+  `'probe depth'`); an unknown name is an error listing the defined ones.
+  Numbers come back as exact decimal strings.
+- **Counts**: `get_counts(question=...)` — exact counts for a fixed set of
+  questions: `events_by_type`, `artifacts_by_role` (with total
+  `size_bytes`), `subjects_by_project_species`, `sessions_per_subject`,
+  `current_tags_by_tag`, `current_variables_by_variable`; optionally for one
+  subject, project or entity kind.
+- **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`, 13
+  checks; empty means healthy).
 
-`get_persons(email=...)` matches case-insensitively, as the database's own
-uniqueness rule does.
+Corrections and retractions: by default (`active_only=True`) every read uses
+the `*_active` views, which leave out rows that a correction replaced and
+rows that were retracted. With `active_only=False`, events and artifacts are
+read from `lab.event_version` / `lab.artifact_version`, so each row carries
+`is_current`, `superseded_by` and `is_retracted`. `get_event_detail` refuses
+a superseded or retracted event by default, naming its successor or quoting
+the retraction reason.
 
 Every tool has named, typed parameters (no generic SQL/JSON blob) so the
 tool's schema is a real source of field names for the calling LLM. No tool
-accepts a table or column name as a free string.
+accepts a table or column name, or SQL; every table, column and ordering the
+server uses is a fixed allowlist in its source. An optional text filter sent
+as the string `"null"` is matched as that text — only a JSON `null` or
+leaving it out means "no filter".
 
 Every list tool takes `limit` (default 200, max 1000) and returns
-`{"rows": [...], "row_count": n, "limit": n, "truncated": bool}` — there is
-no unlimited mode, and `truncated: true` tells the caller the answer was cut
-off instead of letting it read a clipped result as complete.
+`{"row_count": n, "limit": n, "truncated": bool, ..., "rows": [...]}`, flags
+first — there is no unlimited mode, and `truncated: true` tells the caller
+the answer was cut off. The listings that grow without bound (`get_events`,
+`get_artifacts`, `get_subjects`, `get_sessions`, `get_entity_tags`,
+`get_variables`, `find_by_variable`, `get_artifact_verifications`) also
+return `next_cursor`: pass it back as `cursor` with the same arguments for
+the next page (keyset paging on the listing's stable order; `limit` still
+caps each page).
 
-The server is written for schema version 3 (`lab.schema_version`). Against a
+The server is written for schema version 5 (`lab.schema_version`). Against a
 database at another version it logs a warning and adds a `schema_warning`
-string to every list result, since its hard-coded column lists may then
-return incomplete rows.
+string to every result, since its hard-coded column lists may then return
+incomplete rows.
 
 ## Install
+
+On Windows (PowerShell):
 
 ```powershell
 cd mcp-server
@@ -74,36 +104,49 @@ python -m venv .venv
 pip install -e .
 ```
 
-This installs the `mcp` SDK and `psycopg[binary]` (v3). If you'd rather use
-`psycopg2` instead, install with the optional extra: `pip install -e .[psycopg2]`.
+On Linux/macOS: `python3 -m venv .venv && . .venv/bin/activate && pip install -e .`
+
+This installs the `mcp` SDK (1.30 or later, below 2), `pydantic` and
+`psycopg[binary]` (v3). To use `psycopg2` instead, install with the optional
+extra: `pip install -e .[psycopg2]`.
 
 ## Configure
 
 Connection settings come from the standard libpq environment variables —
-same as `web/live/server.py` and the MATLAB class:
+same as `web/live/server.py`:
 
 | Variable | Default |
 |---|---|
 | `PGHOST` | local socket / localhost |
 | `PGPORT` | 5432 |
 | `PGDATABASE` | `lab` |
-| `PGUSER` | OS user |
-| `PGPASSWORD` | (or a `~/.pgpass` entry) |
+| `PGUSER` | OS user — set it to the read-only login below |
+| `PGPASSWORD` | (or `%APPDATA%\postgresql\pgpass.conf` on Windows, `~/.pgpass` elsewhere) |
 | `PGTZ` | server default; set it (e.g. `America/New_York`) so a time-range bound without a UTC offset, such as `occurred_from="2026-09-01"`, means midnight in the lab's zone |
 
 `PGDATABASE` is read at server start; if it is unset the server falls back to
 `lab` (the production database) and logs a warning to stderr, so set it
 explicitly.
 
-For local testing against a scratch database, follow
-[`design_docs/testing-locally.md`](../design_docs/testing-locally.md) §1 to
-stand up `lab_test`, then pass `PGDATABASE=lab_test` to the server in its MCP
-client config (see below) — not as a shell variable.
+### Read-only login
 
-Point `PGUSER` at a `SELECT`-only role (`lab_ro`, created per
-[`design_docs/mcp-server.md`](../design_docs/mcp-server.md) §5) rather than
-`lab_rw` — that role holds `INSERT`, which defeats the point of the outermost
-layer.
+Give the server its own login that inherits `lab_ro`. `design_docs/grants.sql`
+creates `lab_ro` as a group role (`NOLOGIN`) with `SELECT` on everything; apply
+it, then create the login (PowerShell, from the repository root):
+
+```powershell
+psql -U postgres -d lab -v ON_ERROR_STOP=1 -f design_docs\grants.sql
+psql -U postgres -d lab -c "CREATE ROLE lab_mcp LOGIN PASSWORD 'choose-one' IN ROLE lab_ro;"
+```
+
+Never make `lab_ro` itself a login: it is the shared group, and a login per
+service is what the audit columns and `pg_stat_activity` show. Do not use
+`lab_rw`, a login inheriting it, or a superuser — they can write (the server
+logs a warning if they are used). For a scratch database, follow
+[`design_docs/testing-locally.md`](../design_docs/testing-locally.md) §1 to
+stand up `lab_test`, apply `grants.sql` there too, and pass
+`PGDATABASE=lab_test` to the server in its MCP client config (below) — not as
+a shell variable.
 
 ## Register with Claude Code (personal, not committed to the repo)
 
@@ -112,7 +155,7 @@ add a repo-tracked `.mcp.json`, so nothing changes for anyone else who
 clones the repo:
 
 ```powershell
-claude mcp add caraslabdb -e PGDATABASE=lab_test -e PGUSER=lab_ro -- python -m caraslabdb_mcp.server
+claude mcp add caraslabdb -e PGDATABASE=lab_test -e PGUSER=lab_mcp -- python -m caraslabdb_mcp.server
 ```
 
 Pass the database with `-e`, which is stored in the server's config and
@@ -123,8 +166,8 @@ you believe it is on `lab_test`. Use `-e PGDATABASE=lab` once you're happy
 with it.
 
 (Run this from inside the activated `.venv`, or use the venv's absolute
-`python.exe` path in the command if Claude Code is launched from a shell
-where the venv isn't active.)
+`python.exe` path, e.g. `C:\src\CarasLabDB\mcp-server\.venv\Scripts\python.exe`,
+if Claude Code is launched from a shell where the venv isn't active.)
 
 To remove it: `claude mcp remove caraslabdb`.
 
@@ -140,23 +183,27 @@ To remove it: `claude mcp remove caraslabdb`.
    ```
 3. Or register via `claude mcp add` (above) and ask Claude things like "what
    sessions exist for subject X" or "show me the lineage of artifact Y".
-4. Confirm the identifier allowlists hold: calling `get_artifact_lineage`
-   with a `direction` outside `up`/`down` should raise a clear error before
-   any SQL runs, not a database error.
+4. Confirm the identifier allowlists hold: `get_artifact_lineage` with a
+   `direction` outside `up`/`down`, or `get_counts` with an unknown
+   `question`, should raise a clear error before any SQL runs.
 5. Confirm results are bounded: `get_events` with no filters against more
-   than 200 events should come back with `truncated: true`, not the whole
-   table; `limit=-1` should raise a clear error.
+   than 200 events should come back with `truncated: true` and a
+   `next_cursor`, not the whole table; `limit=-1` should raise a clear error.
 
 ## Tests
 
 ```powershell
 pip install -e .[test]
-python -m pytest tests                                  # unit tests only
+python -m pytest tests                                         # unit tests only
 $env:CARASLABDB_TEST_DB = "lab_test"; python -m pytest tests   # plus integration
 ```
+
+(On Linux/macOS: `CARASLABDB_TEST_DB=lab_test python -m pytest tests`.)
 
 The unit tests need no database. The integration tests run only when
 `CARASLABDB_TEST_DB` names a scratch database with `design_docs/schema.sql`
 applied. They connect with the usual `PG*` variables as a login that can
 INSERT, because they seed their own rows (keyed by a random suffix, so they
-can be re-run). CI runs both (`.github/workflows/tests.yml`).
+can be re-run). The read-only-role test also needs `grants.sql` applied and a
+login that may create roles; it skips itself otherwise. CI runs both
+(`.github/workflows/tests.yml`).

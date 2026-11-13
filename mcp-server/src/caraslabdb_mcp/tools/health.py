@@ -10,7 +10,7 @@ def register(app):
 
         An empty result means healthy. Each row is (severity, check_name,
         subject, detail): severity is "error" or "warning", and subject is the
-        id (or storage_root:path) of the offending row. The 11 checks:
+        id (or storage_root:path) of the offending row. The 13 checks:
 
         - event_missing_detail (error): a typed event with no detail row.
         - artifact_verification_failed (error): the latest checksum check of
@@ -26,6 +26,9 @@ def register(app):
           has never been checked (again by file).
         - artifact_producer_superseded (warning): an active artifact still
           attached to an event that has been corrected.
+        - artifact_producer_retracted (warning): an active artifact whose
+          producing event (in its current version) was retracted; the
+          detail gives the retraction reason.
         - artifact_event_mismatch (warning): an active artifact filed under
           a different subject or session than the event that produced it.
         - tag_not_carried_forward (warning): a correction whose predecessor
@@ -33,6 +36,8 @@ def register(app):
         - input_not_carried_forward (warning): a correction that declares no
           inputs although the event it replaced consumed artifacts, so
           lineage through it stops.
+        - input_retracted (warning): an active event that consumed an
+          artifact (in its current version) since retracted.
         - duplicate_active_path (warning): two active artifacts at one path.
 
         Errors are listed first, then by check_name and subject. Returns
