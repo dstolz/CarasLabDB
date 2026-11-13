@@ -153,10 +153,10 @@ function col = local_numberColumn(T, name)
     col = double(v);
 end
 
-function local_refuse(bad, what)
+function local_refuse(bad, problem)
 %LOCAL_REFUSE Raise CarasLabDB:invalidValue naming the rows of T flagged in BAD.
     if any(bad)
         rowList = strjoin(string(reshape(find(bad), 1, [])), ", ");
-        error("CarasLabDB:invalidValue", "Row(s) %s of T %s. Nothing was written.", rowList, what);
+        error("CarasLabDB:invalidValue", "Row(s) %s of T %s. Nothing was written.", rowList, problem);
     end
 end
