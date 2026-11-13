@@ -496,9 +496,19 @@ try{
                      applies_to:[...],created_at,created_by} */ ],
   tags:[ /* {tag,namespace,value,description,retired_at,created_at,created_by} */ ],
   tagAssignments:[ /* append-only log, oldest first: {assignment_id,entity_kind,
-                      entity_id,tag,op:'add'|'remove',note,applied_at,applied_by} */ ]
+                      entity_id,tag,op:'add'|'remove',note,applied_at,applied_by} */ ],
+  variables:[ /* {name,label,description,units,value_type:'number'|'text',
+                 applies_to:[...],retired_at,created_at,created_by} */ ],
+  variableValues:[ /* append-only log, oldest first: {value_id,entity_kind,entity_id,
+                      variable,op:'set'|'unset',value (text, as stored),value_type,
+                      note,set_at,set_by,set_login} */ ],
+  retractions:[ /* {retraction_id,entity_kind:'event'|'artifact',entity_id,reason,
+                   retracted_at,retracted_by,retracted_login} */ ],
+  integrity:{ /* summary of lab.fn_check_integrity(): {computed_at,example_limit,
+               checks:[{severity,check_name,count,examples:[{subject,detail}]}]} */ }
 };</pre>
-      <p>Field names mirror the schema columns. <code>detail</code> holds the class-table-inheritance columns for that event type (e.g. <code>recording_event.sample_rate_hz</code>). Superseded rows are detected via the <code>supersedes</code> links, exactly like the <code>event_active</code> / <code>artifact_active</code> views, and each row's current tags are derived from <code>tagAssignments</code> the way <code>lab.tag_current</code> derives them (latest row per entity and tag wins if it is an <code>add</code>).</p>
+      <p>Field names mirror the schema columns. <code>detail</code> holds the class-table-inheritance columns for that event type (e.g. <code>recording_event.sample_rate_hz</code>). Superseded rows are detected via the <code>supersedes</code> links and retracted ones via <code>retractions</code>, exactly like the <code>event_active</code> / <code>artifact_active</code> views; each row's current tags and variable values are derived from <code>tagAssignments</code> and <code>variableValues</code> the way <code>lab.tag_current</code> and <code>lab.variable_current</code> derive them (the latest row per entity and tag or variable, by id, counts if it is an <code>add</code> / <code>set</code>).</p>
+      <p>The tab, the filters and the open record are kept in the address bar (<code>#tab=…&amp;subject=…&amp;open=subject:…</code>), so any view or record can be linked to.</p>
     </div>
   </details>
 
@@ -2017,7 +2027,7 @@ try{
         html+='</tr>';
       });
       html+='</tbody></table>';
-      if(data.length>limit) html+=`<div class="empty" style="padding:12px">Showing first ${limit} of ${data.length} rows — narrow the filters to see more.</div>`;
+      if(data.length>limit) html+=`<div class="empty cap-note" style="padding:12px">Showing the first ${fmtNum(limit)} of ${fmtNum(data.length)} rows in this order — ${opts.capHint||'narrow the filters or the search to see the others'}.</div>`;
       cont.innerHTML=html;
       cont.querySelectorAll('th.sortable').forEach(th=>{
         th.onclick=()=>{ const c=th.dataset.col; if(st.col===c) st.dir=st.dir==='asc'?'desc':'asc'; else {st.col=c;st.dir='desc';} draw(); };
@@ -2303,7 +2313,7 @@ try{
   function listCapped(rows, limit, render, wrapClass){
     if(!rows.length) return `<div class="lineage-empty">None.</div>`;
     let inner=rows.slice(0,limit).map(render).join('');
-    if(rows.length>limit) inner+=`<div class="empty" style="padding:10px">Showing first ${limit} of ${rows.length}.</div>`;
+    if(rows.length>limit) inner+=`<div class="empty cap-note" style="padding:10px">Showing the first ${fmtNum(limit)} of ${fmtNum(rows.length)}.</div>`;
     return wrapClass ? `<div class="${wrapClass}">${inner}</div>` : inner;
   }
 
@@ -2731,7 +2741,8 @@ try{
       {key:'_set',label:'Set',sortVal:r=>r.row.value_id,render:r=>whoWhen(r.row)},
       {key:'_note',label:'Note',sortable:false,render:r=>r.row.note?`<span class="var-note">${esc(r.row.note)}</span>`:''}
     ];
-    sortableTable('var-values-table',cols,rows,{defaultSort:'_set',defaultDir:'desc',limit:VAR_VALUES_LIMIT});
+    sortableTable('var-values-table',cols,rows,{defaultSort:'_set',defaultDir:'desc',limit:VAR_VALUES_LIMIT,
+      capHint:'sort by another column to see others, or export the CSV, which has every value'});
     const btn=document.querySelector('#modal-body [data-export-variable]');
     if(btn) btn.onclick=()=>{
       const out=rows.map(r=>({entity_kind:r.kind, entity_id:r.id, entity:r.label, variable:name,
@@ -3172,7 +3183,7 @@ try{
       return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
         <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
         ${ev?typeBadge(ev.event_type):''}${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`;
-    }).join('') + (lin.truncated ? `<div class="empty lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
+    }).join('') + (lin.truncated ? `<div class="empty cap-note lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
   }
 
   function openArtifact(aid){

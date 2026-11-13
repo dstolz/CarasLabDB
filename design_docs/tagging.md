@@ -172,8 +172,11 @@ UPDATE lab.tag SET retired_at = now() WHERE tag = 'stage:curated';
 
 `lab.fn_register_tag(tag, description, by)` registers a tag without applying
 it and returns the canonical spelling, under the same open/closed rule as
-`fn_tag`. Raw `INSERT`s do not fill `created_by` / `applied_by`; pass `p_by`
-(or let the MATLAB class do it) if you want the person recorded.
+`fn_tag`. When no person is given, `applied_by` is filled by the database
+with the person mapped to the connected login (`lab.fn_current_person()`,
+from `lab.person.db_login`), and `applied_login` always records the login
+itself. A tag's `created_by` in `lab.tag` is not defaulted that way: pass
+`p_by` (or let the MATLAB class do it) if you want it recorded.
 
 ## 6. How current tags are derived
 
@@ -223,8 +226,8 @@ Token rules:
 `lab.fn_find_by_tags(kind, all_of, any_of, none_of, active_only := true)`
 returns the matching `entity_id`s (text, id order). Untagged entities are
 candidates too, so a `none_of`-only query finds them. For events and artifacts
-`active_only` skips superseded rows, like the `*_active` views; it has no
-effect on the other kinds. An unknown `kind` raises.
+`active_only` skips superseded and retracted rows, like the `*_active`
+views; it has no effect on the other kinds. An unknown `kind` raises.
 
 **Typos in a filter.** `fn_tag_match` treats a token that nothing carries as
 simply unmatched. That is the right rule for matching, but it makes a typo

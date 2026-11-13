@@ -193,7 +193,8 @@ CREATE ROLE lab_dashboard LOGIN PASSWORD 'CHANGE_ME_DASH' IN ROLE lab_ro;
 ```
 
 Offboarding is `ALTER ROLE jdoe NOLOGIN;` (never `DROP ROLE`: the name is in
-the log). Seed the reference rows as `lab_admin` before real use.
+the log). Seed the reference rows (`storage_root`, `species`, ...) before real use;
+members may add them, only `lab_admin` can edit them.
 
 ### 2.5 Auto-start on reboot
 

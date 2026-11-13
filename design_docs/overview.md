@@ -18,7 +18,8 @@ Design goals:
 - **Reproducibility.** Analysis events carry the pipeline name, code version,
   parameters, and input artifacts needed to rerun them.
 - **Auditability.** Events are immutable. Mistakes are corrected by appending a
-  superseding event, not by editing history.
+  superseding event, not by editing history, and the database records which
+  person's login wrote every row.
 
 ## Design philosophy: events, not files
 
@@ -39,20 +40,23 @@ reading an analysis event rather than reverse-engineering a folder.
 
 | Component | Role |
 |---|---|
-| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag vocabulary and tag log |
+| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag and variable definitions and their value logs, retractions |
 | NAS storage | Actual data, laid out as `subject/session/...` |
-| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...) |
-| MATLAB App Designer GUI (`@CarasLabDBApp`) | Interactive metadata entry and browsing for the lab, with a tag filter and a per-row tag editor (Ctrl+T) |
+| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...), variables (`setVariable`, `getVariables`, ...) and retraction (`retractEvent`, `retractArtifact`) |
+| MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, a daily husbandry grid and the integrity report |
 | Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
-| MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag lookups and tag filters |
+| MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag and variable lookups |
+| Tools (`tools/`) | Backup and restore of the database and its roles (`backup_lab.py`, `restore_lab.py`), and the scheduled check of the NAS files against their checksums (`verify_artifacts.py`) |
 
 MATLAB target: R2024b or newer, with the Database Toolbox. The class connects
 through the toolbox's **native `postgresql()`** interface, so no ODBC DSN and no
 JDBC driver `.jar` need to be installed or configured. See
 [Database design](database-design.md) for the table-by-table model and
-[MCP server](mcp-server.md) for the agent-facing interface, and
-[Tagging](tagging.md) for the tag system.
+[MCP server](mcp-server.md) for the agent-facing interface,
+[Tagging](tagging.md) for the tag system and [Variables](variables.md) for
+user-defined variables. The lab's production deployment is on a Windows 11
+server ([deployment guide](deployment-windows.md)).
 
 ## Data flow
 
@@ -78,6 +82,10 @@ flowchart LR
   (`subject/session`). Groups the recording events of that period.
 - **Correction.** An event that supersedes an earlier one via a `supersedes`
   link. The original row is retained; queries filter to the active version.
+- **Retraction.** The withdrawal of an event or artifact that should never
+  have been recorded (entered twice, registered by mistake), with a reason.
+  The row stays in the database but is no longer active; superseding it
+  later brings it back.
 - **Provenance DAG.** The graph of `event → artifact → analysis → artifact`.
   See the recursive lineage query in [Database design](database-design.md).
 - **Tag.** A hashtag-style `namespace:value` label (`stage:raw`, `cohort:a`,
@@ -88,6 +96,15 @@ flowchart LR
   Like events, tag assignments are an append-only log; an entity's current
   tags are derived from it, and a correction carries its predecessor's tags
   forward. See [Tagging](tagging.md).
+- **Variable.** A user-defined named value (`probe depth` = 1200 µm on a
+  session) on any of the same five kinds of entity, for measurements and
+  settings no fixed column anticipates. One number (with units) or one piece
+  of text; setting it again is an update and the history is kept; a
+  correction carries it forward. See [Variables](variables.md).
+- **Login and person.** Every lab member connects with their own database
+  login. The database stamps that login on each row it stores and maps it to
+  the member's `person` row (`lab.person.db_login`), so who entered what does
+  not depend on the client telling the truth.
 
 ## Scope and assumptions
 

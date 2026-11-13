@@ -8,8 +8,10 @@ browser it fetches the real data from Postgres.
 ```
 web/live/
 ├── lab-dashboard-live.html   the dashboard page (fetches /api/data on load)
-├── server.py                 tiny stdlib HTTP server: static files + /api/data
-├── lab_data.sql              one query that emits the whole LAB_DATA payload
+├── build_live_page.py        generates lab-dashboard-live.html from ../lab-dashboard.html
+├── server.py                 tiny stdlib HTTP server: the page + /api/data
+├── lab_data.sql              one query that emits the LAB_DATA payload
+├── lab_integrity.sql         one query that summarises lab.fn_check_integrity()
 └── README.md                 this file
 ```
 
@@ -23,8 +25,12 @@ web/live/
    class-table-inheritance row as a `detail` object; each artifact carries its
    latest `verification`; the tag vocabulary comes as `tagNamespaces` and
    `tags`, and the whole append-only tag log as `tagAssignments`, each row
-   naming its entity by `entity_kind` + `entity_id`; timestamps are UTC
-   ISO-8601 strings and `NOW` is epoch milliseconds).
+   naming its entity by `entity_kind` + `entity_id`; the user-defined
+   variables likewise as `variables` (definitions) and `variableValues` (the
+   whole value log); `retractions` is `lab.retraction`; timestamps are UTC
+   ISO-8601 strings and `NOW` is epoch milliseconds). The server adds one
+   more key, `integrity`, from `lab_integrity.sql` (see *The integrity
+   summary* below).
 3. The page's loader assigns the response to `window.LAB_DATA` and boots the
    dashboard. Everything downstream — filters, KPIs, charts, timelines,
    provenance lineage — is the same code the offline demo runs.
@@ -34,8 +40,8 @@ is derived in the browser from the `supersedes` links, mirroring the
 `lab.event_active` / `lab.artifact_active` views. Current tags are derived the
 same way from the tag log, mirroring `lab.tag_current`: the latest row per
 entity and tag by `assignment_id` counts if it is an `add`. The
-**Active only** toggle hides superseded rows; **↻ Refresh** re-queries the
-database.
+**Active only** toggle hides superseded and retracted rows; **↻ Refresh**
+re-queries the database.
 
 What the page derives is meant to equal what the database's own views and
 functions return, so the same question gets the same answer in MATLAB, in the
@@ -54,6 +60,45 @@ MCP server and here:
   with superseded rows shown.
 - The **From/To** filter dates a file by the event that produced it, so an
   event and its files are always in or out together.
+- **Retraction**: an event or artifact in `lab.retraction` is not active, as
+  in `lab.event_active` / `lab.artifact_active`: hidden under *Active only*,
+  marked *retracted* with its reason otherwise, and left out of every active
+  count, total, latest weight and lineage step.
+- **Variables**: the current value of a variable on an entity is the latest
+  row of the value log for that entity and variable by `value_id`, kept if it
+  is a `set` — `lab.variable_current`. Each value travels as the text the
+  database stored (`coalesce(value_text, value_num::text)`, never a JSON
+  number), so `1350.50` is shown as `1350.50` and a 20-digit number keeps
+  every digit.
+
+## What the page shows
+
+- **Variables** in every dialog (project, subject, session, event, artifact):
+  label, value with units, when it was last set and by whom, and each
+  variable's history (every earlier value and unset) behind *N changes*. The
+  **Variables** tab lists every definition (label, name, units, type,
+  description, how many entities hold a value); a row, or any variable chip
+  in a table, opens all current values of that variable across entities,
+  with a CSV download. Tables get a *Variables* column for the kinds that
+  have any, and the project export (CSV / Excel / PDF) has a *Variables*
+  sheet with the current values on the project and everything in it.
+- **Integrity** on the overview: active files by their file's latest check
+  (ok / mismatch / missing / never verified; a tile lists them), then every
+  check `lab.fn_check_integrity()` reported, errors first, with its count and
+  up to 20 examples (ids link to their records).
+- **Weight plot** in the subject dialog: weights from the subject's active
+  husbandry events over time; a current `baseline weight` variable (in g, or
+  kg) is drawn as a reference line and each weight is also given as a
+  percent of it. Without Chart.js the same data is a table.
+- **Deep links**: the address bar always holds the tab, the filters, the
+  current tab's search and the open record, e.g.
+  `#tab=events&subject=G-0421&active=0&open=event:<uuid>`. Open that URL (or
+  press `c` in a dialog to copy it) to get the same view back, so a record
+  can be linked from a lab notebook. Ids that are not in the data say so.
+- **Caps are stated**: tables show the first 400 rows (a variable's values
+  the first 500) and say how many there are; lineage stops at depth 64 like
+  `lab.fn_artifact_lineage`; the activity chart plots at most 240 months;
+  integrity checks carry 20 examples each. Each says so where it applies.
 
 ## Running it
 
@@ -104,6 +149,33 @@ JSON `{error, detail}` body, and the page shows an error card with a **Retry**
 button rather than a blank screen. The driver's own message, which can name
 the host and login, goes to the server's stderr log only.
 
+### The integrity summary
+
+`lab_integrity.sql` summarises `lab.fn_check_integrity()`: one entry per check
+that returned rows, errors first, with its count and at most 20 example rows.
+The full result can be one row per artifact, so it is never shipped whole.
+
+The check is expensive. Measured on a database of 50,000 events and 50,000
+artifacts (PostgreSQL 16, one machine):
+
+| step                                         | time   |
+| -------------------------------------------- | ------ |
+| `lab_data.sql` (66 MB of JSON)               | 2.4 s  |
+| `lab_integrity.sql`                          | 2.1–2.3 s |
+| gzip of the payload                          | 0.65 s |
+| `/api/data`, first request (both queries side by side) | 3.3 s |
+| `/api/data` with the summary from its cache  | 3.2 s  |
+
+Running the summary inside every export would have made each one about
+5.3 s. So `server.py` keeps it on its own cache: a summary is reused for 5
+minutes (`INTEGRITY_CACHE_SECONDS`); once it is older, the next export starts
+a refresh in the background and ships the previous summary meanwhile. Only
+the first export after start-up waits for it, and then the two queries run in
+parallel. The panel shows when its summary was computed. If the summary
+query fails, the payload carries `{"error": ...}` in its place (the cause is
+in the server log), the panel says so, and the rest of the page is unaffected;
+it is retried after 30 s.
+
 ### Caching and what is served
 
 A finished export is reused for 5 seconds (`CACHE_SECONDS` in `server.py`),
@@ -140,15 +212,21 @@ depends on it.
 
 ## Static export (no server)
 
-`lab_data.sql` is also usable standalone to snapshot the database to a file the
-offline demo could load:
+To snapshot exactly what `/api/data` would return:
+
+```bash
+PGDATABASE=lab python web/live/server.py --dump > lab-data.json
+```
+
+`lab_data.sql` and `lab_integrity.sql` are also usable on their own (each is a
+single statement); `lab_data.sql` alone gives everything but `integrity`, and
+the page then says the integrity report is not part of the data:
 
 ```bash
 PGTZ=UTC psql -tAXq -v ON_ERROR_STOP=1 -d lab -f web/live/lab_data.sql > lab-data.json
 ```
 
-`lab_data.sql` is a single statement. `PGTZ=UTC` matches what `server.py`
-does: top-level timestamps are rendered in UTC either way, and it makes the
+`PGTZ=UTC` matches what `server.py` does: top-level timestamps are rendered in UTC either way, and it makes the
 offsets inside per-event `detail` objects UTC as well.
 
 ## Security notes
@@ -165,6 +243,7 @@ offsets inside per-event `detail` objects UTC as well.
   default and put nginx/Apache with HTTPS and your campus login in front of it;
   it prints a warning at start-up when bound to anything else.
 - Every string on the page comes from the database and was typed by a lab
-  member or written by a script. The page escapes all of it, links only
+  member or written by a script — variable labels, units and values and
+  retraction reasons included. The page escapes all of it, links only
   `http`/`https` URIs, and never renders a `file:` link from a served page
   (browsers refuse to follow them, so the folder is shown as text).

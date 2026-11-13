@@ -484,7 +484,7 @@ try{
   </header>
 
   <div class="banner">
-    <span><b>Live view:</b> reading the <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">lab</code> schema through <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">/api/data</code>. Full history is loaded; use <b>Active only</b> to hide superseded rows.</span>
+    <span><b>Live view:</b> reading the <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">lab</code> schema through <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">/api/data</code>. Full history is loaded; use <b>Active only</b> to hide superseded and retracted rows.</span>
     <span><span class="link" id="btn-refresh" title="Refresh data (r)">↻ Refresh</span> &nbsp;·&nbsp; <span class="link" id="open-shortcuts" title="Keyboard shortcuts (?)">⌨ Shortcuts</span> &nbsp;·&nbsp; <span class="link" id="open-howto">How does this work? →</span></span>
   </div>
 
@@ -503,7 +503,16 @@ try{
       and the whole append-only tag log (<code>tagAssignments</code>) are loaded, and each
       row's current tags are derived in the browser like <code>lab.tag_current</code>.
       Type tags such as <code>stage:raw -qc:fail topic:*</code> in the Tags filter
-      (<code>#</code> focuses it). Hit <b>↻ Refresh</b> to re-query the database.</p>
+      (<code>#</code> focuses it). User-defined variables come the same way: the
+      definitions (<code>variables</code>) and the whole value log
+      (<code>variableValues</code>, each value as the text the database stored), from
+      which the current values are derived like <code>lab.variable_current</code>.
+      Retracted events and files (<code>lab.retraction</code>) count as not active, as in
+      the <code>*_active</code> views. The Integrity panel summarises
+      <code>lab.fn_check_integrity()</code>; the server recomputes it every few minutes,
+      not on every load, because it is as expensive as the rest of the export.
+      The address bar always holds the tab, the filters and the open record, so a
+      record can be linked from a notebook. Hit <b>↻ Refresh</b> to re-query the database.</p>
       <p>Run it from the repo root (with the schema applied to database <code>lab</code>):</p>
       <pre>PGDATABASE=lab python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/</pre>
@@ -1406,7 +1415,7 @@ window.__initDashboard = function(){
         html+='</tr>';
       });
       html+='</tbody></table>';
-      if(data.length>limit) html+=`<div class="empty" style="padding:12px">Showing first ${limit} of ${data.length} rows — narrow the filters to see more.</div>`;
+      if(data.length>limit) html+=`<div class="empty cap-note" style="padding:12px">Showing the first ${fmtNum(limit)} of ${fmtNum(data.length)} rows in this order — ${opts.capHint||'narrow the filters or the search to see the others'}.</div>`;
       cont.innerHTML=html;
       cont.querySelectorAll('th.sortable').forEach(th=>{
         th.onclick=()=>{ const c=th.dataset.col; if(st.col===c) st.dir=st.dir==='asc'?'desc':'asc'; else {st.col=c;st.dir='desc';} draw(); };
@@ -1692,7 +1701,7 @@ window.__initDashboard = function(){
   function listCapped(rows, limit, render, wrapClass){
     if(!rows.length) return `<div class="lineage-empty">None.</div>`;
     let inner=rows.slice(0,limit).map(render).join('');
-    if(rows.length>limit) inner+=`<div class="empty" style="padding:10px">Showing first ${limit} of ${rows.length}.</div>`;
+    if(rows.length>limit) inner+=`<div class="empty cap-note" style="padding:10px">Showing the first ${fmtNum(limit)} of ${fmtNum(rows.length)}.</div>`;
     return wrapClass ? `<div class="${wrapClass}">${inner}</div>` : inner;
   }
 
@@ -2120,7 +2129,8 @@ window.__initDashboard = function(){
       {key:'_set',label:'Set',sortVal:r=>r.row.value_id,render:r=>whoWhen(r.row)},
       {key:'_note',label:'Note',sortable:false,render:r=>r.row.note?`<span class="var-note">${esc(r.row.note)}</span>`:''}
     ];
-    sortableTable('var-values-table',cols,rows,{defaultSort:'_set',defaultDir:'desc',limit:VAR_VALUES_LIMIT});
+    sortableTable('var-values-table',cols,rows,{defaultSort:'_set',defaultDir:'desc',limit:VAR_VALUES_LIMIT,
+      capHint:'sort by another column to see others, or export the CSV, which has every value'});
     const btn=document.querySelector('#modal-body [data-export-variable]');
     if(btn) btn.onclick=()=>{
       const out=rows.map(r=>({entity_kind:r.kind, entity_id:r.id, entity:r.label, variable:name,
@@ -2563,7 +2573,7 @@ window.__initDashboard = function(){
       return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
         <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
         ${ev?typeBadge(ev.event_type):''}${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`;
-    }).join('') + (lin.truncated ? `<div class="empty lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
+    }).join('') + (lin.truncated ? `<div class="empty cap-note lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
   }
 
   function openArtifact(aid){

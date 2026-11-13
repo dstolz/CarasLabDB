@@ -1,5 +1,12 @@
 # Server requirements for deploying CarasLabDB
 
+> **Status.** The lab deploys CarasLabDB on a Windows 11 machine managed
+> through Microsoft Endpoint Configuration Manager (MECM), used as the lab's
+> server. The step-by-step guide is
+> [deployment-windows.md](deployment-windows.md); its §9, "For IT:
+> MECM-managed Windows 11", lists what that arrangement needs from IT. The
+> requirements below hold for any arrangement.
+
 We want to deploy a record-keeping database (a 'metadata server') that logs
 what happens in the lab (animal births, surgeries, recordings, analyses, etc)
 and keeps an index of the data files those activities produce, so that any
@@ -43,8 +50,8 @@ to run the CarasLabDB metadata database, in plain terms, and lists the open
 design questions that affect deployment. It does not cover researcher
 workstations (MATLAB installs) — those are the lab's responsibility and are
 documented separately in `deployment-windows.md` and `deployment-linux.md`.
-Step-by-step install commands for Linux, Windows and Synology are in those
-guides; this page is the summary of *what* we need, not *how* to build it.
+Step-by-step install commands for Windows (the production guide), Linux and
+Synology are in the deployment guides; this page is the summary of *what* we need, not *how* to build it.
 
 ## What the system is
 
@@ -82,8 +89,9 @@ to *reach* the database over the network.
 - PostgreSQL **version 14 or newer**. Any currently supported major release
   is fine; we recommend whichever IT normally deploys. No extensions are
   required (the schema uses only built-in features).
-- Any operating system PostgreSQL supports (Linux preferred; Windows and
-  Docker on a Synology NAS are also documented). A virtual machine is fine.
+- Any operating system PostgreSQL supports. The lab's deployment is on a
+  MECM-managed Windows 11 machine; Linux and Docker on a Synology NAS are
+  also documented. A virtual machine is fine.
 - Python 3 for the dashboard (§2). The server does **not** need MATLAB or a
   mount of the NAS, and nothing on it needs outbound internet access
   (allowing it for OS and PostgreSQL updates is IT's call).
@@ -108,10 +116,13 @@ possible, we need a simple way to request the others:
 
 | Role | Purpose | Privileges |
 |---|---|---|
-| lab admin login | Applies the schema, creates and manages the other logins, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab`; `CREATEROLE` if permitted |
-| `lab_rw` (group, no login) | Holds the read-write privilege set that every lab member's login inherits | Read and insert on all tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
+| lab admin login | Applies the schema and its upgrades, creates and disables the other logins, performs rare maintenance (e.g. renaming an animal ID) | Owner of database `lab`, **not** a superuser; `CREATEROLE` if permitted |
+| `lab_rw` (group, no login) | Holds the read-write privilege set that every lab member's login inherits | Read and insert on the tables in schema `lab`; update on a small set of descriptive tables (see §3, concern 1) |
 | one login per lab member | Used by that person's MATLAB client to record events | Member of `lab_rw`; no privileges of its own |
-| `lab_ro` | Used by the dashboard and the read-only AI query tool | Read only |
+| `lab_ro` (group, no login) | Holds the read-only privilege set | Read only |
+| dashboard login, AI-tool login | Used by the live dashboard and by the read-only AI query tool | Members of `lab_ro` |
+| file-verification login | Used by the scheduled job that checks the data files against their checksums | Member of `lab_rw` |
+| `postgres` superuser | Used only by the nightly backup (which includes the logins) and for restores | Superuser; not reachable from the network |
 
 Per-person logins are a requirement, not a preference: the database is to
 record which login made each entry, and that record is only meaningful if
@@ -144,7 +155,14 @@ privileges above are then applied by a second file, `design_docs/grants.sql`.
 
 - A nightly `pg_dump` of database `lab` (custom format), copied to storage
   separate from the server, retained for at least 30 days. The database is
-  small, so full nightly dumps are practical indefinitely.
+  small, so full nightly dumps are practical indefinitely. We supply
+  `tools/backup_lab.py`, which takes the dump together with the logins and a
+  manifest, verifies it, copies it to a second location (`--copy-to`) and
+  prunes old sets only after a new one succeeded, plus a `--check` mode for
+  monitoring; `tools/restore_lab.py` restores a set into a new database and
+  checks it against the manifest. Both are Python 3, standard library only,
+  and run as the PostgreSQL superuser on the server. If IT's own backup
+  system takes the dumps instead, that is equally fine.
 - File-level snapshots of a running PostgreSQL data directory are **not** a
   reliable backup on their own; the dump is what we need.
 - A test restore into a scratch database once after setup, and periodically
@@ -164,16 +182,17 @@ in advance of planned downtime because there is no offline mode (§3, concern 6)
 
 `web/live/server.py` is a small Python 3 program (standard library only, no
 packages required if the `psql` command is present) that serves one web page
-and one JSON endpoint. On every page load it runs one read-only query against
-the database and renders charts in the browser.
+and one JSON endpoint. It runs one read-only query against the database and
+reuses the result for 5 seconds, so page loads within that window share it;
+the browser renders the charts.
 
-Preferably on the database machine, otherwise any small Linux host. It needs:
+Preferably on the database machine. It needs:
 
 - Python 3. No packages are required if the `psql` command is installed.
-- The read-only database login (`lab_ro`).
-- To be run as a service that starts at boot (a `systemd` unit is given in
-  `deployment-linux.md` §3.2). It listens on one local HTTP port (default
-  8778).
+- Its own database login, a member of `lab_ro`.
+- To start at boot without anyone signed in (a Task Scheduler task on
+  Windows, `deployment-windows.md` §3.3; a `systemd` unit on Linux). It
+  listens on one HTTP port on 127.0.0.1 only (default 8778).
 - **A reverse proxy in front of it that provides HTTPS and campus login**,
   reachable from the lab subnet and VPN only. The program itself has no
   authentication and speaks plain HTTP, so it must not be exposed directly.
@@ -189,33 +208,38 @@ These were found while reviewing the code and documentation for this page.
 Items marked *lab* are ours to fix later and are listed so IT knows they are
 known; items marked *IT decision* need input before go-live.
 
-1. **Account privileges.** *(lab; resolved)* The privilege set is now one
+1. **Account privileges.** *(lab; resolved)* The privilege set is one
    script, `design_docs/grants.sql`, which every guide applies. `lab_rw` can
-   read and insert everywhere, and can update only the descriptive tables the
-   MATLAB client edits (`subject`, `session`, `project`, `project_member`,
-   `project_artifact`, `person`, and the tag vocabulary tables `tag_namespace`
-   and `tag`); every such edit is recorded in the database
-   with the login that made it. `lab_ro` can only read. Default-privilege
-   rules cover tables added later.
+   read, and insert everywhere except the logs only the database writes, and
+   can update only the descriptive tables the MATLAB client edits (`session`,
+   `project`, `project_member`, `project_artifact`, the tag vocabulary
+   `tag_namespace` / `tag`, the variable definitions `variable`, and the
+   descriptive columns of `subject`, not its ID); every such edit is recorded
+   in the database with the login that made it. It cannot edit the `person`
+   table or say which login belongs to which person, and cannot rename an
+   animal. `lab_ro` can only read. Default-privilege rules cover tables added
+   later.
 
 2. **Recording who made each entry depends on per-person logins.** *(IT +
-   lab)* The original deployment guides had every researcher connect as one
-   shared `lab_rw` login and identify themselves by an email address the
-   client looks up in a `person` table; the database did not verify that
-   claim. The lab has decided that the database must record which person
-   made each change, so logins are now one per lab member (see §1). The
-   client currently still records the self-declared email; we will change it
-   to derive the person from the database login so the two cannot disagree.
-   IT's part is the admin login, ideally able to create the others, and, if
-   available, campus directory authentication for them.
+   lab; resolved in the software)* Logins are one per lab member (see §1).
+   The database itself stamps the connected login on every entry and on
+   every edit, whatever the client sends, and maps each login to the lab
+   member it belongs to (set by the lab admin only); when the client names
+   no person, the database fills in the login's person, and the MATLAB
+   client takes the current person from the same mapping. Onboarding is a
+   new login plus that mapping; offboarding disables the login (it is never
+   deleted, because its name is in the record). IT's part is the admin
+   login, ideally able to create the others, and, if available, campus
+   directory authentication for them.
 
 3. **Encryption on the wire is unverified.** *(IT decision, then lab
    verification)* None of the clients (MATLAB, Python, `psql`) set an
    SSL/TLS option, so whether traffic is encrypted depends on the server
    configuration and each driver's default. If campus policy requires TLS on
    the database connection, the server needs `ssl = on` with a certificate and
-   `hostssl`-only rules in `pg_hba.conf`; we will then confirm MATLAB's native
-   PostgreSQL driver negotiates it before anyone relies on it.
+   `hostssl`-only rules in `pg_hba.conf` (`deployment-windows.md` §1.6); we
+   will then confirm MATLAB's native PostgreSQL driver negotiates it before
+   anyone relies on it.
 
 4. **The live dashboard is not hardened.** *(lab / IT)* It is Python's
    built-in HTTP server, unauthenticated, plain HTTP, and it returns the
@@ -227,8 +251,9 @@ known; items marked *IT decision* need input before go-live.
    The database records its schema version (`lab.schema_version`), and an
    existing database is upgraded by the numbered scripts in
    `design_docs/migrations/`, each applied once by the owner role in a
-   maintenance window and refusing to run twice. IT should expect occasional
-   short requests of that kind; we will supply the SQL.
+   maintenance window, after a backup, and refusing to run twice (the
+   current version is 5). The lab admin login applies them; the runbook is
+   `deployment-windows.md` §6.
 
 6. **Single instance, no offline mode.** *(IT decision)* Clients write
    directly to the database and have no local queue. If the server is down,
@@ -240,7 +265,8 @@ known; items marked *IT decision* need input before go-live.
 7. **Administrative operations need a separate, protected login.** *(IT
    decision)* Renaming an animal's ID is the single sanctioned edit to the
    append-only tables and is implemented as a database function that ordinary
-   roles cannot execute. Someone must hold the owner/admin credentials. We
+   roles cannot execute; the owner (the lab admin login) can. Someone must
+   hold the owner/admin credentials. We
    propose the lab PI and one IT contact; IT should say where such credentials
    are expected to be kept.
 

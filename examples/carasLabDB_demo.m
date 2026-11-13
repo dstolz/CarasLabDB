@@ -9,7 +9,9 @@
 
 %% Connect (native postgresql interface; requires Database Toolbox)
 % The current person is resolved by email and used for created_by /
-% recorded_by on every insert below.
+% recorded_by on every insert below. With a login of your own that the
+% database administrator has mapped to you (lab.person.db_login), PersonEmail
+% can be left out: the person is then taken from the login.
 db = CarasLabDB( ...
     Username      = "lab_rw", ...
     Password      = "change-me", ...
@@ -177,6 +179,41 @@ fprintf("weight event %s superseded by %s\n", wEid, newWEid);
 % The correction carries the event's current tags (qc:pass) forward in the
 % same transaction, so it still matches every tag filter the original did.
 disp(db.getEntityTags("event", newWEid));
+
+%% Variables: named values the schema has no column for
+% A variable is defined the first time it is set -- here a number recorded
+% in micrometres -- and from then on its units and value type are fixed (a
+% value given in other units is an error). Setting it again is an update:
+% the log keeps every value, and getVariables returns the current one.
+db.setVariable("session", sid, "Probe Depth", 1200, Units="um", ...
+    Description="Depth of the probe tip below the pia");
+db.setVariable("session", sid, "probe depth", 1350, Note="advanced 150 um");
+db.setVariable("subject", "G-0421", "housing", "pair");     % a text variable
+disp(db.getVariables("session", sid));                       % current: 1350 um
+disp(db.getVariables("session", sid, History=true));         % both values, oldest first
+depths = db.getVariableValues("probe depth");                % every row that has one
+fprintf("rows with a probe depth: %d\n", height(depths));
+
+%% Retraction: withdraw a row that should never have been recorded
+% The weight above was wrong, so it was corrected (superseded). An event
+% entered twice is not a correction of anything: retract it, giving the
+% reason. It stays in the database but leaves the *_active views.
+dupEid = db.addHusbandryEvent( ...
+    SubjectId  = "G-0421", ...
+    OccurredAt = datetime("now", "TimeZone", "local"), ...
+    Measure    = "weight", ...
+    WeightG    = 71.9);
+db.retractEvent(dupEid, "entered twice");
+
+% ActiveOnly=false shows every version of every event, and what became of
+% it: superseded_by (its correction), is_retracted, is_current.
+weights = db.getEvents(SubjectId="G-0421", EventType="husbandry", ActiveOnly=false);
+disp(weights(:, ["event_id", "superseded_by", "is_current", "is_retracted"]));
+disp(db.getRetractions(Kind="event"));
+
+% The database's own list of what needs attention (an empty table = nothing).
+problems = db.checkIntegrity();
+fprintf("integrity findings: %d\n", height(problems));
 
 %% Ad-hoc SQL escape hatch
 n = db.runQuery("SELECT count(*) AS n FROM lab.event_active;");
