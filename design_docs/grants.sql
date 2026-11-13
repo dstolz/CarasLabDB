@@ -57,6 +57,14 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA lab TO lab_rw;
 -- that could insert into them could forge history.
 REVOKE INSERT ON lab.maintenance_log, lab.row_history, lab.schema_version FROM lab_rw;
 
+-- lab.person is insertable, but not its db_login column: that column maps a
+-- database login to a person (lab.fn_current_person), so whoever can set it
+-- can sign entries as someone else. The administrator sets it when a member
+-- is onboarded.
+REVOKE INSERT ON lab.person FROM lab_rw;
+GRANT INSERT (person_id, full_name, email, role, is_active, created_at)
+    ON lab.person TO lab_rw;
+
 -- And except lab.event_type: each event type is one of the schema's detail
 -- tables, so a row added here names a type with no detail table, which every
 -- event of that type then reports as event_missing_detail forever. New event
@@ -65,17 +73,18 @@ REVOKE INSERT ON lab.event_type FROM lab_rw;
 
 -- Edit: the descriptive tables the schema leaves mutable, which the MATLAB
 -- class (updateSubject, updateSession) and the GUI editors change in place,
--- the project tables, and the tag vocabulary (tag_namespace, tag), which any
--- member may extend, describe and retire; trg_tag_namespace_guard and
--- trg_tag_guard stop a namespace's policy drifting once it is in use and a
--- tag being renamed. Every UPDATE is recorded in lab.row_history with the
+-- the project tables, the tag vocabulary (tag_namespace, tag) and the
+-- variable definitions (variable), which any member may extend, describe and
+-- retire; trg_tag_namespace_guard, trg_tag_guard and trg_variable_guard stop
+-- a namespace's policy drifting once it is in use, a tag or variable being
+-- renamed, and a variable's units or type changing once it has values. Every UPDATE is recorded in lab.row_history with the
 -- login that made it. The reference tables (person, species, probe,
 -- storage_root, vocabularies) stay owner-only: lab.person in particular is
 -- what recorded_by / created_by / applied_by point at, so a member who could
 -- edit it could reassign other people's entries.
 GRANT UPDATE ON lab.session, lab.project, lab.project_member,
                 lab.project_artifact,
-                lab.tag_namespace, lab.tag TO lab_rw;
+                lab.tag_namespace, lab.tag, lab.variable TO lab_rw;
 
 -- lab.subject is editable column by column, and subject_id is not among the
 -- columns: it is the natural key every append-only table refers to, and
@@ -96,8 +105,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA lab GRANT USAGE, SELECT ON SEQUENCES TO lab_r
 
 -- Every function except lab.fn_rename_subject keeps PostgreSQL's default
 -- EXECUTE for PUBLIC. None is SECURITY DEFINER but the row_history trigger,
--- so lab.fn_tag and lab.fn_register_tag write with the caller's privileges:
--- lab_rw can tag, and lab_ro calling them is refused at the INSERT.
+-- so lab.fn_tag, lab.fn_register_tag, lab.fn_set_variable, lab.fn_unset_variable
+-- and lab.fn_retract write with the caller's privileges: lab_rw can use them,
+-- and lab_ro calling them is refused at the INSERT.
 --
 -- lab.fn_rename_subject is REVOKEd from PUBLIC in schema.sql. Grant EXECUTE
 -- on it only to the administrator who performs identity maintenance; it is

@@ -29,8 +29,8 @@ BEGIN
 END;
 $$;
 
-SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 4,
-                      'the migrated database is at schema version 4');
+SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 5,
+                      'the migrated database is at schema version 5');
 
 -- Nothing was lost.
 SELECT pg_temp.assert(
@@ -92,7 +92,21 @@ SELECT pg_temp.assert(
       WHERE artifact_id = 'dddddddd-0000-0000-0000-000000000001') = 'ok',
     'the legacy verification is the file''s latest check');
 
--- New rows are written under the version-4 rules.
+-- Version 5 adds tables and a column; it changes no existing row.
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.person WHERE db_login IS NOT NULL)
+    AND NOT EXISTS (SELECT 1 FROM lab.retraction)
+    AND NOT EXISTS (SELECT 1 FROM lab.variable_value)
+    AND (SELECT count(*) FROM lab.event_active) = 3
+    AND (SELECT count(*) FROM lab.event_version WHERE is_current) = 3,
+    'no legacy person is mapped to a login, nothing is retracted, and the active rows are unchanged');
+SELECT lab.fn_set_variable('session', 'cccccccc-0000-0000-0000-000000000001', 'Probe Depth', 1200,
+                           p_units => 'um');
+SELECT pg_temp.assert(
+    lab.fn_variable_number('session', 'cccccccc-0000-0000-0000-000000000001', 'probe depth') = 1200,
+    'variables work on legacy rows');
+
+-- New rows are written under the current rules.
 INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at)
 VALUES ('11111111-0000-0000-0000-000000000005', 'husbandry', 'L-0001', now());
 INSERT INTO lab.husbandry_event (event_id, measure, weight_g)

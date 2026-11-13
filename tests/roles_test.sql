@@ -87,6 +87,9 @@ INSERT INTO lab.husbandry_event (event_id, measure, weight_g) VALUES
     ('00000000-0000-0000-0000-0000000000e1', 'weight', 60),
     ('00000000-0000-0000-0000-0000000000e2', 'weight', 61),
     ('00000000-0000-0000-0000-0000000000e3', 'weight', 62);
+-- The administrator maps the member's login to their person row.
+UPDATE lab.person SET db_login = 'rt_member'
+WHERE person_id = '00000000-0000-0000-0000-0000000000a1';
 
 -- ---------------------------------------------------------------------------
 -- A lab member (lab_rw)
@@ -117,6 +120,48 @@ SELECT pg_temp.assert(
 SELECT pg_temp.assert(
     (SELECT notes FROM lab.subject WHERE subject_id = 'R1') = 'edited by a member',
     'a member may edit a subject''s descriptive columns');
+
+-- A row that names no person is attributed to the person mapped to the
+-- login; a person the member does name (e4, above) is kept.
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-0000000000e5', 'husbandry', 'R1', now());
+INSERT INTO lab.husbandry_event (event_id, measure, weight_g)
+VALUES ('00000000-0000-0000-0000-0000000000e5', 'weight', 630);
+SELECT pg_temp.assert(
+    lab.fn_current_person() = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT recorded_by FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e5')
+        = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT recorded_by FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e4')
+        = '00000000-0000-0000-0000-0000000000a2',
+    'the login''s person is the default for recorded_by, and only the default');
+
+-- May set, update and describe variables, and retract a row entered in error.
+SELECT lab.fn_set_variable('subject', 'R1', 'Probe Depth', 1200, p_units => 'um');
+SELECT lab.fn_set_variable('subject', 'R1', 'probe depth', 1300);
+UPDATE lab.variable SET description = 'described by a member' WHERE name = 'probe depth';
+SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e5', 'weight mistyped');
+SELECT pg_temp.assert(
+    (SELECT value || '|' || set_login || '|' || set_by FROM lab.variable_current
+      WHERE entity_kind = 'subject' AND entity_id = 'R1')
+        = '1300|rt_member|00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT retracted_login || '|' || retracted_by FROM lab.retraction)
+        = 'rt_member|00000000-0000-0000-0000-0000000000a1'
+    AND NOT EXISTS (SELECT 1 FROM lab.event_active
+                    WHERE event_id = '00000000-0000-0000-0000-0000000000e5'),
+    'a member may set and update variables and retract an event; each records the login');
+SELECT pg_temp.expect_error($q$UPDATE lab.variable_value SET value_num = 1$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.variable_value$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.retraction$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.variable$q$, 'permission denied');
+
+-- May add a person, but not map a login to one.
+INSERT INTO lab.person (full_name, email) VALUES ('Added By Member', 'added@example.edu');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.person (full_name, db_login) VALUES ('Imposter', 'rt_reader')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.person SET db_login = 'rt_member'
+       WHERE person_id = '00000000-0000-0000-0000-0000000000a2'$q$, 'permission denied');
 
 -- May not touch the append-only log, the audit logs or the vocabulary of
 -- event types, and may not edit people.
@@ -169,7 +214,7 @@ SELECT pg_temp.expect_error(
     'subject id R1 cannot be changed by rt_legacy');
 RESET SESSION AUTHORIZATION;
 SELECT pg_temp.assert(
-    (SELECT count(*) FROM lab.event WHERE subject_id = 'R1') = 2
+    (SELECT count(*) FROM lab.event WHERE subject_id = 'R1') = 3
     AND NOT EXISTS (SELECT 1 FROM lab.subject WHERE subject_id = 'R1x'),
     'no member-initiated rename took effect');
 
@@ -234,6 +279,9 @@ SELECT pg_temp.assert(
     AND (SELECT count(*) FROM lab.event_version WHERE is_current) = 4
     AND (SELECT count(*) FROM lab.artifact_verification_latest) = 1
     AND (SELECT count(*) FROM lab.tag_current) = 1
+    AND (SELECT count(*) FROM lab.variable_current) = 1
+    AND (SELECT count(*) FROM lab.event_version WHERE is_retracted) = 1
+    AND lab.fn_variable_number('subject', 'R1', 'probe depth') = 1300
     AND (SELECT count(*) FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f1', 'up')) = 1
     AND (SELECT count(*) FROM lab.fn_check_integrity()) >= 0
     AND lab.fn_tag_match('subject', 'R1', ARRAY['topic:roles_test'])
@@ -247,6 +295,11 @@ SELECT pg_temp.expect_error(
 SELECT pg_temp.expect_error(
     $q$UPDATE lab.subject SET notes = 'x' WHERE subject_id = 'R1'$q$, 'permission denied');
 SELECT pg_temp.expect_error($q$SELECT lab.fn_rename_subject('R1', 'R1x')$q$, 'permission denied');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'R1', 'probe depth', 1)$q$, 'permission denied');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e1', 'x')$q$,
+    'permission denied');
 RESET SESSION AUTHORIZATION;
 
 ROLLBACK;

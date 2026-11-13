@@ -44,8 +44,20 @@ CREATE TABLE lab.person (
     email       text,
     role        text,
     is_active   boolean NOT NULL DEFAULT true,
-    created_at  timestamptz NOT NULL DEFAULT now()
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    -- The database login this person connects with, if they have one. It ties
+    -- the two notions of "who": the person named in recorded_by / created_by
+    -- and the login the database stamps in the *_login columns.
+    -- lab.fn_current_person() resolves the connected login to its person, so
+    -- clients need not ask who is typing. Only the administrator sets it
+    -- (design_docs/grants.sql withholds the column from lab_rw): a member who
+    -- could map a login to a person could sign entries as someone else.
+    db_login    text,
+    CONSTRAINT person_db_login_ck CHECK (
+        db_login IS NULL OR (db_login <> '' AND db_login = btrim(db_login)))
 );
+CREATE UNIQUE INDEX uq_person_db_login
+    ON lab.person (db_login) WHERE db_login IS NOT NULL;
 -- Email is the natural login key the client layer resolves "current person" by,
 -- so uniqueness must be case-insensitive: 'Dan@umd.edu' and 'dan@umd.edu' are
 -- one person, and a plain UNIQUE(email) would happily store both and then
@@ -504,6 +516,40 @@ CREATE TABLE lab.artifact_verification (
 );
 
 -- ---------------------------------------------------------------------------
+-- Retractions
+-- ---------------------------------------------------------------------------
+-- A correction replaces a statement of fact with a better one; a retraction
+-- withdraws a row that should never have been written at all -- an event
+-- entered twice, a file registered by mistake. Before this table the only way
+-- to hide such a row was to invent a successor of the same type. Like every
+-- other change to the log it is appended, never applied in place: one row per
+-- retracted event or artifact, with the reason, and the *_active views leave
+-- retracted rows out. A retraction is permanent; to bring a retracted row
+-- back, supersede it (the successor is an ordinary active row).
+CREATE TABLE lab.retraction (
+    retraction_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_kind     text NOT NULL,
+    event_id        uuid REFERENCES lab.event(event_id),
+    artifact_id     uuid REFERENCES lab.artifact(artifact_id),
+    reason          text NOT NULL,
+    retracted_at    timestamptz NOT NULL DEFAULT now(),
+    retracted_by    uuid REFERENCES lab.person(person_id),
+    -- Login that inserted the row (trg_retraction_stamp_login).
+    retracted_login text,
+    CONSTRAINT retraction_kind_ck CHECK (entity_kind IN ('event','artifact')),
+    CONSTRAINT retraction_entity_ck CHECK (
+            (entity_kind = 'event')    = (event_id IS NOT NULL)
+        AND (entity_kind = 'artifact') = (artifact_id IS NOT NULL)),
+    -- A retraction with no stated reason is indistinguishable from data loss.
+    CONSTRAINT retraction_reason_ck CHECK (btrim(reason) <> '')
+);
+-- A row is retracted at most once.
+CREATE UNIQUE INDEX uq_retraction_event
+    ON lab.retraction (event_id) WHERE event_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_retraction_artifact
+    ON lab.retraction (artifact_id) WHERE artifact_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
 -- Tags
 -- ---------------------------------------------------------------------------
 -- Hashtag-style labels on events, artifacts, subjects, sessions and projects,
@@ -608,6 +654,100 @@ CREATE TABLE lab.tag_assignment (
 );
 
 -- ---------------------------------------------------------------------------
+-- User-defined variables
+-- ---------------------------------------------------------------------------
+-- Named values that lab members attach to events, artifacts, subjects,
+-- sessions and projects -- 'probe depth' = 1200 um on a recording session,
+-- 'housing' = 'pair' on an animal -- for the measurements and settings no
+-- fixed column anticipates. A "dataset" here is a session (the recording
+-- folder) or an artifact (one file); both can carry variables.
+--
+-- Same shape as tags, for the same reasons. The definition (lab.variable) is
+-- mutable reference data, edited in place and recorded in row_history. The
+-- values are not: lab.variable_value is an append-only log, one row each time
+-- a value is set or unset, and an entity's current values are derived from
+-- it by lab.variable_current. A user "updates" a variable by setting it
+-- again; every earlier value stays in the log with who set it and when.
+-- Clients write through lab.fn_set_variable.
+
+-- One row per variable. `name` is the key people query by ('probe depth'):
+-- lower case, words of letters, digits, '_' or '-' separated by single
+-- spaces. lab.fn_canonical_variable folds case and whitespace on the way in;
+-- anything else malformed is rejected by the CHECK, never rewritten. `label`
+-- is the common name shown to people ('Probe Depth').
+--
+-- value_type and units are part of what every stored value means, so
+-- trg_variable_guard freezes them once the variable has a value: 1200
+-- recorded as micrometres must not become 1200 millimetres because someone
+-- edited the definition. For different units, define another variable.
+CREATE TABLE lab.variable (
+    name        text PRIMARY KEY,
+    label       text NOT NULL,
+    description text,
+    units       text,                        -- 'um', 'g', 'dB SPL'; NULL = none
+    value_type  text NOT NULL,               -- 'number' | 'text'
+    applies_to  text[] NOT NULL
+                    DEFAULT ARRAY['event','artifact','subject','session','project'],
+    retired_at  timestamptz,                 -- lab.fn_set_variable refuses it once set
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    created_by  uuid REFERENCES lab.person(person_id),
+    CONSTRAINT variable_name_ck CHECK (
+        name ~ '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$' AND length(name) <= 63),
+    CONSTRAINT variable_label_ck CHECK (btrim(label) <> ''),
+    CONSTRAINT variable_units_ck CHECK (units IS NULL OR (units <> '' AND units = btrim(units))),
+    CONSTRAINT variable_value_type_ck CHECK (value_type IN ('number','text')),
+    CONSTRAINT variable_applies_to_ck CHECK (
+        applies_to <@ ARRAY['event','artifact','subject','session','project']
+        AND cardinality(applies_to) > 0)
+);
+
+-- The value log: one row per value set ('set') or cleared ('unset') on an
+-- entity. Exactly the id column matching entity_kind is set, and a 'set' row
+-- carries exactly one of value_num / value_text, whichever the variable's
+-- value_type calls for (trg_variable_value_policy). Numbers are numeric, not
+-- floating point: the digits a user typed are the digits stored. set_at is
+-- when the value was set, the "last updated" time of a current value.
+--
+-- No stored entity_id column, for the reason given at lab.tag_assignment: a
+-- subject rename cascades into subject_id here, and fn_forbid_mutation admits
+-- that cascade only if every other column is unchanged.
+CREATE TABLE lab.variable_value (
+    value_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_kind text NOT NULL,
+    event_id    uuid REFERENCES lab.event(event_id),
+    artifact_id uuid REFERENCES lab.artifact(artifact_id),
+    subject_id  text REFERENCES lab.subject(subject_id) ON UPDATE CASCADE,
+    session_id  uuid REFERENCES lab.session(session_id),
+    project_id  uuid REFERENCES lab.project(project_id),
+    variable    text NOT NULL REFERENCES lab.variable(name),
+    op          text NOT NULL DEFAULT 'set',
+    value_num   numeric,
+    value_text  text,
+    note        text,
+    set_at      timestamptz NOT NULL DEFAULT now(),
+    set_by      uuid REFERENCES lab.person(person_id),
+    -- Login that inserted the row (trg_variable_value_stamp_login).
+    set_login   text,
+    CONSTRAINT variable_value_kind_ck CHECK (
+        entity_kind IN ('event','artifact','subject','session','project')),
+    CONSTRAINT variable_value_op_ck CHECK (op IN ('set','unset')),
+    CONSTRAINT variable_value_entity_ck CHECK (
+            (entity_kind = 'event')    = (event_id IS NOT NULL)
+        AND (entity_kind = 'artifact') = (artifact_id IS NOT NULL)
+        AND (entity_kind = 'subject')  = (subject_id IS NOT NULL)
+        AND (entity_kind = 'session')  = (session_id IS NOT NULL)
+        AND (entity_kind = 'project')  = (project_id IS NOT NULL)),
+    -- A single value: one number or one string when set, neither when unset.
+    CONSTRAINT variable_value_single_ck CHECK (
+        num_nonnulls(value_num, value_text) = CASE op WHEN 'set' THEN 1 ELSE 0 END),
+    -- NaN and the infinities are not measurements; a blank string is "unset".
+    CONSTRAINT variable_value_number_ck CHECK (
+        value_num IS NULL
+        OR value_num NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)),
+    CONSTRAINT variable_value_text_ck CHECK (value_text IS NULL OR btrim(value_text) <> '')
+);
+
+-- ---------------------------------------------------------------------------
 -- Audit logs
 -- ---------------------------------------------------------------------------
 -- Both are append-only (see the trigger loop below). Clients never write to
@@ -695,6 +835,18 @@ CREATE INDEX ix_tag_assignment_subject  ON lab.tag_assignment (subject_id);
 CREATE INDEX ix_tag_assignment_session  ON lab.tag_assignment (session_id);
 CREATE INDEX ix_tag_assignment_project  ON lab.tag_assignment (project_id);
 
+-- Variable values are read the same two ways as tag assignments: per entity
+-- ("this session's variables") and per variable ("every probe depth").
+CREATE INDEX ix_variable_value_entity
+    ON lab.variable_value (entity_kind, coalesce(event_id::text, artifact_id::text, subject_id,
+                                                 session_id::text, project_id::text));
+CREATE INDEX ix_variable_value_variable ON lab.variable_value (variable, entity_kind);
+CREATE INDEX ix_variable_value_event    ON lab.variable_value (event_id);
+CREATE INDEX ix_variable_value_artifact ON lab.variable_value (artifact_id);
+CREATE INDEX ix_variable_value_subject  ON lab.variable_value (subject_id);
+CREATE INDEX ix_variable_value_session  ON lab.variable_value (session_id);
+CREATE INDEX ix_variable_value_project  ON lab.variable_value (project_id);
+
 -- ---------------------------------------------------------------------------
 -- Immutability + validation triggers
 -- ---------------------------------------------------------------------------
@@ -764,7 +916,8 @@ BEGIN
     END IF;
 
     IF TG_TABLE_NAME IN ('artifact_verification', 'maintenance_log',
-                         'row_history', 'schema_version', 'tag_assignment') THEN
+                         'row_history', 'schema_version', 'tag_assignment',
+                         'variable_value', 'retraction') THEN
         RAISE EXCEPTION
           '% on %.% is not allowed: this table is an append-only log.',
           TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
@@ -794,7 +947,7 @@ BEGIN
         'husbandry_event','endpoint_event','histology_event','analysis_event',
         'artifact','event_input',
         'artifact_verification','maintenance_log','row_history','schema_version',
-        'tag_assignment'
+        'tag_assignment','variable_value','retraction'
     ] LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_immutable_%1$s ON lab.%1$s;', t);
@@ -1281,23 +1434,41 @@ CREATE TRIGGER trg_artifact_matches_event
     FOR EACH ROW EXECUTE FUNCTION lab.fn_artifact_matches_event();
 
 -- Record the database login on every row of the append-only logs, whatever
--- the client sends. recorded_by / created_by / verified_by / applied_by name
--- the *person* and are supplied by the client; these columns are the login
--- that was actually connected, which with per-person logins identifies the
--- writer without client cooperation -- the same guarantee row_history gives
--- for the mutable tables. session_user, not current_user: SET ROLE does not
--- change it.
+-- the client sends. recorded_by / created_by / verified_by / applied_by /
+-- retracted_by name the *person* and are supplied by the client; the *_login
+-- columns are the login that was actually connected, which with per-person
+-- logins identifies the writer without client cooperation -- the same
+-- guarantee row_history gives for the mutable tables. session_user, not
+-- current_user: SET ROLE does not change it.
+--
+-- Where the client names no person, the person mapped to the login
+-- (lab.person.db_login, see lab.fn_current_person) is filled in, so a script
+-- or a psql session that sends nothing is still attributed. A person the
+-- client does name is left alone: entering a record on someone's behalf is
+-- legitimate, and the login column says who typed it. lab.variable_value is
+-- stamped but not defaulted here -- lab.fn_set_variable does that -- because
+-- a carried-forward value must keep the set_by it was carried with, NULL
+-- included.
 CREATE OR REPLACE FUNCTION lab.fn_stamp_login() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF TG_TABLE_NAME = 'event' THEN
         NEW.recorded_login := session_user;
+        NEW.recorded_by := coalesce(NEW.recorded_by, lab.fn_current_person());
     ELSIF TG_TABLE_NAME = 'artifact' THEN
         NEW.created_login := session_user;
+        NEW.created_by := coalesce(NEW.created_by, lab.fn_current_person());
     ELSIF TG_TABLE_NAME = 'artifact_verification' THEN
         NEW.verified_login := session_user;
+        NEW.verified_by := coalesce(NEW.verified_by, lab.fn_current_person());
     ELSIF TG_TABLE_NAME = 'tag_assignment' THEN
         NEW.applied_login := session_user;
+        NEW.applied_by := coalesce(NEW.applied_by, lab.fn_current_person());
+    ELSIF TG_TABLE_NAME = 'retraction' THEN
+        NEW.retracted_login := session_user;
+        NEW.retracted_by := coalesce(NEW.retracted_by, lab.fn_current_person());
+    ELSIF TG_TABLE_NAME = 'variable_value' THEN
+        NEW.set_login := session_user;
     ELSE
         RAISE EXCEPTION 'lab.fn_stamp_login is not defined for table %', TG_TABLE_NAME;
     END IF;
@@ -1319,6 +1490,14 @@ CREATE TRIGGER trg_artifact_verification_stamp_login
 
 CREATE TRIGGER trg_tag_assignment_stamp_login
     BEFORE INSERT ON lab.tag_assignment
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_retraction_stamp_login
+    BEFORE INSERT ON lab.retraction
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_variable_value_stamp_login
+    BEFORE INSERT ON lab.variable_value
     FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
 
 -- subject_id is the natural key every append-only table refers to, so only a
@@ -1346,6 +1525,194 @@ $$;
 CREATE TRIGGER trg_subject_id_guard
     BEFORE UPDATE ON lab.subject
     FOR EACH ROW EXECUTE FUNCTION lab.fn_subject_id_guard();
+
+-- The one canonical spelling of a variable name: lower case, with every run
+-- of whitespace (leading, trailing, internal) reduced to nothing or to one
+-- space. 'Probe  Depth ' and 'probe depth' are one variable everywhere.
+-- Nothing else is rewritten; variable_name_ck rejects the rest.
+CREATE OR REPLACE FUNCTION lab.fn_canonical_variable(p_name text) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT btrim(regexp_replace(lower(p_name), '\s+', ' ', 'g'));
+$$;
+
+-- Canonicalise a variable definition on the way in: the name, a label that
+-- defaults to the name, and blank units stored as NULL.
+CREATE OR REPLACE FUNCTION lab.fn_normalize_variable() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    NEW.name  := lab.fn_canonical_variable(NEW.name);
+    NEW.label := coalesce(nullif(btrim(NEW.label), ''), NEW.name);
+    NEW.units := nullif(btrim(NEW.units), '');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_variable_normalize
+    BEFORE INSERT ON lab.variable
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_variable();
+
+-- A variable's name is what the value log refers to, and its value type and
+-- units are what every stored value means: the name never changes, and once
+-- the variable has a value its type and units are frozen and applies_to may
+-- only grow. Label, description and retired_at stay editable.
+CREATE OR REPLACE FUNCTION lab.fn_variable_guard() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    IF NEW.name IS DISTINCT FROM OLD.name THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('variable %s cannot be renamed', OLD.name),
+            HINT    = 'Retire it (set retired_at) and define the new variable instead.';
+    END IF;
+    NEW.units := nullif(btrim(NEW.units), '');
+    IF (NEW.value_type IS DISTINCT FROM OLD.value_type
+        OR NEW.units IS DISTINCT FROM OLD.units
+        OR NOT (NEW.applies_to @> OLD.applies_to))
+       AND EXISTS (SELECT 1 FROM lab.variable_value v WHERE v.variable = OLD.name) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('variable %s has values, so its value type and units are frozen '
+                             'and applies_to may only grow', OLD.name),
+            HINT    = 'Define a new variable for different units and set the converted values.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_variable_guard
+    BEFORE UPDATE ON lab.variable
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_variable_guard();
+
+-- Enforce the definition on every value row, however it is written
+-- (lab.fn_set_variable, a raw INSERT, MATLAB, the GUI). Rejected: a variable
+-- that is not defined; an entity kind outside its applies_to; a number where
+-- the variable holds text or the reverse; an 'unset' of a variable the
+-- entity has no current value for. A row whose entity columns do not match
+-- its entity_kind, or whose op is invalid, is passed through for the CHECKs
+-- to reject. Whether a retired variable takes new values is decided by
+-- lab.fn_set_variable, not here, so that a correction can still carry a
+-- retired variable's value forward. Writers are serialised per (entity,
+-- variable) by an advisory lock held to the end of the transaction.
+CREATE OR REPLACE FUNCTION lab.fn_variable_value_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_var lab.variable%ROWTYPE;
+    v_eid text;
+BEGIN
+    NEW.variable := lab.fn_canonical_variable(NEW.variable);
+    v_eid := CASE NEW.entity_kind
+                 WHEN 'event'    THEN NEW.event_id::text
+                 WHEN 'artifact' THEN NEW.artifact_id::text
+                 WHEN 'subject'  THEN NEW.subject_id
+                 WHEN 'session'  THEN NEW.session_id::text
+                 WHEN 'project'  THEN NEW.project_id::text
+             END;
+    IF v_eid IS NULL OR NEW.op IS NULL OR NEW.op NOT IN ('set', 'unset') THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT v.* INTO v_var FROM lab.variable v WHERE v.name = NEW.variable;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('variable %s is not defined', NEW.variable),
+            HINT    = 'Use lab.fn_set_variable, which defines a variable on first use, '
+                      'or lab.fn_define_variable.';
+    END IF;
+    IF NOT (NEW.entity_kind = ANY (v_var.applies_to)) THEN
+        RAISE EXCEPTION 'variable % applies to % only, not to %',
+            v_var.name, array_to_string(v_var.applies_to, ', '), NEW.entity_kind;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.variable', NEW.entity_kind, v_eid, NEW.variable), 0));
+
+    IF NEW.op = 'unset' THEN
+        IF NOT EXISTS (SELECT 1 FROM lab.variable_current c
+                       WHERE c.entity_kind = NEW.entity_kind
+                         AND c.entity_id = v_eid AND c.variable = NEW.variable) THEN
+            RAISE EXCEPTION '% % has no value for variable %, so there is nothing to unset',
+                NEW.entity_kind, v_eid, NEW.variable;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF v_var.value_type = 'number' AND NEW.value_num IS NULL THEN
+        RAISE EXCEPTION 'variable % holds a number, not text', v_var.name;
+    END IF;
+    IF v_var.value_type = 'text' AND NEW.value_text IS NULL THEN
+        RAISE EXCEPTION 'variable % holds text, not a number', v_var.name;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_variable_value_policy
+    BEFORE INSERT ON lab.variable_value
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_variable_value_policy();
+
+-- A correction is a new row, so without this it would start with none of its
+-- predecessor's variables. Copy them when the superseding event or artifact
+-- is inserted, in the database, so that every client -- and a correction
+-- typed into psql -- behaves the same.
+CREATE OR REPLACE FUNCTION lab.fn_carry_variables_on_supersede() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    IF NEW.supersedes IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF TG_TABLE_NAME = 'event' THEN
+        PERFORM lab.fn_carry_variables('event', NEW.supersedes, NEW.event_id);
+    ELSIF TG_TABLE_NAME = 'artifact' THEN
+        PERFORM lab.fn_carry_variables('artifact', NEW.supersedes, NEW.artifact_id);
+    ELSE
+        RAISE EXCEPTION 'lab.fn_carry_variables_on_supersede is not defined for table %',
+            TG_TABLE_NAME;
+    END IF;
+    RETURN NULL;        -- AFTER trigger: the return value is ignored
+END;
+$$;
+
+CREATE TRIGGER trg_event_carry_variables
+    AFTER INSERT ON lab.event
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_carry_variables_on_supersede();
+
+CREATE TRIGGER trg_artifact_carry_variables
+    AFTER INSERT ON lab.artifact
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_carry_variables_on_supersede();
+
+-- Only the current version of a row can be retracted, and only once: a
+-- superseded row is already inactive, and retracting it would say nothing
+-- about the correction that replaced it.
+CREATE OR REPLACE FUNCTION lab.fn_retraction_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE v_next uuid;
+BEGIN
+    IF NEW.entity_kind = 'event' AND NEW.event_id IS NOT NULL THEN
+        SELECT s.event_id INTO v_next FROM lab.event s WHERE s.supersedes = NEW.event_id;
+        IF v_next IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('event %s has been superseded by %s', NEW.event_id, v_next),
+                HINT    = 'Retract the current version instead.';
+        END IF;
+        IF EXISTS (SELECT 1 FROM lab.retraction r WHERE r.event_id = NEW.event_id) THEN
+            RAISE EXCEPTION 'event % is already retracted', NEW.event_id;
+        END IF;
+    ELSIF NEW.entity_kind = 'artifact' AND NEW.artifact_id IS NOT NULL THEN
+        SELECT s.artifact_id INTO v_next FROM lab.artifact s WHERE s.supersedes = NEW.artifact_id;
+        IF v_next IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('artifact %s has been superseded by %s', NEW.artifact_id, v_next),
+                HINT    = 'Retract the current version instead.';
+        END IF;
+        IF EXISTS (SELECT 1 FROM lab.retraction r WHERE r.artifact_id = NEW.artifact_id) THEN
+            RAISE EXCEPTION 'artifact % is already retracted', NEW.artifact_id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_retraction_policy
+    BEFORE INSERT ON lab.retraction
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_retraction_policy();
 
 -- Edit history for the mutable tables (see lab.row_history). SECURITY DEFINER
 -- so that clients need no INSERT privilege on row_history and cannot write
@@ -1388,7 +1755,8 @@ BEGIN
         ('subject',            '''subject_id'''),
         ('session',            '''session_id'''),
         ('tag_namespace',      '''namespace'''),
-        ('tag',                '''tag''')
+        ('tag',                '''tag'''),
+        ('variable',           '''name''')
     ) AS v(tbl, pk_args) LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_history_%1$s ON lab.%1$s;', r.tbl);
@@ -1455,29 +1823,41 @@ REVOKE ALL ON FUNCTION lab.fn_rename_subject(text, text) FROM PUBLIC;
 -- ---------------------------------------------------------------------------
 -- Views
 -- ---------------------------------------------------------------------------
+-- A row is active when nothing supersedes it and it has not been retracted.
 CREATE VIEW lab.event_active AS
     SELECT e.* FROM lab.event e
     WHERE NOT EXISTS (
-        SELECT 1 FROM lab.event s WHERE s.supersedes = e.event_id);
+        SELECT 1 FROM lab.event s WHERE s.supersedes = e.event_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM lab.retraction r WHERE r.event_id = e.event_id);
 
 CREATE VIEW lab.artifact_active AS
     SELECT a.* FROM lab.artifact a
     WHERE NOT EXISTS (
-        SELECT 1 FROM lab.artifact s WHERE s.supersedes = a.artifact_id);
+        SELECT 1 FROM lab.artifact s WHERE s.supersedes = a.artifact_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM lab.retraction r WHERE r.artifact_id = a.artifact_id);
 
--- Every version of every event / artifact, superseded or not, with the row
--- that replaced it. Readers of full history use these instead of the base
--- tables so that a superseded row cannot be mistaken for a current one:
--- is_current is false and superseded_by names its correction.
+-- Every version of every event / artifact, superseded, retracted or neither,
+-- with the row that replaced it. Readers of full history use these instead of
+-- the base tables so that a row that is no longer in force cannot be mistaken
+-- for a current one: is_current is false, and superseded_by names its
+-- correction or is_retracted says it was withdrawn.
 CREATE VIEW lab.event_version AS
-    SELECT e.*, s.event_id AS superseded_by, (s.event_id IS NULL) AS is_current
+    SELECT e.*, s.event_id AS superseded_by,
+           (s.event_id IS NULL AND r.retraction_id IS NULL) AS is_current,
+           (r.retraction_id IS NOT NULL) AS is_retracted
     FROM lab.event e
-    LEFT JOIN lab.event s ON s.supersedes = e.event_id;
+    LEFT JOIN lab.event s ON s.supersedes = e.event_id
+    LEFT JOIN lab.retraction r ON r.event_id = e.event_id;
 
 CREATE VIEW lab.artifact_version AS
-    SELECT a.*, s.artifact_id AS superseded_by, (s.artifact_id IS NULL) AS is_current
+    SELECT a.*, s.artifact_id AS superseded_by,
+           (s.artifact_id IS NULL AND r.retraction_id IS NULL) AS is_current,
+           (r.retraction_id IS NOT NULL) AS is_retracted
     FROM lab.artifact a
-    LEFT JOIN lab.artifact s ON s.supersedes = a.artifact_id;
+    LEFT JOIN lab.artifact s ON s.supersedes = a.artifact_id
+    LEFT JOIN lab.retraction r ON r.artifact_id = a.artifact_id;
 
 -- The latest integrity check of the *file* each artifact row describes.
 -- Verification belongs to the file, not to the row: a correction to an
@@ -1528,9 +1908,8 @@ CREATE VIEW lab.subject_current AS
     LEFT JOIN LATERAL (
         SELECT h.weight_g, e.occurred_at
         FROM lab.husbandry_event h
-        JOIN lab.event e ON e.event_id = h.event_id
+        JOIN lab.event_active e ON e.event_id = h.event_id
         WHERE e.subject_id = s.subject_id AND h.weight_g IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM lab.event x WHERE x.supersedes = e.event_id)
         -- event_id breaks ties: two weights recorded at the same instant would
         -- otherwise make this view return a different number run to run.
         ORDER BY e.occurred_at DESC, e.event_id DESC LIMIT 1
@@ -1538,10 +1917,9 @@ CREATE VIEW lab.subject_current AS
     LEFT JOIN LATERAL (
         SELECT e.event_id, e.occurred_at
         FROM lab.endpoint_event ee
-        JOIN lab.event e ON e.event_id = ee.event_id
+        JOIN lab.event_active e ON e.event_id = ee.event_id
         WHERE e.subject_id = s.subject_id
-          AND NOT EXISTS (SELECT 1 FROM lab.event x WHERE x.supersedes = e.event_id)
-        ORDER BY e.occurred_at DESC LIMIT 1
+        ORDER BY e.occurred_at DESC, e.event_id DESC LIMIT 1
     ) ep ON true;
 
 -- Current tags: the latest assignment row per (entity, tag), kept when it is
@@ -1582,6 +1960,42 @@ CREATE VIEW lab.entity_tags AS
            array_agg(tc.display_tag ORDER BY tc.tag) AS display_tags
     FROM lab.tag_current tc
     GROUP BY tc.entity_kind, tc.entity_id;
+
+-- Current variables: the latest value row per (entity, variable), kept when
+-- it is a 'set'. "Latest" is insertion order (value_id), as for tags. value
+-- is the value as text whichever kind it is, units and label come from the
+-- definition, and set_at is when this value was set -- the variable's "last
+-- updated" time. The full history is lab.variable_value.
+CREATE VIEW lab.variable_current AS
+    SELECT c.value_id, c.entity_kind, c.entity_id,
+           c.event_id, c.artifact_id, c.subject_id, c.session_id, c.project_id,
+           c.variable, v.label, v.units, v.value_type,
+           c.value_num, c.value_text,
+           coalesce(c.value_text, c.value_num::text) AS value,
+           c.note, c.set_at, c.set_by, c.set_login
+    FROM (
+        SELECT DISTINCT ON (x.entity_kind, x.entity_id, x.variable) x.*
+        FROM (
+            SELECT vv.*,
+                   coalesce(vv.event_id::text, vv.artifact_id::text, vv.subject_id,
+                            vv.session_id::text, vv.project_id::text) AS entity_id
+            FROM lab.variable_value vv
+        ) x
+        ORDER BY x.entity_kind, x.entity_id, x.variable, x.value_id DESC
+    ) c
+    JOIN lab.variable v ON v.name = c.variable
+    WHERE c.op = 'set';
+
+-- One row per entity that has at least one current variable, with all of them
+-- as one JSON object {name: value} -- numbers as JSON numbers, text as
+-- strings -- for joining onto a list of subjects, sessions or files.
+CREATE VIEW lab.entity_variables AS
+    SELECT vc.entity_kind, vc.entity_id,
+           jsonb_object_agg(vc.variable,
+                            CASE WHEN vc.value_num IS NOT NULL THEN to_jsonb(vc.value_num)
+                                 ELSE to_jsonb(vc.value_text) END) AS variables
+    FROM lab.variable_current vc
+    GROUP BY vc.entity_kind, vc.entity_id;
 
 -- ---------------------------------------------------------------------------
 -- Correction chains and the recursive lineage function
@@ -1920,8 +2334,8 @@ $$;
 -- Every entity of kind p_kind that lab.fn_tag_match accepts, as entity_id
 -- text in id order. Untagged entities are candidates too, so a p_none-only
 -- query finds them. For events and artifacts p_active_only (the default)
--- skips superseded rows, like the *_active views; it has no effect on the
--- other kinds.
+-- skips superseded and retracted rows, like the *_active views; it has no
+-- effect on the other kinds.
 CREATE OR REPLACE FUNCTION lab.fn_find_by_tags(
     p_kind        text,
     p_all         text[] DEFAULT NULL,
@@ -1935,14 +2349,14 @@ BEGIN
         RETURN QUERY
         SELECT e.event_id::text FROM lab.event e
         WHERE (NOT p_active_only
-               OR NOT EXISTS (SELECT 1 FROM lab.event s WHERE s.supersedes = e.event_id))
+               OR EXISTS (SELECT 1 FROM lab.event_active x WHERE x.event_id = e.event_id))
           AND lab.fn_tag_match('event', e.event_id::text, p_all, p_any, p_none)
         ORDER BY 1;
     ELSIF p_kind = 'artifact' THEN
         RETURN QUERY
         SELECT a.artifact_id::text FROM lab.artifact a
         WHERE (NOT p_active_only
-               OR NOT EXISTS (SELECT 1 FROM lab.artifact s WHERE s.supersedes = a.artifact_id))
+               OR EXISTS (SELECT 1 FROM lab.artifact_active x WHERE x.artifact_id = a.artifact_id))
           AND lab.fn_tag_match('artifact', a.artifact_id::text, p_all, p_any, p_none)
         ORDER BY 1;
     ELSIF p_kind = 'subject' THEN
@@ -1964,6 +2378,298 @@ BEGIN
         RAISE EXCEPTION 'entity kind must be event, artifact, subject, session or project, got %',
             p_kind;
     END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- People and logins
+-- ---------------------------------------------------------------------------
+-- The person whose lab.person.db_login is the login now connected, or NULL
+-- when the login is mapped to nobody (a shared or service login). Clients
+-- use it to resolve "current person" without asking, and trg_*_stamp_login
+-- uses it to attribute a row whose client named no person.
+CREATE OR REPLACE FUNCTION lab.fn_current_person() RETURNS uuid
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT p.person_id FROM lab.person p WHERE p.db_login = session_user::text;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Retraction
+-- ---------------------------------------------------------------------------
+-- Withdraw an event or artifact that should never have been recorded:
+--
+--     SELECT lab.fn_retract('event', '<event_id>', 'entered twice');
+--
+-- The row and everything that refers to it stay in the database; the
+-- *_active views stop returning it. Retracting an event does not retract the
+-- files it produced -- lab.fn_check_integrity reports them as
+-- artifact_producer_retracted until each is retracted or re-pointed at the
+-- right event. Returns the retraction_id.
+CREATE OR REPLACE FUNCTION lab.fn_retract(
+    p_kind   text,
+    p_id     uuid,
+    p_reason text,
+    p_by     uuid DEFAULT NULL
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE v_out bigint;
+BEGIN
+    IF p_kind IS NULL OR p_kind NOT IN ('event', 'artifact') THEN
+        RAISE EXCEPTION 'only an event or an artifact can be retracted, got %', p_kind;
+    END IF;
+    IF p_id IS NULL THEN
+        RAISE EXCEPTION 'an id is required';
+    END IF;
+    INSERT INTO lab.retraction (entity_kind, event_id, artifact_id, reason, retracted_by)
+    VALUES (p_kind,
+            CASE WHEN p_kind = 'event'    THEN p_id END,
+            CASE WHEN p_kind = 'artifact' THEN p_id END,
+            p_reason, p_by)
+    RETURNING retraction_id INTO v_out;
+    RETURN v_out;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- User-defined variables: writes and simple reads
+-- ---------------------------------------------------------------------------
+-- Define a variable without setting it, and return its canonical name. A
+-- variable that already exists is returned as is, provided the value type
+-- and units asked for are the ones it has; otherwise this raises rather than
+-- letting two meanings share a name.
+CREATE OR REPLACE FUNCTION lab.fn_define_variable(
+    p_name        text,
+    p_value_type  text DEFAULT 'number',
+    p_units       text DEFAULT NULL,
+    p_label       text DEFAULT NULL,
+    p_description text DEFAULT NULL,
+    p_applies_to  text[] DEFAULT NULL,
+    p_by          uuid DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_name  text := lab.fn_canonical_variable(p_name);
+    v_units text := nullif(btrim(p_units), '');
+    v_var   lab.variable%ROWTYPE;
+BEGIN
+    IF v_name IS NULL OR v_name = '' THEN
+        RAISE EXCEPTION 'a variable name is required';
+    END IF;
+    IF v_name !~ '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$' OR length(v_name) > 63 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('"%s" is not a valid variable name', v_name),
+            HINT    = 'Use words of letters, digits, _ or -, separated by single spaces and '
+                      'starting with a letter, at most 63 characters: probe depth';
+    END IF;
+    SELECT v.* INTO v_var FROM lab.variable v WHERE v.name = v_name;
+    IF FOUND THEN
+        IF v_var.value_type IS DISTINCT FROM p_value_type
+           OR v_var.units IS DISTINCT FROM v_units THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('variable %s is already defined as a %s in %s; asked for a %s in %s',
+                                 v_name, v_var.value_type, coalesce(v_var.units, 'no units'),
+                                 coalesce(p_value_type, 'NULL'), coalesce(v_units, 'no units')),
+                HINT    = 'Use the existing definition, or define a variable with another name.';
+        END IF;
+        RETURN v_name;
+    END IF;
+    INSERT INTO lab.variable (name, label, description, units, value_type, applies_to, created_by)
+    VALUES (v_name, p_label, p_description, v_units, p_value_type,
+            coalesce(p_applies_to, ARRAY['event','artifact','subject','session','project']),
+            coalesce(p_by, lab.fn_current_person()))
+    ON CONFLICT (name) DO NOTHING;
+    RETURN v_name;
+END;
+$$;
+
+-- The one write entry point for variables, used by every client. Exactly one
+-- of p_number / p_text is given:
+--
+--     SELECT lab.fn_set_variable('session', '<session_id>', 'Probe Depth', 1200,
+--                                p_units => 'um', p_label => 'Probe Depth',
+--                                p_description => 'Depth of the probe tip below the pia');
+--     SELECT lab.fn_set_variable('subject', 'G-0421', 'housing', p_text => 'pair');
+--     SELECT lab.fn_set_variable('session', '<session_id>', 'probe depth', 1350);  -- an update
+--
+-- p_kind is event, artifact, subject, session or project and p_id that
+-- entity's id as text. The name is canonicalised (lab.fn_canonical_variable).
+-- A variable used for the first time is defined on the spot, as a number or
+-- as text according to which value was given, with the units, label and
+-- description supplied; for a variable that already exists those three are
+-- not changed by this call (edit lab.variable), and units that differ from
+-- the definition are an error, so a value in millimetres cannot be filed
+-- under a variable recorded in micrometres. Setting a variable again appends
+-- a row -- that is an update -- and lab.variable_current shows the latest.
+-- Returns the value_id of the row written.
+CREATE OR REPLACE FUNCTION lab.fn_set_variable(
+    p_kind        text,
+    p_id          text,
+    p_name        text,
+    p_number      numeric DEFAULT NULL,
+    p_text        text DEFAULT NULL,
+    p_units       text DEFAULT NULL,
+    p_label       text DEFAULT NULL,
+    p_description text DEFAULT NULL,
+    p_note        text DEFAULT NULL,
+    p_by          uuid DEFAULT NULL
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_name  text := lab.fn_canonical_variable(p_name);
+    v_units text := nullif(btrim(p_units), '');
+    v_var   lab.variable%ROWTYPE;
+    v_uuid  uuid;
+    v_out   bigint;
+BEGIN
+    IF p_kind IS NULL OR p_kind NOT IN ('event', 'artifact', 'subject', 'session', 'project') THEN
+        RAISE EXCEPTION 'entity kind must be event, artifact, subject, session or project, got %',
+            p_kind;
+    END IF;
+    IF p_id IS NULL THEN
+        RAISE EXCEPTION 'an entity id is required';
+    END IF;
+    IF v_name IS NULL OR v_name = '' THEN
+        RAISE EXCEPTION 'a variable name is required';
+    END IF;
+    IF num_nonnulls(p_number, p_text) <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('variable %s needs exactly one value: a number or a string', v_name),
+            HINT    = 'To clear a variable use lab.fn_unset_variable.';
+    END IF;
+    IF p_kind <> 'subject' THEN
+        v_uuid := p_id::uuid;
+    END IF;
+
+    SELECT v.* INTO v_var FROM lab.variable v WHERE v.name = v_name;
+    IF NOT FOUND THEN
+        PERFORM lab.fn_define_variable(
+            v_name, CASE WHEN p_number IS NOT NULL THEN 'number' ELSE 'text' END,
+            v_units, p_label, p_description, NULL, p_by);
+        SELECT v.* INTO v_var FROM lab.variable v WHERE v.name = v_name;
+    ELSE
+        IF v_var.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION 'variable % was retired at % and takes no new values',
+                v_name, v_var.retired_at;
+        END IF;
+        IF v_units IS NOT NULL AND v_units IS DISTINCT FROM v_var.units THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('variable %s is recorded in %s, not in %s',
+                                 v_name, coalesce(v_var.units, 'no units'), v_units),
+                HINT    = 'Convert the value, or define a separate variable for the other units.';
+        END IF;
+    END IF;
+    IF v_var.value_type = 'number' AND p_number IS NULL THEN
+        RAISE EXCEPTION 'variable % holds a number; pass p_number', v_name;
+    END IF;
+    IF v_var.value_type = 'text' AND p_text IS NULL THEN
+        RAISE EXCEPTION 'variable % holds text; pass p_text', v_name;
+    END IF;
+
+    INSERT INTO lab.variable_value (entity_kind, event_id, artifact_id, subject_id, session_id,
+                                    project_id, variable, op, value_num, value_text, note, set_by)
+    VALUES (p_kind,
+            CASE WHEN p_kind = 'event'    THEN v_uuid END,
+            CASE WHEN p_kind = 'artifact' THEN v_uuid END,
+            CASE WHEN p_kind = 'subject'  THEN p_id END,
+            CASE WHEN p_kind = 'session'  THEN v_uuid END,
+            CASE WHEN p_kind = 'project'  THEN v_uuid END,
+            v_name, 'set', p_number, p_text, p_note, coalesce(p_by, lab.fn_current_person()))
+    RETURNING value_id INTO v_out;
+    RETURN v_out;
+END;
+$$;
+
+-- Clear a variable on an entity: appends an 'unset' row, after which the
+-- entity has no current value for it. The earlier values stay in the log.
+CREATE OR REPLACE FUNCTION lab.fn_unset_variable(
+    p_kind text,
+    p_id   text,
+    p_name text,
+    p_note text DEFAULT NULL,
+    p_by   uuid DEFAULT NULL
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_uuid uuid;
+    v_out  bigint;
+BEGIN
+    IF p_kind IS NULL OR p_kind NOT IN ('event', 'artifact', 'subject', 'session', 'project') THEN
+        RAISE EXCEPTION 'entity kind must be event, artifact, subject, session or project, got %',
+            p_kind;
+    END IF;
+    IF p_id IS NULL THEN
+        RAISE EXCEPTION 'an entity id is required';
+    END IF;
+    IF p_kind <> 'subject' THEN
+        v_uuid := p_id::uuid;
+    END IF;
+    INSERT INTO lab.variable_value (entity_kind, event_id, artifact_id, subject_id, session_id,
+                                    project_id, variable, op, note, set_by)
+    VALUES (p_kind,
+            CASE WHEN p_kind = 'event'    THEN v_uuid END,
+            CASE WHEN p_kind = 'artifact' THEN v_uuid END,
+            CASE WHEN p_kind = 'subject'  THEN p_id END,
+            CASE WHEN p_kind = 'session'  THEN v_uuid END,
+            CASE WHEN p_kind = 'project'  THEN v_uuid END,
+            p_name, 'unset', p_note, coalesce(p_by, lab.fn_current_person()))
+    RETURNING value_id INTO v_out;
+    RETURN v_out;
+END;
+$$;
+
+-- The current value of one variable on one entity, for use in an ordinary
+-- query -- NULL when the entity has no current value for it:
+--
+--     SELECT s.session_id, s.label,
+--            lab.fn_variable_number('session', s.session_id::text, 'probe depth') AS probe_depth_um
+--     FROM lab.session s;
+--
+-- fn_variable_number is the number (NULL for a text variable);
+-- fn_variable_text is the value as text, whichever kind it is.
+CREATE OR REPLACE FUNCTION lab.fn_variable_number(p_kind text, p_id text, p_name text)
+RETURNS numeric
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT c.value_num FROM lab.variable_current c
+    WHERE c.entity_kind = p_kind
+      AND c.entity_id = CASE WHEN p_kind IN ('event', 'artifact', 'session', 'project')
+                             THEN p_id::uuid::text ELSE p_id END
+      AND c.variable = lab.fn_canonical_variable(p_name);
+$$;
+
+CREATE OR REPLACE FUNCTION lab.fn_variable_text(p_kind text, p_id text, p_name text)
+RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT c.value FROM lab.variable_current c
+    WHERE c.entity_kind = p_kind
+      AND c.entity_id = CASE WHEN p_kind IN ('event', 'artifact', 'session', 'project')
+                             THEN p_id::uuid::text ELSE p_id END
+      AND c.variable = lab.fn_canonical_variable(p_name);
+$$;
+
+-- Copy the current variables of a superseded event or artifact onto its
+-- successor, keeping each value's set_at and set_by: the value was not
+-- changed by the correction, so its "last updated" must not move. Called by
+-- trg_*_carry_variables; returns the number of values copied.
+CREATE OR REPLACE FUNCTION lab.fn_carry_variables(p_kind text, p_old_id uuid, p_new_id uuid)
+RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE v_n integer;
+BEGIN
+    IF p_kind IS NULL OR p_kind NOT IN ('event', 'artifact') THEN
+        RAISE EXCEPTION 'variables are carried forward for events and artifacts only, got %', p_kind;
+    END IF;
+    INSERT INTO lab.variable_value (entity_kind, event_id, artifact_id, variable, op,
+                                    value_num, value_text, note, set_at, set_by)
+    SELECT p_kind,
+           CASE WHEN p_kind = 'event'    THEN p_new_id END,
+           CASE WHEN p_kind = 'artifact' THEN p_new_id END,
+           c.variable, 'set', c.value_num, c.value_text,
+           format('carried forward from %s', p_old_id), c.set_at, c.set_by
+    FROM lab.variable_current c
+    WHERE c.entity_kind = p_kind AND c.entity_id = p_old_id::text
+    ORDER BY c.value_id;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
 END;
 $$;
 
@@ -2157,6 +2863,25 @@ LANGUAGE sql STABLE AS $$
     HAVING count(*) > 1
 
     UNION ALL
+    -- Active artifacts whose producing event has been retracted (in its
+    -- current version): the event was withdrawn but its files are still
+    -- listed. Retract each file too, or supersede it with
+    -- produced_by_event_id set to the event it belongs to.
+    SELECT 'warning', 'artifact_producer_retracted', a.artifact_id::text,
+           format('produced by event %s, which was retracted: %s', r.event_id, r.reason)
+    FROM lab.artifact_active a
+    JOIN lab.retraction r ON r.event_id = lab.fn_event_current(a.produced_by_event_id)
+
+    UNION ALL
+    -- Active events that consumed an artifact since retracted: the analysis
+    -- rests on a file the lab has withdrawn.
+    SELECT 'warning', 'input_retracted', e.event_id::text,
+           format('consumed artifact %s, which was retracted: %s', ei.artifact_id, r.reason)
+    FROM lab.event_active e
+    JOIN lab.event_input ei ON ei.event_id = e.event_id
+    JOIN lab.retraction r ON r.artifact_id = lab.fn_artifact_current(ei.artifact_id)
+
+    UNION ALL
     -- Two active artifacts at one path: the NAS file can only be one of them.
     SELECT 'warning', 'duplicate_active_path',
            a.storage_root_id || ':' || a.relative_path,
@@ -2232,7 +2957,7 @@ ON CONFLICT (tag) DO NOTHING;
 -- design_docs/migrations/ and with the client constants that check it
 -- (CarasLabDB.SchemaVersionExpected, caraslabdb_mcp.db.SCHEMA_VERSION).
 INSERT INTO lab.schema_version (version, description) VALUES
-    (4, 'Fresh install from schema.sql')
+    (5, 'Fresh install from schema.sql')
 ON CONFLICT (version) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
