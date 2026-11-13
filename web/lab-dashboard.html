@@ -11,7 +11,12 @@ try{
   document.documentElement.setAttribute('data-theme', theme);
 }catch(e){}
 </script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+<!-- Chart.js is the page's one network dependency. It is loaded with `async`
+     so that a CDN which never answers cannot hold the page up: the app starts
+     without it, draws the charts when it arrives, and shows a notice in their
+     place if it fails or is late (see loadCharts). The handlers record the
+     outcome for an app that starts after the script has already settled. -->
+<script async id="chartjs-cdn" src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous" onload="window.__chartJsState='ok'" onerror="window.__chartJsState='failed'"></script>
 <style>
   :root{
     --bg-primary:#eef1f6;
@@ -394,7 +399,7 @@ try{
       </div>
       <div class="filter-group">
         <label for="f-subject">Subject</label>
-        <select id="f-subject"><option value="all">All subjects</option></select>
+        <select id="f-subject"><option value="">All subjects</option></select>
       </div>
       <div class="filter-group">
         <label for="f-event">Event type</label>
@@ -471,17 +476,17 @@ try{
     <div class="chart-grid" id="chart-grid">
       <div class="card">
         <h3>Events by type</h3>
-        <div class="card-sub">Active events in the current selection</div>
+        <div class="card-sub" id="chart-events-sub">Active events in the current selection</div>
         <div class="chart-wrap"><canvas id="chart-events"></canvas></div>
       </div>
       <div class="card">
         <h3>Lab activity over time</h3>
-        <div class="card-sub">Events per month, with recordings highlighted</div>
+        <div class="card-sub" id="chart-time-sub">Events per month, with recordings highlighted</div>
         <div class="chart-wrap"><canvas id="chart-time"></canvas></div>
       </div>
       <div class="card">
         <h3>Storage by artifact role</h3>
-        <div class="card-sub">Registered bytes on the NAS</div>
+        <div class="card-sub">Registered bytes on the NAS, each file counted once</div>
         <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
       </div>
     </div>
@@ -1191,20 +1196,48 @@ try{
   const isEventActive = e => !supersededEvents.has(e.event_id);
   const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
 
+  // Correction chains. uq_event_supersedes / uq_artifact_supersedes keep each
+  // chain linear, so every row has exactly one current version: the end of
+  // its chain. Same resolution as lab.fn_event_current / fn_artifact_current
+  // (chainEnd) and lab.fn_event_versions / fn_artifact_versions (chainRows,
+  // the current row first).
+  const eventSuccessor = new Map(D.events.filter(e=>e.supersedes).map(e=>[e.supersedes,e.event_id]));
+  const artifactSuccessor = new Map(D.artifacts.filter(a=>a.supersedes).map(a=>[a.supersedes,a.artifact_id]));
+  const chainEnd = (succ,id) => { for(let n=0; succ.has(id) && n<100000; n++) id=succ.get(id); return id; };
+  const eventCurrent = id => chainEnd(eventSuccessor,id);
+  const artifactCurrent = id => chainEnd(artifactSuccessor,id);
+  const chainRows = (byId,succ,id) => {
+    const out=[]; let row=byId.get(chainEnd(succ,id));
+    for(let n=0; row && n<100000; n++){ out.push(row); row=row.supersedes?byId.get(row.supersedes):null; }
+    return out;
+  };
+
+  // Storage totals count a file once. A superseded artifact row and its
+  // correction describe the same bytes (same storage root, path and checksum),
+  // so with "Active only" off both rows are listed but the file is still one.
+  // The active row is kept as the file's representative: its role is current.
+  const fileKey = a => a.storage_root_id+'\u0000'+a.relative_path+'\u0000'+a.checksum;
+  function distinctFiles(arts){
+    const byFile=new Map();
+    arts.forEach(a=>{ const k=fileKey(a), p=byFile.get(k); if(!p || (!isArtifactActive(p) && isArtifactActive(a))) byFile.set(k,a); });
+    return [...byFile.values()];
+  }
+  const totalBytes = arts => distinctFiles(arts).reduce((s,a)=>s+(a.size_bytes||0),0);
+
   // current tags per entity, derived from the append-only assignment log like
-  // lab.tag_current: the latest row per (entity, tag) -- by applied_at, then
-  // assignment_id -- counts when it is an 'add'.
+  // lab.tag_current: the latest row per (entity, tag) counts when it is an
+  // 'add'. "Latest" is insertion order (assignment_id), never applied_at,
+  // which a client can supply.
   const tagNsByName = new Map(D.tagNamespaces.map(n=>[n.namespace,n]));
   const tagByName = new Map(D.tags.map(t=>[t.tag,t]));
   const tagKey = (kind,id) => kind+'|'+id;
-  // applied_at compares as text once the fraction has a fixed width (the live
+  // a timestamp compares as text once its fraction has a fixed width (the live
   // export carries microseconds, the synthetic data milliseconds)
   const tsKey = s => { const m=/^(.*?)(?:\.(\d+))?Z$/.exec(s||''); return m ? m[1]+'.'+((m[2]||'')+'000000').slice(0,6) : String(s||''); };
   const latestTagRow = new Map();         // 'kind|id|tag' -> newest log row
   D.tagAssignments.forEach(r=>{
     const k=tagKey(r.entity_kind,r.entity_id)+'|'+r.tag, p=latestTagRow.get(k);
-    const rk=tsKey(r.applied_at), pk=p&&tsKey(p.applied_at);
-    if(!p || rk>pk || (rk===pk && r.assignment_id>p.assignment_id)) latestTagRow.set(k,r);
+    if(!p || r.assignment_id>p.assignment_id) latestTagRow.set(k,r);
   });
   const currentTagsByEntity = new Map();  // 'kind|id' -> [tag], sorted
   latestTagRow.forEach(r=>{
@@ -1236,17 +1269,24 @@ try{
     artifactsByEvent.get(a.produced_by_event_id).push(a);
   });
 
-  // subject_current: latest active weight + endpoint status
+  // subject_current: latest active weight + endpoint status. "Latest" is the
+  // view's own order -- occurred_at DESC, then event_id DESC -- so two weights
+  // entered with the same timestamp resolve to the same row here as in
+  // lab.subject_current (uuids compare bytewise there, i.e. as their text).
+  const laterEvent = (a,b) => {
+    const ka=tsKey(a.occurred_at), kb=tsKey(b.occurred_at);
+    return ka!==kb ? ka>kb : String(a.event_id)>String(b.event_id);
+  };
   const subjectCurrent = new Map();
   D.subjects.forEach(s=> subjectCurrent.set(s.subject_id, {latest_weight_g:null, latest_weight_at:null, is_endpointed:false, endpoint_at:null}));
   D.events.forEach(e=>{
     if(!isEventActive(e) || !e.subject_id) return;
     const sc = subjectCurrent.get(e.subject_id); if(!sc) return;
     if(e.event_type==='husbandry' && e.detail && e.detail.weight_g!=null){
-      if(!sc.latest_weight_at || e.occurred_at > sc.latest_weight_at){ sc.latest_weight_g=e.detail.weight_g; sc.latest_weight_at=e.occurred_at; }
+      if(!sc._w || laterEvent(e,sc._w)){ sc._w=e; sc.latest_weight_g=e.detail.weight_g; sc.latest_weight_at=e.occurred_at; }
     }
     if(e.event_type==='endpoint'){
-      if(!sc.endpoint_at || e.occurred_at > sc.endpoint_at){ sc.is_endpointed=true; sc.endpoint_at=e.occurred_at; }
+      if(!sc._e || laterEvent(e,sc._e)){ sc._e=e; sc.is_endpointed=true; sc.endpoint_at=e.occurred_at; }
     }
   });
   // event / artifact counts per subject & session
@@ -1295,7 +1335,17 @@ try{
     return (v>=100||i===0?v.toFixed(0):v.toFixed(1))+' '+u[i];
   }
   function fmtNum(n){ return n==null?'—':n.toLocaleString(); }
-  const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  // Every value from the payload goes through esc() on its way into HTML, the
+  // constrained ones (event type, status, sex, ...) included: a CHECK or a
+  // lookup table is the database's promise, not this page's.
+  const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  // A data value used as part of a CSS class name: anything outside
+  // [A-Za-z0-9_-] becomes '_', so it can neither leave the attribute nor add
+  // a second class.
+  const cssTok = s => String(s==null?'':s).replace(/[^A-Za-z0-9_-]/g,'_');
+  // Only web links become links. A stored URI is free text, and a javascript:
+  // or data: URL must never reach an href; anything else is shown as text.
+  const webHref = u => { const s=String(u==null?'':u).trim(); return /^https?:\/\//i.test(s) ? s : null; };
   // Timestamps arrive as UTC ISO-8601 ('…Z' or '…+00:00'); dates such as
   // date_of_birth and started_on arrive as bare 'YYYY-MM-DD'. Timestamps are
   // shown, filtered and bucketed in the viewer's own time zone (named in the
@@ -1311,7 +1361,7 @@ try{
   function localDay(iso){
     if(isDateOnly(iso)) return iso;
     const d=parseTs(iso);
-    if(isNaN(d)) return String(iso).slice(0,10);
+    if(isNaN(d)) return esc(String(iso).slice(0,10));   // unparseable: shown as stored, never as markup
     return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
   }
   const fmtDate = iso => iso ? localDay(iso) : '—';
@@ -1319,12 +1369,13 @@ try{
     if(!iso) return '—';
     if(isDateOnly(iso)) return iso;
     const d=parseTs(iso);
-    if(isNaN(d)) return String(iso).slice(0,16).replace('T',' ');
+    if(isNaN(d)) return esc(String(iso).slice(0,16).replace('T',' '));
     return `${localDay(iso)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   }
   const personName = id => { const p=personById.get(id); return p?p.full_name:'—'; };
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
-  function typeBadge(t){ return `<span class="badge ev-${t}"><span class="dot dot-${t}"></span>${etLabel.get(t)||t}</span>`; }
+  const etName = t => etLabel.get(t)||t||'';
+  function typeBadge(t){ const c=cssTok(t); return `<span class="badge ev-${c}"><span class="dot dot-${c}"></span>${esc(etName(t))}</span>`; }
   // current tags as clickable chips (a click appends the tag to the tag filter)
   function tagChips(kind,id){
     return entityTags(kind,id).map(t=>{
@@ -1365,8 +1416,13 @@ try{
     const dir = artifactFolderPath(a);
     return dir ? root+'/'+dir : root;
   }
+  // A browser refuses to follow a file: link from a page served over http(s)
+  // ("Not allowed to load local resource"), so the link is offered only when
+  // the page itself was opened from disk. A served page shows the folder as
+  // text in the artifact dialog instead of a link that does nothing.
+  const CAN_LINK_FILES = location.protocol==='file:';
   function folderLink(a){
-    const href = artifactFolderUri(a);
+    const href = CAN_LINK_FILES ? artifactFolderUri(a) : null;
     if(!href) return '';
     return `<a class="link" href="${esc(href)}" target="_blank" rel="noopener" title="Open parent folder — ${esc(artifactFolderLabel(a))}">folder</a>`;
   }
@@ -1379,20 +1435,23 @@ try{
   function eventSummary(e){
     const d=e.detail||{};
     switch(e.event_type){
-      case 'birth': return `Litter ${esc(d.litter_id||'—')}${d.birth_weight_g?`, ${d.birth_weight_g} g`:''}`;
-      case 'surgery': return `${esc(d.procedure||'Surgery')} · ${esc(d.target_region||'')} ${d.hemisphere?'('+d.hemisphere+')':''}`;
-      case 'recording': return `${esc((d.modality||'ephys'))} · ${d.n_channels||'?'} ch @ ${d.sample_rate_hz? (d.sample_rate_hz/1000)+' kHz':'?'} · ${fmtDur(d.duration_s)}`;
-      case 'behavior': return `${esc(d.task||'')} · ${esc(d.stage||'')} · ${d.trials_completed||0} trials${d.performance!=null?` · perf ${d.performance}`:''}`;
-      case 'husbandry': return d.measure==='weight' ? `Weight ${d.weight_g} g` : `${esc(d.measure)}${d.water_ml?` · ${d.water_ml} mL`:''}`;
+      case 'birth': return `Litter ${esc(d.litter_id||'—')}${d.birth_weight_g?`, ${esc(d.birth_weight_g)} g`:''}`;
+      case 'surgery': return `${esc(d.procedure||'Surgery')} · ${esc(d.target_region||'')} ${d.hemisphere?'('+esc(d.hemisphere)+')':''}`;
+      case 'recording': return `${esc((d.modality||'ephys'))} · ${esc(d.n_channels||'?')} ch @ ${d.sample_rate_hz? esc(d.sample_rate_hz/1000)+' kHz':'?'} · ${fmtDur(d.duration_s)}`;
+      case 'behavior': return `${esc(d.task||'')} · ${esc(d.stage||'')} · ${esc(d.trials_completed||0)} trials${d.performance!=null?` · perf ${esc(d.performance)}`:''}`;
+      case 'husbandry': return d.measure==='weight' ? `Weight ${esc(d.weight_g)} g` : `${esc(d.measure)}${d.water_ml?` · ${esc(d.water_ml)} mL`:''}`;
       case 'endpoint': return `${esc(d.method||'')}${d.perfusion_fixative?` · ${esc(d.perfusion_fixative)}`:''}`;
       case 'histology': return `${esc(d.technique||'')} · ${esc(d.stain||'')} · ${esc(d.target_region||'')}`;
-      case 'analysis': return `${esc(d.pipeline_name||'pipeline')} · <span class="pill ${d.status||''}">${esc(d.status||'—')}</span>`;
+      case 'analysis': return `${esc(d.pipeline_name||'pipeline')} · <span class="pill ${cssTok(d.status)}">${esc(d.status||'—')}</span>`;
       default: return '';
     }
   }
 
   // ---- filters / state ----
-  const F = { species:'all', subject:'all', event:'all', from:'', to:'', activeOnly:true, tags:'' };
+  // subject:'' means "all subjects". The empty string is the one value a
+  // subject_id can never be (lab.subject's CHECK), whereas a word such as
+  // 'all' is a legal animal id and would then be impossible to select.
+  const F = { species:'all', subject:'', event:'all', from:'', to:'', activeOnly:true, tags:'' };
   let currentView='overview';
 
   // Tag filter: space-separated tokens that must all hold (AND); '-tok' must
@@ -1427,11 +1486,21 @@ try{
     return true;
   }
 
+  // The From/To filter is about when things happened in the lab. A file is
+  // dated by the event that produced it (its current version, if corrected),
+  // so an event and its files are always in or out together; created_at --
+  // when the row was registered, which for back-filled data is years later --
+  // is used only if that event is missing from the payload.
+  function artifactWhen(a){
+    const ev=eventById.get(eventCurrent(a.produced_by_event_id))||eventById.get(a.produced_by_event_id);
+    return ev ? ev.occurred_at : a.created_at;
+  }
+
   function filteredEvents(){
     return D.events.filter(e=>{
       if(F.activeOnly && !isEventActive(e)) return false;
       if(F.event!=='all' && e.event_type!==F.event) return false;
-      if(F.subject!=='all' && e.subject_id!==F.subject) return false;
+      if(F.subject!=='' && e.subject_id!==F.subject) return false;
       if(!passSpecies(e.subject_id)) return false;
       if((F.from||F.to) && !withinDate(e.occurred_at)) return false;
       if(!passTags('event',e.event_id)) return false;
@@ -1441,14 +1510,14 @@ try{
   function filteredSubjects(){
     return D.subjects.filter(s=>{
       if(F.species!=='all' && s.species_code!==F.species) return false;
-      if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      if(F.subject!=='' && s.subject_id!==F.subject) return false;
       if(!passTags('subject',s.subject_id)) return false;
       return true;
     });
   }
   function filteredSessions(){
     return D.sessions.filter(s=>{
-      if(F.subject!=='all' && s.subject_id!==F.subject) return false;
+      if(F.subject!=='' && s.subject_id!==F.subject) return false;
       if(!passSpecies(s.subject_id)) return false;
       if((F.from||F.to) && !withinDate(s.started_at)) return false;
       if(!passTags('session',s.session_id)) return false;
@@ -1458,9 +1527,9 @@ try{
   function filteredArtifacts(){
     return D.artifacts.filter(a=>{
       if(F.activeOnly && !isArtifactActive(a)) return false;
-      if(F.subject!=='all' && a.subject_id!==F.subject) return false;
+      if(F.subject!=='' && a.subject_id!==F.subject) return false;
       if(!passSpecies(a.subject_id)) return false;
-      if((F.from||F.to) && !withinDate(a.created_at)) return false;
+      if((F.from||F.to) && !withinDate(artifactWhen(a))) return false;
       if(!passTags('artifact',a.artifact_id)) return false;
       return true;
     });
@@ -1479,7 +1548,7 @@ try{
     const recs = evs.filter(e=>e.event_type==='recording');
     const recHours = recs.reduce((a,e)=> a + ((e.detail&&e.detail.duration_s)||0)/3600, 0);
     const activeSubs = subs.filter(s=>!subjectCurrent.get(s.subject_id).is_endpointed).length;
-    const bytes = arts.reduce((a,x)=>a+(x.size_bytes||0),0);
+    const bytes = totalBytes(arts);   // each file once, even with superseded rows listed
     const analyses = evs.filter(e=>e.event_type==='analysis').length;
     const cards = [
       {c:'c6', label:'Subjects',   value:subs.length,               sub:`${activeSubs} active · ${subs.length-activeSubs} endpointed`},
@@ -1504,20 +1573,42 @@ try{
   // simply absent, and touching it here would abort the whole app and leave a
   // blank page. Everything except the three canvases works fine without it, so
   // gate the chart entry points instead and say so in the chart grid.
-  const HAS_CHART = typeof Chart !== 'undefined';
-  if(HAS_CHART){
+  //
+  // The script tag is `async`, so the library can also arrive after this code
+  // has started, or hang: a CDN that is silently dropped rather than refused
+  // would otherwise keep the whole page blank until the browser gives up.
+  // loadCharts() therefore draws the charts whenever the library is there and
+  // falls back to the notice on an error or after CHART_WAIT_MS.
+  let HAS_CHART = false;               // true once the charts have been built
+  const CHART_WAIT_MS = 8000;          // measured from the start of the page load
+  const MAX_MONTHS = 240;              // activity chart: at most the latest 20 years
+  const BYTE_UNITS = ['B','KB','MB','GB','TB','PB'];
+  function chartsUnavailable(){
+    if(HAS_CHART) return;
+    const grid=document.getElementById('chart-grid');
+    if(grid && !grid.querySelector('.chart-offline')) grid.innerHTML='<div class="card chart-offline"><b>Charts unavailable offline.</b> '+
+      'Chart.js could not be loaded from its CDN. Every KPI, table, filter and drill-down below still works.</div>';
+  }
+  function startCharts(){
+    if(HAS_CHART) return;
+    // no canvas: the notice has already replaced the grid (the library was late)
+    if(typeof Chart === 'undefined' || !document.getElementById('chart-events')){ chartsUnavailable(); return; }
+    HAS_CHART = true;
     Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
     Chart.defaults.font.size = 12;
     Chart.defaults.color = CSSVAR.getPropertyValue('--text-secondary').trim();
+    buildCharts(); applyChartTheme(); updateCharts();
+  }
+  function loadCharts(){
+    if(typeof Chart !== 'undefined'){ startCharts(); return; }
+    const tag=document.getElementById('chartjs-cdn');
+    if(!tag || window.__chartJsState==='failed'){ chartsUnavailable(); return; }
+    tag.addEventListener('load', startCharts);
+    tag.addEventListener('error', chartsUnavailable);
+    setTimeout(chartsUnavailable, Math.max(1500, CHART_WAIT_MS - performance.now()));
   }
 
   function buildCharts(){
-    if(!HAS_CHART){
-      const grid=document.getElementById('chart-grid');
-      if(grid) grid.innerHTML='<div class="card chart-offline"><b>Charts unavailable offline.</b> '+
-        'Chart.js could not be loaded from its CDN. Every KPI, table, filter and drill-down below still works.</div>';
-      return;
-    }
     charts.events = new Chart(document.getElementById('chart-events'),{
       type:'doughnut',
       data:{labels:[],datasets:[{data:[],backgroundColor:[],borderColor:CSSVAR.getPropertyValue('--bg-card').trim(),borderWidth:2}]},
@@ -1527,10 +1618,13 @@ try{
     });
     charts.storage = new Chart(document.getElementById('chart-storage'),{
       type:'bar',
-      data:{labels:[],datasets:[{label:'GB',data:[],backgroundColor:'#4C72B0CC',borderColor:'#4C72B0',borderWidth:1,borderRadius:4}]},
+      // Bars are the exact byte totals divided by one unit chosen from the
+      // largest bar (updateCharts sets $unit and $bytes); nothing is rounded
+      // before it is drawn, and the tooltip reads the true total, not the bar.
+      data:{labels:[],datasets:[{label:'Size',data:[],backgroundColor:'#4C72B0CC',borderColor:'#4C72B0',borderWidth:1,borderRadius:4}]},
       options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',
-        plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${fmtBytes(c.raw*1073741824)}`}}},
-        scales:{x:{beginAtZero:true,ticks:{callback:v=>v+' GB'},grid:{color:CSSVAR.getPropertyValue('--chart-grid').trim()}},y:{grid:{display:false}}}}
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>{ const b=(c.chart.$bytes||[])[c.dataIndex]; return b==null?'':` ${fmtBytes(b)} (${fmtNum(b)} bytes)`; }}}},
+        scales:{x:{beginAtZero:true,ticks:{callback:function(v){ return +Number(v).toFixed(2)+' '+(this.chart.$unit||'GB'); }},grid:{color:CSSVAR.getPropertyValue('--chart-grid').trim()}},y:{grid:{display:false}}}}
     });
     charts.time = new Chart(document.getElementById('chart-time'),{
       type:'line',
@@ -1573,23 +1667,42 @@ try{
     const roleBytes={};
     // artifact.role is nullable in the schema — bucket those under a readable
     // label rather than letting the bar be titled "null".
-    arts.forEach(a=>{ const r=a.role||'(unspecified)'; roleBytes[r]=(roleBytes[r]||0)+(a.size_bytes||0); });
+    distinctFiles(arts).forEach(a=>{ const r=a.role||'(unspecified)'; roleBytes[r]=(roleBytes[r]||0)+(a.size_bytes||0); });
     const rolePairs = Object.entries(roleBytes).sort((a,b)=>b[1]-a[1]);
+    // one unit for the whole axis, taken from the largest bar
+    let ui=0; for(let m=rolePairs.length?rolePairs[0][1]:0; m>=1024 && ui<BYTE_UNITS.length-1; m/=1024) ui++;
+    const unitBytes=Math.pow(1024,ui);
+    charts.storage.$unit = BYTE_UNITS[ui];
+    charts.storage.$bytes = rolePairs.map(p=>p[1]);
     charts.storage.data.labels = rolePairs.map(p=>p[0]);
-    charts.storage.data.datasets[0].data = rolePairs.map(p=>+(p[1]/1073741824).toFixed(2));
+    charts.storage.data.datasets[0].data = rolePairs.map(p=>p[1]/unitBytes);
     charts.storage.update('none');
+    const esub=document.getElementById('chart-events-sub');
+    if(esub) esub.textContent = F.activeOnly ? 'Active events in the current selection' : 'Events in the current selection, superseded rows included';
 
     // activity over time (monthly)
-    const months=[]; const key = iso=>localDay(iso).slice(0,7);
+    // 'YYYY-MM' in the viewer's zone; mIdx/mKey convert a key to a month number and back
+    const key = iso=>{ const d=localDay(iso); return d.slice(0,d.lastIndexOf('-')); };
+    const mIdx = k=>{ const p=k.split('-').map(Number); return p[0]*12+(p[1]-1); };
+    const mKey = i=>`${Math.floor(i/12)}-${pad2(i%12+1)}`;
     const allK={}, recK={};
     evs.forEach(e=>{ const k=key(e.occurred_at); allK[k]=(allK[k]||0)+1; if(e.event_type==='recording') recK[k]=(recK[k]||0)+1; });
-    let keys = Object.keys(allK).sort();
+    let keys = Object.keys(allK).filter(k=>Number.isFinite(mIdx(k))).sort((a,b)=>mIdx(a)-mIdx(b));
+    let timeNote = 'Events per month, with recordings highlighted';
     if(keys.length){
-      // fill gaps
-      const filled=[]; let cur=keys[0]; const last=keys[keys.length-1];
-      while(cur<=last){ filled.push(cur); const[y,m]=cur.split('-').map(Number); const nm=m===12?1:m+1, ny=m===12?y+1:y; cur=`${ny}-${String(nm).padStart(2,'0')}`; if(filled.length>60)break; }
-      keys=filled;
+      // Fill the gaps so a quiet month shows as zero. The whole range is
+      // plotted. Only a span longer than MAX_MONTHS (one mistyped year is
+      // enough to produce one) is cut, and then it is the OLDEST months that
+      // go and the card says how many events that leaves out.
+      const first=mIdx(keys[0]), last=mIdx(keys[keys.length-1]);
+      const from=Math.max(first, last-MAX_MONTHS+1);
+      if(from>first){
+        const dropped=keys.filter(k=>mIdx(k)<from).reduce((s,k)=>s+allK[k],0);
+        timeNote = `Most recent ${MAX_MONTHS} months shown: ${fmtNum(dropped)} earlier event${dropped!==1?'s':''} (back to ${keys[0]}) not plotted`;
+      }
+      keys=[]; for(let i=from;i<=last;i++) keys.push(mKey(i));
     }
+    const tsub=document.getElementById('chart-time-sub'); if(tsub) tsub.textContent=timeNote;
     charts.time.data.labels = keys;
     charts.time.data.datasets[0].data = keys.map(k=>allK[k]||0);
     charts.time.data.datasets[1].data = keys.map(k=>recK[k]||0);
@@ -1758,7 +1871,8 @@ try{
       artifactOpenLinks(a) });
   }
   function docNode(a){
-    const loc = a.uri ? `<a class="link" href="${esc(a.uri)}" target="_blank" rel="noopener">link</a>`
+    const loc = webHref(a.uri) ? `<a class="link" href="${esc(webHref(a.uri))}" target="_blank" rel="noopener noreferrer">link</a>`
+      : a.uri ? `<span class="mono truncate" style="max-width:380px" title="${esc(a.uri)}">${esc(a.uri)}</span>`
       : `<span class="mono truncate" style="max-width:380px" title="${esc(a.relative_path||'')}">${esc((rootById.get(a.storage_root_id)||{}).name||'')}:${esc(a.relative_path||'')}</span>`;
     return treeNode({ rowHtml:
       `<span class="pill">${esc(a.kind||'file')}</span><span>${esc(a.title||'')}</span> <span class="tree-meta">${loc}</span>` });
@@ -1957,8 +2071,9 @@ try{
 
     body+=`<h4>Documents (${docs.length})</h4>`;
     body+=listCapped(docs, 100, a=>{
-      const loc = a.uri
-        ? `<a class="link" href="${esc(a.uri)}" target="_blank" rel="noopener">${esc(a.uri)}</a>`
+      const loc = webHref(a.uri)
+        ? `<a class="link" href="${esc(webHref(a.uri))}" target="_blank" rel="noopener noreferrer">${esc(a.uri)}</a>`
+        : a.uri ? `<span class="mono">${esc(a.uri)}</span>`
         : `<span class="mono">${esc((rootById.get(a.storage_root_id)||{}).name||'')}:${esc(a.relative_path||'')}</span>`;
       return `<div class="tl-row">${projKindPill(a.kind)} <span>${esc(a.title)}</span> ${a.content_type?`<span class="muted">${esc(a.content_type)}</span>`:''} · ${loc}</div>`;
     }, 'timeline');
@@ -2115,7 +2230,8 @@ try{
       if(!rows.length) return `<h2>${xmlEsc(titleCase(name))} <span class="ct">(0)</span></h2><p class="none">None.</p>`;
       const cols=Object.keys(rows[0]);
       // the `folder` column carries a file: URI — render it as a clickable link
-      const cell=(c,v)=> (c==='folder'&&v) ? `<a href="${xmlEsc(v)}">${xmlEsc(v)}</a>` : xmlEsc(v);
+      // (only from a page opened from disk: a served page cannot follow file: links)
+      const cell=(c,v)=> (c==='folder'&&v&&CAN_LINK_FILES) ? `<a href="${xmlEsc(v)}">${xmlEsc(v)}</a>` : xmlEsc(v);
       return `<h2>${xmlEsc(titleCase(name))} <span class="ct">(${rows.length})</span></h2>`+
         `<table><thead><tr>${cols.map(c=>`<th>${xmlEsc(c)}</th>`).join('')}</tr></thead><tbody>`+
         rows.map(r=>`<tr>${cols.map(c=>`<td>${cell(c,r[c])}</td>`).join('')}</tr>`).join('')+`</tbody></table>`;
@@ -2159,7 +2275,7 @@ try{
       {key:'subject_id',label:'Subject ID',render:s=>`<span class="mono" style="font-weight:600">${esc(s.subject_id)}</span>`},
       {key:'_project',label:'Project',sortVal:s=>projectName(s.project_id),render:s=>esc(projectName(s.project_id))},
       {key:'species_code',label:'Species',render:s=>esc(speciesName(s.species_code))},
-      {key:'sex',label:'Sex',render:s=>`<span class="pill">${s.sex}</span>`},
+      {key:'sex',label:'Sex',render:s=>`<span class="pill">${esc(s.sex)}</span>`},
       {key:'strain',label:'Strain / genotype',render:s=>esc([s.strain,s.genotype].filter(Boolean).join(' · ')||'—')},
       {key:'source',label:'Source',render:s=>esc(s.source||'—')},
       {key:'_age',label:'Age (d)',cls:'num',sortVal:s=>s.date_of_birth?Math.round((NOW-Date.parse(s.date_of_birth))/86400000):null,
@@ -2218,7 +2334,7 @@ try{
       tagCol('event')
     ];
     sortableTable('events-table',cols,rows,{clickable:true,defaultSort:'occurred_at',defaultDir:'desc',limit:400,
-      rowAttrs:e=>`data-event="${e.event_id}"`, onClick:d=>openEvent(d.event)});
+      rowAttrs:e=>`data-event="${esc(e.event_id)}"`, onClick:d=>openEvent(d.event)});
   }
 
   /* ------------------------------------------------------------ artifacts tab */
@@ -2230,7 +2346,7 @@ try{
     if(roleF!=='all') rows=rows.filter(a=>a.role===roleF);
     if(vF!=='all') rows=rows.filter(a=>a.verification.status===vF);
     if(q) rows=rows.filter(a=>(a.relative_path+' '+(a.format||'')+' '+a.checksum+' '+(a.role||'')).toLowerCase().includes(q));
-    const bytes=rows.reduce((s,a)=>s+(a.size_bytes||0),0);
+    const bytes=totalBytes(rows);   // each file once, even with superseded rows listed
     document.getElementById('artifacts-meta').textContent = `${rows.length} artifact${rows.length!==1?'s':''} · ${fmtBytes(bytes)}`;
     const cols=[
       {key:'relative_path',label:'Path',render:a=>`<span class="mono truncate" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>`},
@@ -2241,12 +2357,12 @@ try{
       {key:'_root',label:'Root',render:a=>esc((rootById.get(a.storage_root_id)||{}).name||'—')},
       {key:'created_at',label:'Created',sortVal:a=>a.created_at,render:a=>fmtDate(a.created_at)},
       {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
-        render:a=>`<span class="pill ${a.verification.status}">${a.verification.status}</span>`},
+        render:a=>`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span>`},
       tagCol('artifact'),
       {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
     ];
     sortableTable('artifacts-table',cols,rows,{clickable:true,defaultSort:'size_bytes',defaultDir:'desc',limit:400,
-      rowAttrs:a=>`data-artifact="${a.artifact_id}"`, onClick:d=>openArtifact(d.artifact)});
+      rowAttrs:a=>`data-artifact="${esc(a.artifact_id)}"`, onClick:d=>openArtifact(d.artifact)});
   }
 
   /* ------------------------------------------------------- overview: tags */
@@ -2372,11 +2488,11 @@ try{
     body+=`<div class="timeline">`;
     evs.forEach(e=>{
       const sup=!isEventActive(e);
-      body+=`<div class="tl-item t-${e.event_type} ${sup?'superseded':''}">
+      body+=`<div class="tl-item t-${cssTok(e.event_type)} ${sup?'superseded':''}">
         <div class="tl-row">
           <span class="tl-date">${fmtDate(e.occurred_at)}</span>
           ${typeBadge(e.event_type)}
-          <span class="tl-summary">${eventSummary(e)} <span class="link" data-open-event="${e.event_id}">details</span>${sup?' · <span class="pill superseded">superseded</span>':''}</span>
+          <span class="tl-summary">${eventSummary(e)} <span class="link" data-open-event="${esc(e.event_id)}">details</span>${sup?' · <span class="pill superseded">superseded</span>':''}</span>
         </div>
         ${e.notes?`<div class="tl-note">${esc(e.notes)}</div>`:''}
       </div>`;
@@ -2396,10 +2512,12 @@ try{
       ['Occurred at',fmtDateTime(e.occurred_at)],
       ['Recorded at',fmtDateTime(e.recorded_at)],
       ['Recorded by',personName(e.recorded_by)],
+      ['Database login',e.recorded_login],     // who actually inserted the row (schema v4); absent on older rows
       ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
       ['Tags',tagChips('event',eid),true]
     ];
-    if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${e.supersedes}">${fmtDate(p.occurred_at)} ${etLabel.get(p.event_type)}</span>`:'(prior row)',true]); }
+    if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${esc(e.supersedes)}">${fmtDate(p.occurred_at)} ${esc(etName(p.event_type))}</span>`:'(prior row)',true]); }
+    if(eventSuccessor.has(eid)){ const n=eventById.get(eventSuccessor.get(eid)); if(n) base.push(['Superseded by', `<span class="link" data-open-event="${esc(n.event_id)}">${fmtDate(n.occurred_at)} ${esc(etName(n.event_type))}</span>`,true]); }
     // detail rows per type
     const detailMap={
       birth:[['Litter',d.litter_id],['Birth weight',d.birth_weight_g!=null?d.birth_weight_g+' g':null],['Dam',d.dam_subject_id],['Sire',d.sire_subject_id]],
@@ -2412,7 +2530,7 @@ try{
       husbandry:[['Measure',d.measure],['Weight',d.weight_g!=null?d.weight_g+' g':null],['Water',d.water_ml!=null?d.water_ml+' mL':null],['Health',d.health_status]],
       endpoint:[['Method',d.method],['Fixative',d.perfusion_fixative],['Tissue collected',d.tissue_collected==null?null:(d.tissue_collected?'yes':'no')],['Disposition',d.disposition]],
       histology:[['Technique',d.technique],['Target',d.target_region],['Stain',d.stain],['Microscope',d.microscope]],
-      analysis:[['Pipeline',d.pipeline_name],['Code version',d.code_version?`<span class="mono">${esc(d.code_version)}</span>`:null,true],['Status',d.status?`<span class="pill ${d.status}">${d.status}</span>`:null,true],
+      analysis:[['Pipeline',d.pipeline_name],['Code version',d.code_version?`<span class="mono">${esc(d.code_version)}</span>`:null,true],['Status',d.status?`<span class="pill ${cssTok(d.status)}">${esc(d.status)}</span>`:null,true],
         ['Started',fmtDateTime(d.started_at)],['Finished',fmtDateTime(d.finished_at)],
         ['Parameters',d.parameters?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.parameters))}</span>`:null,true],
         ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]]
@@ -2434,44 +2552,65 @@ try{
     openModal(typeBadge(e.event_type), `Event · ${fmtDate(e.occurred_at)}`, body);
   }
 
-  // recursive-ish lineage (mirrors fn_artifact_lineage), depth-guarded
+  // Lineage, as lab.fn_artifact_lineage(id, direction) returns it by default,
+  // i.e. following corrections. Provenance edges are immutable, so after a
+  // correction they still name the superseded rows; each node therefore
+  // stands for its whole chain and every row listed is a current one:
+  //   * an artifact is produced by the current version of its producing event;
+  //   * an event's inputs are those its current version declares, each
+  //     resolved to its current artifact;
+  //   * an artifact's consumers are the current events with an edge to any of
+  //     its versions, and their outputs the active artifacts produced by any
+  //     version of the event.
+  // Both walks stop at the function's depth cap and report that they did.
+  const LINEAGE_MAX_DEPTH = 64;
   function lineageUp(startId){
-    const out=[]; const seen=new Set(); let frontier=[{id:startId,depth:0}];
+    const out=[]; const seen=new Set(); let truncated=false; let frontier=[{id:artifactCurrent(startId),depth:0}];
     while(frontier.length){
       const next=[];
       frontier.forEach(({id,depth})=>{
-        if(seen.has(id)||depth>32) return; seen.add(id);
+        if(seen.has(id)) return; seen.add(id);
         const a=artifactById.get(id); if(!a) return;
         out.push({depth,artifact:a});
-        (inputsByEvent.get(a.produced_by_event_id)||[]).forEach(inpId=> next.push({id:inpId,depth:depth+1}));
+        const inputs=(inputsByEvent.get(eventCurrent(a.produced_by_event_id))||[]).map(artifactCurrent);
+        if(depth>=LINEAGE_MAX_DEPTH){ if(inputs.some(i=>!seen.has(i))) truncated=true; return; }
+        inputs.forEach(inpId=> next.push({id:inpId,depth:depth+1}));
       });
       frontier=next;
     }
-    return out;
+    return {nodes:out,truncated};
   }
   function lineageDown(startId){
-    const out=[]; const seen=new Set(); let frontier=[{id:startId,depth:0}];
+    const out=[]; const seen=new Set(); let truncated=false; let frontier=[{id:artifactCurrent(startId),depth:0}];
     while(frontier.length){
       const next=[];
       frontier.forEach(({id,depth})=>{
-        if(seen.has(id)||depth>32) return; seen.add(id);
+        if(seen.has(id)) return; seen.add(id);
         const a=artifactById.get(id); if(!a) return;
         out.push({depth,artifact:a});
-        (consumersByArtifact.get(id)||[]).forEach(evId=> (artifactsByEvent.get(evId)||[]).forEach(prod=> next.push({id:prod.artifact_id,depth:depth+1})));
+        const consumers=new Set();
+        chainRows(artifactById,artifactSuccessor,id).forEach(v=> (consumersByArtifact.get(v.artifact_id)||[]).forEach(evId=>{
+          const ev=eventById.get(evId); if(ev && isEventActive(ev)) consumers.add(evId); }));
+        const outputs=[];
+        consumers.forEach(evId=> chainRows(eventById,eventSuccessor,evId).forEach(v=>
+          (artifactsByEvent.get(v.event_id)||[]).forEach(prod=>{ if(isArtifactActive(prod)) outputs.push(prod.artifact_id); })));
+        if(depth>=LINEAGE_MAX_DEPTH){ if(outputs.some(o=>!seen.has(o))) truncated=true; return; }
+        outputs.forEach(o=> next.push({id:o,depth:depth+1}));
       });
       frontier=next;
     }
-    return out;
+    return {nodes:out,truncated};
   }
-  function lineageList(nodes,startId){
-    const items=nodes.filter(n=>n.artifact.artifact_id!==startId);
+  function lineageList(lin,startId){
+    const self=artifactCurrent(startId);
+    const items=lin.nodes.filter(n=>n.artifact.artifact_id!==self);
     if(!items.length) return `<div class="lineage-empty">None.</div>`;
     return items.map(n=>{
-      const a=n.artifact, ev=eventById.get(a.produced_by_event_id);
+      const a=n.artifact, ev=eventById.get(eventCurrent(a.produced_by_event_id));
       return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
         <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
-        ${ev?typeBadge(ev.event_type):''}${artifactOpenLinks(a)}</div>`;
-    }).join('');
+        ${ev?typeBadge(ev.event_type):''}${isArtifactActive(a)?'':'<span class="pill superseded">superseded</span>'}${artifactOpenLinks(a)}</div>`;
+    }).join('') + (lin.truncated ? `<div class="empty lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
   }
 
   function openArtifact(aid){
@@ -2480,21 +2619,28 @@ try{
     const base=[
       ['Path',`<span class="mono">${esc(a.relative_path)}</span>`,true],
       ['Storage root',(rootById.get(a.storage_root_id)||{}).name||'—'],
-      ['Folder', artifactFolderUri(a) ? `<a class="link mono" href="${esc(artifactFolderUri(a))}" target="_blank" rel="noopener" title="Open parent folder in file browser">${esc(artifactFolderLabel(a))}</a>` : '—', true],
+      ['Folder', !artifactFolderUri(a) ? '—'
+        : CAN_LINK_FILES ? `<a class="link mono" href="${esc(artifactFolderUri(a))}" target="_blank" rel="noopener" title="Open parent folder in file browser">${esc(artifactFolderLabel(a))}</a>`
+        : `<span class="mono">${esc(artifactFolderLabel(a))}</span>`, true],
       ['Role',`<span class="pill">${esc(a.role||'—')}</span>`,true],
       ['Format',a.format||'—'],
       ['Size',fmtBytes(a.size_bytes)],
-      ['Checksum',`<span class="mono" style="font-size:11.5px">${a.checksum_algo}:${esc(a.checksum.slice(0,24))}…</span>`,true],
+      ['Checksum',`<span class="mono" style="font-size:11.5px">${esc(a.checksum_algo)}:${esc(String(a.checksum||'').slice(0,24))}…</span>`,true],
       ['Subject', a.subject_id?`<span class="link mono" data-open-subject="${esc(a.subject_id)}">${esc(a.subject_id)}</span>`:'—',true],
       ['Session',a.session_id?`<span class="mono">${esc((sessionById.get(a.session_id)||{}).label||'')}</span>`:'—',true],
       ['Created',fmtDateTime(a.created_at)],
       ['Created by',personName(a.created_by)],
-      ['Verification',`<span class="pill ${a.verification.status}">${a.verification.status}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
-      ['Produced by', ev?`<span class="link" data-open-event="${ev.event_id}">${etLabel.get(ev.event_type)} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
+      ['Database login',a.created_login],      // who actually inserted the row (schema v4); absent on older rows
+      // the latest check of the FILE, whichever row of its correction chain it was recorded against
+      ['Verification',`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
+      ['Produced by', ev?`<span class="link" data-open-event="${esc(ev.event_id)}">${esc(etName(ev.event_type))} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
       ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['Supersedes', a.supersedes&&artifactById.has(a.supersedes) ? `<span class="link" data-open-artifact="${esc(a.supersedes)}">previous version</span>` : null, true],
+      ['Superseded by', artifactSuccessor.has(aid) ? `<span class="link" data-open-artifact="${esc(artifactSuccessor.get(aid))}">${artifactCurrent(aid)===artifactSuccessor.get(aid)?'current version':'next version'}</span>` : null, true],
       ['Tags',tagChips('artifact',aid),true]
     ];
     let body=kv(base);
+    body+=`<div class="muted" style="font-size:12px;margin:2px 0 -4px">Lineage follows corrections: every row listed is a current version${isArtifactActive(a)?'':', and it is the lineage of this row’s current version'}.</div>`;
     body+=`<div class="lineage-col">
       <div><h4>Upstream (inputs)</h4>${lineageList(lineageUp(aid),aid)}</div>
       <div><h4>Downstream (derived)</h4>${lineageList(lineageDown(aid),aid)}</div>
@@ -2530,12 +2676,12 @@ try{
   }
   function refreshSubjectOptions(){
     const sel=document.getElementById('f-subject'); const cur=sel.value;
-    sel.innerHTML='<option value="all">All subjects</option>';
+    sel.innerHTML='<option value="">All subjects</option>';
     D.subjects.filter(s=>F.species==='all'||s.species_code===F.species)
       .sort((a,b)=>a.subject_id.localeCompare(b.subject_id))
       .forEach(s=>{ const o=document.createElement('option'); o.value=s.subject_id; o.textContent=s.subject_id; sel.appendChild(o); });
-    sel.value=[...sel.options].some(o=>o.value===cur)?cur:'all';
-    if(sel.value==='all') F.subject='all';
+    sel.value=[...sel.options].some(o=>o.value===cur)?cur:'';
+    if(sel.value==='') F.subject='';
   }
 
   document.getElementById('f-species').onchange=e=>{ F.species=e.target.value; refreshSubjectOptions(); renderAll(); };
@@ -2546,7 +2692,7 @@ try{
   document.getElementById('f-active').onchange=e=>{ F.activeOnly=e.target.checked; renderAll(); };
   document.getElementById('f-tags').oninput=e=>{ setTagFilter(e.target.value); renderAll(); };
   document.getElementById('f-clear').onclick=()=>{
-    F.species='all';F.subject='all';F.event='all';F.from='';F.to='';F.activeOnly=true;setTagFilter('');
+    F.species='all';F.subject='';F.event='all';F.from='';F.to='';F.activeOnly=true;setTagFilter('');
     document.getElementById('f-tags').value='';
     document.getElementById('f-species').value='all';
     document.getElementById('f-event').value='all';
@@ -2629,9 +2775,8 @@ try{
 
   // go
   populateFilters();
-  buildCharts();
-  applyChartTheme();
   renderAll();
+  loadCharts();
 })();
 </script>
 </body>

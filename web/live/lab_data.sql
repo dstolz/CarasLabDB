@@ -17,20 +17,27 @@
 --   * Each event carries a `detail` object = its class-table-inheritance
 --     row (birth_event, surgery_event, ...) minus the event_id/event_type
 --     bookkeeping columns.
---   * Each artifact carries a `verification` object = its latest
---     lab.artifact_verification row, or {status:'unverified'} if none.
+--   * Each artifact carries a `verification` object = the latest check of
+--     the FILE it describes, from lab.artifact_verification_latest (a
+--     corrected artifact row keeps its file's verification state), or
+--     {status:'unverified'} if the file was never checked.
 --   * Tags: `tagNamespaces` and `tags` are the vocabulary (applies_to as a
 --     JSON array); `tagAssignments` is the whole append-only log in
 --     assignment_id order, each row naming its entity as (entity_kind,
 --     entity_id) -- entity_id computed exactly as lab.tag_current does. The
---     dashboard derives current tags from the log (latest row per entity and
---     tag by applied_at, then assignment_id, kept if it is an 'add'), like
---     lab.tag_current. applied_at keeps its microseconds so that ordering
---     survives the trip; the other timestamps are whole seconds.
+--     dashboard derives current tags from the log like lab.tag_current: the
+--     latest row per entity and tag by assignment_id, kept if it is an 'add'.
 --   * timestamptz values are rendered as UTC ISO-8601 ("...Z") strings and
---     `NOW` as epoch milliseconds, matching what the front-end parses. The
---     timestamps inside `detail` objects carry the session zone's offset;
---     server.py pins that zone to UTC, and PGTZ=UTC does the same for psql.
+--     `NOW` as epoch milliseconds, matching what the front-end parses.
+--     event.occurred_at and tag_assignment.applied_at keep their microseconds:
+--     the dashboard orders events by occurred_at (latest weight per subject,
+--     like lab.subject_current), and two events in one second must not tie
+--     there when they do not tie in the database. The other timestamps are
+--     whole seconds. The timestamps inside `detail` objects carry the
+--     session zone's offset; server.py pins that zone to UTC, and PGTZ=UTC
+--     does the same for psql.
+--   * recorded_login / created_login are the database logins that inserted
+--     the row (NULL on rows older than schema version 4).
 --
 -- This file is a single statement. Run it standalone to produce a static
 -- export:
@@ -121,9 +128,10 @@ events AS (
     SELECT coalesce(json_agg(json_build_object(
         'event_id', e.event_id, 'event_type', e.event_type,
         'subject_id', e.subject_id, 'session_id', e.session_id,
-        'occurred_at', to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'occurred_at', to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
         'recorded_at', to_char(e.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-        'recorded_by', e.recorded_by, 'supersedes', e.supersedes, 'notes', e.notes,
+        'recorded_by', e.recorded_by, 'recorded_login', e.recorded_login,
+        'supersedes', e.supersedes, 'notes', e.notes,
         -- coalesce: a partially-written event (base row inserted, detail row
         -- not) would otherwise yield JSON null and make the dashboard's
         -- ev.detail.<field> lookups throw.
@@ -138,7 +146,7 @@ events AS (
             WHEN 'analysis'  THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.analysis_event  x WHERE x.event_id = e.event_id)
             ELSE '{}'::jsonb
         END, '{}'::jsonb)
-    ) ORDER BY e.occurred_at), '[]'::json) AS j
+    ) ORDER BY e.occurred_at, e.event_id), '[]'::json) AS j
     FROM lab.event e
 ),
 artifacts AS (
@@ -150,19 +158,22 @@ artifacts AS (
         'subject_id', a.subject_id, 'session_id', a.session_id,
         'supersedes', a.supersedes,
         'created_at', to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-        'created_by', a.created_by,
+        'created_by', a.created_by, 'created_login', a.created_login,
+        -- The view holds one row per artifact whose FILE (storage root, path,
+        -- checksum) has ever been checked, whichever row of the correction
+        -- chain the check was recorded against, latest check first by
+        -- (verified_at, verification_id). verified_artifact_id tells the
+        -- dashboard when that was another row than this one.
         'verification', coalesce((
             SELECT json_build_object(
                 'status', v.status,
-                'verified_at', to_char(v.verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                'verified_at', to_char(v.verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                'verified_artifact_id', v.verified_artifact_id
             )
-            FROM lab.artifact_verification v
+            FROM lab.artifact_verification_latest v
             WHERE v.artifact_id = a.artifact_id
-            -- verification_id breaks ties so re-runs of this export agree on
-            -- which check "wins" when two share a verified_at.
-            ORDER BY v.verified_at DESC, v.verification_id DESC
-            LIMIT 1
-        ), json_build_object('status', 'unverified', 'verified_at', NULL))
+        ), json_build_object('status', 'unverified', 'verified_at', NULL,
+                             'verified_artifact_id', NULL))
     )), '[]'::json) AS j
     FROM lab.artifact a
 ),
