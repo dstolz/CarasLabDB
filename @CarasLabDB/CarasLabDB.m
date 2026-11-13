@@ -21,19 +21,30 @@ classdef CarasLabDB < handle
 %                       Server="nas-main.lab", DatabaseName="lab", ...
 %                       PersonEmail="dstolz@umd.edu");
 %
-%   A "current person" resolved at construction auto-populates the
-%   created_by / recorded_by provenance columns on inserts (override per
-%   call with CreatedBy=/RecordedBy=).
+%   A "current person" resolved at construction (PersonId=, PersonEmail= or
+%   PersonName=) auto-populates the created_by / recorded_by provenance
+%   columns on inserts (override per call with CreatedBy=/RecordedBy=). A
+%   PersonId, email or name that matches no one, and a PersonName shared by
+%   several people (CarasLabDB:personAmbiguous), are errors. With no
+%   identity at all the object still works but warns
+%   CarasLabDB:noCurrentPerson: rows are then written with a NULL
+%   recorded_by / created_by, and only the login the database itself
+%   records (recorded_login, created_login, ...) says who wrote them.
 %
 %   At connection the session time zone is set to this workstation's zone,
 %   so timestamps come back as local wall-clock time (see PINITSESSION), and
-%   the database's schema version is read into SchemaVersion; a version other
-%   than SchemaVersionExpected raises a CarasLabDB:schemaVersionMismatch
-%   warning.
+%   the database's schema version is read into SchemaVersion. A version other
+%   than SchemaVersionExpected is an error (CarasLabDB:schemaVersionMismatch):
+%   this class hard-codes the schema's columns, so against another version
+%   it could write or read the wrong thing. AllowSchemaMismatch=true turns
+%   the error into a warning with the same identifier, for deliberately
+%   working with an older or newer database.
 %
 %   Example:
 %       db  = CarasLabDB(Username="u", Password="p", PersonEmail="me@lab");
-%       db.addSubject(SubjectId="G-0421", SpeciesCode="meriones_unguiculatus", Sex="M");
+%       pid = db.addProject(Name="Gerbil AC plasticity");
+%       db.addSubject(SubjectId="G-0421", ProjectId=pid, ...
+%                     SpeciesCode="meriones_unguiculatus", Sex="M");
 %       sid = db.addSession(SubjectId="G-0421", Label="2026-07-02_pen1", ...
 %                           StorageRootId=1, RelativePath="G-0421/2026-07-02_pen1");
 %       eid = db.addRecordingEvent(SubjectId="G-0421", SessionId=sid, ...
@@ -52,8 +63,9 @@ classdef CarasLabDB < handle
 %       addBirthEvent, addSurgeryEvent, addRecordingEvent, addBehaviorEvent,
 %       addHusbandryEvent, addEndpointEvent, addHistologyEvent,
 %       addAnalysisEvent, addArtifact, supersedeEvent, supersedeArtifact,
-%       artifactLineage, addTagNamespace, registerTag, addTag, removeTag,
-%       setTag, getEntityTags, findByTags.
+%       artifactLineage, runReadOnlyQuery, updateSubject, updateSession,
+%       addTagNamespace, registerTag, addTag, removeTag, setTag,
+%       getEntityTags, findByTags.
 %
 %   Tags. Events, artifacts, subjects, sessions and projects can carry
 %   namespace:value tags (stage:raw, cohort:a, qc:fail; a bare tag such as
@@ -67,7 +79,15 @@ classdef CarasLabDB < handle
 %       ids = db.findByTags("artifact", Tags="topic:*");
 %   Superseding an event or artifact (supersedeEvent, supersedeArtifact, or
 %   Supersedes= on an add method) copies its current tags onto the successor
-%   in the same transaction.
+%   in the same transaction. Correcting an event, by supersedeEvent or by
+%   Supersedes= on an addXEvent method, also takes over its provenance: the
+%   input edges are copied (unless CarryInputs=false) and the files it
+%   produced are re-pointed at the new event, filed under its subject and
+%   session.
+%   A tag filter (Tags= / AnyTags= / NotTags=) naming a namespace that does
+%   not exist or does not apply to the rows asked for, or a tag that is not
+%   registered, raises CarasLabDB:tagFilterProblem instead of quietly
+%   matching nothing.
 %
 %   Requires MATLAB R2024b or later and the Database Toolbox.
 %
@@ -84,7 +104,7 @@ classdef CarasLabDB < handle
     end
 
     properties (Constant)
-        SchemaVersionExpected = 3               % schema version this class is written for
+        SchemaVersionExpected = 4               % schema version this class is written for
     end
 
     properties
@@ -139,10 +159,20 @@ classdef CarasLabDB < handle
                 opts.PersonEmail (1,1) string = string(missing)
                 opts.PersonName (1,1) string = string(missing)
                 opts.UseActiveViews (1,1) logical = true
+                opts.AllowSchemaMismatch (1,1) logical = false  % warn, not error, on another schema version
                 opts.Connection = []    % inject an existing connection instead of opening one
                                         % (its session time zone is changed; see pInitSession)
             end
 
+            % The schema name is the one identifier that comes from a caller
+            % and is concatenated into every statement (pT), so it is held to
+            % a plain lower-case identifier before it is ever used.
+            if ismissing(opts.Schema) || ...
+                    isempty(regexp(char(opts.Schema), '^[a-z_][a-z0-9_]*$', 'once'))
+                error("CarasLabDB:invalidSchema", ...
+                    "Schema must be a plain lower-case identifier (a-z, 0-9 and _, " + ...
+                    "not starting with a digit).");
+            end
             obj.Schema = opts.Schema;
             obj.UseActiveViews = opts.UseActiveViews;
 
@@ -173,8 +203,21 @@ classdef CarasLabDB < handle
                 error("CarasLabDB:connectionFailed", "Database connection failed. %s", msg);
             end
 
-            obj.pInitSession();
-            obj.CurrentPersonId = obj.pResolvePerson(opts.PersonId, opts.PersonEmail, opts.PersonName);
+            try
+                obj.pInitSession(opts.AllowSchemaMismatch);
+                obj.CurrentPersonId = obj.pResolvePerson(opts.PersonId, opts.PersonEmail, opts.PersonName);
+            catch ME
+                % A refused construction (schema version, unknown person) must
+                % not leave behind a connection this object opened.
+                if obj.OwnsConnection
+                    try
+                        obj.disconnect();
+                    catch
+                    end
+                end
+                rethrow(ME);
+            end
+            obj.pWarnNoPerson();
         end
 
         function tf = isOpen(obj)
@@ -199,6 +242,7 @@ classdef CarasLabDB < handle
                 opts.PersonName (1,1) string = string(missing)
             end
             obj.CurrentPersonId = obj.pResolvePerson(opts.PersonId, opts.PersonEmail, opts.PersonName);
+            obj.pWarnNoPerson();
         end
 
         function delete(obj)
@@ -758,6 +802,9 @@ classdef CarasLabDB < handle
             %   Rows are ordered newest first (created_at DESC, artifact_id).
             %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS):
             %       T = db.getArtifacts(SessionId=sid, Tags="stage:raw");
+            %   Checksum= is matched as the database stores it: surrounding
+            %   whitespace is dropped and the hex lower-cased, so the
+            %   upper-case digest some tools print finds the file.
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
@@ -782,7 +829,10 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "session_id", opts.SessionId);
             f = obj.pSet(f, "role", opts.Role);
-            f = obj.pSet(f, "checksum", opts.Checksum);
+            if obj.pIsProvided(opts.Checksum)
+                % The column holds lower(btrim(checksum)) (trg_artifact_normalize).
+                f.checksum = lower(strtrim(opts.Checksum));
+            end
             T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="created_at DESC, artifact_id", ...
                 Where=obj.pTagWhere("artifact", opts.Tags, opts.AnyTags, opts.NotTags));
         end
@@ -1030,36 +1080,75 @@ classdef CarasLabDB < handle
             n = height(obj.pSelect(sql));
         end
 
-        function eventId = pInsertEvent(obj, base, detailTable, detail, inputs, artifacts)
+        function eventId = pInsertEvent(obj, base, detailTable, detail, opts)
             %PINSERTEVENT Insert the base event and its detail row in one transaction.
-            %   INPUTS is an optional cell array of lab.event_input structs
-            %   (artifact_id, role) to attach to the new event, and ARTIFACTS
-            %   an optional cell array of lab.artifact insert structs for files
-            %   the new event produced (supersedeEvent passes the successors
-            %   of the old event's artifacts); event_id / produced_by_event_id
-            %   are filled in here. Both are written inside the same
-            %   transaction, so a correction can never commit an event whose
-            %   provenance edges or files are only half-carried over.
+            %   The one write path of every event, new or correcting.
             %
             %   When BASE sets supersedes (supersedeEvent, or Supersedes= on an
-            %   addXEvent method), the superseded event's current tags are
-            %   copied onto the new event, and each artifact with supersedes
-            %   gets its predecessor's tags, in the same transaction (see
-            %   PCARRYTAGS).
+            %   addXEvent method) the new event is a correction, and it takes
+            %   over the superseded event's provenance in the same transaction
+            %   (PCARRYPROVENANCE reads it, PINSERTEVENTROWS writes it):
+            %     * its event_input edges are copied to the new event, unless
+            %       CarryInputs=false (the caller re-declares them);
+            %     * every active artifact it produced is superseded by a row
+            %       produced by the new event and filed under the new event's
+            %       subject and session;
+            %     * its current tags, and each re-pointed artifact's, are
+            %       copied onto the new rows (PCARRYTAGS).
+            %   A correction can therefore never commit an event whose edges,
+            %   files or tags are only half-carried over, whichever method
+            %   made it.
             arguments
                 obj (1,1) CarasLabDB
                 base (1,1) struct
                 detailTable (1,1) string
                 detail (1,1) struct
-                inputs cell = {}
-                artifacts cell = {}
+                opts.CarryInputs (1,1) logical = true
+            end
+            inputs = {};
+            artifacts = {};
+            if isfield(base, "supersedes") && obj.pIsProvided(base.supersedes)
+                [inputs, artifacts] = obj.pCarryProvenance(base.supersedes, opts.CarryInputs);
             end
             eventId = obj.pTransact(@() ...
                 obj.pInsertEventRows(base, detailTable, detail, inputs, artifacts));
         end
 
+        function [inputs, artifacts] = pCarryProvenance(obj, oldEventId, carryInputs)
+            %PCARRYPROVENANCE What a correction of event OLDEVENTID takes over from it.
+            %   INPUTS is a cell array of lab.event_input insert structs
+            %   (artifact_id, role; event_id is set on insert), one per edge
+            %   of the old event, or empty when CARRYINPUTS is false.
+            %   ARTIFACTS is a cell array of lab.artifact insert structs, the
+            %   successor of each active artifact the old event produced
+            %   (PARTIFACTSUCCESSOR; produced_by_event_id, subject_id and
+            %   session_id are set on insert). Rows are read as exact text
+            %   (PROWSASTEXT), so nothing carried passes through a double.
+            arguments
+                obj (1,1) CarasLabDB
+                oldEventId (1,1) string
+                carryInputs (1,1) logical = true
+            end
+            litOld = obj.sqlLiteral(oldEventId);
+            inputs = {};
+            if carryInputs
+                inputs = obj.pRowsAsText(obj.pT("event_input"), ...
+                    "r.event_id = " + litOld, "artifact_id");
+                for k = 1:numel(inputs)
+                    inputs{k} = rmfield(inputs{k}, "event_id");
+                end
+            end
+            artifacts = obj.pRowsAsText(obj.pT("artifact_active"), ...
+                "r.produced_by_event_id = " + litOld, "artifact_id");
+            for k = 1:numel(artifacts)
+                artifacts{k} = obj.pArtifactSuccessor(artifacts{k});
+            end
+        end
+
         function eventId = pInsertEventRows(obj, base, detailTable, detail, inputs, artifacts)
             %PINSERTEVENTROWS The writes of PINSERTEVENT. Run only inside PTRANSACT.
+            %   INPUTS and ARTIFACTS are PCARRYPROVENANCE's outputs (empty for
+            %   an event that corrects nothing).
             eventId = obj.pInsertReturning(obj.pT("event"), base, "event_id");
             detail.event_id = eventId;
             if ~isfield(detail, "event_type")
@@ -1074,9 +1163,24 @@ classdef CarasLabDB < handle
             if isfield(base, "supersedes") && obj.pIsProvided(base.supersedes)
                 obj.pCarryTags("event", base.supersedes, eventId);
             end
+            if isempty(artifacts)
+                return
+            end
+            % The files follow the corrected event. The new event's subject
+            % and session are read back as stored, i.e. after
+            % trg_event_fill_subject has derived the subject from the session,
+            % and each re-pointed file is filed under them; where the event
+            % names none the file keeps its own. A correction that moves an
+            % event to another animal or session thus moves its files too
+            % (trg_artifact_matches_event rejects leaving them behind).
+            stored = obj.pRowsAsText(obj.pT("event"), ...
+                "r.event_id = " + obj.sqlLiteral(eventId), "event_id");
             for k = 1:numel(artifacts)
                 a = artifacts{k};
                 a.produced_by_event_id = eventId;
+                if ~isempty(stored)
+                    a = CarasLabDB.pFollowEvent(a, stored{1});
+                end
                 obj.pInsertArtifact(a);
             end
         end
