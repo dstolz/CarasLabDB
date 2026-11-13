@@ -254,7 +254,21 @@ Key behaviors baked into the class:
 - `pTransact(fn)` runs a multi-statement write as one transaction (manual
   `AutoCommit` toggle + commit/rollback); use it for any new method that writes more than
   one statement. `pInsertEvent`, `supersedeArtifact`, `addArtifact(Supersedes=)`
-  and multi-tag `addTag`/`removeTag` go through it.
+  and multi-tag `addTag`/`removeTag` go through it. It marks the transaction
+  (`SET LOCAL caraslabdb.txn`) and reads the mark back before `COMMIT`: when a
+  statement fails, the Database Toolbox rolls back by itself, starts another
+  transaction and, for a `fetch`, runs the statement again, so without the
+  check a transaction could commit its second half without its first
+  (`CarasLabDB:transactionInterrupted`). Never catch a database error inside
+  a `pTransact` body and continue.
+- Three ways to send SQL, and which to use (see
+  `design_docs/matlab-database-toolbox-notes.md`): `pSelect` for a read (it
+  drops a trailing semicolon, which would make the driver's `SELECT * FROM
+  (...) as temp LIMIT 0` probe a syntax error in the server log); `pWrite`
+  for a statement that writes and returns rows (`INSERT`/`UPDATE ...
+  RETURNING`, `SELECT lab.fn_...()`), which always runs inside `pTransact`;
+  `pExec` for a statement that returns nothing.
+  `VariableTests/fetchedWritesAreInTransactionsAndReadsAreBare` checks it.
 - `supersedeEvent`/`supersedeArtifact` implement the correction workflow:
   read the old row(s) as exact text (`pRowsAsText`, via
   `jsonb_each_text(to_jsonb(row))`), carry every column forward except
@@ -320,8 +334,12 @@ database that holds rows (`tests/seed_v1.sql`,
 `tests/migrated_data_test.sql`), runs the artifact verifier end to end
 (`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
-and runs the MCP server's pytest suite. CI has no MATLAB, so the MATLAB tests
-in `tests/matlab/` run locally only; a separate job parses every MATLAB file
+and runs the MCP server's pytest suite. The `matlab` job runs
+`tests/matlab/` in MATLAB R2024b, R2025a and the latest release on Linux
+(`matlab-actions`, free for a public repository) against a PostgreSQL
+service, under Xvfb for the GUI tests; `tests/run_matlab_tests.m` is its
+entry point and fails the job if a test fails or a database test did not
+run. It does not run on Windows. A separate job parses every MATLAB file
 with GNU Octave (`tests/check_matlab_syntax.py`), which is a syntax check and
 nothing more -- Octave cannot run this code. There is no package.json. Practical ways
 to exercise the code:
@@ -342,12 +360,18 @@ to exercise the code:
 - **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
   tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
   integration tests)
-- **MATLAB tests**: `runtests("tests/matlab")` — `TagTests` (the class's
-  tagging feature) and `TagGuiTests` (the app's Tags filter and tag editor,
-  driven with `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
+- **MATLAB tests**: `runtests("tests/matlab")` — `TagTests` (tags,
+  corrections, transactions, the demo script), `VariableTests` (variables,
+  retraction, husbandry batch, file registration) and `TagGuiTests` (the
+  app's browse filters, tag editor and variables editor, driven with
+  `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
   creates and drops a scratch `lab_mtest` database; it is opt-in through
   `CARASLABDB_MTEST_ADMIN` (see its help), and without it only the
-  database-free tests run. See `design_docs/testing-locally.md` §2.7.
+  database-free tests run. `RecordingConnection` is the fake connection of
+  the database-free tests. The GUI tests drive modal windows from a timer
+  callback, where `matlab.uitest` does not wait for the app: steps there use
+  `typeIn`/`pressOn`/`chooseIn`/`dismissAlert`, not the plain gestures. See
+  `design_docs/testing-locally.md` §2.7.
 - **MATLAB class**: add the repo root to the MATLAB path (so `@CarasLabDB` is
   visible as a class folder), then adapt `examples/carasLabDB_demo.m` — it
   needs a real reachable Postgres instance with the schema applied.

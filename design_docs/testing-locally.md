@@ -18,7 +18,7 @@ PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
 because CI has no MATLAB; beyond it, "testing" them here means a disciplined
 manual walkthrough with explicit pass/fail checks.
 
-Before the first real use of the MATLAB class and GUI, also work through [matlab-first-run-checklist.md](matlab-first-run-checklist.md): that code was written without MATLAB to run it.
+Before the first real use of the MATLAB class and GUI, also work through [matlab-first-run-checklist.md](matlab-first-run-checklist.md): CI runs the MATLAB tests on Linux only, and most of the GUI is not covered by any automated test.
 
 The parts this guide covers and how each is tested:
 
@@ -508,11 +508,18 @@ end
 
 ### 2.7 Automated tests (`tests/matlab`)
 
-The tagging feature has a `matlab.unittest` suite. `TagTests` covers the class:
-tag syntax, the vocabulary, assigning tags, the tag filters (checked against
+The class and the GUI have a `matlab.unittest` suite. `TagTests` covers tag
+syntax, the vocabulary, assigning tags, the tag filters (checked against
 `lab.fn_find_by_tags`), carry-forward on correction, subject rename, argument
-validation, and `examples/carasLabDB_demo.m`. `TagGuiTests` drives
-`CarasLabDBApp`'s Tags field and tag editor with `matlab.uitest`.
+validation, transactions, and `examples/carasLabDB_demo.m`. `VariableTests`
+covers variables, retraction, the person-from-login mapping, the husbandry
+batch and file registration. `TagGuiTests` drives `CarasLabDBApp`'s browse
+filters, tag editor and variables editor with `matlab.uitest`.
+
+CI runs the whole suite on Linux in MATLAB R2024b, R2025a and the latest
+release (the `matlab` job of `.github/workflows/tests.yml`; its entry point is
+`tests/run_matlab_tests.m`). It does not run on Windows there, so run it once
+on a lab workstation as below.
 
 It does not use `lab_test`. Its shared fixture, `LabScratchDb`, creates a
 database `lab_mtest`, applies `schema.sql` and `grants.sql`, adds a
@@ -533,9 +540,11 @@ will not touch an existing `lab_mtest` it did not create. Without
 `CARASLABDB_MTEST_ADMIN`, or without Database Toolbox, the database tests are
 reported as Incomplete and only the database-free ones run
 (`runtests("tests/matlab", Tag="NoDatabase")`, which works on any supported
-release). `TagGuiTests` opens and closes the app's windows for about three
+release). `TagGuiTests` opens and closes the app's windows for about four
 minutes; do not interact with them while it runs. It saves your
-`CarasLabDBApp` preferences first and restores them afterwards.
+`CarasLabDBApp` preferences first and restores them afterwards. The fixture
+runs `psql`; on Linux it does so without MATLAB's own library path, with no
+pager and with no input, because MATLAB runs commands on a pseudo-terminal.
 
 **Pass:** no failures. The suite cannot press real keys (`matlab.uitest` has
 no key-press gesture), so it tests each shortcut through the window's

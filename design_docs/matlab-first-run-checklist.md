@@ -1,96 +1,97 @@
-# MATLAB first-run checklist
+# MATLAB checklist: what CI runs, and what still needs a person
 
 The MATLAB class (`@CarasLabDB`) and GUI (`@CarasLabDBApp`) were extended for
-schema versions 4 and 5 in an environment that had **no MATLAB**. The SQL each
-method generates was run against PostgreSQL, and the files were checked by
-reading and by a structural check (balanced blocks, declared methods), but
-**none of the MATLAB code has been executed**. Work through this list on a
-workstation, against a scratch database, before anyone relies on it.
+schema versions 4 and 5 in an environment that had no MATLAB. Since then the
+test suite in `tests/matlab` has been run **in MATLAB, in CI**: R2024b, R2025a
+and R2026b on Linux, against PostgreSQL 16, all tests passing
+(`.github/workflows/tests.yml`, job `matlab`). That first execution found and
+fixed problems in the test fixture, in the GUI tests, and in how the class
+uses transactions
+([matlab-database-toolbox-notes.md](matlab-database-toolbox-notes.md)).
 
-**What GNU Octave could and could not tell us.** Octave cannot run this code:
-it has no `string` type, `datetime`, `table`, Database Toolbox, `uifigure`
-components or `matlab.unittest`, all of which the class, the GUI and the tests
-are built on. It can parse it. `python tests/check_matlab_syntax.py` (run in
-CI) parses every MATLAB file with Octave and so catches syntax errors -- a
-malformed statement, an unbalanced bracket, an unterminated string -- but
-nothing about behaviour, nothing inside `arguments` blocks, and not reliably a
-missing `end` inside a `classdef` file. One piece of logic was also run under
-Octave's Java bridge: the body of `fileChecksum` (with Octave's spelling of
-the one Java static call) gave the same SHA-256 and MD5 as `sha256sum` and
-`md5sum` for a 3-byte file, an empty file, a file of every byte value and an
-8 MiB + 5 byte file. MATLAB converts arrays to Java differently, so the
-`fileChecksum` item below still has to be done in MATLAB.
+What this does **not** establish:
 
-Set up the scratch database as in [testing-locally.md](testing-locally.md),
-then:
+- **Nothing has been run on Windows**, which is what the lab uses. The suite
+  and the fixture are written for both, but only the Linux half has been
+  exercised.
+- **Most of the GUI is not covered by automated tests.** `TagGuiTests` drives
+  the browse filters, the tag editor and the variables editor. The forms, the
+  change preview, the retract dialog, the daily husbandry grid, the integrity
+  window, the login dialog and export are untested by any machine.
+- **Real keys are not pressed.** `matlab.uitest` has no key-press gesture, so
+  shortcuts are tested by calling the window's `KeyPressFcn`.
+
+So: run the suite once on a lab workstation, then work through the manual
+items below against a scratch database before anyone relies on the GUI.
 
 ```matlab
 addpath(pwd)                       % repository root
-results = runtests("tests/matlab") % with and without CARASLABDB_MTEST_ADMIN
+results = runtests("tests/matlab") % see testing-locally.md section 2.7
 ```
 
 A failure in any item below is a bug to report, not something to work around.
 
+(GNU Octave cannot run this code. `python tests/check_matlab_syntax.py`, also
+in CI, only parses every MATLAB file with it, which catches syntax errors and
+nothing else.)
+
 ## 1. Class (`@CarasLabDB`)
 
-- [ ] **The class loads.** `methods CarasLabDB` lists the methods, and
-      `CarasLabDB.fileChecksum(f)` resolves (it is declared in a
-      `methods (Static)` signature block).
-- [ ] **`fileChecksum` is right.** `VariableTests/fileChecksumMatchesKnownHashes`
-      passes (`'abc'`, an empty file, an 8 MiB + 5 byte file). Then hash one
-      real recording and compare with `certutil -hashfile <file> SHA256`. This
-      depends on MATLAB passing `uint8` to Java bit-for-bit and on
-      `typecast(digester.digest(), 'uint8')`; a wrong hash here would register
+Covered by the tests that pass in CI on Linux; the test is named where one
+item maps to one test:
+
+- The class loads; constructor checks (`TagTests/constructionChecks`).
+- `fileChecksum` for `'abc'`, an empty file and an 8 MiB + 5 byte file
+  (`VariableTests/fileChecksumMatchesKnownHashes`).
+- `addArtifactFromFile`: relative path, size, checksum, and a file outside
+  the root (`VariableTests/artifactFromFileWorksOutPathSizeAndChecksum`,
+  `artifactFromFileIsRegistered`).
+- The person comes from the login (`VariableTests/personComesFromTheLogin`,
+  `personComesFromTheLoginOnTheServer`).
+- Variables: set, update, unset, history, units mismatch, definitions, name
+  canonicalisation (`VariableTests`).
+- Retraction, including the required reason (`VariableTests`).
+- `addHusbandryBatch`: all-or-none, validation before writing.
+- Corrections: files move with the event, inputs and tags are carried,
+  variables are carried once, a failure leaves nothing behind (`TagTests`,
+  `VariableTests/correctionCarriesVariablesOnce`).
+- `Clear=` on updates, and setting and clearing the same column.
+- Tag filters, including a mistyped token.
+- Transactions: atomic on failure, refused inside a caller's transaction, and
+  not half-committed when the driver retries a statement
+  (`TagTests/retriedStatementCannotHalfCommit`).
+- `runReadOnlyQuery` refuses a write.
+- `examples/carasLabDB_demo.m` runs end to end with no warning.
+
+Still to do by hand, on Windows:
+
+- [ ] **Run the suite** on a workstation, with and without
+      `CARASLABDB_MTEST_ADMIN`. It has never run on Windows.
+- [ ] **`fileChecksum` on a real recording.** Hash one and compare with
+      `certutil -hashfile <file> SHA256`. A wrong hash here would register
       wrong checksums, so do not skip it.
-- [ ] **`addArtifactFromFile` paths.** `info.relative_path` is correct for a
-      file under the storage root, including a `RootPath` with a trailing
-      separator; a file outside the root raises `fileNotUnderRoot`.
 - [ ] **Windows path case.** Register a file typed in the wrong case
       (`z:\DATA\...\raw.dat`) and check `info.relative_path` has the on-disk
       spelling. A mapped drive against a UNC `RootPath` should raise
       `fileNotUnderRoot`.
-- [ ] **Driver return types.** `value_num` comes back as double with `NaN`
-      for NULL; NULL uuid/text columns (`superseded_by`, `value_text`,
-      `units`) as missing strings; `is_current` / `is_retracted` work with
-      `logical()`; the ids returned by `setVariable` and `retractEvent` are
-      doubles.
-- [ ] **Person from the login.** With the login mapped in
-      `lab.person.db_login`, `CarasLabDB(...)` with no person argument
-      constructs without a warning and `db.CurrentPersonId` is that person
-      (`VariableTests/personComesFromTheLoginOnTheServer`). With an unmapped
-      login it warns `CarasLabDB:noCurrentPerson`.
-- [ ] **Schema check.** Against a version-4 database the constructor errors
-      with `CarasLabDB:schemaVersionMismatch`; with `AllowSchemaMismatch=true`
-      it warns instead.
-- [ ] **Variables.** `db.setVariable("session", id, "Probe Depth", 1200,
-      Units="um", Label="Probe Depth")`, then `db.setVariable(..., 1350.5)`,
-      then `db.getVariables("session", id)` shows 1350.5 and
-      `History=true` shows both. `setVariable(..., 71.9)` stores the text
-      `71.9` (`VariableTests/setUpdateUnsetAndHistory`). A value in other
-      units is refused by the database.
-- [ ] **`normalizeVariableName`.** `"  Probe   Depth "` becomes
-      `"probe depth"`; `"Bad!Name"` is refused locally.
-- [ ] **Retraction.** `db.retractEvent(id, "entered twice")` removes the event
-      from `getEvents()`; `getEvents(ActiveOnly=false)` shows it with
-      `is_retracted` true. A blank reason raises `CarasLabDB:reasonRequired`.
-- [ ] **`addHusbandryBatch`.** A table of three animals writes three events in
-      one transaction; a table with one unknown subject writes none, and
-      `AutoCommit` is back on afterwards. String, cellstr and categorical
+- [ ] **Schema check against a real older database.** Against a version-4
+      database the constructor errors with
+      `CarasLabDB:schemaVersionMismatch`; with `AllowSchemaMismatch=true` it
+      warns instead. (CI checks this with a fake connection only.)
+- [ ] **`addHusbandryBatch` input types.** String, cellstr and categorical
       `subject_id` columns all work.
-- [ ] **Corrections.** `supersedeEvent` moving an event to another session
-      moves its files with it; `add*Event(..., Supersedes=old)` carries inputs
-      and files; `CarryInputs=false` does not copy inputs. Variables on the old
-      row appear on the new one (the database copies them).
-- [ ] **Edits.** `updateSubject(id, Clear="notes")` sets notes to NULL;
-      setting and clearing the same column raises `CarasLabDB:clearAndSet`.
-- [ ] **Tag filters.** `getArtifacts(NotTags="qc:fial")` raises
-      `CarasLabDB:tagFilterProblem`.
-- [ ] **Demo.** `examples/carasLabDB_demo.m` runs end to end with no warning
-      (`TagTests/demoScriptRunsEndToEnd`).
 
 ## 2. GUI (`@CarasLabDBApp`)
 
-- [ ] `runtests("tests/matlab/TagGuiTests.m")` passes.
+`TagGuiTests` passes in CI: the Tags filter on each browse tab, a malformed
+or unknown token, Clear, the remembered filter, the tag editor (add, set,
+remove, policy refusals, its shortcuts through `KeyPressFcn`), the toolbar and
+shortcut list, row actions without a selection, quick search, the Exact date
+filter, the events tab's `recorded_login` column, `parseNumber`, and the
+variables editor writing only on Save. Everything else below has been checked
+by nobody:
+
+- [ ] `runtests("tests/matlab/TagGuiTests.m")` passes on Windows.
 - [ ] **Every form opens:** Add Subject, Add Session, Add Event (type picker,
       then form), and Edit on a subject, a session and an event.
 - [ ] **Change preview.** Edit a subject's strain and clear its notes, then

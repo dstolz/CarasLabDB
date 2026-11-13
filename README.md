@@ -167,9 +167,17 @@ migrations on a database holding data, `tests/check_verify_artifacts.py` the
 file verifier, `tests/check_lab_data.py` the live dashboard's export, and
 `mcp-server/tests/` the MCP server. CI runs them on PostgreSQL 14, 15, 16
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
-run locally only (`design_docs/testing-locally.md` §2.7).
+run in CI too, in MATLAB R2024b, R2025a and the latest release on Linux
+against a PostgreSQL service, and locally with `runtests("tests/matlab")`
+(`design_docs/testing-locally.md` §2.7).
 
-The MATLAB class and GUI were extended for schema versions 4 and 5 without MATLAB to run them: work through [design_docs/matlab-first-run-checklist.md](design_docs/matlab-first-run-checklist.md) on a workstation before relying on them.
+CI runs MATLAB on Linux only, and its GUI tests cover the browse filters, the
+tag editor and the variables editor. What that leaves for a person at a
+Windows workstation is listed in
+[design_docs/matlab-first-run-checklist.md](design_docs/matlab-first-run-checklist.md).
+How the Database Toolbox's PostgreSQL connection behaves, and what the class
+does about it, is in
+[design_docs/matlab-database-toolbox-notes.md](design_docs/matlab-database-toolbox-notes.md).
 
 ```sh
 psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/schema_test.sql
@@ -260,7 +268,7 @@ mcp-server/          Read-only MCP server (Python): typed query tools for LLM ag
 tools/               Backup, restore and file verification (Python)
 examples/            End-to-end demo scripts
 tests/               Schema, role and migration assertions (psql), tool checks (Python)
-  matlab/              MATLAB unit and GUI tests (run locally)
+  matlab/              MATLAB unit and GUI tests (CI and local)
 CLAUDE.md            Repo conventions for Claude Code / coding agents
 ```
 
