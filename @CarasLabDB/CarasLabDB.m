@@ -193,6 +193,12 @@ classdef CarasLabDB < handle
         valueId     = setVariable(obj, kind, entityId, name, value, opts)
         T           = getVariables(obj, kind, entityId, opts)
         name        = defineVariable(obj, name, opts)
+        eventIds    = addHusbandryBatch(obj, T, opts)
+        [artifactId, info] = addArtifactFromFile(obj, filePath, opts)
+    end
+
+    methods (Static)
+        checksum    = fileChecksum(filePath, opts)
     end
 
     % ==================================================================

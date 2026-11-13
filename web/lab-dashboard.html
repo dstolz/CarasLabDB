@@ -1197,12 +1197,127 @@ try{
   tags.sort((a,b)=> a.tag<b.tag?-1:a.tag>b.tag?1:0);
   tags.forEach(t=>{ delete t._auto; delete t._at; });
 
+  // -- retractions ------------------------------------------------------------
+  // Drawn after the tags, again so that the earlier stream is unchanged. One
+  // behaviour event entered twice, and one spike-sorting output withdrawn
+  // although an analysis had already consumed it (which the integrity report
+  // then flags as input_retracted). Neither is active any more.
+  const retractions = [];
+  const retract = (kind, id, reason, at, by) => retractions.push({
+    retraction_id:retractions.length+1, entity_kind:kind, entity_id:id, reason,
+    retracted_at:iso(at), retracted_by:by.person_id, retracted_login:null });
+  const dupBehavior = events.filter(e=>e.event_type==='behavior')[7];
+  if(dupBehavior) retract('event', dupBehavior.event_id, 'Entered twice: the session was logged again from the rig PC.',
+    T(dupBehavior.recorded_at)+2*DAY, people[1]);
+  const usedSpikes = eventInputs.find(ei=>ei.role==='spikes');
+  if(usedSpikes) retract('artifact', usedSpikes.artifact_id, 'Sorted with the wrong channel map; re-sort queued.',
+    Math.min(T(genEventById.get(usedSpikes.event_id).occurred_at)+5*DAY, NOW), people[1]);
+  // Files registered in the last two weeks have not been through the
+  // nightly verifier yet. Every other file's check names the row it ran on.
+  artifacts.forEach(a=>{
+    if(T(a.created_at) > NOW - 14*DAY) a.verification = {status:'unverified', verified_at:null, verified_artifact_id:null};
+    else a.verification.verified_artifact_id = a.artifact_id;
+  });
+
+  // -- user-defined variables ---------------------------------------------------
+  // Definitions (lab.variable) and an append-only value log (lab.variable_value)
+  // as lab.fn_set_variable / fn_unset_variable write them: values are TEXT as
+  // the database stores them, value_id is insertion order, and updates and an
+  // unset are later rows of the same (entity, variable).
+  const VAR_AT = T('2024-09-02T12:00:00Z');
+  const variables = [
+    {name:'probe depth', label:'Probe depth', units:'um', value_type:'number', applies_to:['session','event'],
+     description:'Depth of the probe tip below the pia at the start of the session'},
+    {name:'sound level', label:'Sound level', units:'dB SPL', value_type:'number', applies_to:['session'],
+     description:'Calibrated level of the unmodulated noise carrier'},
+    {name:'baseline weight', label:'Baseline weight', units:'g', value_type:'number', applies_to:['subject'],
+     description:'Free-feeding weight before water restriction; the reference for the 80% rule'},
+    {name:'housing', label:'Housing', units:null, value_type:'text', applies_to:['subject'],
+     description:'How the animal is housed'},
+    {name:'isolation score', label:'Isolation score', units:null, value_type:'number', applies_to:['artifact'],
+     description:'Median unit isolation quality of a sorting output (0-1)'},
+    {name:'grant', label:'Grant', units:null, value_type:'text', applies_to:['project'],
+     description:'Award that funds the project'},
+    {name:'cage card', label:'Cage card', units:null, value_type:'text', applies_to:['subject'],
+     description:'Old paper cage-card number (retired: the facility moved to barcodes)'}
+  ].map(v=>Object.assign(v,{retired_at:null, created_at:iso(VAR_AT), created_by:PI.person_id}));
+  variables.find(v=>v.name==='cage card').retired_at = iso(T('2025-06-30T16:00:00Z'));
+  variables.sort((a,b)=> a.name<b.name?-1:1);
+  const varLog = [];
+  const varDef = n => variables.find(v=>v.name===n);
+  function setVar(kind, id, name, value, at, by, note){
+    if(at > NOW) return;
+    varLog.push({entity_kind:kind, entity_id:id, variable:name, op:value==null?'unset':'set',
+      value:value==null?null:String(value), value_type:varDef(name).value_type, note:note||null,
+      set_at:at, set_by:by.person_id, set_login:null, _seq:varLog.length});
+  }
+  projects.forEach((pr,i)=> setVar('project', pr.project_id, 'grant',
+    ['R01 DC020341','R01 DC020341','R21 DC019874','Internal pilot funds'][i], T(pr.started_on)+16*HOUR, PI));
+  const firstWeight = new Map();
+  events.forEach(e=>{ if(e.event_type==='husbandry' && e.detail.weight_g!=null && !firstWeight.has(e.subject_id)) firstWeight.set(e.subject_id, e); });
+  subjects.forEach((s,i)=>{
+    const t0 = T(s.created_at) + 3*HOUR;
+    if(i<6 && Math.max(t0, VAR_AT) < T('2025-06-30T16:00:00Z')) setVar('subject', s.subject_id, 'cage card', `CC-${4100+i}`, Math.max(t0, VAR_AT), people[4]);
+    setVar('subject', s.subject_id, 'housing', pick(['pair','pair','single','group of 3']), Math.max(t0, VAR_AT), people[4]);
+    if(chance(0.25)) setVar('subject', s.subject_id, 'housing', 'single', Math.max(t0, VAR_AT) + ri(20,90)*DAY, people[4], 'Separated after fighting.');
+    const fw = firstWeight.get(s.subject_id), sg = surgeryBySubject.get(s.subject_id);
+    if(fw && sg){
+      // the last weight before restriction starts is the baseline
+      const pre = events.filter(e=>e.subject_id===s.subject_id && e.event_type==='husbandry' && e.detail.weight_g!=null && T(e.occurred_at) < T(sg.occurred_at) - 18*DAY);
+      const b = pre.length ? pre[pre.length-1] : fw;
+      setVar('subject', s.subject_id, 'baseline weight', (+b.detail.weight_g).toFixed(1), T(b.occurred_at)+HOUR, personOf(b.recorded_by));
+      if(chance(0.2)) setVar('subject', s.subject_id, 'baseline weight', (+b.detail.weight_g + rf(-1.5,1.5)).toFixed(1),
+        T(b.occurred_at)+ri(2,6)*DAY, PI, 'Re-baselined after a week of free feeding.');
+    }
+  });
+  const housingUnset = subjects.find(s=>varLog.some(r=>r.entity_id===s.subject_id && r.variable==='housing'));
+  if(housingUnset) setVar('subject', housingUnset.subject_id, 'housing', null, T('2026-05-12T14:00:00Z'), people[4], 'Moved to the satellite facility; housing no longer tracked here.');
+  sessions.forEach((s,i)=>{
+    const at = T(s.started_at) + 15*60000;
+    const depth = 25*ri(32,64);
+    setVar('session', s.session_id, 'probe depth', depth, at, pick([people[1],people[2]]));
+    if(chance(0.15)) setVar('session', s.session_id, 'probe depth', depth + 25*ri(1,6), at + 40*60000, people[2], 'Advanced the probe after the first block.');
+    setVar('session', s.session_id, 'sound level', pick([60,65,70]), at, pick([people[1],people[2]]));
+    if(i===4) setVar('session', s.session_id, 'sound level', null, at + DAY, people[1], 'Calibration file was for the other booth.');
+  });
+  artifacts.forEach(a=>{
+    if(a.role==='spikes' && chance(0.6)) setVar('artifact', a.artifact_id, 'isolation score', rf(0.55,0.97).toFixed(3), T(a.created_at)+2*HOUR, personOf(a.created_by));
+  });
+  varLog.sort((a,b)=> a.set_at-b.set_at || a._seq-b._seq);
+  const variableValues = varLog.map((r,i)=>({ value_id:i+1, entity_kind:r.entity_kind, entity_id:r.entity_id,
+    variable:r.variable, op:r.op, value:r.value, value_type:r.value_type, note:r.note,
+    set_at:iso(r.set_at), set_by:r.set_by, set_login:r.set_login }));
+
+  // -- integrity summary -------------------------------------------------------
+  // What web/live/lab_integrity.sql would report for this data: the checks of
+  // lab.fn_check_integrity() that this dataset can trip, counted over the
+  // active rows exactly as the function does, with at most 20 examples each.
+  const supE = new Set(events.filter(e=>e.supersedes).map(e=>e.supersedes));
+  const supA = new Set(artifacts.filter(a=>a.supersedes).map(a=>a.supersedes));
+  const retE = new Set(retractions.filter(r=>r.entity_kind==='event').map(r=>r.entity_id));
+  const retA = new Map(retractions.filter(r=>r.entity_kind==='artifact').map(r=>[r.entity_id,r]));
+  const activeA = artifacts.filter(a=>!supA.has(a.artifact_id) && !retA.has(a.artifact_id));
+  const activeE = events.filter(e=>!supE.has(e.event_id) && !retE.has(e.event_id));
+  const pgTs = s => s.replace('T',' ').replace(/\.\d+Z$|Z$/,'+00');
+  const checks = [
+    ['error','artifact_verification_failed', activeA.filter(a=>a.verification.status==='mismatch'||a.verification.status==='missing')
+      .map(a=>({subject:a.artifact_id, detail:`latest verification is ${a.verification.status} (${pgTs(a.verification.verified_at)})`}))],
+    ['warning','artifact_never_verified', activeA.filter(a=>a.verification.status==='unverified')
+      .map(a=>({subject:a.artifact_id, detail:`registered ${pgTs(a.created_at)}, no verification recorded`}))],
+    ['warning','input_retracted', activeE.flatMap(e=>eventInputs.filter(ei=>ei.event_id===e.event_id && retA.has(ei.artifact_id))
+      .map(ei=>({subject:e.event_id, detail:`consumed artifact ${ei.artifact_id}, which was retracted: ${retA.get(ei.artifact_id).reason}`})))]
+  ].filter(c=>c[2].length).map(([severity,check_name,rows])=>{
+    rows.sort((a,b)=> a.subject<b.subject?-1:a.subject>b.subject?1:0);
+    return {severity, check_name, count:rows.length, examples:rows.slice(0,20)};
+  });
+  const integrity = {computed_at:iso(NOW), example_limit:20, synthetic:true, checks};
+
   // expose
   window.LAB_DATA = {
     people, probes, pipelines, storageRoots, species,
     projects, projectMembers, projectArtifacts,
     eventTypeMeta, roleMeta, subjects, sessions, events, artifacts, eventInputs,
-    tagNamespaces, tags, tagAssignments, NOW
+    tagNamespaces, tags, tagAssignments, variables, variableValues, retractions, integrity, NOW
   };
 })();
 </script>

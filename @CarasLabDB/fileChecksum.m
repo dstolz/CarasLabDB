@@ -32,7 +32,7 @@ function checksum = fileChecksum(filePath, opts)
         opts.Algo (1,1) string {mustBeMember(opts.Algo, ["sha256", "md5"])} = "sha256"
     end
 
-    if ~usejava("jvm")
+    if ~usejava('jvm')
         error("CarasLabDB:noJava", ...
             "fileChecksum needs the Java virtual machine (MATLAB was started without it).");
     end
