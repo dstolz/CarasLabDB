@@ -104,7 +104,7 @@ classdef CarasLabDB < handle
     end
 
     properties (Constant)
-        SchemaVersionExpected = 4               % schema version this class is written for
+        SchemaVersionExpected = 5               % schema version this class is written for
     end
 
     properties
@@ -1301,8 +1301,40 @@ classdef CarasLabDB < handle
                 w = strings(1, 0);
                 return
             end
+            obj.pCheckTagFilter(kind, allTags, anyTags, noneTags);
             w = obj.pT("fn_tag_match") + "(" + obj.sqlLiteral(kind) + ", " + ...
                 pk + "::text, " + strjoin(arrs, ", ") + ")";
+        end
+
+        function pCheckTagFilter(obj, kind, allTags, anyTags, noneTags)
+            %PCHECKTAGFILTER Refuse a tag filter that cannot mean what it says.
+            %   lab.fn_tag_match treats an unknown token as "nothing carries
+            %   it", so a typo is silent: NotTags="qc:fial" excludes nothing
+            %   and returns the failed recordings. One call of
+            %   lab.fn_tag_filter_problems per query reports a namespace that
+            %   does not exist, one whose tags cannot be put on KIND, and a
+            %   tag that is not registered; any row raises
+            %   CarasLabDB:tagFilterProblem naming each token and what is
+            %   wrong with it. Tokens are validated and canonicalised first
+            %   (PTAGTOKENS), so a malformed one fails before any SQL is sent.
+            tokens = unique([CarasLabDB.pTagTokens(allTags), ...
+                             CarasLabDB.pTagTokens(anyTags), ...
+                             CarasLabDB.pTagTokens(noneTags)], "stable");
+            if isempty(tokens)
+                return
+            end
+            R = obj.pSelect("SELECT token, problem FROM " + ...
+                obj.pT("fn_tag_filter_problems") + "(" + obj.sqlLiteral(kind) + ", " + ...
+                CarasLabDB.pTagArrayLiteral(tokens) + ");");
+            if height(R) == 0
+                return
+            end
+            found = reshape(CarasLabDB.pColText(R.token) + ": " + ...
+                CarasLabDB.pColText(R.problem), 1, []);
+            error("CarasLabDB:tagFilterProblem", ...
+                "The tag filter cannot match %s rows as written:\n  %s\n" + ...
+                "Correct the tag, or see getTags / getTagNamespaces for the vocabulary.", ...
+                kind, strjoin(found, newline + "  "));
         end
 
         function ids = pApplyTags(obj, kind, entityId, tags, op, note, appliedBy)
@@ -1369,7 +1401,20 @@ classdef CarasLabDB < handle
 
         function pid = pResolvePerson(obj, personId, email, name)
             %PRESOLVEPERSON Resolve a person_id from an id, email, or full name.
+            %   Returns missing when none of the three is given. An id, email
+            %   or name that matches no lab.person row raises
+            %   CarasLabDB:personNotFound; a name shared by several people
+            %   raises CarasLabDB:personAmbiguous rather than attributing
+            %   every later row to whichever of them the database returns
+            %   first.
             if obj.pIsProvided(personId)
+                % Checked now: a person_id that names no one would otherwise
+                % surface only as a foreign-key error on the first insert.
+                T = obj.pSelect("SELECT person_id FROM " + obj.pT("person") + ...
+                    " WHERE person_id = " + obj.sqlLiteral(personId) + ";");
+                if height(T) == 0
+                    error("CarasLabDB:personNotFound", "No person with id %s.", personId);
+                end
                 pid = personId;
                 return
             end
@@ -1385,12 +1430,29 @@ classdef CarasLabDB < handle
                 pid = string(missing);
                 return
             end
+            % LIMIT 2 is enough to tell one match from several. Emails are
+            % unique (uq_person_email_lower); full names are not.
             T = obj.pSelect("SELECT person_id FROM " + obj.pT("person") + ...
-                " WHERE " + where + " LIMIT 1;");
+                " WHERE " + where + " ORDER BY person_id LIMIT 2;");
             if height(T) == 0
                 error("CarasLabDB:personNotFound", "No person matches the supplied identity.");
             end
+            if height(T) > 1
+                error("CarasLabDB:personAmbiguous", ...
+                    "More than one person matches the supplied identity. " + ...
+                    "Use PersonEmail= or PersonId=, which are unique.");
+            end
             pid = string(T.person_id(1));
+        end
+
+        function pWarnNoPerson(obj)
+            %PWARNNOPERSON Warn when inserts will carry no person (CurrentPersonId missing).
+            if ismissing(obj.CurrentPersonId)
+                warning("CarasLabDB:noCurrentPerson", ...
+                    "No current person: rows will be written with a NULL recorded_by / " + ...
+                    "created_by (the database still records the login). Pass PersonEmail=, " + ...
+                    "PersonId= or PersonName=, or call setPerson.");
+            end
         end
 
         function T = pSelectFrom(obj, tableRef, filters, opts)
@@ -1442,8 +1504,12 @@ classdef CarasLabDB < handle
             end
         end
 
-        function pInitSession(obj)
+        function pInitSession(obj, allowMismatch)
             %PINITSESSION Align the session time zone and read the schema version.
+            %   A schema version other than SchemaVersionExpected raises
+            %   CarasLabDB:schemaVersionMismatch: an error, or with
+            %   ALLOWMISMATCH true a warning.
+            %
             %   The native driver returns timestamptz as an *unzoned* datetime
             %   holding the server session's wall-clock reading, while
             %   sqlLiteral tags an unzoned datetime as this workstation's
@@ -1478,11 +1544,20 @@ classdef CarasLabDB < handle
                 else
                     found = string(obj.SchemaVersion);
                 end
-                warning("CarasLabDB:schemaVersionMismatch", ...
-                    "Database schema version is %s; this CarasLabDB class is " + ...
+                msg = sprintf("Database schema version is %s; this CarasLabDB class is " + ...
                     "written for version %d. Upgrade the database with the " + ...
                     "scripts in design_docs/migrations/, or use a matching client.", ...
                     found, CarasLabDB.SchemaVersionExpected);
+                if allowMismatch
+                    warning("CarasLabDB:schemaVersionMismatch", "%s", msg);
+                else
+                    % The table and column names of the expected version are
+                    % hard-coded throughout this class, so against any other
+                    % version a write can fail half-way or land in the wrong
+                    % column. Refusing is the safe default.
+                    error("CarasLabDB:schemaVersionMismatch", ...
+                        "%s (Pass AllowSchemaMismatch=true to connect anyway.)", msg);
+                end
             end
         end
 
@@ -1525,10 +1600,11 @@ classdef CarasLabDB < handle
         function s = pArtifactSuccessor(obj, row)
             %PARTIFACTSUCCESSOR Insert struct for the row that supersedes artifact ROW.
             %   ROW is a pRowsAsText struct of lab.artifact. Every column is
-            %   carried forward except the regenerated ones; supersedes points
-            %   at ROW and created_by is the current person.
+            %   carried forward except the regenerated ones (created_login is
+            %   stamped by the database); supersedes points at ROW and
+            %   created_by is the current person.
             s = rmfield(row, intersect(fieldnames(row), ...
-                {'artifact_id', 'created_at', 'created_by', 'supersedes'}));
+                {'artifact_id', 'created_at', 'created_by', 'created_login', 'supersedes'}));
             s.supersedes = row.artifact_id;
             s = obj.pSet(s, "created_by", obj.pCreatedBy(string(missing)));
         end
@@ -1552,6 +1628,8 @@ classdef CarasLabDB < handle
                 tf = ~isempty(v) && ~all(isnat(v(:)));
             elseif isnumeric(v)
                 tf = ~isempty(v) && ~all(isnan(v(:)));
+            elseif isa(v, "missing")
+                tf = false;     % the missing object itself, as string(missing)
             else
                 tf = ~isempty(v);
             end
@@ -1609,14 +1687,11 @@ classdef CarasLabDB < handle
             %   normalizeTag(AllowWildcard=true) so a malformed token fails here
             %   with a clear message. No token left gives NULL::text[], which
             %   lab.fn_tag_match treats as "no constraint".
-            tokens = reshape(string(tokens), 1, []);
-            tokens = tokens(~ismissing(tokens));
-            tokens = tokens(strlength(strip(tokens, "both", " ")) > 0);
+            tokens = CarasLabDB.pTagTokens(tokens);
             if isempty(tokens)
                 lit = "NULL::text[]";
                 return
             end
-            tokens = CarasLabDB.normalizeTag(tokens, AllowWildcard=true);
             lits = strings(1, numel(tokens));
             for i = 1:numel(tokens)
                 lits(i) = CarasLabDB.sqlLiteral(tokens(i));
@@ -1638,6 +1713,58 @@ classdef CarasLabDB < handle
                     "AppliesTo must be a non-empty list of: %s.", strjoin(known, ", "));
             end
             lit = "{" + strjoin(known(ismember(known, kinds)), ",") + "}";
+        end
+
+        function tokens = pTagTokens(tokens)
+            %PTAGTOKENS Tag-filter tokens as a validated, canonical 1-by-n string array.
+            %   Missing and blank elements are dropped; the rest go through
+            %   normalizeTag(AllowWildcard=true), which raises
+            %   CarasLabDB:invalidTag for a malformed one. Applying it to its
+            %   own output changes nothing.
+            tokens = reshape(string(tokens), 1, []);
+            tokens = tokens(~ismissing(tokens));
+            tokens = tokens(strlength(strip(tokens, "both", " ")) > 0);
+            if ~isempty(tokens)
+                tokens = CarasLabDB.normalizeTag(tokens, AllowWildcard=true);
+            end
+        end
+
+        function a = pFollowEvent(a, ev)
+            %PFOLLOWEVENT File artifact insert struct A under event EV's subject and session.
+            %   EV is a pRowsAsText struct of the producing lab.event row.
+            %   Where it names a subject or a session, A takes it; where it
+            %   does not (NULL), A keeps its own value.
+            for col = ["subject_id", "session_id"]
+                c = char(col);
+                if isfield(ev, c) && CarasLabDB.pIsProvided(ev.(c))
+                    a.(c) = ev.(c);
+                end
+            end
+        end
+
+        function s = pApplyClear(s, cols, clearable)
+            %PAPPLYCLEAR Add "column = NULL" to update struct S for each column in COLS.
+            %   COLS holds database column names and must be a subset of
+            %   CLEARABLE, the fixed list of nullable columns the calling
+            %   update method edits -- so a caller's text can only select one
+            %   of those identifiers, never become one. A column that S
+            %   already sets raises CarasLabDB:clearAndSet.
+            cols = unique(reshape(string(cols), 1, []), "stable");
+            if isempty(cols)
+                return
+            end
+            if any(ismissing(cols)) || ~all(ismember(cols, clearable))
+                error("CarasLabDB:invalidValue", ...
+                    "Clear must name columns from: %s.", strjoin(clearable, ", "));
+            end
+            both = cols(ismember(cols, reshape(string(fieldnames(s)), 1, [])));
+            if ~isempty(both)
+                error("CarasLabDB:clearAndSet", ...
+                    "A column cannot be both cleared and set: %s.", strjoin(both, ", "));
+            end
+            for i = 1:numel(cols)
+                s.(char(cols(i))) = string(missing);    % sqlLiteral -> NULL
+            end
         end
 
         function pCheckMember(value, allowed, name)
@@ -1729,7 +1856,8 @@ classdef CarasLabDB < handle
     methods (Static)
         function out = sqlLiteral(v)
             %SQLLITERAL Format a MATLAB value as a Postgres SQL literal.
-            %   Handles NULLs (missing/NaN/NaT/[]), text (quotes doubled),
+            %   Handles NULLs (string(missing), the missing object, NaN, NaT,
+            %   []), text (quotes doubled),
             %   numbers, logicals, datetime (timestamptz), and jsonb (struct /
             %   containers.Map / dictionary via jsonencode).
             if isempty(v)
@@ -1737,6 +1865,15 @@ classdef CarasLabDB < handle
                 return
             end
             if isstring(v) && isscalar(v) && ismissing(v)
+                out = "NULL";
+                return
+            end
+            if isa(v, "missing")
+                % The missing object itself, e.g. struct("notes", missing) in
+                % a supersede override: NULL, like string(missing).
+                if ~isscalar(v)
+                    error("CarasLabDB:scalarExpected", "missing SQL values must be scalar.");
+                end
                 out = "NULL";
                 return
             end

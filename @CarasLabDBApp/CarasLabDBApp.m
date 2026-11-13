@@ -33,6 +33,8 @@ classdef CarasLabDBApp < handle
         Prefs   struct = struct()   % live preferences (persisted on close)
         OwnsDb  (1,1) logical = false   % delete Db on close only if we opened it
         TabKeys string = strings(1,0)   % ordered browse-tab keys
+        DisplaySel struct = struct()    % per tab: DisplaySelection of the last selection event
+        Capped  struct = struct()       % per tab: true when the last query hit RowLimit
     end
 
     properties (Constant, Access = private)
@@ -64,12 +66,13 @@ classdef CarasLabDBApp < handle
     end
 
     methods (Static, Access = private)
-        out = pFormDialog(titleText, specs)
+        out = pFormDialog(titleText, specs, headerText)
     end
 
     methods (Static)
         specs = eventFieldSpecs(eventType)
         showShortcutHelp(fig, context)
+        [action, v] = fieldChange(f, raw, isEdit, opts)
     end
 
     % ==================================================================
@@ -153,7 +156,8 @@ classdef CarasLabDBApp < handle
                 "Key", "events", "Title", "Events", ...
                 "Table", "event", "ActiveTable", "event_active", ...
                 "Columns", ["event_id","event_type","subject_id","session_id", ...
-                            "occurred_at","recorded_at","recorded_by","supersedes","notes"], ...
+                            "occurred_at","recorded_at","recorded_by","recorded_login", ...
+                            "supersedes","notes"], ...
                 "DateCols", ["occurred_at","recorded_at"], "NumCols", strings(1,0), ...
                 "HasSubject", true, "OrderBy", "occurred_at DESC", "Entity", "event");
 
@@ -269,9 +273,12 @@ classdef CarasLabDBApp < handle
                 uialert(obj.Fig, "Editing is not available on this tab.", "Edit");
                 return
             end
-            id = obj.pSelectedId(d);
+            [id, problem] = obj.pSelectedId(d);
             if ismissing(id)
-                uialert(obj.Fig, "Select a row first.", "Edit");
+                if strlength(problem) == 0
+                    problem = "Select a row first.";
+                end
+                uialert(obj.Fig, problem, "Edit");
                 return
             end
             switch d.Entity
@@ -290,36 +297,95 @@ classdef CarasLabDBApp < handle
                 uialert(obj.Fig, "Tags are edited on the browse tabs.", "Tags");
                 return
             end
-            id = obj.pSelectedId(d);
+            [id, problem] = obj.pSelectedId(d);
             if ismissing(id)
-                uialert(obj.Fig, "Select a row first.", "Tags");
+                if strlength(problem) == 0
+                    problem = "Select a row first.";
+                end
+                uialert(obj.Fig, problem, "Tags");
                 return
             end
             obj.showTagEditor(d.Entity, id);
         end
 
-        function id = pSelectedId(obj, d)
+        function onTableSelection(obj, key, evt)
+            %ONTABLESELECTION Remember where a selection sits in the sorted display.
+            %   SelectionChangedFcn of the browse tables. The event's
+            %   DisplaySelection (the selection as displayed, after a column
+            %   sort) is kept per tab so PSELECTEDID can cross-check the row
+            %   it is about to act on. [] when the event carries none.
+            ds = [];
+            try
+                if isprop(evt, "DisplaySelection")
+                    ds = evt.DisplaySelection;
+                end
+            catch
+                ds = [];
+            end
+            obj.DisplaySel.(char(key)) = ds;
+        end
+
+        function [id, problem] = pSelectedId(obj, d)
             %PSELECTEDID Primary-key value of the selected row on tab D, or <missing>.
+            %   [id, problem] = pSelectedId(obj, d). ID is <missing> when no
+            %   row is selected (PROBLEM "") or when the selected row cannot
+            %   be identified with certainty (PROBLEM says why, for an alert).
+            %
+            %   An edit, a correction or a tag must never land on a guessed
+            %   row. While the table is unsorted, the Selection index and the
+            %   Data row are the same thing. Once the user has sorted a
+            %   column, the id read from Data at Selection is accepted only if
+            %   the id read from DisplayData at the DisplaySelection of the
+            %   last selection event is the same row; otherwise nothing is
+            %   returned and the caller tells the user.
             id = string(missing);
+            problem = "";
             t = obj.UI.Tables.(d.Key);
             sel = t.Selection;
             if isempty(sel) || isempty(t.Data)
                 return
             end
             r = sel(1);
-            % Selection indexes the displayed (possibly sorted) order, so read
-            % from DisplayData when available to stay aligned after a sort.
             data = t.Data;
+            idCol = char(d.Columns(1));          % PK is always the first column
+            if ~istable(data) || ~ismember(idCol, data.Properties.VariableNames) ...
+                    || r < 1 || r > height(data)
+                return
+            end
+            idData = string(data.(idCol)(r));
+
+            shown = [];
             try
-                if ~isempty(t.DisplayData)
-                    data = t.DisplayData;
-                end
+                shown = t.DisplayData;
             catch
             end
-            idCol = d.Columns(1);          % PK is always the first column
-            if ismember(idCol, string(data.Properties.VariableNames)) && r <= height(data)
-                id = string(data.(char(idCol))(r));
+            sorted = false;
+            if istable(shown) && height(shown) > 0 ...
+                    && ismember(idCol, shown.Properties.VariableNames)
+                sorted = ~isequal(reshape(string(shown.(idCol)), [], 1), ...
+                                  reshape(string(data.(idCol)), [], 1));
             end
+            if ~sorted
+                id = idData;
+                return
+            end
+
+            ds = [];
+            if isfield(obj.DisplaySel, char(d.Key))
+                ds = obj.DisplaySel.(char(d.Key));
+            end
+            if ~isempty(ds) && isnumeric(ds) && ds(1) >= 1 && ds(1) <= height(shown)
+                idDisp = string(shown.(idCol)(ds(1)));
+                if isscalar(idDisp) && isscalar(idData) && ~ismissing(idData) ...
+                        && idDisp == idData
+                    id = idData;
+                    return
+                end
+            end
+            problem = "The selected row could not be identified with certainty " + ...
+                "while the table is sorted, so nothing was opened. Click the row " + ...
+                "again; if this message comes back, press Refresh (Ctrl+R) to " + ...
+                "clear the sort and select the row in the unsorted table.";
         end
 
         function onExport(obj, ~, ~)

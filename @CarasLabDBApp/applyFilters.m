@@ -1,11 +1,13 @@
 function applyFilters(obj)
 %APPLYFILTERS Run the current tab's filtered query and populate its table.
 %
-%   Builds "SELECT * FROM <table><where> ORDER BY <orderby> LIMIT <cap>",
+%   Builds "SELECT * FROM <table><where> ORDER BY <orderby>, <pk> LIMIT <cap>",
 %   honoring the active-only toggle (events/artifacts read the *_active view),
 %   executes via CarasLabDB.runQuery, and shows the result. Event rows are
-%   color-coded by event_type. Errors (e.g. a bad regex) surface in the status
-%   bar and an alert rather than throwing.
+%   color-coded by event_type, and recorded_login is shown next to
+%   recorded_by. Errors (e.g. a bad regex) surface in the status bar and an
+%   alert rather than throwing. Whether the result hit the row limit is
+%   remembered per tab (obj.Capped) so an export can say it is incomplete.
 %
 %   See also CARASLABDBAPP/BUILDWHERE, CARASLABDBAPP/REFRESHACTIVETAB.
 
@@ -33,8 +35,15 @@ function applyFilters(obj)
         return
     end
 
+    % The primary key as a last sort key makes the order total, so a result
+    % cut off at the row limit is a stable, well-defined subset.
+    orderBy = d.OrderBy;
+    pk = d.Columns(1);
+    if ~startsWith(orderBy, pk)
+        orderBy = orderBy + ", " + pk;
+    end
     sql = "SELECT * FROM " + obj.pQualify(tableName) + where + ...
-        " ORDER BY " + d.OrderBy + " LIMIT " + string(obj.RowLimit) + ";";
+        " ORDER BY " + orderBy + " LIMIT " + string(obj.RowLimit) + ";";
 
     tbl = obj.UI.Tables.(d.Key);
     try
@@ -44,21 +53,45 @@ function applyFilters(obj)
         uialert(obj.Fig, string(ME.message), "Query failed");
         return
     end
+    T = local_placeColumns(d, T);
 
     tbl.Data = T;
     tbl.Selection = [];
+    obj.DisplaySel.(char(d.Key)) = [];      % no selection event has happened on this data
     local_colorEvents(obj, d, tbl, T);
 
     n = height(T);
+    capped = n >= obj.RowLimit;
+    obj.Capped.(char(d.Key)) = capped;      % exportToWorkspace reports it
     capNote = "";
-    if n >= obj.RowLimit
+    if capped
         capNote = " (capped at " + string(obj.RowLimit) + ")";
     end
     tagNote = "";
     if strlength(strtrim(tagText)) > 0
         tagNote = " · tags: " + strtrim(tagText);
+        if n == 0
+            % fn_tag_match gives no rows for a tag that does not exist or
+            % does not apply to this kind of row, so say what to check.
+            tagNote = tagNote + " (no match: check that each tag exists and applies to " + ...
+                lower(d.Title) + ")";
+        end
     end
     obj.pStatus(d.Title + ": " + string(n) + " row(s)" + capNote + " · " + tableName + tagNote);
+end
+
+% =============================================================================
+function T = local_placeColumns(d, T)
+    %LOCAL_PLACECOLUMNS Show recorded_login right after recorded_by on the Events tab.
+    %   The column is last in lab.event; next to recorded_by it reads as
+    %   "who recorded this: the person, and the database login".
+    if d.Key ~= "events" || ~istable(T)
+        return
+    end
+    vars = string(T.Properties.VariableNames);
+    if all(ismember(["recorded_by", "recorded_login"], vars))
+        T = movevars(T, "recorded_login", "After", "recorded_by");
+    end
 end
 
 % =============================================================================

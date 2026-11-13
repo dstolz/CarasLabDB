@@ -8,7 +8,12 @@ function showSubjectEditor(obj, mode, subjectId)
 %   in-place UPDATE via CarasLabDB.updateSubject. The natural key subject_id is
 %   set only on add and is read-only when editing.
 %
-%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDB/ADDSUBJECT, CARASLABDB/UPDATESUBJECT.
+%   Editing writes only what the user changed. A field that held a value and
+%   is emptied is cleared (updateSubject's Clear=); Sex cannot be cleared.
+%   If nothing was changed, nothing is written.
+%
+%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
+%   CARASLABDB/ADDSUBJECT, CARASLABDB/UPDATESUBJECT.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -87,8 +92,10 @@ function showSubjectEditor(obj, mode, subjectId)
     else
         idx = find([fields.Key] == "Sex", 1);
         fields(idx).Value = "U";
+        % The id format is shown as a placeholder, not prefilled: a prefilled
+        % example can be saved as a real subject_id, which is a permanent key.
         idx = find([fields.Key] == "SubjectId", 1);
-        fields(idx).Value = "SUBJ-ID-";
+        fields(idx).Placeholder = "lab id, e.g. G-0421";
         idx = find([fields.Key] == "SpeciesCode", 1);
         gerbilIdx = find(contains(lower(speciesChoices), "gerbil"), 1);
         if ~isempty(gerbilIdx)
@@ -105,7 +112,7 @@ function showSubjectEditor(obj, mode, subjectId)
     if ~res.OK, return; end
 
     try
-        [args, subjId] = local_args(fields, res.Values, isEdit, subjectId, ...
+        [args, subjId, clearCols] = local_args(fields, res.Values, isEdit, subjectId, ...
             speciesCodes, speciesChoices, projects);
     catch ME
         uialert(obj.Fig, string(ME.message), "Invalid input");
@@ -114,6 +121,13 @@ function showSubjectEditor(obj, mode, subjectId)
 
     try
         if isEdit
+            if isempty(args) && isempty(clearCols)
+                obj.pStatus("No changes to save for subject " + subjId + ".");
+                return
+            end
+            if ~isempty(clearCols)
+                args = [args, {"Clear", clearCols}];
+            end
             obj.Db.updateSubject(subjId, args{:});
             obj.pStatus("Updated subject " + subjId);
         else
@@ -136,50 +150,57 @@ function showSubjectEditor(obj, mode, subjectId)
 end
 
 % =============================================================================
-function [args, subjId] = local_args(fields, values, isEdit, subjectId, ...
+function [args, subjId, clearCols] = local_args(fields, values, isEdit, subjectId, ...
         speciesCodes, speciesChoices, projects)
+    %LOCAL_ARGS Name=Value arguments for addSubject / updateSubject.
+    %   Adding: every non-blank field. Editing: only the fields the user
+    %   changed (ARGS), plus the columns of fields that were prefilled and
+    %   are now blank (CLEARCOLS, for updateSubject's Clear=). An untouched
+    %   field is never written back, so it cannot be altered by the form's
+    %   rendering of it. Emptying a field the database requires is an error
+    %   that names the field.
     args = {};
+    clearCols = strings(1, 0);
     subjId = subjectId;
+    clearable = ["species_code","strain","genotype","source","date_of_birth","notes"];
     for i = 1:numel(fields)
         f = fields(i);
-        if isEdit && f.Key == "ProjectId"
-            continue   % updateSubject cannot move a subject between projects
+        if isEdit && ismember(f.Key, ["SubjectId", "ProjectId"])
+            continue   % read-only when editing: shown for context only
         end
-        [provided, v] = local_convert(f, values.(char(f.Key)), ...
+        [action, v] = local_convert(f, values.(char(f.Key)), isEdit, ...
             speciesCodes, speciesChoices, projects);
         if f.Key == "SubjectId"
-            if ~isEdit && provided
+            if action == "set"
                 subjId = v;
             end
             continue   % handled as the positional key, never a Name=Value arg
         end
-        if provided
+        if action == "set"
             args(end+1:end+2) = {f.Arg, v};
+        elseif action == "clear"
+            if ~ismember(f.Col, clearable)
+                error("CarasLabDBApp:requiredField", ...
+                    "%s is required and cannot be cleared.", f.Label);
+            end
+            clearCols(end+1) = f.Col;
         end
     end
 end
 
-function [provided, v] = local_convert(f, raw, speciesCodes, speciesChoices, projects)
-    switch f.Type
-        case "datetime"
-            v = raw;
-            if isnat(v)
-                provided = false; return
-            end
-            v.TimeZone = "local";
-            provided = true;
-        otherwise
-            v = strtrim(string(raw));
-            provided = strlength(v) > 0;
-            if ~provided
-                return
-            end
-            % Dropdowns show a friendly label; the database wants the key.
-            if f.Key == "SpeciesCode"
-                v = local_lookup(v, speciesChoices, speciesCodes);
-            elseif f.Key == "ProjectId"
-                v = local_lookup(v, projects.Choices, projects.Ids);
-            end
+function [action, v] = local_convert(f, raw, isEdit, speciesCodes, speciesChoices, projects)
+    %LOCAL_CONVERT What to do with one form value: "set", "clear" or "keep".
+    %   CarasLabDBApp.fieldChange decides; date_of_birth is a calendar date,
+    %   so it counts as unchanged while the day is the same.
+    [action, v] = CarasLabDBApp.fieldChange(f, raw, isEdit, ...
+        DateOnly=(f.Col == "date_of_birth"));
+    if action == "set" && isstring(v)
+        % Dropdowns show a friendly label; the database wants the key.
+        if f.Key == "SpeciesCode"
+            v = local_lookup(v, speciesChoices, speciesCodes);
+        elseif f.Key == "ProjectId"
+            v = local_lookup(v, projects.Choices, projects.Ids);
+        end
     end
 end
 
@@ -187,7 +208,8 @@ end
 function s = local_spec(key, col, label, type, choices)
     s = struct("Key", string(key), "Arg", string(key), "Col", string(col), ...
         "Label", string(label), "Type", string(type), ...
-        "Choices", string(choices), "Value", string(missing), "Editable", true);
+        "Choices", string(choices), "Value", string(missing), "Editable", true, ...
+        "Placeholder", "");
 end
 
 function s = local_espec(key, col, label, type, choices)

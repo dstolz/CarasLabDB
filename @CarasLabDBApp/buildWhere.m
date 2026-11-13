@@ -10,9 +10,17 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
 %
 %   Modes:
 %       Exact    -> col = <lit>
-%       Contains -> CAST(col AS text) ILIKE %val%   (case-insensitive substring)
+%       Contains -> CAST(col AS text) ILIKE %val%   (case-insensitive substring;
+%                   %, _ and \ in val are matched literally)
 %       Regex    -> CAST(col AS text) ~* val        (case-insensitive POSIX regex)
 %       Range    -> col >= <lo> [AND col <= <hi>]
+%
+%   Dates. On a date / timestamp column (tabDef.DateCols) a value written as a
+%   bare date, yyyy-MM-dd, stands for that whole day in the session time zone
+%   (the workstation's): Exact becomes col >= <d> AND col < <d>::date + 1, and
+%   the upper end of a Range becomes col < <hi>::date + 1, so "to 2026-07-02"
+%   includes everything that happened on 2 July. A value with a time of day
+%   is compared as written.
 %
 %   Tag filter (TAGTEXT), the same grammar as the web dashboard's: tokens
 %   separated by spaces must all hold; "-tok" must not; "ns:*" is any current
@@ -48,7 +56,7 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
             clauses(end+1) = "CAST(subject_id AS text) ~* " + CarasLabDB.sqlLiteral(qt);
         else
             clauses(end+1) = "CAST(subject_id AS text) ILIKE " + ...
-                CarasLabDB.sqlLiteral("%" + qt + "%");
+                CarasLabDB.sqlLiteral(local_likePattern(qt));
         end
     end
 
@@ -57,16 +65,24 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
         mode = rows(i).Mode;
         val = strtrim(rows(i).Val);
         val2 = strtrim(rows(i).Val2);
+        % A bare date on a date / timestamp column means that whole day.
+        isDateCol = ismember(col, reshape(string(tabDef.DateCols), 1, []));
 
         switch mode
             case "Exact"
                 if strlength(val) == 0, continue; end
-                clauses(end+1) = col + " = " + CarasLabDB.sqlLiteral(val); %#ok<AGROW>
+                if isDateCol && local_isBareDate(val)
+                    lit = CarasLabDB.sqlLiteral(val);
+                    clauses(end+1) = "(" + col + " >= " + lit + " AND " + ...
+                        col + " < (" + lit + "::date + 1))"; %#ok<AGROW>
+                else
+                    clauses(end+1) = col + " = " + CarasLabDB.sqlLiteral(val); %#ok<AGROW>
+                end
 
             case "Contains"
                 if strlength(val) == 0, continue; end
                 clauses(end+1) = "CAST(" + col + " AS text) ILIKE " + ...
-                    CarasLabDB.sqlLiteral("%" + val + "%"); %#ok<AGROW>
+                    CarasLabDB.sqlLiteral(local_likePattern(val)); %#ok<AGROW>
 
             case "Regex"
                 if strlength(val) == 0, continue; end
@@ -79,7 +95,13 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
                     parts(end+1) = col + " >= " + CarasLabDB.sqlLiteral(val); %#ok<AGROW>
                 end
                 if strlength(val2) > 0
-                    parts(end+1) = col + " <= " + CarasLabDB.sqlLiteral(val2); %#ok<AGROW>
+                    if isDateCol && local_isBareDate(val2)
+                        % "to 2026-07-02" includes all of 2 July.
+                        parts(end+1) = col + " < (" + ...
+                            CarasLabDB.sqlLiteral(val2) + "::date + 1)"; %#ok<AGROW>
+                    else
+                        parts(end+1) = col + " <= " + CarasLabDB.sqlLiteral(val2); %#ok<AGROW>
+                    end
                 end
                 if ~isempty(parts)
                     clauses(end+1) = "(" + strjoin(parts, " AND ") + ")"; %#ok<AGROW>
@@ -100,6 +122,22 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
 end
 
 % =============================================================================
+function p = local_likePattern(val)
+    %LOCAL_LIKEPATTERN "%val%" with the LIKE wildcards in VAL made literal.
+    %   Without this "G_04" also matches "GX04" and "%" matches every row.
+    %   Backslash is Postgres's default LIKE escape character, so it is
+    %   escaped first; sqlLiteral then quotes the whole pattern as a value.
+    v = replace(val, "\", "\\");
+    v = replace(v, "%", "\%");
+    v = replace(v, "_", "\_");
+    p = "%" + v + "%";
+end
+
+function tf = local_isBareDate(val)
+    %LOCAL_ISBAREDATE True for a date with no time of day, written yyyy-MM-dd.
+    tf = ~isempty(regexp(char(val), '^\d{4}-\d{2}-\d{2}$', 'once'));
+end
+
 function c = local_tagClause(tabDef, tagText, fnRef)
     %LOCAL_TAGCLAUSE The lab.fn_tag_match clause for the Tags field, or "".
     %   FNREF is the schema-qualified function name (internal).

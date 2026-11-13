@@ -3,7 +3,11 @@ function out = pFormDialog(titleText, specs)
 %
 %   out = CarasLabDBApp.pFormDialog(titleText, specs) builds a scrollable modal
 %   form from a struct-array of field specs and blocks until the user clicks OK
-%   or Cancel. Used by the event/subject/session editors.
+%   (Ctrl+S) or Cancel (Esc). Used by the event/subject/session editors.
+%
+%   out = CarasLabDBApp.pFormDialog(titleText, specs, headerText) also shows
+%   HEADERTEXT in bold above the fields; the editors use it to name the row
+%   being edited.
 %
 %   Each spec element:
 %       Key      - identifier used as the output struct field
@@ -12,6 +16,11 @@ function out = pFormDialog(titleText, specs)
 %       Choices  - items for Type=="enum" (else ignored)
 %       Value    - initial value (string/double/logical/datetime; may be missing)
 %       Editable - optional logical (default true)
+%       Placeholder - optional hint shown in an empty "text" field
+%
+%   Number fields take plain decimal notation with a period (71.9, 30000,
+%   1.5e3). Text with a comma is refused rather than parsed: str2double
+%   would silently read "71,9" as 719.
 %
 %   Returns a struct with:
 %       out.OK      - true if the user confirmed
@@ -29,20 +38,34 @@ function out = pFormDialog(titleText, specs)
     arguments
         titleText (1,1) string
         specs struct
+        headerText (1,1) string = ""
     end
 
     out = struct("OK", false, "Values", struct());
     n = numel(specs);
     hasTextarea = any(string({specs.Type}) == "textarea");
+    hasHeader = strlength(headerText) > 0;
 
-    figH = min(720, 96 + n * 40);
+    figH = min(720, 96 + n * 40 + 30 * double(hasHeader));
     f = uifigure("Name", titleText, ...
         "Position", local_center(560, figH), "WindowStyle", "modal", ...
         "KeyPressFcn", @(~,e) onKeyPress(e));
-    outer = uigridlayout(f, [2 1]);
-    outer.RowHeight = {'1x', 44};
+    % Children fill the grid in creation order: [header,] fields, buttons.
+    if hasHeader
+        outer = uigridlayout(f, [3 1]);
+        outer.RowHeight = {22, '1x', 44};
+    else
+        outer = uigridlayout(f, [2 1]);
+        outer.RowHeight = {'1x', 44};
+    end
     outer.ColumnWidth = {'1x'};
     outer.Padding = [10 10 10 10];
+    if hasHeader
+        % Names the row being edited, so a correction cannot be made to a
+        % row other than the one the user believes is open.
+        uilabel(outer, "Text", char(headerText), "FontWeight", "bold", ...
+            "Tooltip", char(headerText));
+    end
 
     panel = uipanel(outer, "BorderType", "none", "Scrollable", "on");
     gg = uigridlayout(panel, [n 2]);
@@ -68,8 +91,9 @@ function out = pFormDialog(titleText, specs)
     uilabel(brow, "Text", "");
     uibutton(brow, "Text", "Cancel", "Tooltip", "Cancel (Esc)", ...
         "ButtonPushedFcn", @(~,~) onCancel());
-    okTip = "OK";
-    if ~hasTextarea, okTip = okTip + " (Enter)"; end
+    okTip = "Save (Ctrl+S";
+    if ~hasTextarea, okTip = okTip + ", Enter"; end
+    okTip = okTip + ")";
     uibutton(brow, "Text", "OK", "Tooltip", char(okTip), "ButtonPushedFcn", @(~,~) onOk());
 
     uiwait(f);
@@ -78,15 +102,18 @@ function out = pFormDialog(titleText, specs)
 
     % ---- nested callbacks -----------------------------------------------
     function onKeyPress(e)
-        %ONKEYPRESS Escape cancels; Enter submits unless a textarea field
-        %   is present (where Enter must insert a newline instead);
-        %   Ctrl+? lists the shortcuts.
+        %ONKEYPRESS Ctrl+S saves (OK); Escape cancels; Enter submits unless
+        %   a textarea field is present (where Enter must insert a newline
+        %   instead); Ctrl+? lists the shortcuts. A uifigure delivers these
+        %   only while no text box has the focus.
         mods = string(e.Modifier);
         ctrl = any(mods == "control") || any(mods == "command");
         key  = string(e.Key);
         if ctrl && (ismember(key, ["slash", "questionmark", "help"]) || ...
                 string(e.Character) == "?")
             CarasLabDBApp.showShortcutHelp(f, "form");
+        elseif key == "s" && ctrl
+            onOk();
         elseif key == "escape"
             onCancel();
         elseif key == "return"
@@ -153,6 +180,12 @@ function w = local_makeWidget(parent, s)
                 "Tooltip", "Time of day, 24-hour (blank = 00:00:00)");
         otherwise   % "text"
             w = uieditfield(parent, "text", "Value", local_initStr(s.Value));
+            % An example of what to type is a Placeholder, never a Value:
+            % a prefilled example can be saved as if it were real data.
+            if isfield(s, "Placeholder") && ~isempty(s.Placeholder) ...
+                    && strlength(string(s.Placeholder)) > 0
+                w.Placeholder = char(s.Placeholder);
+            end
     end
 end
 
@@ -165,11 +198,26 @@ function [v, err] = local_readWidget(w, type)
             v = strtrim(v);
         case "number"
             txt = strtrim(string(w.Value));
-            v = str2double(txt);
-            if strlength(txt) == 0
-                v = NaN;                     % blank means "not provided"
-            elseif isnan(v)
-                err = "'" + txt + "' is not a number.";
+            v = NaN;                         % blank means "not provided"
+            if strlength(txt) > 0
+                if contains(txt, ",")
+                    % str2double reads a comma as a thousands separator and
+                    % drops it wherever it stands: "71,9" would become 719.
+                    % Never hand it text with a comma in it.
+                    err = "'" + txt + "' contains a comma. Use a period as the " + ...
+                        "decimal separator and no thousands separator (for " + ...
+                        "example 71.9 or 30000).";
+                elseif isempty(regexp(char(txt), ...
+                        '^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$', 'once'))
+                    % Plain decimal notation only: no "3i", "inf", "1d3".
+                    err = "'" + txt + "' is not a number.";
+                else
+                    v = str2double(txt);
+                    if ~isreal(v) || ~isfinite(v)
+                        v = NaN;
+                        err = "'" + txt + "' is not a number.";
+                    end
+                end
             end
         case "bool"
             v = logical(w.Value);
