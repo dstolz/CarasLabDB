@@ -84,6 +84,7 @@ def register(app):
         entity_id: str,
         include_history: bool = False,
         limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
     ) -> dict:
         """List the tags on one event, artifact, subject, session or project.
 
@@ -105,21 +106,24 @@ def register(app):
         Tags are put on specific rows: a superseded event or artifact keeps
         the tags it had, and its correction is tagged separately. No rows
         means no tags -- or no such entity; this tool does not tell the two
-        apart.
+        apart. Counts of current tags across all entities:
+        get_counts(question="current_tags_by_tag").
 
-        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        Returns {"row_count", "limit", "truncated", "next_cursor", "rows"}.
+        `truncated` true means more rows matched than were returned: call
+        again with the same arguments and cursor=<next_cursor> for the next
+        page (null when nothing is left); `limit` (max 1000) caps each page.
         """
         pk = db.tag_pk(entity_kind)
         if include_history:
             return db.select_from(
                 "lab.tag_assignment",
                 {"entity_kind": entity_kind, pk: entity_id},
-                limit=limit, order_by=db.ORDER_BY_TAG_ASSIGNMENT)
+                limit=limit, order_by=db.ORDER_BY_TAG_ASSIGNMENT, paged=True, cursor=cursor)
         return db.select_from(
             "lab.tag_current",
             {"entity_kind": entity_kind, pk: entity_id},
-            limit=limit, order_by=db.ORDER_BY_TAG_CURRENT)
+            limit=limit, order_by=db.ORDER_BY_TAG_CURRENT, paged=True, cursor=cursor)
 
     @app.tool()
     def find_by_tags(
@@ -155,8 +159,9 @@ def register(app):
         entity_kind (see get_tag_namespaces: cohort, for instance, is on
         subjects and sessions, never on artifacts).
 
-        active_only (default True) skips superseded events and artifacts,
-        like get_events / get_artifacts; it has no effect on other kinds.
+        active_only (default True) skips superseded and retracted events and
+        artifacts, like get_events / get_artifacts; it has no effect on other
+        kinds.
 
         Returns {"row_count", "limit", "truncated", "rows": [{"entity_id":
         ...}, ...]}, ordered by entity_id. Look the rows up with get_events,

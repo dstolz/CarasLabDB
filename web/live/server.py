@@ -7,6 +7,15 @@ live Postgres database and returns the whole ``LAB_DATA`` payload the
 dashboard expects. Everything the browser needs comes from the same origin,
 so there are no CORS concerns.
 
+The payload is lab_data.sql's JSON with one more key, ``integrity``: the
+summary of lab.fn_check_integrity() that lab_integrity.sql computes. That
+query costs about as much as the whole export on a large database (about 2 s
+each at 50,000 events and 50,000 artifacts), so it has its own cache: a
+result is reused for INTEGRITY_CACHE_SECONDS (5 min), and once it is older
+the next export starts a refresh in the background and ships the previous
+result meanwhile (the page shows when it was computed). Only the very first
+export waits for it, and the two queries then run side by side.
+
 A finished export is reused for CACHE_SECONDS (5 s), counted from the moment
 it finished, so page loads and refreshes inside that window share it however
 long the query took. Requests that arrive while an export is running wait for
@@ -46,6 +55,9 @@ Usage:
     # from the repo root, with the schema applied to database "lab":
     PGDATABASE=lab python web/live/server.py --port 8778
     # then open http://127.0.0.1:8778/
+
+    # or write the payload the page would get to a file and exit:
+    PGDATABASE=lab python web/live/server.py --dump > lab-data.json
 """
 
 import argparse
@@ -61,11 +73,23 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SQL_PATH = os.path.join(HERE, "lab_data.sql")
+INTEGRITY_SQL_PATH = os.path.join(HERE, "lab_integrity.sql")
 PAGE = "/lab-dashboard-live.html"
 CACHE_SECONDS = 5.0
 # After a failed export, answer from the failure for this long instead of
 # making every queued request wait out its own connect timeout.
 ERROR_RETRY_SECONDS = 2.0
+# The integrity summary is reused this long (see the module docstring), and
+# after a failure it is not retried for INTEGRITY_ERROR_RETRY_SECONDS.
+INTEGRITY_CACHE_SECONDS = 300.0
+INTEGRITY_ERROR_RETRY_SECONDS = 30.0
+# What the payload carries when no integrity summary is available: the
+# query failed (the cause is in the server log) and no earlier one exists.
+INTEGRITY_UNAVAILABLE = json.dumps({
+    "computed_at": None, "example_limit": None, "checks": None,
+    "error": "The integrity report could not be computed. The dashboard "
+             "server's log has the cause.",
+})
 CONNECT_TIMEOUT = 10        # seconds; PGCONNECT_TIMEOUT overrides
 STATEMENT_TIMEOUT = 120     # seconds; LAB_DASHBOARD_STATEMENT_TIMEOUT overrides
 
@@ -105,8 +129,8 @@ def export_deadline():
 # Data access -- three interchangeable backends, tried in order of niceness.
 # Each runs the export in one READ ONLY transaction that is rolled back.
 # --------------------------------------------------------------------------
-def _load_sql():
-    with open(SQL_PATH, "r", encoding="utf-8") as fh:
+def _load_sql(path=SQL_PATH):
+    with open(path, "r", encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -207,6 +231,86 @@ def fetch_lab_data(sql):
     return _fetch_via_psql(sql)
 
 
+def merge_payload(data_json, integrity_json):
+    """lab_data.sql's JSON object with ``"integrity": <integrity_json>`` added.
+
+    Both are JSON text and stay text: the payload is spliced, not parsed and
+    re-serialised (see _fetch_via_psycopg).
+    """
+    body = data_json.rstrip()
+    if not body.endswith("}"):
+        raise ValueError("lab_data.sql did not return a JSON object")
+    return body[:-1] + ',"integrity":' + integrity_json.strip() + "}"
+
+
+def fetch_payload():
+    """The whole payload, both queries run now and uncached (``--dump`` and
+    tests/check_lab_data.py). The integrity summary is the fixed
+    INTEGRITY_UNAVAILABLE object if its query fails."""
+    data = fetch_lab_data(SQL)
+    try:
+        integrity = fetch_lab_data(INTEGRITY_SQL)
+    except Exception:
+        sys.stderr.write("integrity summary failed:\n" + traceback.format_exc())
+        integrity = INTEGRITY_UNAVAILABLE
+    return merge_payload(data, integrity)
+
+
+# --------------------------------------------------------------------------
+# The integrity summary's own, longer-lived cache.
+# --------------------------------------------------------------------------
+class _IntegrityJob:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.done = threading.Event()
+        self.raw = None
+
+
+_integ_lock = threading.Lock()
+_integ = {"at": None, "raw": None, "failed_at": None, "job": None}
+
+
+def _run_integrity(job):
+    try:
+        job.raw = fetch_lab_data(INTEGRITY_SQL)
+    except Exception:
+        sys.stderr.write("integrity summary failed:\n" + traceback.format_exc())
+    with _integ_lock:
+        if _integ["job"] is job:
+            _integ["job"] = None
+            if job.raw is None:
+                _integ["failed_at"] = time.monotonic()
+            else:
+                _integ.update(at=time.monotonic(), raw=job.raw, failed_at=None)
+    job.done.set()
+
+
+def integrity_json(wait_seconds):
+    """The integrity summary as JSON text for the next payload.
+
+    Starts a refresh when the cached one is older than INTEGRITY_CACHE_SECONDS
+    (or there is none), but returns the cached one at once if there is one,
+    stale or not. With nothing cached it waits up to wait_seconds for the
+    refresh, and returns INTEGRITY_UNAVAILABLE if that fails or is late.
+    """
+    with _integ_lock:
+        now = time.monotonic()
+        fresh = _integ["at"] is not None and now - _integ["at"] < INTEGRITY_CACHE_SECONDS
+        resting = (_integ["failed_at"] is not None
+                   and now - _integ["failed_at"] < INTEGRITY_ERROR_RETRY_SECONDS)
+        job = _integ["job"]
+        if not fresh and not resting and (job is None or now - job.started > export_deadline()):
+            job = _integ["job"] = _IntegrityJob()
+            threading.Thread(target=_run_integrity, args=(job,), name="lab-integrity",
+                             daemon=True).start()
+        raw = _integ["raw"]
+    if raw is not None:
+        return raw
+    if job is not None and wait_seconds > 0 and job.done.wait(wait_seconds) and job.raw:
+        return job.raw
+    return INTEGRITY_UNAVAILABLE
+
+
 # --------------------------------------------------------------------------
 # Short-lived payload cache, shared by all request threads.
 # --------------------------------------------------------------------------
@@ -237,7 +341,11 @@ _inflight = None
 def _run_export(job):
     global _inflight
     try:
-        raw = fetch_lab_data(SQL).encode("utf-8")
+        integrity_json(0)       # start a refresh, if one is due, alongside the export
+        data = fetch_lab_data(SQL)
+        waited = time.monotonic() - job.started
+        raw = merge_payload(data, integrity_json(max(1.0, export_deadline() - waited)))
+        raw = raw.encode("utf-8")
         job.raw, job.gz = raw, gzip.compress(raw, compresslevel=6)
     except Exception:  # DB down, bad creds, missing schema, timeout, ...
         # The driver's message can name the host, port and login; it stays in
@@ -413,6 +521,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 SQL = _load_sql()
+INTEGRITY_SQL = _load_sql(INTEGRITY_SQL_PATH)
 
 
 def main():
@@ -420,11 +529,17 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8778, help="HTTP port (default 8778)")
     ap.add_argument("--db", help="database name (overrides/sets PGDATABASE)")
+    ap.add_argument("--dump", action="store_true",
+                    help="write the /api/data payload to stdout and exit")
     args = ap.parse_args()
 
     if args.db:
         os.environ["PGDATABASE"] = args.db
     os.environ.setdefault("PGDATABASE", "lab")
+    if args.dump:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.write(fetch_payload() + "\n")
+        return
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = "http://%s:%d/" % (args.host, args.port)
@@ -432,6 +547,8 @@ def main():
     print("  database : %s" % os.environ.get("PGDATABASE"))
     print("  data API : %sapi/data" % url)
     print("  timeouts : connect %d s, export %d s" % (connect_timeout(), statement_timeout()))
+    print("  caches   : payload %g s, integrity summary %g s"
+          % (CACHE_SECONDS, INTEGRITY_CACHE_SECONDS))
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("  WARNING  : listening on %s with no authentication and no TLS -- "
               "anyone who can reach this port can read the whole database export."

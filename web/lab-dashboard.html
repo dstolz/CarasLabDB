@@ -247,6 +247,10 @@ try{
   .pill.missing{background:rgba(220,53,69,.13);color:#b02a37;}
   .pill.mismatch{background:rgba(217,140,0,.15);color:#a06400;}
   .pill.superseded{background:rgba(107,118,136,.15);color:#5b6577;}
+  /* withdrawn on purpose: struck through, red outline */
+  .pill.retracted{background:transparent;color:#b02a37;box-shadow:inset 0 0 0 1px rgba(220,53,69,.55);text-decoration:line-through;}
+  html[data-theme="dark"] .pill.retracted{color:#f4a3a8;}
+  .tl-item.retracted{opacity:.5;}
   /* "never checked" is an absence, not a state — outline it instead of filling it */
   .pill.unverified{background:transparent;color:#6b7688;box-shadow:inset 0 0 0 1px var(--border-strong);}
   .pill.active{background:rgba(31,157,85,.13);color:#187a41;}
@@ -262,6 +266,42 @@ try{
   .tag-chip.retired{opacity:.6;text-decoration:line-through;}
   html[data-theme="dark"] .tag-chip{background:rgba(63,167,183,.18);color:#8fdcea;border-color:rgba(63,167,183,.4);}
   .tags-card{margin-bottom:var(--gap);}
+
+  /* Variable chips (label value units) and the dialogs' Variables section */
+  .var-chip{display:inline-block;padding:1px 7px;margin:1px 4px 1px 0;border-radius:6px;font-size:11px;white-space:nowrap;cursor:pointer;
+    background:rgba(129,114,179,.10);color:#5f5296;border:1px solid rgba(129,114,179,.28);font-variant-numeric:tabular-nums;}
+  .var-chip .var-k{font-weight:650;}
+  .var-chip:hover{background:rgba(129,114,179,.2);}
+  html[data-theme="dark"] .var-chip{background:rgba(129,114,179,.2);color:#c7bbee;border-color:rgba(129,114,179,.45);}
+  table.data.var-table{margin-bottom:6px;border:1px solid var(--border);border-radius:8px;}
+  table.data.var-table tbody td{white-space:normal;vertical-align:top;}
+  details.var-hist summary{cursor:pointer;color:var(--accent);font-size:12px;font-weight:550;}
+  .var-hist-rows{margin-top:4px;border-left:2px solid var(--border-strong);padding-left:8px;}
+  .var-hist-row{font-size:12px;padding:1px 0;}
+  .var-hist-row.latest{font-weight:600;}
+  .var-note{font-size:12px;color:var(--text-secondary);font-style:italic;}
+  .cap-note{font-size:12px;color:var(--warn);margin:6px 0;}
+
+  /* Integrity panel */
+  .integ-card{margin-bottom:var(--gap);}
+  .integ-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:4px 0 14px;}
+  .integ-tile{border:1px solid var(--border);border-radius:8px;padding:8px 12px;background:var(--surface-1);}
+  .integ-tile .n{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;}
+  .integ-tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);font-weight:600;}
+  .integ-tile.ok .n{color:var(--positive);} .integ-tile.bad .n{color:var(--negative);} .integ-tile.warn .n{color:var(--warn);}
+  .integ-check{border:1px solid var(--border);border-radius:8px;margin-bottom:6px;background:var(--surface-1);}
+  .integ-check summary{padding:7px 12px;cursor:pointer;display:flex;gap:10px;align-items:center;font-size:13px;}
+  .integ-check summary .cnt{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums;}
+  .integ-ex{padding:2px 12px 10px;font-size:12px;}
+  .integ-ex div{padding:2px 0;border-top:1px solid var(--hairline);word-break:break-word;}
+  .pill.error{background:rgba(220,53,69,.13);color:#b02a37;}
+  .pill.warning{background:rgba(217,140,0,.15);color:#a06400;}
+  html[data-theme="dark"] .pill.error{background:rgba(220,53,69,.22);color:#f4a3a8;}
+  html[data-theme="dark"] .pill.warning{background:rgba(217,140,0,.24);color:#ffd28c;}
+
+  /* Weight plot (subject dialog) */
+  .weight-wrap{position:relative;height:230px;margin-bottom:8px;}
+  .weight-table{max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;}
   .tags-table{overflow:auto;max-height:420px;}
 
   .link{color:var(--accent);cursor:pointer;font-weight:550;}
@@ -277,6 +317,7 @@ try{
   .modal-head .sub{font-size:13px;color:var(--text-secondary);margin-top:2px;}
   .modal-close{border:none;background:var(--hairline);width:32px;height:32px;border-radius:8px;font-size:18px;cursor:pointer;color:var(--text-secondary);flex:none;line-height:1;}
   .modal-close:hover{background:var(--border);color:var(--text-primary);}
+  .modal-actions{display:flex;gap:8px;align-items:center;flex:none;}
   .modal-body{padding:20px 24px 26px;}
 
   /* Export toolbar (project detail modal) */
@@ -468,6 +509,7 @@ try{
     <button class="tab" data-view="sessions">Sessions <span class="count" id="tc-sessions">0</span></button>
     <button class="tab" data-view="events">Event log <span class="count" id="tc-events">0</span></button>
     <button class="tab" data-view="artifacts">Artifacts <span class="count" id="tc-artifacts">0</span></button>
+    <button class="tab" data-view="variables">Variables <span class="count" id="tc-variables">0</span></button>
   </nav>
 
   <!-- OVERVIEW -->
@@ -489,6 +531,11 @@ try{
         <div class="card-sub">Registered bytes on the NAS, each file counted once</div>
         <div class="chart-wrap"><canvas id="chart-storage"></canvas></div>
       </div>
+    </div>
+    <div class="card integ-card" id="integrity-card">
+      <h3>Integrity</h3>
+      <div class="card-sub" id="integrity-sub">lab.fn_check_integrity() and the verification state of the active files</div>
+      <div id="integrity-body"></div>
     </div>
     <div class="card tags-card">
       <h3>Tags</h3>
@@ -572,6 +619,17 @@ try{
     <div class="table-wrap" id="artifacts-table"></div>
   </section>
 
+  <!-- VARIABLES -->
+  <section class="view" id="view-variables">
+    <div class="section-head">
+      <div><h2>Variables</h2><div class="meta" id="variables-meta"></div></div>
+      <div class="toolbar">
+        <input type="search" id="variables-search" placeholder="Search name, label, units, description…">
+      </div>
+    </div>
+    <div class="table-wrap" id="variables-table"></div>
+  </section>
+
   <footer class="app-footer">
     Lab Metadata Explorer · synthetic data, no server · data as of <span id="asof2"></span> ·
     generated to match <code style="font-family:ui-monospace,monospace">design_docs/schema.sql</code>
@@ -583,7 +641,8 @@ try{
   <div class="modal" role="dialog" aria-modal="true">
     <div class="modal-head">
       <div><h2 id="modal-title"></h2><div class="sub" id="modal-sub"></div></div>
-      <button class="modal-close" id="modal-close" aria-label="Close">×</button>
+      <div class="modal-actions"><button class="btn-tree" id="modal-link" type="button" title="Copy a link to this record (c)">🔗 Link</button>
+      <button class="modal-close" id="modal-close" aria-label="Close">×</button></div>
     </div>
     <div class="modal-body" id="modal-body"></div>
   </div>
@@ -1160,7 +1219,8 @@ try{
   // below and leave a white screen, so default every collection to empty.
   ['people','probes','pipelines','storageRoots','species','projects','projectMembers',
    'projectArtifacts','subjects','sessions','events','artifacts','eventInputs',
-   'eventTypeMeta','roleMeta','tagNamespaces','tags','tagAssignments'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
+   'eventTypeMeta','roleMeta','tagNamespaces','tags','tagAssignments',
+   'variables','variableValues','retractions'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
   const NOW = D.NOW;
 
   // ---- lookups ----
@@ -1190,11 +1250,19 @@ try{
   D.subjects.forEach(s=>{ if(s.project_id) subjectCountByProject.set(s.project_id,(subjectCountByProject.get(s.project_id)||0)+1); });
   const projectName = id => (projectById.get(id)||{}).name || '—';
 
-  // superseded sets
+  // superseded and retracted sets. A row is active when nothing supersedes it
+  // and it has not been retracted -- the definition of lab.event_active /
+  // lab.artifact_active -- so a retracted row is hidden by "Active only" and
+  // left out of every active figure, like a superseded one.
   const supersededEvents = new Set(D.events.filter(e=>e.supersedes).map(e=>e.supersedes));
   const supersededArtifacts = new Set(D.artifacts.filter(a=>a.supersedes).map(a=>a.supersedes));
-  const isEventActive = e => !supersededEvents.has(e.event_id);
-  const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id);
+  const retractedEvents = new Map(), retractedArtifacts = new Map();   // id -> lab.retraction row
+  D.retractions.forEach(r=>{ (r.entity_kind==='event'?retractedEvents:r.entity_kind==='artifact'?retractedArtifacts:new Map()).set(r.entity_id,r); });
+  const isEventActive = e => !supersededEvents.has(e.event_id) && !retractedEvents.has(e.event_id);
+  const isArtifactActive = a => !supersededArtifacts.has(a.artifact_id) && !retractedArtifacts.has(a.artifact_id);
+  // 'retracted' wins over 'superseded': a withdrawn row is withdrawn whatever replaced it
+  const eventState = e => retractedEvents.has(e.event_id) ? 'retracted' : supersededEvents.has(e.event_id) ? 'superseded' : 'active';
+  const artifactState = a => retractedArtifacts.has(a.artifact_id) ? 'retracted' : supersededArtifacts.has(a.artifact_id) ? 'superseded' : 'active';
 
   // Correction chains. uq_event_supersedes / uq_artifact_supersedes keep each
   // chain linear, so every row has exactly one current version: the end of
@@ -1253,6 +1321,42 @@ try{
   const canonicalTag = s => { const t=String(s==null?'':s).trim().toLowerCase(); return t.includes(':') ? t : 'tag:'+t; };
   const displayTag = t => t.startsWith('tag:') ? t.slice(4) : t;   // as lab.tag_current.display_tag
   const tagNamespace = t => t.slice(0, t.indexOf(':'));
+
+  // User-defined variables, derived from the append-only value log like
+  // lab.variable_current: the latest row per (entity, variable) by value_id
+  // -- insertion order, never set_at -- is the current value when it is a
+  // 'set'. Values arrive as the text the database stored (1350.50 stays
+  // 1350.50) and are shown as that text; only the weight plot reads one as a
+  // number.
+  const varByName = new Map(D.variables.map(v=>[v.name,v]));
+  const varHistory = new Map();          // 'kind|id' -> Map(variable -> [rows], newest first)
+  D.variableValues.forEach(r=>{
+    const k=tagKey(r.entity_kind,r.entity_id);
+    if(!varHistory.has(k)) varHistory.set(k,new Map());
+    const m=varHistory.get(k);
+    if(!m.has(r.variable)) m.set(r.variable,[]);
+    m.get(r.variable).push(r);
+  });
+  varHistory.forEach(m=>m.forEach(rows=>rows.sort((a,b)=>b.value_id-a.value_id)));
+  const varLabel = name => { const v=varByName.get(name); return (v&&v.label)||name; };
+  const varUnits = name => (varByName.get(name)||{}).units||'';
+  // every variable an entity has ever had, current value first: [{name, def, current|null, rows}]
+  function entityVariables(kind,id){
+    const m=varHistory.get(tagKey(kind,id)); if(!m) return [];
+    return [...m].map(([name,rows])=>({name, def:varByName.get(name)||null,
+      current: rows[0].op==='set' ? rows[0] : null, rows}))
+      .sort((a,b)=> (a.current?0:1)-(b.current?0:1) || varLabel(a.name).localeCompare(varLabel(b.name)));
+  }
+  const currentVariables = (kind,id) => entityVariables(kind,id).filter(v=>v.current);
+  // entities currently holding each variable: name -> [{kind, id, row}]
+  const varHolders = new Map();
+  varHistory.forEach((m,k)=>{
+    const i=k.indexOf('|'), kind=k.slice(0,i), id=k.slice(i+1);
+    m.forEach((rows,name)=>{ if(rows[0].op!=='set') return;
+      if(!varHolders.has(name)) varHolders.set(name,[]);
+      varHolders.get(name).push({kind,id,row:rows[0]}); });
+  });
+  const kindsWithVariables = new Set([...varHistory.keys()].map(k=>k.slice(0,k.indexOf('|'))));
 
   // provenance edges (produces + consumes), like lab.provenance_edge
   const inputsByEvent = new Map();      // event_id -> [artifact_id]
@@ -1376,6 +1480,22 @@ try{
   const speciesName = code => { const s=speciesByCode.get(code); return s?s.common_name:(code||'—'); };
   const etName = t => etLabel.get(t)||t||'';
   function typeBadge(t){ const c=cssTok(t); return `<span class="badge ev-${c}"><span class="dot dot-${c}"></span>${esc(etName(t))}</span>`; }
+  // active / superseded / retracted, as a pill; a retraction carries its reason
+  const retractionOf = (kind,id) => (kind==='event'?retractedEvents:retractedArtifacts).get(id)||null;
+  function statePill(kind,row,opts){
+    const st = kind==='event' ? eventState(row) : artifactState(row);
+    if(st==='active') return opts&&opts.quiet ? '' : '<span class="pill active">active</span>';
+    if(st==='superseded') return '<span class="pill superseded">superseded</span>';
+    const r=retractionOf(kind,row[kind+'_id']);
+    return `<span class="pill retracted" title="Retracted ${esc(fmtDateTime(r.retracted_at))}: ${esc(r.reason)}">retracted</span>`+
+      (opts&&opts.reason ? ` <span class="muted">${esc(r.reason)}</span>` : '');
+  }
+  // the kv rows of a retraction, for the event and artifact dialogs
+  function retractionRows(kind,id){
+    const r=retractionOf(kind,id); if(!r) return [];
+    return [['Retracted', `${esc(fmtDateTime(r.retracted_at))}${r.retracted_by?' · '+esc(personName(r.retracted_by)):''}${r.retracted_login?` <span class="muted">(${esc(r.retracted_login)})</span>`:''}`, true],
+            ['Retraction reason', r.reason]];
+  }
   // current tags as clickable chips (a click appends the tag to the tag filter)
   function tagChips(kind,id){
     return entityTags(kind,id).map(t=>{
@@ -1384,6 +1504,37 @@ try{
     }).join('');
   }
   const tagCol = kind => ({key:'_tags',label:'Tags',sortable:false,render:r=>tagChips(kind,r[kind+'_id'])});
+
+  // ---- variables: value text, compact chips, and the dialog section ----
+  const varValue = (name,row) => { const u=varUnits(name); return esc(row.value)+(u?' '+esc(u):''); };
+  const varValueText = (name,row) => { const u=varUnits(name); return String(row.value==null?'':row.value)+(u?' '+u:''); };
+  function varChips(kind,id){
+    return currentVariables(kind,id).map(v=>
+      `<span class="var-chip" data-open-variable="${esc(v.name)}" title="${esc(varLabel(v.name))} (${esc(v.name)}) — set ${esc(fmtDateTime(v.current.set_at))}${v.current.set_by?' by '+esc(personName(v.current.set_by)):''}; click for every value of this variable"><span class="var-k">${esc(varLabel(v.name))}</span> ${varValue(v.name,v.current)}</span>`).join('');
+  }
+  // Only kinds that hold at least one variable get the column, so a lab that
+  // does not use variables sees the tables it always had.
+  const varCol = kind => kindsWithVariables.has(kind)
+    ? [{key:'_vars',label:'Variables',sortable:false,render:r=>varChips(kind,r[kind+'_id'])}] : [];
+  const whoWhen = r => `${esc(fmtDateTime(r.set_at))}${r.set_by?` · ${esc(personName(r.set_by))}`:''}${r.set_login?` <span class="muted">(${esc(r.set_login)})</span>`:''}`;
+  function variablesSection(kind,id){
+    const vars=entityVariables(kind,id);
+    const n=vars.filter(v=>v.current).length;
+    let h=`<h4>Variables (${n}${vars.length!==n?`, ${vars.length-n} unset`:''})</h4>`;
+    if(!vars.length) return h+`<div class="lineage-empty">No variables set.</div>`;
+    h+=`<table class="data var-table"><thead><tr><th>Variable</th><th>Value</th><th>Last set</th><th>History</th></tr></thead><tbody>`;
+    vars.forEach(v=>{
+      const last=v.rows[0], def=v.def||{};
+      const val = v.current ? `<b>${varValue(v.name,v.current)}</b>` : `<span class="pill superseded">unset</span>`;
+      const hist = v.rows.length>1 || last.note
+        ? `<details class="var-hist"><summary>${v.rows.length} change${v.rows.length!==1?'s':''}</summary><div class="var-hist-rows">`+
+          v.rows.map((r,i)=>`<div class="var-hist-row${i===0?' latest':''}"><span class="mono">${r.op==='set'?varValue(v.name,r):'<span class="pill superseded">unset</span>'}</span> <span class="muted">${whoWhen(r)}</span>${r.note?` <span class="var-note">“${esc(r.note)}”</span>`:''}</div>`).join('')+
+          `</div></details>` : '<span class="muted">—</span>';
+      h+=`<tr><td><span class="link" data-open-variable="${esc(v.name)}" title="${esc(def.description||'Every value of this variable')}">${esc(varLabel(v.name))}</span>${def.label&&def.label!==v.name?` <span class="muted mono">${esc(v.name)}</span>`:''}${def.retired_at?' <span class="pill superseded">retired</span>':''}</td>`+
+         `<td>${val}</td><td class="muted">${whoWhen(last)}</td><td>${hist}</td></tr>`;
+    });
+    return h+`</tbody></table>`;
+  }
   function fmtDur(s){ if(s==null) return '—'; const h=Math.floor(s/3600), m=Math.round((s%3600)/60); return h?`${h}h ${m}m`:`${m}m`; }
   // session.started_at/ended_at are both nullable, and fmtDur only guards null —
   // an open session would otherwise render "NaNm". Return null for "unknown".
@@ -1776,7 +1927,8 @@ try{
       {key:'started_on',label:'Started',sortVal:p=>p.started_on,render:p=>fmtDate(p.started_on)},
       {key:'_status',label:'Status',sortVal:p=>p.is_active?0:1,
         render:p=>p.is_active?`<span class="pill active">active</span>`:`<span class="pill superseded">inactive</span>`},
-      tagCol('project')
+      tagCol('project'),
+      ...varCol('project')
     ];
     sortableTable('projects-table',cols,rows,{clickable:true,defaultSort:'name',defaultDir:'asc',
       rowAttrs:p=>`data-project="${esc(p.project_id)}"`, onClick:d=>openProject(d.project)});
@@ -1839,7 +1991,7 @@ try{
       const toggle = ev => { if(ev && ev.altKey) setSubtreeOpen(node, !node._open); else node._setOpen(!node._open); };
       caret.onclick = toggle;
       content.addEventListener('click', ev=>{
-        if(ev.target.closest('[data-open-project],[data-open-subject],[data-open-event],[data-open-artifact],a')) return;
+        if(ev.target.closest('[data-open-project],[data-open-subject],[data-open-session],[data-open-event],[data-open-artifact],a')) return;
         toggle(ev);
       });
       branch.onclick = ev=>{ ev.stopPropagation(); setSubtreeOpen(node, !node._open); };
@@ -1867,7 +2019,7 @@ try{
     return treeNode({ rowHtml:
       `<span class="pill">${esc(a.role||'file')}</span>`+
       `<span class="mono truncate" style="max-width:440px" title="${esc(a.relative_path||'')}">${esc(a.relative_path||'')}</span>`+
-      `<span class="tree-meta">${fmtBytes(a.size_bytes)}${!isArtifactActive(a)?' · <span class="pill superseded">superseded</span>':''}</span>`+
+      `<span class="tree-meta">${fmtBytes(a.size_bytes)}${!isArtifactActive(a)?' · '+statePill('artifact',a):''}</span>`+
       artifactOpenLinks(a) });
   }
   function docNode(a){
@@ -1900,7 +2052,7 @@ try{
     }
     const nEv=eventCountBySession.get(s.session_id)||0, nArt=artifactCountBySession.get(s.session_id)||0;
     return treeNode({ rowHtml:
-      `<span class="tree-label mono">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')} · ${nEv} ev · ${nArt} files</span>`,
+      `<span class="tree-label click mono" data-open-session="${esc(s.session_id)}">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')} · ${nEv} ev · ${nArt} files</span>`,
       buildChildren: build });
   }
   function subjectExtras(sub, depth){ // subject-level events (full) or files (files) with no session
@@ -1960,7 +2112,7 @@ try{
     if(depth==='files'){ let arts=(artifactsBySession.get(s.session_id)||[]); if(F.activeOnly) arts=arts.filter(isArtifactActive); kids=(self?arts:ffFiles(arts,q)).map(fileNode); }
     else if(depth==='full'){ let evs=(eventsBySession.get(s.session_id)||[]); if(F.activeOnly) evs=evs.filter(isEventActive); kids=(self?evs.map(eventNode):evs.map(e=>ffEvent(e,q)).filter(Boolean)); }
     if(!self && !kids.length) return null;
-    const n=treeNode({ rowHtml:`<span class="tree-label mono">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')}</span>`, buildChildren: kids.length?()=>kids:null });
+    const n=treeNode({ rowHtml:`<span class="tree-label click mono" data-open-session="${esc(s.session_id)}">${esc(s.label)}</span> <span class="tree-meta">${fmtDate(s.started_at)} · ${esc(s.rig||'—')}</span>`, buildChildren: kids.length?()=>kids:null });
     if(kids.length) n._setOpen(true);
     return n;
   }
@@ -2064,6 +2216,7 @@ try{
       ['Documents',docs.length],
       ['Tags',tagChips('project',pid),true]
     ]);
+    body+=variablesSection('project',pid);
 
     body+=`<h4>Members (${mem.length})</h4>`;
     body+=listCapped(mem, 100,
@@ -2087,13 +2240,13 @@ try{
 
     body+=`<h4>Sessions (${projSessions.length})</h4>`;
     body+=listCapped(projSessions, 60,
-      s=>`<div class="lineage-node"><span class="link mono" data-open-subject="${esc(s.subject_id)}">${esc(s.label)}</span><span class="muted">${esc(s.subject_id)}</span><span class="muted" style="flex:1">${fmtDateTime(s.started_at)}</span><span class="pill">${esc(s.rig||'—')}</span></div>`);
+      s=>`<div class="lineage-node"><span class="link mono" data-open-session="${esc(s.session_id)}">${esc(s.label)}</span><span class="link muted mono" data-open-subject="${esc(s.subject_id)}">${esc(s.subject_id)}</span><span class="muted" style="flex:1">${fmtDateTime(s.started_at)}</span><span class="pill">${esc(s.rig||'—')}</span></div>`);
 
     body+=`<h4>Files (${projArtifacts.length} · ${fmtBytes(projBytes)})</h4>`;
     body+=listCapped(projArtifacts, 80,
       a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${artifactOpenLinks(a)}</div>`);
 
-    openModal(esc(p.name), `${p.is_active?'active':'inactive'} project · ${subs.length} subject${subs.length!==1?'s':''} · ${projArtifacts.length} file${projArtifacts.length!==1?'s':''}`, body);
+    openModal(esc(p.name), `${p.is_active?'active':'inactive'} project · ${subs.length} subject${subs.length!==1?'s':''} · ${projArtifacts.length} file${projArtifacts.length!==1?'s':''}`, body, {kind:'project', id:pid});
     document.getElementById('modal-body').querySelectorAll('[data-export]').forEach(el=>el.onclick=()=>{
       const fmt=el.dataset.export;
       if(fmt==='csv') exportProjectCSV(pid);
@@ -2154,7 +2307,8 @@ try{
       events: events.map(e=>({
         event_id:e.event_id, occurred_at:e.occurred_at, recorded_at:e.recorded_at,
         event_type:e.event_type, subject_id:e.subject_id||'', session:sessLabel(e.session_id),
-        recorded_by:personName(e.recorded_by), state:isEventActive(e)?'active':'superseded',
+        recorded_by:personName(e.recorded_by), state:eventState(e),
+        retraction_reason:(retractionOf('event',e.event_id)||{}).reason||'',
         summary:stripTags(eventSummary(e)).replace(/\s+/g,' ').trim(),
         detail:JSON.stringify(e.detail||{}), notes:e.notes||'' })),
       artifacts: artifacts.map(a=>({
@@ -2165,7 +2319,16 @@ try{
         created_at:a.created_at, created_by:personName(a.created_by),
         verification:(a.verification||{}).status||'',
         verified_at:(a.verification||{}).verified_at?fmtDate(a.verification.verified_at):'',
-        state:isArtifactActive(a)?'active':'superseded' }))
+        state:artifactState(a),
+        retraction_reason:(retractionOf('artifact',a.artifact_id)||{}).reason||'' })),
+      // the current value of every variable on the project and on each row
+      // above, one line per value (the value exactly as stored, as text)
+      variables: [['project',[pid]], ['subject',subs.map(x=>x.subject_id)], ['session',sessions.map(x=>x.session_id)],
+                  ['event',events.map(x=>x.event_id)], ['artifact',artifacts.map(x=>x.artifact_id)]]
+        .flatMap(([kind,ids])=>ids.flatMap(id=>currentVariables(kind,id).map(v=>({
+          entity_kind:kind, entity_id:id, entity:entityLabel(kind,id), variable:v.name, label:varLabel(v.name),
+          value:v.current.value, units:varUnits(v.name), set_at:v.current.set_at||'',
+          set_by:v.current.set_by?personName(v.current.set_by):'', note:v.current.note||'' }))))
     };
   }
   const titleCase = s => s.charAt(0).toUpperCase()+s.slice(1);
@@ -2286,7 +2449,8 @@ try{
       {key:'_events',label:'Events',cls:'num',sortVal:s=>eventCountBySubject.get(s.subject_id)||0,render:s=>eventCountBySubject.get(s.subject_id)||0},
       {key:'_status',label:'Status',sortVal:s=>subjectCurrent.get(s.subject_id).is_endpointed?1:0,
         render:s=>subjectCurrent.get(s.subject_id).is_endpointed?`<span class="pill superseded">endpointed</span>`:`<span class="pill active">active</span>`},
-      tagCol('subject')
+      tagCol('subject'),
+      ...varCol('subject')
     ];
     sortableTable('subjects-table',cols,rows,{clickable:true,defaultSort:'subject_id',defaultDir:'asc',
       rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
@@ -2308,10 +2472,11 @@ try{
       {key:'relative_path',label:'Path',cls:'mono',render:s=>`<span class="truncate" title="${esc(s.relative_path)}">${esc(s.relative_path)}</span>`},
       {key:'_ev',label:'Events',cls:'num',sortVal:s=>eventCountBySession.get(s.session_id)||0,render:s=>eventCountBySession.get(s.session_id)||0},
       {key:'_art',label:'Artifacts',cls:'num',sortVal:s=>artifactCountBySession.get(s.session_id)||0,render:s=>artifactCountBySession.get(s.session_id)||0},
-      tagCol('session')
+      tagCol('session'),
+      ...varCol('session')
     ];
     sortableTable('sessions-table',cols,rows,{clickable:true,defaultSort:'started_at',defaultDir:'desc',
-      rowAttrs:s=>`data-subject="${esc(s.subject_id)}"`, onClick:d=>openSubject(d.subject)});
+      rowAttrs:s=>`data-session="${esc(s.session_id)}"`, onClick:d=>openSession(d.session)});
   }
 
   /* ------------------------------------------------------------ event log tab */
@@ -2329,9 +2494,9 @@ try{
       {key:'subject_id',label:'Subject',render:e=>e.subject_id?`<span class="mono">${esc(e.subject_id)}</span>`:'—'},
       {key:'_summary',label:'Summary',sortable:false,render:e=>`<span class="truncate" style="max-width:360px;display:inline-block;vertical-align:bottom">${eventSummary(e)}</span>`},
       {key:'_by',label:'Recorded by',render:e=>esc(personName(e.recorded_by))},
-      {key:'_state',label:'State',sortVal:e=>isEventActive(e)?0:1,
-        render:e=>isEventActive(e)?`<span class="pill active">active</span>`:`<span class="pill superseded">superseded</span>`},
-      tagCol('event')
+      {key:'_state',label:'State',sortVal:e=>eventState(e),render:e=>statePill('event',e)},
+      tagCol('event'),
+      ...varCol('event')
     ];
     sortableTable('events-table',cols,rows,{clickable:true,defaultSort:'occurred_at',defaultDir:'desc',limit:400,
       rowAttrs:e=>`data-event="${esc(e.event_id)}"`, onClick:d=>openEvent(d.event)});
@@ -2358,11 +2523,245 @@ try{
       {key:'created_at',label:'Created',sortVal:a=>a.created_at,render:a=>fmtDate(a.created_at)},
       {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
         render:a=>`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span>`},
+      {key:'_state',label:'State',sortVal:a=>artifactState(a),render:a=>statePill('artifact',a)},
       tagCol('artifact'),
+      ...varCol('artifact'),
       {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
     ];
     sortableTable('artifacts-table',cols,rows,{clickable:true,defaultSort:'size_bytes',defaultDir:'desc',limit:400,
       rowAttrs:a=>`data-artifact="${esc(a.artifact_id)}"`, onClick:d=>openArtifact(d.artifact)});
+  }
+
+  /* ------------------------------------------------------------ variables tab */
+  // Every definition in lab.variable, with how many entities hold a current
+  // value of it. The counts are over the whole database, not the filters: a
+  // variable is a lab-wide definition. A row opens the variable's values.
+  const varLogCount = new Map(), varLastSet = new Map();
+  D.variableValues.forEach(r=>{ varLogCount.set(r.variable,(varLogCount.get(r.variable)||0)+1);
+    if(!varLastSet.has(r.variable) || r.value_id>varLastSet.get(r.variable).value_id) varLastSet.set(r.variable,r); });
+  function renderVariables(){
+    const q=(document.getElementById('variables-search').value||'').toLowerCase();
+    let rows=D.variables.slice();
+    if(q) rows=rows.filter(v=>[v.name,v.label,v.units,v.value_type,v.description].join(' ').toLowerCase().includes(q));
+    document.getElementById('variables-meta').textContent =
+      `${rows.length} variable${rows.length!==1?'s':''} · ${fmtNum(D.variableValues.length)} value log row${D.variableValues.length!==1?'s':''} · counts are lab-wide, not filtered`;
+    const holders = v => varHolders.get(v.name)||[];
+    const byKind = v => { const c={}; holders(v).forEach(h=>c[h.kind]=(c[h.kind]||0)+1); return Object.entries(c).map(([k,n])=>`${n} ${k}${n!==1?'s':''}`).join(', '); };
+    const cols=[
+      {key:'label',label:'Variable',sortVal:v=>v.label||v.name,render:v=>`<span style="font-weight:600">${esc(v.label||v.name)}</span>${v.retired_at?' <span class="pill superseded">retired</span>':''}`},
+      {key:'name',label:'Name',render:v=>`<span class="mono">${esc(v.name)}</span>`},
+      {key:'units',label:'Units',render:v=>esc(v.units||'—')},
+      {key:'value_type',label:'Type',render:v=>`<span class="pill">${esc(v.value_type)}</span>`},
+      {key:'_applies',label:'Applies to',sortable:false,render:v=>`<span class="muted">${esc((v.applies_to||[]).join(', '))}</span>`},
+      {key:'description',label:'Description',sortable:false,render:v=>`<span class="truncate" style="max-width:300px;display:inline-block;vertical-align:bottom" title="${esc(v.description||'')}">${esc(v.description||'—')}</span>`},
+      {key:'_n',label:'Entities',cls:'num',sortVal:v=>holders(v).length,render:v=>`<span title="${esc(byKind(v))}">${fmtNum(holders(v).length)}</span>`},
+      {key:'_log',label:'Log rows',cls:'num',sortVal:v=>varLogCount.get(v.name)||0,render:v=>fmtNum(varLogCount.get(v.name)||0)},
+      {key:'_last',label:'Last set',sortVal:v=>(varLastSet.get(v.name)||{}).value_id||0,render:v=>{ const r=varLastSet.get(v.name); return r?fmtDateTime(r.set_at):'—'; }}
+    ];
+    sortableTable('variables-table',cols,rows,{clickable:true,defaultSort:'label',defaultDir:'asc',
+      rowAttrs:v=>`data-variable="${esc(v.name)}"`, onClick:d=>openVariable(d.variable)});
+  }
+
+  // a readable name for any entity, and the dialog that shows it
+  function entityLabel(kind,id){
+    if(kind==='project') return (projectById.get(id)||{}).name||id;
+    if(kind==='subject') return id;
+    if(kind==='session'){ const s=sessionById.get(id); return s?`${s.subject_id} / ${s.label}`:id; }
+    if(kind==='event'){ const e=eventById.get(id); return e?`${etName(e.event_type)} · ${e.subject_id||'—'} · ${fmtDate(e.occurred_at)}`:id; }
+    if(kind==='artifact'){ const a=artifactById.get(id); return a?a.relative_path:id; }
+    return id;
+  }
+  const ENTITY_OPEN = {project:'data-open-project',subject:'data-open-subject',session:'data-open-session',event:'data-open-event',artifact:'data-open-artifact'};
+  const entityLink = (kind,id,html) => `<span class="link" ${ENTITY_OPEN[kind]}="${esc(id)}">${html==null?esc(entityLabel(kind,id)):html}</span>`;
+  const entityKnown = (kind,id) => ({project:projectById,subject:subjectById,session:sessionById,event:eventById,artifact:artifactById})[kind].has(id);
+
+  // Every entity that currently holds a variable: value, when and by whom.
+  const VAR_VALUES_LIMIT = 500;
+  function variableHolderRows(name){
+    return (varHolders.get(name)||[]).map(h=>({kind:h.kind, id:h.id, row:h.row,
+      label:entityLabel(h.kind,h.id), num:Number(h.row.value)}));
+  }
+  function openVariable(name){
+    const v=varByName.get(name)||{name, label:name, value_type:'?'};
+    const rows=variableHolderRows(name);
+    const nums=rows.map(r=>r.num).filter(Number.isFinite);
+    const unsetNow=[...varHistory.values()].filter(m=>m.has(name)&&m.get(name)[0].op==='unset').length;
+    const pairs=[
+      ['Name',`<span class="mono">${esc(v.name)}</span>`,true], ['Label',v.label||v.name],
+      ['Units',v.units||'—'], ['Type',v.value_type], ['Applies to',(v.applies_to||[]).join(', ')],
+      ['Description',v.description||'—'],
+      ['Entities with a value',fmtNum(rows.length)], ['Unset since',unsetNow?fmtNum(unsetNow)+' entit'+(unsetNow!==1?'ies':'y'):null],
+      ['Log rows',fmtNum(varLogCount.get(name)||0)],
+      ['Created',v.created_at?`${esc(fmtDateTime(v.created_at))}${v.created_by?' · '+esc(personName(v.created_by)):''}`:null,true],
+      ['Retired',v.retired_at?fmtDateTime(v.retired_at):null]
+    ];
+    if(v.value_type==='number' && nums.length) pairs.push(['Range',`${Math.min(...nums)} – ${Math.max(...nums)}${v.units?' '+v.units:''} (mean ${(nums.reduce((a,b)=>a+b,0)/nums.length).toPrecision(4)})`]);
+    const icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>';
+    let body=`<div class="export-bar"><span class="export-label">Export values</span><button class="btn-export" data-export-variable="csv" title="Download every current value of this variable as CSV">${icon}CSV</button></div>`;
+    body+=kv(pairs);
+    body+=`<h4>Current values (${fmtNum(rows.length)})</h4><div class="table-wrap" id="var-values-table"></div>`;
+    openModal(esc(v.label||v.name), `variable · ${esc(v.value_type)}${v.units?' in '+esc(v.units):''} · across all entities, whatever the filters`, body, {kind:'variable', id:name});
+    const cols=[
+      {key:'kind',label:'Kind',render:r=>`<span class="pill">${esc(r.kind)}</span>`},
+      {key:'label',label:'Entity',render:r=>entityKnown(r.kind,r.id)?entityLink(r.kind,r.id):`<span class="mono muted" title="not in this export">${esc(r.id)}</span>`},
+      {key:'_value',label:'Value',cls:v.value_type==='number'?'num':'',sortVal:r=>Number.isFinite(r.num)&&v.value_type==='number'?r.num:String(r.row.value),render:r=>varValue(name,r.row)},
+      {key:'_set',label:'Set',sortVal:r=>r.row.value_id,render:r=>whoWhen(r.row)},
+      {key:'_note',label:'Note',sortable:false,render:r=>r.row.note?`<span class="var-note">${esc(r.row.note)}</span>`:''}
+    ];
+    sortableTable('var-values-table',cols,rows,{defaultSort:'_set',defaultDir:'desc',limit:VAR_VALUES_LIMIT});
+    const btn=document.querySelector('#modal-body [data-export-variable]');
+    if(btn) btn.onclick=()=>{
+      const out=rows.map(r=>({entity_kind:r.kind, entity_id:r.id, entity:r.label, variable:name,
+        value:r.row.value, units:v.units||'', set_at:r.row.set_at||'', set_by:personName(r.row.set_by)==='—'?'':personName(r.row.set_by),
+        set_login:r.row.set_login||'', note:r.row.note||''}));
+      downloadBlob(name.replace(/[^a-z0-9]+/gi,'-')+'_values.csv','text/csv;charset=utf-8','﻿'+(out.length?tableToCSV(out):'entity_kind,entity_id,entity,variable,value,units,set_at,set_by,set_login,note'));
+    };
+  }
+
+  /* --------------------------------------------- subject dialog: weight plot */
+  // Weights over time from the subject's ACTIVE husbandry events (the rows
+  // lab.subject_current reads), in its order. A current "baseline weight"
+  // variable on the subject, in g (or kg), is drawn as a reference line and
+  // every weight is also given as a percent of it. Without Chart.js the
+  // table is the whole view.
+  function subjectWeights(sid){
+    return D.events.filter(e=>e.subject_id===sid && e.event_type==='husbandry' && isEventActive(e)
+        && e.detail && e.detail.weight_g!=null && Number.isFinite(Number(e.detail.weight_g)))
+      .sort((a,b)=> laterEvent(a,b)?1:laterEvent(b,a)?-1:0);
+  }
+  function subjectBaseline(sid){
+    const v=currentVariables('subject',sid).find(x=>/^baseline[ _-]?weight$/.test(x.name));
+    if(!v) return null;
+    const u=(varUnits(v.name)||'g').toLowerCase(), n=Number(v.current.value);
+    const g = u==='g' ? n : u==='kg' ? n*1000 : u==='mg' ? n/1000 : NaN;
+    return {name:v.name, row:v.current, grams:Number.isFinite(g)&&g>0?g:null, units:u};
+  }
+  const pctOf = (w,b) => b ? (w/b*100).toFixed(1)+'%' : '—';
+  function weightSection(sid){
+    const ws=subjectWeights(sid), base=subjectBaseline(sid);
+    let h=`<h4>Weight (${ws.length} measurement${ws.length!==1?'s':''})</h4>`;
+    if(base) h+= base.grams!=null
+      ? `<div class="muted" style="font-size:12.5px;margin:-4px 0 6px">Baseline ${varValue(base.name,base.row)} (variable <span class="link" data-open-variable="${esc(base.name)}">${esc(varLabel(base.name))}</span>, set ${esc(fmtDate(base.row.set_at))})${ws.length?` · latest ${esc(ws[ws.length-1].detail.weight_g)} g = <b>${pctOf(Number(ws[ws.length-1].detail.weight_g),base.grams)}</b> of baseline`:''}</div>`
+      : `<div class="cap-note">The baseline weight variable is in ${esc(base.units)}, which this page cannot convert to grams; it is not drawn.</div>`;
+    if(!ws.length) return h+`<div class="lineage-empty">No active weight measurements.</div>`;
+    const b=base&&base.grams;
+    h+=`<div class="weight-wrap" id="weight-wrap"><canvas id="weight-chart" aria-label="Weight over time"></canvas></div>`;
+    h+=`<details class="var-hist" id="weight-details"><summary>Weights as a table</summary><div class="weight-table"><table class="data"><thead><tr><th>Occurred</th><th class="num">Weight (g)</th>${b?'<th class="num">% of baseline</th>':''}<th></th></tr></thead><tbody>`+
+      ws.slice().reverse().map(e=>`<tr><td>${fmtDateTime(e.occurred_at)}</td><td class="num">${esc(e.detail.weight_g)}</td>${b?`<td class="num">${pctOf(Number(e.detail.weight_g),b)}</td>`:''}<td><span class="link" data-open-event="${esc(e.event_id)}">details</span></td></tr>`).join('')+
+      `</tbody></table></div></details>`;
+    return h;
+  }
+  function drawWeightChart(sid){
+    const wrap=document.getElementById('weight-wrap'); if(!wrap) return;
+    const showTable=msg=>{ wrap.outerHTML=`<div class="muted" style="font-size:12.5px;margin-bottom:4px">${msg}</div>`; const d=document.getElementById('weight-details'); if(d) d.open=true; };
+    if(typeof Chart==='undefined'){ showTable('Chart unavailable (Chart.js did not load); the weights are listed below.'); return; }
+    const ws=subjectWeights(sid), base=subjectBaseline(sid), b=base&&base.grams;
+    const pts=ws.map(e=>({x:parseTs(e.occurred_at).getTime(), y:Number(e.detail.weight_g), id:e.event_id}));
+    const xs=pts.map(p=>p.x);
+    const sets=[{label:'Weight (g)',data:pts,borderColor:'#8172B3',backgroundColor:'#8172B3',pointRadius:3,borderWidth:2,tension:0}];
+    if(b) sets.push({label:`Baseline ${b} g`,data:[{x:Math.min(...xs),y:b},{x:Math.max(...xs),y:b}],borderColor:'#C44E52',borderDash:[6,4],pointRadius:0,borderWidth:1.5,fill:false});
+    const dayOf = v => localDay(new Date(v).toISOString());
+    try{
+      modalCharts.push(new Chart(document.getElementById('weight-chart'),{
+        type:'line', data:{datasets:sets},
+        options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:true,
+          interaction:{mode:'nearest',intersect:false},
+          plugins:{legend:{position:'top',labels:{usePointStyle:true,boxWidth:8}},
+            tooltip:{callbacks:{title:items=>items.length?dayOf(items[0].parsed.x):'',
+              label:c=>c.datasetIndex===0?` ${c.parsed.y} g${b?' · '+pctOf(c.parsed.y,b)+' of baseline':''}`:` baseline ${b} g`}}},
+          scales:{x:{type:'linear',ticks:{maxTicksLimit:6,callback:v=>dayOf(v)},grid:{display:false}},
+                  y:{title:{display:true,text:'g'},grid:{color:CSSVAR.getPropertyValue('--chart-grid').trim()}}}}
+      }));
+    }catch(err){ showTable('Chart could not be drawn; the weights are listed below.'); }
+  }
+
+  /* ------------------------------------------------------- overview: integrity */
+  // D.integrity is a summary of lab.fn_check_integrity() (web/live/
+  // lab_integrity.sql): per check its severity, its row count and at most
+  // example_limit example rows. It is lab-wide and ignores the filters, like
+  // the verification tiles above it, which count the ACTIVE artifacts by
+  // their file's latest check.
+  const CHECK_HELP = {
+    event_missing_detail:'Typed events whose detail row was never written',
+    event_missing_subject:'Non-analysis events with no subject',
+    artifact_verification_failed:'Active files whose latest integrity check failed',
+    event_recorded_before_occurred:'Events recorded more than a day before they occurred',
+    artifact_never_verified:'Active files that have never been checked',
+    artifact_producer_superseded:'Active files still attached to a corrected event',
+    tag_not_carried_forward:'Corrections that dropped their predecessor’s tags',
+    artifact_event_mismatch:'Files filed under a different subject or session than their event',
+    input_not_carried_forward:'Corrections that dropped every input of their predecessor',
+    tag_cardinality_violation:'More than one current tag in a single-valued namespace',
+    artifact_producer_retracted:'Active files whose producing event was retracted',
+    input_retracted:'Active events that consumed a retracted file',
+    duplicate_active_path:'Two active files at one path'
+  };
+  function integrityExample(x){
+    const sub=String(x.subject==null?'':x.subject);
+    const kind = artifactById.has(sub)?'artifact':eventById.has(sub)?'event':sessionById.has(sub)?'session':subjectById.has(sub)?'subject':projectById.has(sub)?'project':null;
+    return `<div>${kind?`<span class="pill">${kind}</span> `+entityLink(kind,sub,`<span class="mono">${esc(sub)}</span>`):`<span class="mono">${esc(sub)}</span>`} <span class="muted">${esc(x.detail)}</span></div>`;
+  }
+  function renderIntegrity(){
+    const body=document.getElementById('integrity-body'), sub=document.getElementById('integrity-sub');
+    const act=D.artifacts.filter(isArtifactActive);
+    const vc={ok:0,mismatch:0,missing:0,unverified:0};
+    act.forEach(a=>{ const st=(a.verification||{}).status||'unverified'; vc[st in vc?st:'unverified']++; });
+    let h=`<div class="integ-tiles">`+
+      [['ok','Verified ok','ok'],['mismatch','Checksum mismatch','bad'],['missing','Missing','bad'],['unverified','Never verified','warn']]
+        .map(([k,l,c])=>`<div class="integ-tile ${vc[k]?c:''}" data-verif="${k}" title="Show these active artifacts" style="cursor:pointer"><div class="n">${fmtNum(vc[k])}</div><div class="l">${l}</div></div>`).join('')+
+      `</div><div class="muted" style="font-size:12px;margin:-8px 0 12px">${fmtNum(act.length)} active artifacts, by the latest check of each one’s file; click a tile to list them.</div>`;
+    const I=D.integrity;
+    if(!I || typeof I!=='object'){
+      h+=`<div class="lineage-empty">The integrity report is not part of this data. The live server adds it (web/live/lab_integrity.sql); <code>lab_data.sql</code> run on its own does not.</div>`;
+    } else if(!Array.isArray(I.checks)){
+      h+=`<div class="lineage-empty">${esc(I.error||'The integrity report is unavailable.')}</div>`;
+    } else {
+      const checks=I.checks.slice().sort((a,b)=>(a.severity==='error'?0:1)-(b.severity==='error'?0:1) || String(a.check_name).localeCompare(String(b.check_name)));
+      const nErr=checks.filter(c=>c.severity==='error').reduce((s,c)=>s+(c.count||0),0);
+      const nWarn=checks.filter(c=>c.severity!=='error').reduce((s,c)=>s+(c.count||0),0);
+      sub.textContent=`lab.fn_check_integrity() computed ${I.computed_at?fmtDateTime(I.computed_at):'—'}${I.synthetic?' (synthetic)':' (the server refreshes it every few minutes)'} · ${fmtNum(nErr)} error${nErr!==1?'s':''}, ${fmtNum(nWarn)} warning${nWarn!==1?'s':''}`;
+      if(!checks.length) h+=`<div class="lineage-empty">No problems found.</div>`;
+      checks.forEach(c=>{
+        const ex=Array.isArray(c.examples)?c.examples:[];
+        h+=`<details class="integ-check"><summary><span class="pill ${cssTok(c.severity)}">${esc(c.severity)}</span><span class="mono">${esc(c.check_name)}</span><span class="muted">${esc(CHECK_HELP[c.check_name]||'')}</span><span class="cnt">${fmtNum(c.count)}</span></summary><div class="integ-ex">`+
+          ex.map(integrityExample).join('')+
+          (c.count>ex.length?`<div class="cap-note">Showing ${ex.length} example${ex.length!==1?'s':''} of ${fmtNum(c.count)}; run <code>SELECT * FROM lab.fn_check_integrity() WHERE check_name = '${esc(c.check_name)}'</code> for all of them.</div>`:'')+
+          `</div></details>`;
+      });
+    }
+    body.innerHTML=h;
+    body.querySelectorAll('[data-verif]').forEach(t=>t.onclick=()=>{
+      F.activeOnly=true; document.getElementById('f-active').checked=true;
+      document.getElementById('artifacts-verif').value=t.dataset.verif;
+      renderAll(); showView('artifacts');
+    });
+  }
+  document.getElementById('integrity-body').addEventListener('click',ev=>{
+    const el=ev.target.closest(OPEN_SEL); if(!el) return; ev.preventDefault(); openFromLink(el);
+  });
+
+  /* ------------------------------------------------------------ session dialog */
+  function openSession(sid){
+    const s=sessionById.get(sid); if(!s) return;
+    const evs=(eventsBySession.get(sid)||[]).slice().sort((a,b)=>tsKey(a.occurred_at)<tsKey(b.occurred_at)?-1:1);
+    const arts=(artifactsBySession.get(sid)||[]).filter(a=>!F.activeOnly||isArtifactActive(a)).sort((a,b)=>(b.size_bytes||0)-(a.size_bytes||0));
+    const nActive=evs.filter(isEventActive).length;
+    let body=kv([
+      ['Subject',`<span class="link mono" data-open-subject="${esc(s.subject_id)}">${esc(s.subject_id)}</span>`,true],
+      ['Label',s.label], ['Started',fmtDateTime(s.started_at)], ['Ended',fmtDateTime(s.ended_at)],
+      ['Duration',fmtDur(sessionDur(s))], ['Rig',s.rig||'—'],
+      ['Storage root',(rootById.get(s.storage_root_id)||{}).name||'—'],
+      ['Path',`<span class="mono">${esc(s.relative_path)}</span>`,true],
+      ['Created by',personName(s.created_by)],
+      ['Tags',tagChips('session',sid),true]
+    ]);
+    if(s.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-6px 0 6px">${esc(s.notes)}</div>`;
+    body+=variablesSection('session',sid);
+    body+=`<h4>Events (${nActive} active${evs.length!==nActive?`, ${evs.length-nActive} superseded or retracted`:''})</h4>`;
+    body+=listCapped(evs.filter(e=>!F.activeOnly||isEventActive(e)), 200, e=>`<div class="lineage-node">${typeBadge(e.event_type)}<span class="muted">${fmtDateTime(e.occurred_at)}</span><span class="truncate" style="flex:1">${eventSummary(e)}</span>${statePill('event',e,{quiet:true})}<span class="link" data-open-event="${esc(e.event_id)}">details</span></div>`);
+    body+=`<h4>Files (${arts.length} · ${fmtBytes(totalBytes(arts))})</h4>`;
+    body+=listCapped(arts, 200, a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`);
+    openModal(`<span class="mono">${esc(s.label)}</span>`, `session · ${esc(s.subject_id)} · ${fmtDate(s.started_at)}`, body, {kind:'session', id:sid});
   }
 
   /* ------------------------------------------------------- overview: tags */
@@ -2398,23 +2797,53 @@ try{
 
   /* --------------------------------------------------------------- modals */
   const overlay=document.getElementById('modal-overlay');
-  function openModal(title,sub,bodyHtml){
+  // The record the open dialog shows ({kind, id}), kept in the URL hash so a
+  // dialog can be linked to (see syncHash); null for help-type dialogs.
+  let currentRecord=null;
+  const modalCharts=[];        // Chart.js instances drawn inside the dialog
+  function destroyModalCharts(){ while(modalCharts.length){ try{ modalCharts.pop().destroy(); }catch(e){} } }
+  function openModal(title,sub,bodyHtml,record){
+    destroyModalCharts();
     document.getElementById('modal-title').innerHTML=title;
     document.getElementById('modal-sub').innerHTML=sub||'';
     document.getElementById('modal-body').innerHTML=bodyHtml;
+    document.getElementById('modal-link').style.display = record ? '' : 'none';
     overlay.classList.add('open');
-    // wire internal links
-    document.getElementById('modal-body').querySelectorAll('[data-open-artifact]').forEach(el=>el.onclick=()=>openArtifact(el.dataset.openArtifact));
-    document.getElementById('modal-body').querySelectorAll('[data-open-event]').forEach(el=>el.onclick=()=>openEvent(el.dataset.openEvent));
-    document.getElementById('modal-body').querySelectorAll('[data-open-subject]').forEach(el=>el.onclick=()=>openSubject(el.dataset.openSubject));
-    document.getElementById('modal-body').querySelectorAll('[data-open-project]').forEach(el=>el.onclick=()=>openProject(el.dataset.openProject));
+    document.getElementById('modal-body').scrollTop=0; overlay.scrollTop=0;
+    currentRecord=record||null;
+    syncHash();
   }
-  function closeModal(){ overlay.classList.remove('open'); }
+  function closeModal(){
+    if(!overlay.classList.contains('open')) return;
+    overlay.classList.remove('open'); destroyModalCharts(); currentRecord=null; syncHash();
+  }
+  // every data-open-* link, anywhere in the dialog (including tables drawn into it later)
+  function openFromLink(el){
+    if(el.dataset.openArtifact!=null) openArtifact(el.dataset.openArtifact);
+    else if(el.dataset.openEvent!=null) openEvent(el.dataset.openEvent);
+    else if(el.dataset.openSubject!=null) openSubject(el.dataset.openSubject);
+    else if(el.dataset.openSession!=null) openSession(el.dataset.openSession);
+    else if(el.dataset.openProject!=null) openProject(el.dataset.openProject);
+    else if(el.dataset.openVariable!=null) openVariable(el.dataset.openVariable);
+  }
+  const OPEN_SEL='[data-open-artifact],[data-open-event],[data-open-subject],[data-open-session],[data-open-project],[data-open-variable]';
+  document.getElementById('modal-body').addEventListener('click',ev=>{
+    const el=ev.target.closest(OPEN_SEL); if(!el || el.closest('a[href]')) return;
+    ev.preventDefault(); openFromLink(el);
+  });
   document.getElementById('modal-close').onclick=closeModal;
   overlay.onclick=e=>{ if(e.target===overlay) closeModal(); };
+  // Copy a link to the open record (the page URL with its hash)
+  function copyRecordLink(){
+    const url=location.href, btn=document.getElementById('modal-link');
+    const done=ok=>{ btn.textContent=ok?'Copied':'Copy failed'; setTimeout(()=>{ btn.textContent='🔗 Link'; },1400); };
+    try{ navigator.clipboard.writeText(url).then(()=>done(true),()=>{ window.prompt('Link to this record:',url); done(true); }); }
+    catch(e){ window.prompt('Link to this record:',url); done(true); }
+  }
+  document.getElementById('modal-link').onclick=copyRecordLink;
 
   /* --------------------------------------------------------- keyboard shortcuts */
-  const SEARCH_BY_VIEW={projects:'projects-search',subjects:'subjects-search',sessions:'sessions-search',events:'events-search',artifacts:'artifacts-search'};
+  const SEARCH_BY_VIEW={projects:'projects-search',subjects:'subjects-search',sessions:'sessions-search',events:'events-search',artifacts:'artifacts-search',variables:'variables-search'};
   function focusCurrentSearch(){
     const id=SEARCH_BY_VIEW[currentView];
     if(id) document.getElementById(id).focus();
@@ -2424,7 +2853,8 @@ try{
     const rows=[
       ['?','Show this shortcuts help'],
       ['Esc','Close the open dialog'],
-      ['1 – 6','Switch tabs (Overview → Artifacts)'],
+      ['c','Copy a link to the open record (the URL also always holds the tab, filters and open record)'],
+      ['1 – 7','Switch tabs (Overview → Variables)'],
       ['/','Focus the search box for the current tab'],
       ['#','Focus the tag filter (e.g. stage:raw -qc:fail topic:*)'],
       ['t','Toggle dark / light theme'],
@@ -2442,8 +2872,9 @@ try{
     const tag=(e.target&&e.target.tagName||'').toLowerCase();
     const typing = tag==='input'||tag==='textarea'||tag==='select'||(e.target&&e.target.isContentEditable);
     if(e.key==='?'){ if(!typing){ e.preventDefault(); showShortcutsHelp(); } return; }
+    if(!typing && !e.ctrlKey && !e.metaKey && !e.altKey && e.key==='c' && overlay.classList.contains('open') && currentRecord){ copyRecordLink(); return; }
     if(typing || e.ctrlKey || e.metaKey || e.altKey || overlay.classList.contains('open')) return;
-    if(e.key>='1' && e.key<='6'){
+    if(e.key>='1' && e.key<='7'){
       const tabs=[...document.getElementById('tabs').querySelectorAll('.tab')];
       const t=tabs[Number(e.key)-1]; if(t) t.click();
       return;
@@ -2483,23 +2914,29 @@ try{
       ['Tags',tagChips('subject',sid),true]
     ]);
     if(s.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-6px 0 6px">${esc(s.notes)}</div>`;
+    body+=variablesSection('subject',sid);
+    body+=weightSection(sid);
+    body+=`<h4>Sessions (${subSessions.length})</h4>`;
+    body+=listCapped(subSessions.slice().sort((a,b)=>String(a.started_at||'')<String(b.started_at||'')?1:-1), 200,
+      x=>`<div class="lineage-node"><span class="link mono" data-open-session="${esc(x.session_id)}">${esc(x.label)}</span><span class="muted" style="flex:1">${fmtDateTime(x.started_at)}</span><span class="pill">${esc(x.rig||'—')}</span>${varChips('session',x.session_id)}</div>`);
 
     body+=`<h4>Event timeline (${activeEvs.length} active${evs.length!==activeEvs.length?`, ${evs.length-activeEvs.length} superseded`:''})</h4>`;
     body+=`<div class="timeline">`;
     evs.forEach(e=>{
       const sup=!isEventActive(e);
-      body+=`<div class="tl-item t-${cssTok(e.event_type)} ${sup?'superseded':''}">
+      body+=`<div class="tl-item t-${cssTok(e.event_type)} ${sup?cssTok(eventState(e)):''}">
         <div class="tl-row">
           <span class="tl-date">${fmtDate(e.occurred_at)}</span>
           ${typeBadge(e.event_type)}
-          <span class="tl-summary">${eventSummary(e)} <span class="link" data-open-event="${esc(e.event_id)}">details</span>${sup?' · <span class="pill superseded">superseded</span>':''}</span>
+          <span class="tl-summary">${eventSummary(e)} <span class="link" data-open-event="${esc(e.event_id)}">details</span>${sup?' · '+statePill('event',e,{reason:true}):''}</span>
         </div>
         ${e.notes?`<div class="tl-note">${esc(e.notes)}</div>`:''}
       </div>`;
     });
     body+=`</div>`;
 
-    openModal(`<span class="mono">${esc(sid)}</span>`, `${esc(speciesName(s.species_code))} · subject record`, body);
+    openModal(`<span class="mono">${esc(sid)}</span>`, `${esc(speciesName(s.species_code))} · subject record`, body, {kind:'subject', id:sid});
+    drawWeightChart(sid);
   }
 
   function openEvent(eid){
@@ -2508,12 +2945,13 @@ try{
     const base=[
       ['Event type',etLabel.get(e.event_type)],
       ['Subject', e.subject_id?`<span class="link mono" data-open-subject="${esc(e.subject_id)}">${esc(e.subject_id)}</span>`:'—',true],
-      ['Session', e.session_id?`<span class="mono">${esc((sessionById.get(e.session_id)||{}).label||e.session_id)}</span>`:'—',true],
+      ['Session', e.session_id?(sessionById.has(e.session_id)?`<span class="link mono" data-open-session="${esc(e.session_id)}">${esc(sessionById.get(e.session_id).label)}</span>`:`<span class="mono">${esc(e.session_id)}</span>`):'—',true],
       ['Occurred at',fmtDateTime(e.occurred_at)],
       ['Recorded at',fmtDateTime(e.recorded_at)],
       ['Recorded by',personName(e.recorded_by)],
       ['Database login',e.recorded_login],     // who actually inserted the row (schema v4); absent on older rows
-      ['State', isEventActive(e)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['State', statePill('event',e),true],
+      ...retractionRows('event',eid),
       ['Tags',tagChips('event',eid),true]
     ];
     if(e.supersedes){ const p=eventById.get(e.supersedes); base.push(['Supersedes', p?`<span class="link" data-open-event="${esc(e.supersedes)}">${fmtDate(p.occurred_at)} ${esc(etName(p.event_type))}</span>`:'(prior row)',true]); }
@@ -2537,19 +2975,20 @@ try{
     };
     let body = kv(base.concat(detailMap[e.event_type]||[]));
     if(e.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-4px 0 8px">“${esc(e.notes)}”</div>`;
+    body+=variablesSection('event',eid);
 
     // produced / consumed artifacts
     const produced=artifactsByEvent.get(eid)||[];
     const consumed=(inputsByEvent.get(eid)||[]).map(id=>artifactById.get(id)).filter(Boolean);
     if(produced.length){
       body+=`<h4>Produced artifacts (${produced.length})</h4>`;
-      body+=produced.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${artifactOpenLinks(a)}</div>`).join('');
+      body+=produced.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span><span class="muted">${fmtBytes(a.size_bytes)}</span>${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`).join('');
     }
     if(consumed.length){
       body+=`<h4>Consumed inputs (${consumed.length})</h4>`;
-      body+=consumed.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>${artifactOpenLinks(a)}</div>`).join('');
+      body+=consumed.map(a=>`<div class="lineage-node"><span class="pill">${esc(a.role||'')}</span><span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`).join('');
     }
-    openModal(typeBadge(e.event_type), `Event · ${fmtDate(e.occurred_at)}`, body);
+    openModal(typeBadge(e.event_type), `Event · ${fmtDate(e.occurred_at)}`, body, {kind:'event', id:eid});
   }
 
   // Lineage, as lab.fn_artifact_lineage(id, direction) returns it by default,
@@ -2609,7 +3048,7 @@ try{
       const a=n.artifact, ev=eventById.get(eventCurrent(a.produced_by_event_id));
       return `<div class="lineage-node"><span class="depth">d${n.depth}</span><span class="pill">${esc(a.role||'')}</span>
         <span class="mono truncate" style="flex:1" title="${esc(a.relative_path)}">${esc(a.relative_path)}</span>
-        ${ev?typeBadge(ev.event_type):''}${isArtifactActive(a)?'':'<span class="pill superseded">superseded</span>'}${artifactOpenLinks(a)}</div>`;
+        ${ev?typeBadge(ev.event_type):''}${statePill('artifact',a,{quiet:true})}${artifactOpenLinks(a)}</div>`;
     }).join('') + (lin.truncated ? `<div class="empty lineage-truncated" style="padding:10px">Stopped at depth ${LINEAGE_MAX_DEPTH}, the cap of lab.fn_artifact_lineage — the lineage continues beyond the rows shown.</div>` : '');
   }
 
@@ -2627,25 +3066,27 @@ try{
       ['Size',fmtBytes(a.size_bytes)],
       ['Checksum',`<span class="mono" style="font-size:11.5px">${esc(a.checksum_algo)}:${esc(String(a.checksum||'').slice(0,24))}…</span>`,true],
       ['Subject', a.subject_id?`<span class="link mono" data-open-subject="${esc(a.subject_id)}">${esc(a.subject_id)}</span>`:'—',true],
-      ['Session',a.session_id?`<span class="mono">${esc((sessionById.get(a.session_id)||{}).label||'')}</span>`:'—',true],
+      ['Session',a.session_id?(sessionById.has(a.session_id)?`<span class="link mono" data-open-session="${esc(a.session_id)}">${esc(sessionById.get(a.session_id).label)}</span>`:`<span class="mono">${esc(a.session_id)}</span>`):'—',true],
       ['Created',fmtDateTime(a.created_at)],
       ['Created by',personName(a.created_by)],
       ['Database login',a.created_login],      // who actually inserted the row (schema v4); absent on older rows
       // the latest check of the FILE, whichever row of its correction chain it was recorded against
       ['Verification',`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
       ['Produced by', ev?`<span class="link" data-open-event="${esc(ev.event_id)}">${esc(etName(ev.event_type))} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
-      ['State',isArtifactActive(a)?'<span class="pill active">active</span>':'<span class="pill superseded">superseded</span>',true],
+      ['State',statePill('artifact',a),true],
+      ...retractionRows('artifact',aid),
       ['Supersedes', a.supersedes&&artifactById.has(a.supersedes) ? `<span class="link" data-open-artifact="${esc(a.supersedes)}">previous version</span>` : null, true],
       ['Superseded by', artifactSuccessor.has(aid) ? `<span class="link" data-open-artifact="${esc(artifactSuccessor.get(aid))}">${artifactCurrent(aid)===artifactSuccessor.get(aid)?'current version':'next version'}</span>` : null, true],
       ['Tags',tagChips('artifact',aid),true]
     ];
     let body=kv(base);
+    body+=variablesSection('artifact',aid);
     body+=`<div class="muted" style="font-size:12px;margin:2px 0 -4px">Lineage follows corrections: every row listed is a current version${isArtifactActive(a)?'':', and it is the lineage of this row’s current version'}.</div>`;
     body+=`<div class="lineage-col">
       <div><h4>Upstream (inputs)</h4>${lineageList(lineageUp(aid),aid)}</div>
       <div><h4>Downstream (derived)</h4>${lineageList(lineageDown(aid),aid)}</div>
     </div>`;
-    openModal(`<span class="pill">${esc(a.role||'artifact')}</span> Artifact`, `${esc(a.format||'')} · ${fmtBytes(a.size_bytes)}`, body);
+    openModal(`<span class="pill">${esc(a.role||'artifact')}</span> Artifact`, `${esc(a.format||'')} · ${fmtBytes(a.size_bytes)}`, body, {kind:'artifact', id:aid});
   }
 
   /* ---------------------------------------------------------------- render all */
@@ -2658,6 +3099,7 @@ try{
     renderKPIs(); updateCharts(); renderTagsPanel();
     renderProjects(); renderSubjects(); renderSessions(); renderEvents(); renderArtifacts();
     if(treeMode==='tree') renderProjectsTree();
+    syncHash();
   }
 
   /* ---------------------------------------------------------------- filters UI */
@@ -2715,6 +3157,13 @@ try{
     ev.preventDefault(); ev.stopPropagation();
     closeModal(); addTagToFilter(chip.dataset.tag);
   },true);
+  // A variable chip in a table row opens that variable's values, not the row.
+  document.addEventListener('click',ev=>{
+    const chip=ev.target.closest && ev.target.closest('.var-chip[data-open-variable]');
+    if(!chip || chip.closest('#modal-body')) return;
+    ev.preventDefault(); ev.stopPropagation();
+    openVariable(chip.dataset.openVariable);
+  },true);
 
   document.getElementById('projects-search').oninput=()=>{ renderProjects(); if(treeMode==='tree') renderProjectsTree(); };
   ['subjects-search'].forEach(id=>document.getElementById(id).oninput=renderSubjects);
@@ -2730,6 +3179,7 @@ try{
     // tree controls stay visible; they're just disabled outside tree mode
     ['tree-depth','tree-expand','tree-collapse'].forEach(id=>document.getElementById(id).disabled = !isTree);
     if(isTree) renderProjectsTree();
+    syncHash();
   }
   projModeSeg.querySelectorAll('.seg-btn').forEach(b=> b.onclick=()=>setProjectsMode(b.dataset.mode));
   document.getElementById('tree-depth').onchange=()=>{ if(treeMode==='tree') renderProjectsTree(); };
@@ -2742,23 +3192,105 @@ try{
     else if((el=ev.target.closest('[data-open-event]'))) { ev.preventDefault(); openEvent(el.dataset.openEvent); }
     else if((el=ev.target.closest('[data-open-subject]'))) { ev.preventDefault(); openSubject(el.dataset.openSubject); }
     else if((el=ev.target.closest('[data-open-project]'))) { ev.preventDefault(); openProject(el.dataset.openProject); }
+    else if((el=ev.target.closest('[data-open-session]'))) { ev.preventDefault(); openSession(el.dataset.openSession); }
   });
   document.getElementById('sessions-search').oninput=renderSessions;
   document.getElementById('events-search').oninput=renderEvents;
   document.getElementById('artifacts-search').oninput=renderArtifacts;
   document.getElementById('artifacts-role').onchange=renderArtifacts;
   document.getElementById('artifacts-verif').onchange=renderArtifacts;
+  document.getElementById('variables-search').oninput=renderVariables;
+  // the search boxes and selects are part of the URL hash (see syncHash)
+  Object.values(SEARCH_BY_VIEW).concat(['artifacts-role','artifacts-verif']).forEach(id=>
+    document.getElementById(id).addEventListener(id.endsWith('search')?'input':'change', ()=>syncHash()));
 
   // tabs
-  document.getElementById('tabs').querySelectorAll('.tab').forEach(tab=>{
-    tab.onclick=()=>{
-      document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-      document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
-      tab.classList.add('active');
-      currentView=tab.dataset.view;
-      document.getElementById('view-'+currentView).classList.add('active');
-    };
-  });
+  const VIEWS=[...document.getElementById('tabs').querySelectorAll('.tab')].map(t=>t.dataset.view);
+  function showView(view){
+    if(!VIEWS.includes(view)) view='overview';
+    document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.view===view));
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+    currentView=view;
+    document.getElementById('view-'+currentView).classList.add('active');
+    syncHash();
+  }
+  document.getElementById('tabs').querySelectorAll('.tab').forEach(tab=>{ tab.onclick=()=>showView(tab.dataset.view); });
+
+  /* ------------------------------------------------------------- deep links
+     The active tab, the filters, the current tab's search box (and the
+     artifact role / verification selects, the projects table/tree mode) and
+     the open record live in the URL hash, e.g.
+       #tab=events&subject=GERB041&from=2026-01-01&active=0&open=event:<uuid>
+     so a record or a view can be linked from a notebook. Only values that
+     differ from the defaults are written. The hash is rewritten in place
+     (history.replaceState), so filtering does not fill the back button. */
+  let applyingHash=false, lastHash=null;
+  function hashState(){
+    const p=new URLSearchParams();
+    if(currentView!=='overview') p.set('tab',currentView);
+    if(F.species!=='all') p.set('species',F.species);
+    if(F.subject!=='') p.set('subject',F.subject);
+    if(F.event!=='all') p.set('event',F.event);
+    if(F.from) p.set('from',F.from);
+    if(F.to) p.set('to',F.to);
+    if(!F.activeOnly) p.set('active','0');
+    if(F.tags.trim()) p.set('tags',F.tags.trim());
+    const sid=SEARCH_BY_VIEW[currentView], q=sid?document.getElementById(sid).value:'';
+    if(q) p.set('q',q);
+    if(currentView==='artifacts'){
+      const r=document.getElementById('artifacts-role').value, v=document.getElementById('artifacts-verif').value;
+      if(r!=='all') p.set('role',r);
+      if(v!=='all') p.set('verif',v);
+    }
+    if(currentView==='projects' && treeMode==='tree') p.set('mode','tree');
+    if(currentRecord) p.set('open',currentRecord.kind+':'+currentRecord.id);
+    return p.toString();
+  }
+  function syncHash(){
+    if(applyingHash || typeof F==='undefined') return;
+    const h=hashState();
+    if(h===lastHash) return;
+    lastHash=h;
+    const url=location.pathname+location.search+(h?'#'+h:'');
+    try{ history.replaceState(null,'',url); }
+    catch(e){ try{ location.replace(h?'#'+h:'#'); }catch(e2){} }
+  }
+  function applyHash(){
+    const h=location.hash.replace(/^#/,'');
+    if(h===lastHash) return;
+    const p=new URLSearchParams(h);
+    applyingHash=true;
+    try{
+      const optVal=(id,v,dflt)=>{ const el=document.getElementById(id); const ok=v!=null && [...el.options].some(o=>o.value===v); el.value=ok?v:dflt; return el.value; };
+      F.species=optVal('f-species',p.get('species'),'all');
+      refreshSubjectOptions();
+      F.subject=optVal('f-subject',p.get('subject'),'');
+      F.event=optVal('f-event',p.get('event'),'all');
+      const day=v=>/^\d{4}-\d{2}-\d{2}$/.test(v||'')?v:'';
+      F.from=day(p.get('from')); document.getElementById('f-from').value=F.from;
+      F.to=day(p.get('to')); document.getElementById('f-to').value=F.to;
+      F.activeOnly=p.get('active')!=='0'; document.getElementById('f-active').checked=F.activeOnly;
+      setTagFilter(p.get('tags')||''); document.getElementById('f-tags').value=F.tags;
+      const view=VIEWS.includes(p.get('tab'))?p.get('tab'):'overview';
+      Object.entries(SEARCH_BY_VIEW).forEach(([v,id])=>{ document.getElementById(id).value = v===view ? (p.get('q')||'') : ''; });
+      optVal('artifacts-role',view==='artifacts'?p.get('role'):null,'all');
+      optVal('artifacts-verif',view==='artifacts'?p.get('verif'):null,'all');
+      if((view==='projects' && p.get('mode')==='tree') !== (treeMode==='tree')) setProjectsMode(view==='projects' && p.get('mode')==='tree'?'tree':'table');
+      renderAll(); renderVariables();
+      showView(view);
+      const open=p.get('open')||'', i=open.indexOf(':');
+      closeModal();
+      if(i>0) openRecord(open.slice(0,i), open.slice(i+1));
+    } finally { applyingHash=false; }
+    lastHash=null; syncHash();
+  }
+  function openRecord(kind,id){
+    const fn={project:openProject,subject:openSubject,session:openSession,event:openEvent,artifact:openArtifact,variable:openVariable}[kind];
+    const known = kind==='variable' ? varByName.has(id) : (ENTITY_OPEN[kind] && entityKnown(kind,id));
+    if(fn && known){ fn(id); return; }
+    openModal('Record not found', '', `<div class="lineage-empty">The link names ${esc(kind)} <span class="mono">${esc(id)}</span>, which is not in this data${kind==='variable'?'':' (it may belong to another database)'}.</div>`);
+  }
+  window.addEventListener('hashchange', applyHash);
   document.getElementById('open-howto').onclick=()=>{ const h=document.getElementById('howto'); h.open=true; h.scrollIntoView({behavior:'smooth',block:'nearest'}); };
 
   document.getElementById('theme-toggle').onclick=()=>{
@@ -2775,7 +3307,9 @@ try{
 
   // go
   populateFilters();
-  renderAll();
+  document.getElementById('tc-variables').textContent=D.variables.length;
+  renderVariables(); renderIntegrity();
+  if(location.hash.length>1) applyHash(); else renderAll();
   loadCharts();
 })();
 </script>

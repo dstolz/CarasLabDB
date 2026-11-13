@@ -1,8 +1,15 @@
 """Unit tests for db.py's guards and SQL construction. No database needed."""
 
+import base64
+import datetime
+import json
+import uuid
+
 import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from caraslabdb_mcp import db
+from caraslabdb_mcp.tools import OptNumber, summary
 
 
 class Captured(list):
@@ -11,6 +18,7 @@ class Captured(list):
     def __init__(self):
         super().__init__()
         self.tag_checks = []
+        self.page_orders = []
 
 
 @pytest.fixture
@@ -18,10 +26,12 @@ def captured(monkeypatch):
     """Capture the SQL select_from would run instead of running it."""
     calls = Captured()
 
-    def fake_fetch_limited(sql, params=(), limit=db.DEFAULT_LIMIT, tag_check=None):
+    def fake_fetch_limited(sql, params=(), limit=db.DEFAULT_LIMIT, tag_check=None,
+                           page_order=None, extra=None):
         calls.append((sql, list(params), limit))
         calls.tag_checks.append(tag_check)
-        return db._envelope([], db._effective_limit(limit))
+        calls.page_orders.append(page_order)
+        return db._envelope([], db._effective_limit(limit), page_order=page_order)
 
     monkeypatch.setattr(db, "fetch_limited", fake_fetch_limited)
     return calls
@@ -281,3 +291,146 @@ def test_tag_pk_rejects_unknown_kind():
     assert db.tag_pk("subject") == "subject_id"
     with pytest.raises(ValueError, match="entity kind"):
         db.tag_pk("person")
+
+
+# ---------------------------------------------------------------------------
+# Paging, file lookup, active-entity clause, numbers, counts
+# ---------------------------------------------------------------------------
+
+def test_page_keys_spell_their_orderings():
+    # The keyset must be exactly the ORDER BY, column for column and direction
+    # for direction, or a page boundary skips or repeats rows.
+    for order, keys in db.PAGE_KEYS.items():
+        assert order in db.ALLOWED_ORDER_BY
+        assert order == ", ".join(c + (" DESC" if d else "") for c, d, _ in keys)
+        for column, _, cast in keys:
+            assert db._FILTER_KEY_RE.match(column)
+            assert cast in ("timestamptz", "uuid", "text", "bigint")
+
+
+def test_keyset_clause_mixes_directions_and_binds_values():
+    clause, params = db.keyset_clause(db.ORDER_BY_EVENT, ["2026-01-01T00:00:00+00:00", "u"])
+    assert clause == (
+        "((occurred_at < %s::timestamptz) OR "
+        "(occurred_at = %s::timestamptz AND event_id > %s::uuid))")
+    assert params == ["2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", "u"]
+
+
+def test_cursor_round_trips_exactly():
+    when = datetime.datetime(2026, 9, 1, 4, 30, 0, 123456, tzinfo=datetime.timezone.utc)
+    ident = uuid.uuid4()
+    cursor = db.encode_cursor(db.ORDER_BY_EVENT, {"occurred_at": when, "event_id": ident, "x": 1})
+    assert db.decode_cursor(db.ORDER_BY_EVENT, cursor) == [when.isoformat(), str(ident)]
+    assert db.decode_cursor(db.ORDER_BY_TAG_ASSIGNMENT, db.encode_cursor(
+        db.ORDER_BY_TAG_ASSIGNMENT, {"assignment_id": 42})) == [42]
+
+
+def _forge(payload):
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+
+@pytest.mark.parametrize("cursor", [
+    "", "abc", "null", "!!!", _forge([1, 2]), _forge({"o": db.ORDER_BY_ARTIFACT, "k": ["a", "b"]}),
+    _forge({"o": db.ORDER_BY_EVENT, "k": ["a"]}), _forge({"o": db.ORDER_BY_EVENT, "k": ["a", ["b"]]}),
+    _forge({"o": db.ORDER_BY_EVENT, "k": ["a", True]}), _forge({"o": db.ORDER_BY_EVENT}),
+])
+def test_decode_cursor_rejects_anything_but_its_own(cursor):
+    with pytest.raises(ValueError, match="Invalid cursor"):
+        db.decode_cursor(db.ORDER_BY_EVENT, cursor)
+
+
+def test_cursor_on_an_unpageable_ordering_is_refused():
+    with pytest.raises(ValueError, match="cannot be paged"):
+        db.decode_cursor("code", "x")
+
+
+def test_select_from_pages_with_a_bound_keyset(captured):
+    cursor = _forge({"o": db.ORDER_BY_SUBJECT, "k": ["x'); DROP TABLE lab.subject; --"]})
+    db.select_from("lab.subject", {"project_id": "p"}, limit=5, paged=True, cursor=cursor)
+    sql, params, _ = captured[0]
+    assert sql == ("SELECT * FROM lab.subject WHERE project_id = %s AND "
+                   "((subject_id > %s::text)) ORDER BY subject_id")
+    assert params == ["p", "x'); DROP TABLE lab.subject; --"]
+    assert captured.page_orders == [db.ORDER_BY_SUBJECT]
+
+
+def test_select_from_paging_guards(captured):
+    with pytest.raises(ValueError, match="does not take a cursor"):
+        db.select_from("lab.subject", {}, cursor="x")
+    with pytest.raises(ValueError, match="cannot be paged"):
+        db.select_from("lab.species", {}, paged=True)
+    assert captured == []
+
+
+def test_envelope_next_cursor():
+    rows = [{"subject_id": s} for s in ("a", "b", "c")]
+    env = db._envelope(rows, 2, page_order=db.ORDER_BY_SUBJECT)
+    assert list(env)[:4] == ["row_count", "limit", "truncated", "next_cursor"]
+    assert db.decode_cursor(db.ORDER_BY_SUBJECT, env["next_cursor"]) == ["b"]
+    assert db._envelope(rows, 3, page_order=db.ORDER_BY_SUBJECT)["next_cursor"] is None
+    assert "next_cursor" not in db._envelope(rows, 2)
+    env = db._envelope(rows, 2, extra={"question": "q"})
+    assert list(env) == ["row_count", "limit", "truncated", "question", "rows"]
+
+
+@pytest.mark.parametrize("prefix, pattern", [
+    ("G-0421/s1/", "G-0421/s1/%"),
+    ("a_b%c", "a\\_b\\%c%"),
+    ("back\\slash", "back\\\\slash%"),
+])
+def test_like_prefix_escapes_wildcards(prefix, pattern):
+    assert db.like_prefix(prefix) == pattern
+
+
+def test_prefix_num_and_active_clauses(captured):
+    db.select_from("lab.variable_current", {"entity_kind": "event"},
+                   prefix_filters={"variable": "probe_%"},
+                   num_ranges={"value_num": ("1.5", None)}, active_entities="event")
+    sql, params, _ = captured[0]
+    assert sql == (
+        "SELECT * FROM lab.variable_current WHERE entity_kind = %s "
+        "AND value_num >= %s::numeric AND variable LIKE %s ESCAPE '\\' "
+        "AND event_id IN (SELECT x.event_id FROM lab.event_active x) "
+        "ORDER BY entity_kind, entity_id, variable")
+    assert params == ["event", "1.5", "probe\\_\\%%"]
+    with pytest.raises(ValueError, match="active_entities"):
+        db.select_from("lab.event", {}, active_entities="subject")
+    with pytest.raises(ValueError, match="column name"):
+        db.select_from("lab.event", {}, prefix_filters={"x LIKE '%' OR 1": "a"})
+
+
+def test_entity_id_value():
+    ident = uuid.uuid4()
+    assert db.entity_id_value("session", f" {str(ident).upper()} ") == str(ident)
+    assert db.entity_id_value("subject", " G-0421") == " G-0421"
+    assert db.entity_id_value("event", None) is None
+    with pytest.raises(ValueError, match="not one"):
+        db.entity_id_value("artifact", "G-0421")
+    with pytest.raises(ValueError, match="entity kind"):
+        db.entity_id_value("person", "x")
+
+
+@pytest.mark.parametrize("given, expected", [
+    (None, None), (1200, "1200"), (1200.5, "1200.5"), (0.1, "0.1"),
+    ("1200.50", "1200.50"), (" -3e2 ", "-3e2"),
+])
+def test_opt_number_keeps_the_digits(given, expected):
+    assert TypeAdapter(OptNumber).validate_python(given) == expected
+
+
+@pytest.mark.parametrize("given", ["null", "", "abc", "NaN", "inf", True, float("nan"), [1]])
+def test_opt_number_refuses_non_numbers(given):
+    with pytest.raises(ValidationError):
+        TypeAdapter(OptNumber).validate_python(given)
+
+
+@pytest.mark.parametrize("question", sorted(summary.QUESTIONS))
+@pytest.mark.parametrize("active_only", [True, False])
+def test_count_questions_are_fixed_sql(question, active_only):
+    evil = "x'); DROP TABLE lab.event; --"
+    build, _ = summary.QUESTIONS[question]
+    sql, params = build(active_only, evil, evil, evil)
+    assert evil not in sql and "DROP" not in sql
+    assert sql.count("%s") == len(params)
+    assert " ORDER BY " in sql and "LIMIT" not in sql
+    assert all(p in (evil, active_only) for p in params)

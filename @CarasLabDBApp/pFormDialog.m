@@ -1,4 +1,4 @@
-function out = pFormDialog(titleText, specs)
+function out = pFormDialog(titleText, specs, headerText, acceptFcn)
 %PFORMDIALOG Generic modal form; returns entered values keyed by spec.Key.
 %
 %   out = CarasLabDBApp.pFormDialog(titleText, specs) builds a scrollable modal
@@ -8,6 +8,20 @@ function out = pFormDialog(titleText, specs)
 %   out = CarasLabDBApp.pFormDialog(titleText, specs, headerText) also shows
 %   HEADERTEXT in bold above the fields; the editors use it to name the row
 %   being edited.
+%
+%   out = CarasLabDBApp.pFormDialog(titleText, specs, headerText, acceptFcn)
+%   calls ACCEPTED = ACCEPTFCN(values, formFig) when the user presses OK and
+%   every field is readable, while the form is still open. VALUES is the
+%   struct described below and FORMFIG the form's window (the parent for an
+%   alert or confirmation). The form closes with out.OK = true only if
+%   ACCEPTFCN returns true; if it returns false the form stays open with
+%   everything the user typed, and if it throws, the error message is shown
+%   as an "Invalid input" alert and the form stays open. The editors use it
+%   to validate the entries, to show the change preview
+%   (CarasLabDBApp.confirmChanges) and then to write, so that a refusal --
+%   theirs or the database's -- never costs the user what they typed. While
+%   ACCEPTFCN runs, and once the form has been accepted, further OK presses
+%   are ignored, so it is called at most once per accepted form.
 %
 %   Each spec element:
 %       Key      - identifier used as the output struct field
@@ -20,7 +34,7 @@ function out = pFormDialog(titleText, specs)
 %
 %   Number fields take plain decimal notation with a period (71.9, 30000,
 %   1.5e3). Text with a comma is refused rather than parsed: str2double
-%   would silently read "71,9" as 719.
+%   would silently read "71,9" as 719 (see CarasLabDBApp.parseNumber).
 %
 %   Returns a struct with:
 %       out.OK      - true if the user confirmed
@@ -33,15 +47,18 @@ function out = pFormDialog(titleText, specs)
 %   time-of-day), so a typo can never be silently dropped on the way to the
 %   database.
 %
-%   See also CARASLABDBAPP/SHOWEVENTEDITOR.
+%   See also CARASLABDBAPP/SHOWEVENTEDITOR, CARASLABDBAPP/PARSENUMBER,
+%   CARASLABDBAPP/CONFIRMCHANGES.
 
     arguments
         titleText (1,1) string
         specs struct
         headerText (1,1) string = ""
+        acceptFcn = []                  % function handle: accepted = f(values, formFig)
     end
 
     out = struct("OK", false, "Values", struct());
+    busy = false;       % OK is being handled (the accept hook may be writing)
     n = numel(specs);
     hasTextarea = any(string({specs.Type}) == "textarea");
     hasHeader = strlength(headerText) > 0;
@@ -126,6 +143,23 @@ function out = pFormDialog(titleText, specs)
     end
 
     function onOk()
+        % One OK at a time, and none after the form was accepted: the accept
+        % hook may write to the database, and a second Enter or click that
+        % arrives while it runs must not write again.
+        if busy || out.OK
+            return
+        end
+        busy = true;
+        try
+            handleOk();
+        catch okErr
+            busy = false;
+            rethrow(okErr);
+        end
+        busy = false;
+    end
+
+    function handleOk()
         vals = struct();
         problems = strings(1, 0);
         for k = 1:n
@@ -141,6 +175,19 @@ function out = pFormDialog(titleText, specs)
             % otherwise be dropped from the INSERT without the user noticing.
             uialert(f, strjoin(problems, newline), "Invalid input");
             return
+        end
+        if ~isempty(acceptFcn)
+            % The caller checks the values, and may ask for confirmation,
+            % while the form is still open: a refusal loses nothing typed.
+            try
+                accepted = acceptFcn(vals, f);
+            catch acceptErr
+                uialert(f, string(acceptErr.message), "Invalid input");
+                return
+            end
+            if ~(islogical(accepted) && isscalar(accepted) && accepted)
+                return
+            end
         end
         out.OK = true;
         out.Values = vals;
@@ -197,28 +244,13 @@ function [v, err] = local_readWidget(w, type)
             v = strjoin(string(w.Value), newline);
             v = strtrim(v);
         case "number"
-            txt = strtrim(string(w.Value));
-            v = NaN;                         % blank means "not provided"
-            if strlength(txt) > 0
-                if contains(txt, ",")
-                    % str2double reads a comma as a thousands separator and
-                    % drops it wherever it stands: "71,9" would become 719.
-                    % Never hand it text with a comma in it.
-                    err = "'" + txt + "' contains a comma. Use a period as the " + ...
-                        "decimal separator and no thousands separator (for " + ...
-                        "example 71.9 or 30000).";
-                elseif isempty(regexp(char(txt), ...
-                        '^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$', 'once'))
-                    % Plain decimal notation only: no "3i", "inf", "1d3".
-                    err = "'" + txt + "' is not a number.";
-                else
-                    v = str2double(txt);
-                    if ~isreal(v) || ~isfinite(v)
-                        v = NaN;
-                        err = "'" + txt + "' is not a number.";
-                    end
-                end
+            % Blank reads as NaN ("not provided"). Text with a comma is
+            % refused, never parsed: str2double would read "71,9" as 719.
+            txt = string(w.Value);
+            if ~isscalar(txt)
+                txt = strjoin(reshape(txt, 1, []), "");
             end
+            [v, err] = CarasLabDBApp.parseNumber(txt);
         case "bool"
             v = logical(w.Value);
         case "datetime"

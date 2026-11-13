@@ -11,25 +11,34 @@ classdef CarasLabDB < handle
 %
 %   The schema is append-only: UPDATE and DELETE are blocked by database
 %   triggers. Corrections are made by inserting a *superseding* row and
-%   pointing its "supersedes" column at the row it replaces. Read helpers
-%   default to the *_active views (latest, non-superseded rows); set
-%   UseActiveViews=false (globally) or ActiveOnly=false (per call) to see
-%   full history.
+%   pointing its "supersedes" column at the row it replaces; a row that
+%   should never have been written is *retracted* (retractEvent,
+%   retractArtifact). Read helpers default to the *_active views (rows that
+%   are neither superseded nor retracted); set UseActiveViews=false
+%   (globally) or ActiveOnly=false (per call) to see full history, where
+%   getEvents and getArtifacts add the columns superseded_by, is_current
+%   and is_retracted to say what became of each row.
 %
 %   Construction (Name=Value):
+%       db = CarasLabDB(Username="jdoe", Password=secret, ...
+%                       Server="nas-main.lab", DatabaseName="lab");
 %       db = CarasLabDB(Username="lab_rw", Password=secret, ...
 %                       Server="nas-main.lab", DatabaseName="lab", ...
 %                       PersonEmail="dstolz@umd.edu");
 %
-%   A "current person" resolved at construction (PersonId=, PersonEmail= or
-%   PersonName=) auto-populates the created_by / recorded_by provenance
-%   columns on inserts (override per call with CreatedBy=/RecordedBy=). A
-%   PersonId, email or name that matches no one, and a PersonName shared by
-%   several people (CarasLabDB:personAmbiguous), are errors. With no
-%   identity at all the object still works but warns
-%   CarasLabDB:noCurrentPerson: rows are then written with a NULL
-%   recorded_by / created_by, and only the login the database itself
-%   records (recorded_login, created_login, ...) says who wrote them.
+%   A "current person" resolved at construction auto-populates the
+%   created_by / recorded_by provenance columns on inserts (override per
+%   call with CreatedBy=/RecordedBy=). It is the person named by PersonId=,
+%   PersonEmail= or PersonName=; a PersonId, email or name that matches no
+%   one, and a PersonName shared by several people
+%   (CarasLabDB:personAmbiguous), are errors. When none of the three is
+%   given it is the person the database login is mapped to
+%   (lab.person.db_login, read with lab.fn_current_person()), so a lab
+%   member with a login of their own needs to name nobody. Only when the
+%   login is mapped to no one either does the object warn
+%   CarasLabDB:noCurrentPerson: it still works, but rows are then written
+%   with a NULL recorded_by / created_by, and only the login the database
+%   itself records (recorded_login, created_login, ...) says who wrote them.
 %
 %   At connection the session time zone is set to this workstation's zone,
 %   so timestamps come back as local wall-clock time (see PINITSESSION), and
@@ -59,13 +68,22 @@ classdef CarasLabDB < handle
 %       L   = db.artifactLineage(aid, Direction="up");
 %
 %   Large methods live in their own files under @CarasLabDB and are declared
-%   in the "methods" signature block below:
+%   in the "methods" signature blocks below:
 %       addBirthEvent, addSurgeryEvent, addRecordingEvent, addBehaviorEvent,
 %       addHusbandryEvent, addEndpointEvent, addHistologyEvent,
-%       addAnalysisEvent, addArtifact, supersedeEvent, supersedeArtifact,
-%       artifactLineage, runReadOnlyQuery, updateSubject, updateSession,
-%       addTagNamespace, registerTag, addTag, removeTag, setTag,
-%       getEntityTags, findByTags.
+%       addAnalysisEvent, addHusbandryBatch, addArtifact,
+%       addArtifactFromFile, fileChecksum (static), supersedeEvent,
+%       supersedeArtifact, artifactLineage, runReadOnlyQuery, updateSubject,
+%       updateSession, addTagNamespace, registerTag, addTag, removeTag,
+%       setTag, getEntityTags, findByTags, setVariable, getVariables,
+%       defineVariable.
+%   Defined in this file: the add/get methods of the reference, project,
+%   subject and session tables; getEvents, getEventDetail, getArtifacts and
+%   the other readers; getTagNamespaces, getTags, updateTagNamespace,
+%   retireTag; unsetVariable, getVariableValues, getVariableDefinitions,
+%   updateVariableDefinition, retireVariable; retractEvent,
+%   retractArtifact, getRetractions; checkIntegrity; and the static helpers
+%   sqlLiteral, normalizeTag, parseTag, displayTag, normalizeVariableName.
 %
 %   Tags. Events, artifacts, subjects, sessions and projects can carry
 %   namespace:value tags (stage:raw, cohort:a, qc:fail; a bare tag such as
@@ -88,6 +106,37 @@ classdef CarasLabDB < handle
 %   not exist or does not apply to the rows asked for, or a tag that is not
 %   registered, raises CarasLabDB:tagFilterProblem instead of quietly
 %   matching nothing.
+%
+%   Variables. The same five kinds of row can carry user-defined named
+%   values -- one number or one string each, with units -- for what the
+%   schema has no column for ("probe depth" 1200 um on a session). Every
+%   write goes through lab.fn_set_variable / lab.fn_unset_variable:
+%       db.setVariable("session", sid, "Probe Depth", 1200, Units="um");
+%       db.setVariable("session", sid, "probe depth", 1350);   % an update
+%       db.setVariable("subject", "G-0421", "housing", "pair");
+%       T = db.getVariables("session", sid);                   % current values
+%       H = db.getVariables("session", sid, History=true);     % the log
+%       V = db.getVariableValues("probe depth");               % across rows
+%       db.unsetVariable("session", sid, "probe depth");
+%   A variable is defined on first use (or ahead of time with
+%   defineVariable); its value type and units are then fixed, so a value in
+%   other units is an error. Values are an append-only log, like tags: an
+%   update is a new row, and the database copies a superseded event's or
+%   artifact's current variables to its successor.
+%
+%   Retraction. An event or artifact that should never have been recorded
+%   (entered twice, registered by mistake) is withdrawn, with a reason:
+%       db.retractEvent(eid, "entered twice");
+%       db.retractArtifact(aid, "registered under the wrong path");
+%       R = db.getRetractions();
+%   The row stays in the database; the *_active views, and so the get*
+%   methods by default, stop returning it.
+%
+%   Housekeeping. checkIntegrity() returns lab.fn_check_integrity(), the
+%   database's own list of what needs attention (errors first).
+%   addHusbandryBatch writes one weigh-in sheet as one transaction, and
+%   addArtifactFromFile registers a file from its path, computing the size
+%   and SHA-256 itself (static fileChecksum).
 %
 %   Requires MATLAB R2024b or later and the Database Toolbox.
 %
@@ -141,6 +190,9 @@ classdef CarasLabDB < handle
         [assignmentId, changed] = setTag(obj, kind, entityId, tag, opts)
         T           = getEntityTags(obj, kind, entityId, opts)
         ids         = findByTags(obj, kind, opts)
+        valueId     = setVariable(obj, kind, entityId, name, value, opts)
+        T           = getVariables(obj, kind, entityId, opts)
+        name        = defineVariable(obj, name, opts)
     end
 
     % ==================================================================
@@ -235,6 +287,9 @@ classdef CarasLabDB < handle
         function setPerson(obj, opts)
             %SETPERSON Change the current provenance identity after construction.
             %   setPerson(PersonId=...) | setPerson(PersonEmail=...) | setPerson(PersonName=...)
+            %   setPerson() with no argument goes back to the person the
+            %   database login is mapped to (lab.fn_current_person()), and
+            %   warns CarasLabDB:noCurrentPerson when it is mapped to no one.
             arguments
                 obj (1,1) CarasLabDB
                 opts.PersonId (1,1) string = string(missing)
@@ -355,6 +410,10 @@ classdef CarasLabDB < handle
 
         function code = addEventType(obj, opts)
             %ADDEVENTTYPE Insert an event_type vocabulary row; returns code.
+            %   For the schema owner only: design_docs/grants.sql withholds
+            %   INSERT on lab.event_type from lab_rw, because every event
+            %   type is one of the schema's detail tables and a new one
+            %   arrives with a migration, not at run time.
             arguments
                 obj (1,1) CarasLabDB
                 opts.Code (1,1) string
@@ -728,6 +787,14 @@ classdef CarasLabDB < handle
             %GETEVENTS Retrieve base event rows. Reads event_active unless ActiveOnly=false.
             %   Rows are ordered newest first (occurred_at DESC, event_id).
             %
+            %   By default only active rows are returned: events that have
+            %   been neither superseded nor retracted. ActiveOnly=false reads
+            %   lab.event_version instead, i.e. every version of every event,
+            %   with three more columns that say what became of each row:
+            %   superseded_by (the event_id of its correction, or missing),
+            %   is_retracted, and is_current (false once a row is superseded
+            %   or retracted).
+            %
             %   Tag filters (string arrays; each element is a tag such as
             %   "stage:raw", a bare tag such as "auditory_cortex", which means
             %   "tag:auditory_cortex", or a wildcard "ns:*" for any tag of
@@ -748,7 +815,7 @@ classdef CarasLabDB < handle
                 opts.AnyTags string = strings(1, 0)    % ... and at least one of these
                 opts.NotTags string = strings(1, 0)    % ... and none of these
             end
-            tbl = obj.pT("event");
+            tbl = obj.pT("event_version");
             if opts.ActiveOnly
                 tbl = obj.pT("event_active");
             end
@@ -769,8 +836,10 @@ classdef CarasLabDB < handle
             %   not already present on the base row (event_id, event_type are the
             %   join/discriminator columns and are taken from the base only).
             %   Reads event_active unless ActiveOnly=false, so a superseded
-            %   event is reported as not found rather than returned as if it
-            %   were current.
+            %   or retracted event is reported as not found rather than
+            %   returned as if it were current. (With ActiveOnly=false the
+            %   row comes from lab.event as recorded; GETEVENTS says whether
+            %   it is still current.)
             arguments
                 obj (1,1) CarasLabDB
                 opts.EventId (1,1) string
@@ -800,6 +869,10 @@ classdef CarasLabDB < handle
         function T = getArtifacts(obj, opts)
             %GETARTIFACTS Retrieve artifacts. Reads artifact_active unless ActiveOnly=false.
             %   Rows are ordered newest first (created_at DESC, artifact_id).
+            %   By default only active rows are returned (neither superseded
+            %   nor retracted). ActiveOnly=false reads lab.artifact_version:
+            %   every version of every artifact, plus the columns
+            %   superseded_by, is_current and is_retracted (see GETEVENTS).
             %   Tags= / AnyTags= / NotTags= filter on current tags (see GETEVENTS):
             %       T = db.getArtifacts(SessionId=sid, Tags="stage:raw");
             %   Checksum= is matched as the database stores it: surrounding
@@ -819,7 +892,7 @@ classdef CarasLabDB < handle
                 opts.AnyTags string = strings(1, 0)    % ... and at least one of these
                 opts.NotTags string = strings(1, 0)    % ... and none of these
             end
-            tbl = obj.pT("artifact");
+            tbl = obj.pT("artifact_version");
             if opts.ActiveOnly
                 tbl = obj.pT("artifact_active");
             end
@@ -1014,6 +1087,297 @@ classdef CarasLabDB < handle
     end
 
     % ==================================================================
+    % Variables -- user-defined named values. Setting, reading and defining
+    % them live in their own files: setVariable, getVariables,
+    % defineVariable.
+    % ==================================================================
+    methods
+        function valueId = unsetVariable(obj, kind, entityId, name, opts)
+            %UNSETVARIABLE Clear a variable on an event, artifact, subject, session or project.
+            %   id = db.unsetVariable("session", sid, "probe depth")
+            %   id = db.unsetVariable("session", sid, "probe depth", Note="measured on the wrong probe")
+            %
+            %   Appends an 'unset' row to the value log through
+            %   lab.fn_unset_variable, after which the row has no current
+            %   value for the variable; the earlier values stay in the log
+            %   (GETVARIABLES with History=true). The database refuses to
+            %   unset a variable the row has no current value for. To change
+            %   a value, set it again with SETVARIABLE instead.
+            %
+            %   Name=Value: Note (free text on the log row), SetBy (person_id;
+            %   default: the current person). Returns the value_id written.
+            %
+            %   See also SETVARIABLE, GETVARIABLES.
+            arguments
+                obj (1,1) CarasLabDB
+                kind (1,1) string {mustBeMember(kind, ["event", "artifact", "subject", "session", "project"])}
+                entityId (1,1) string
+                name (1,1) string
+                opts.Note (1,1) string = string(missing)
+                opts.SetBy (1,1) string = string(missing)
+            end
+            name = CarasLabDB.normalizeVariableName(name);
+            R = obj.pSelect("SELECT " + obj.pT("fn_unset_variable") + "(" + ...
+                obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + ", " + ...
+                obj.sqlLiteral(name) + ", " + obj.sqlLiteral(opts.Note) + ", " + ...
+                obj.sqlLiteral(obj.pCreatedBy(opts.SetBy)) + "::uuid) AS value_id;");
+            valueId = double(R.value_id(1));
+        end
+
+        function T = getVariableValues(obj, name, opts)
+            %GETVARIABLEVALUES The current value of one variable on every row that has one.
+            %   T = db.getVariableValues("probe depth")
+            %   T = db.getVariableValues("probe depth", Kind="session")
+            %
+            %   Reads lab.variable_current. One row per event, artifact,
+            %   subject, session or project that currently has a value for
+            %   the variable, ordered by entity_kind, entity_id, with columns
+            %   entity_kind, entity_id, value (the value as text, exact
+            %   digits), value_num (the number; NaN for a text variable),
+            %   value_text, units, set_at (when that value was set).
+            %
+            %   Kind= keeps one kind of row. ActiveOnly (default:
+            %   UseActiveViews) leaves out superseded and retracted events
+            %   and artifacts, whose values their corrections carry.
+            %
+            %   See also SETVARIABLE, GETVARIABLES, GETVARIABLEDEFINITIONS.
+            arguments
+                obj (1,1) CarasLabDB
+                name (1,1) string
+                opts.Kind (1,1) string = string(missing)
+                opts.ActiveOnly (1,1) logical = obj.UseActiveViews
+            end
+            name = CarasLabDB.normalizeVariableName(name);
+            obj.pCheckMember(opts.Kind, ...
+                ["event", "artifact", "subject", "session", "project"], "Kind");
+            clauses = "c.variable = " + obj.sqlLiteral(name);
+            if obj.pIsProvided(opts.Kind)
+                clauses(end+1) = "c.entity_kind = " + obj.sqlLiteral(opts.Kind);
+            end
+            if opts.ActiveOnly
+                clauses(end+1) = "(c.entity_kind <> 'event' OR c.event_id IN " + ...
+                    "(SELECT event_id FROM " + obj.pT("event_active") + "))";
+                clauses(end+1) = "(c.entity_kind <> 'artifact' OR c.artifact_id IN " + ...
+                    "(SELECT artifact_id FROM " + obj.pT("artifact_active") + "))";
+            end
+            T = obj.pSelect("SELECT c.entity_kind, c.entity_id, c.value, c.value_num, " + ...
+                "c.value_text, c.units, c.set_at FROM " + obj.pT("variable_current") + ...
+                " c WHERE " + strjoin(clauses, " AND ") + ...
+                " ORDER BY c.entity_kind, c.entity_id;");
+        end
+
+        function T = getVariableDefinitions(obj, opts)
+            %GETVARIABLEDEFINITIONS The defined variables: name, label, units, value type.
+            %   T = db.getVariableDefinitions()
+            %   T = db.getVariableDefinitions(IncludeRetired=true)
+            %   T = db.getVariableDefinitions(Name="Probe Depth", IncludeRetired=true)
+            %
+            %   Reads lab.variable, ordered by name: name, label,
+            %   description, units, value_type ('number' or 'text'),
+            %   applies_to, retired_at, created_at, created_by. applies_to
+            %   comes back as comma-separated text ("session,event"), as in
+            %   GETTAGNAMESPACES. Retired variables (retired_at set) are left
+            %   out unless IncludeRetired=true.
+            %
+            %   See also DEFINEVARIABLE, UPDATEVARIABLEDEFINITION, RETIREVARIABLE.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.Name (1,1) string = string(missing)
+                opts.IncludeRetired (1,1) logical = false
+            end
+            f = struct();
+            if obj.pIsProvided(opts.Name)
+                f.name = CarasLabDB.normalizeVariableName(opts.Name);
+            end
+            extra = strings(1, 0);
+            if ~opts.IncludeRetired
+                extra = "retired_at IS NULL";
+            end
+            T = obj.pSelect("SELECT name, label, description, units, value_type, " + ...
+                "array_to_string(applies_to, ',') AS applies_to, retired_at, " + ...
+                "created_at, created_by FROM " + obj.pT("variable") + ...
+                obj.pWhere(f, extra) + " ORDER BY name;");
+        end
+
+        function updateVariableDefinition(obj, name, opts)
+            %UPDATEVARIABLEDEFINITION Edit a variable's label or description (row_history logs it).
+            %   db.updateVariableDefinition("probe depth", Label="Probe Depth (tip)")
+            %   db.updateVariableDefinition("probe depth", Description="Below the pia, in um")
+            %
+            %   Only the arguments you supply are changed. The name never
+            %   changes, and the value type and units are fixed once the
+            %   variable has a value: for other units, define another
+            %   variable. A name that is not defined raises
+            %   CarasLabDB:variableNotFound.
+            %
+            %   See also DEFINEVARIABLE, GETVARIABLEDEFINITIONS, RETIREVARIABLE.
+            arguments
+                obj (1,1) CarasLabDB
+                name (1,1) string
+                opts.Label (1,1) string = string(missing)
+                opts.Description (1,1) string = string(missing)
+            end
+            name = CarasLabDB.normalizeVariableName(name);
+            s = struct();
+            s = obj.pSet(s, "label", opts.Label);
+            s = obj.pSet(s, "description", opts.Description);
+            n = obj.pUpdate(obj.pT("variable"), s, "name = " + obj.sqlLiteral(name), "name");
+            if n == 0
+                error("CarasLabDB:variableNotFound", "No variable named %s.", name);
+            end
+        end
+
+        function retireVariable(obj, name, opts)
+            %RETIREVARIABLE Retire a variable (no new values), or bring it back.
+            %   db.retireVariable("probe depth")
+            %   db.retireVariable("probe depth", Retired=false)
+            %
+            %   A variable is never renamed or deleted, because the value
+            %   log refers to it by name: retire it and define the
+            %   replacement. Rows keep the values they have, and a
+            %   correction still carries them forward; SETVARIABLE refuses
+            %   new ones. Retiring a variable that is already retired (or
+            %   un-retiring a live one) changes nothing, so the original
+            %   retired_at is kept.
+            %
+            %   See also DEFINEVARIABLE, GETVARIABLEDEFINITIONS.
+            arguments
+                obj (1,1) CarasLabDB
+                name (1,1) string
+                opts.Retired (1,1) logical = true
+            end
+            name = CarasLabDB.normalizeVariableName(name);
+            where = "name = " + obj.sqlLiteral(name);
+            R = obj.pSelect("SELECT (retired_at IS NOT NULL) AS is_retired FROM " + ...
+                obj.pT("variable") + " WHERE " + where + ";");
+            if height(R) == 0
+                error("CarasLabDB:variableNotFound", "No variable named %s.", name);
+            end
+            if logical(R.is_retired(1)) == opts.Retired
+                return   % already in the requested state
+            end
+            if opts.Retired
+                s = struct("retired_at", datetime("now", "TimeZone", "local"));
+            else
+                s = struct("retired_at", NaT);    % sqlLiteral(NaT) -> NULL
+            end
+            obj.pUpdate(obj.pT("variable"), s, where, "name");
+        end
+    end
+
+    % ==================================================================
+    % Retraction and the integrity report
+    % ==================================================================
+    methods
+        function retractionId = retractEvent(obj, eventId, reason, opts)
+            %RETRACTEVENT Withdraw an event that should never have been recorded.
+            %   id = db.retractEvent(eid, "entered twice")
+            %
+            %   A correction (SUPERSEDEEVENT) replaces a statement of fact
+            %   with a better one; a retraction withdraws a row that should
+            %   not exist at all. Writes one lab.retraction row through
+            %   lab.fn_retract. The event and everything that refers to it
+            %   stay in the database, but event_active -- and so GETEVENTS,
+            %   GETEVENTDETAIL and the other readers by default -- stop
+            %   returning it; GETEVENTS with ActiveOnly=false shows it with
+            %   is_retracted true.
+            %
+            %   REASON is required and must not be blank
+            %   (CarasLabDB:reasonRequired). Only the current version of an
+            %   event can be retracted, and only once; a retraction is
+            %   permanent (to bring the event back, supersede it). The files
+            %   the event produced are NOT retracted with it: CHECKINTEGRITY
+            %   reports them as artifact_producer_retracted until each is
+            %   retracted too (RETRACTARTIFACT) or re-pointed.
+            %
+            %   Name=Value: RetractedBy (person_id; default: the current
+            %   person). Returns the retraction_id.
+            %
+            %   See also RETRACTARTIFACT, GETRETRACTIONS, SUPERSEDEEVENT, CHECKINTEGRITY.
+            arguments
+                obj (1,1) CarasLabDB
+                eventId (1,1) string
+                reason (1,1) string
+                opts.RetractedBy (1,1) string = string(missing)
+            end
+            retractionId = obj.pRetract("event", eventId, reason, opts.RetractedBy);
+        end
+
+        function retractionId = retractArtifact(obj, artifactId, reason, opts)
+            %RETRACTARTIFACT Withdraw an artifact (file registration) made by mistake.
+            %   id = db.retractArtifact(aid, "registered under the wrong path")
+            %
+            %   Like RETRACTEVENT, for lab.artifact: the row stays, and
+            %   artifact_active -- so GETARTIFACTS by default -- stops
+            %   returning it. REASON is required and must not be blank.
+            %   Only the current version of an artifact can be retracted,
+            %   and only once. Nothing on disk is touched.
+            %
+            %   Name=Value: RetractedBy (person_id; default: the current
+            %   person). Returns the retraction_id.
+            %
+            %   See also RETRACTEVENT, GETRETRACTIONS, SUPERSEDEARTIFACT.
+            arguments
+                obj (1,1) CarasLabDB
+                artifactId (1,1) string
+                reason (1,1) string
+                opts.RetractedBy (1,1) string = string(missing)
+            end
+            retractionId = obj.pRetract("artifact", artifactId, reason, opts.RetractedBy);
+        end
+
+        function T = getRetractions(obj, opts)
+            %GETRETRACTIONS The retraction log: which events and artifacts were withdrawn, and why.
+            %   T = db.getRetractions()
+            %   T = db.getRetractions(Kind="event")
+            %   T = db.getRetractions(EventId=eid)       % is this event retracted?
+            %
+            %   Reads lab.retraction, oldest first: retraction_id,
+            %   entity_kind ('event' or 'artifact'), event_id, artifact_id
+            %   (the one matching entity_kind is set), reason, retracted_at,
+            %   retracted_by, retracted_login.
+            %
+            %   See also RETRACTEVENT, RETRACTARTIFACT.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.Kind (1,1) string = string(missing)
+                opts.EventId (1,1) string = string(missing)
+                opts.ArtifactId (1,1) string = string(missing)
+            end
+            obj.pCheckMember(opts.Kind, ["event", "artifact"], "Kind");
+            f = struct();
+            f = obj.pSet(f, "entity_kind", opts.Kind);
+            f = obj.pSet(f, "event_id", opts.EventId);
+            f = obj.pSet(f, "artifact_id", opts.ArtifactId);
+            T = obj.pSelectFrom(obj.pT("retraction"), f, OrderBy="retraction_id");
+        end
+
+        function R = checkIntegrity(obj)
+            %CHECKINTEGRITY The database's integrity report (lab.fn_check_integrity()).
+            %   R = db.checkIntegrity()
+            %
+            %   One row per finding, errors first, then by check_name and
+            %   subject: severity ('error' or 'warning'), check_name,
+            %   subject (the id of the row concerned) and detail. No rows
+            %   means nothing needs attention. Examples of checks: an event
+            %   with no detail row, a file never verified or whose last
+            %   check failed, a correction that did not carry its tags or
+            %   inputs forward, a file whose producing event was retracted.
+            %
+            %       R = db.checkIntegrity();
+            %       disp(R(R.severity == "error", :));
+            %
+            %   See also ADDARTIFACTVERIFICATION, RETRACTEVENT, SUPERSEDEEVENT.
+            arguments
+                obj (1,1) CarasLabDB
+            end
+            R = obj.pSelect("SELECT severity, check_name, subject, detail FROM " + ...
+                obj.pT("fn_check_integrity") + "() " + ...
+                "ORDER BY (severity = 'error') DESC, severity, check_name, subject;");
+        end
+    end
+
+    % ==================================================================
     % Private helpers used by both inline and external methods
     % ==================================================================
     methods (Access = private)
@@ -1195,6 +1559,33 @@ classdef CarasLabDB < handle
             if isfield(s, "supersedes") && obj.pIsProvided(s.supersedes)
                 obj.pCarryTags("artifact", s.supersedes, artifactId);
             end
+        end
+
+        function ids = pInsertEventBatch(obj, bases, detailTable, details)
+            %PINSERTEVENTBATCH Insert several new events, base + detail each. Run only inside PTRANSACT.
+            %   BASES and DETAILS are parallel cell arrays of insert structs
+            %   for lab.event and DETAILTABLE (none of them a correction).
+            %   Returns the new event ids as a string column, in order.
+            ids = strings(numel(bases), 1);
+            for k = 1:numel(bases)
+                ids(k) = obj.pInsertEventRows(bases{k}, detailTable, details{k}, {}, {});
+            end
+        end
+
+        function id = pRetract(obj, kind, entityId, reason, by)
+            %PRETRACT lab.fn_retract(KIND, id, reason, by); returns the retraction_id.
+            %   KIND is 'event' or 'artifact', supplied by RETRACTEVENT /
+            %   RETRACTARTIFACT. A missing or blank REASON is refused here,
+            %   before the database's CHECK would refuse it less helpfully.
+            if ismissing(reason) || strlength(strip(reason)) == 0
+                error("CarasLabDB:reasonRequired", ...
+                    "A reason is required to retract an %s: say why the row is withdrawn.", kind);
+            end
+            R = obj.pSelect("SELECT " + obj.pT("fn_retract") + "(" + ...
+                obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + "::uuid, " + ...
+                obj.sqlLiteral(reason) + ", " + ...
+                obj.sqlLiteral(obj.pCreatedBy(by)) + "::uuid) AS retraction_id;");
+            id = double(R.retraction_id(1));
         end
 
         function pCarryTags(obj, kind, oldId, newId)
@@ -1401,21 +1792,24 @@ classdef CarasLabDB < handle
 
         function pid = pResolvePerson(obj, personId, email, name)
             %PRESOLVEPERSON Resolve a person_id from an id, email, or full name.
-            %   Returns missing when none of the three is given. An id, email
-            %   or name that matches no lab.person row raises
-            %   CarasLabDB:personNotFound; a name shared by several people
-            %   raises CarasLabDB:personAmbiguous rather than attributing
-            %   every later row to whichever of them the database returns
-            %   first.
+            %   When none of the three is given, the person is the one the
+            %   database login is mapped to (PLOGINPERSON), or missing when
+            %   it is mapped to nobody. An id, email or name that matches no
+            %   lab.person row raises CarasLabDB:personNotFound; a name
+            %   shared by several people raises CarasLabDB:personAmbiguous
+            %   rather than attributing every later row to whichever of them
+            %   the database returns first.
             if obj.pIsProvided(personId)
                 % Checked now: a person_id that names no one would otherwise
                 % surface only as a foreign-key error on the first insert.
+                % The id is returned as the database spells it (lower case),
+                % so it compares equal to the ids read back from other rows.
                 T = obj.pSelect("SELECT person_id FROM " + obj.pT("person") + ...
                     " WHERE person_id = " + obj.sqlLiteral(personId) + ";");
                 if height(T) == 0
                     error("CarasLabDB:personNotFound", "No person with id %s.", personId);
                 end
-                pid = personId;
+                pid = string(T.person_id(1));
                 return
             end
             if obj.pIsProvided(email)
@@ -1427,7 +1821,7 @@ classdef CarasLabDB < handle
             elseif obj.pIsProvided(name)
                 where = "full_name = " + obj.sqlLiteral(name);
             else
-                pid = string(missing);
+                pid = obj.pLoginPerson();
                 return
             end
             % LIMIT 2 is enough to tell one match from several. Emails are
@@ -1445,13 +1839,37 @@ classdef CarasLabDB < handle
             pid = string(T.person_id(1));
         end
 
+        function pid = pLoginPerson(obj)
+            %PLOGINPERSON The person_id the connected database login is mapped to, or missing.
+            %   SELECT lab.fn_current_person(): the lab.person row whose
+            %   db_login is this session's login (an administrator sets
+            %   db_login when a member is onboarded). Missing when the login
+            %   is mapped to nobody, and on a schema older than version 5,
+            %   which has no such function -- asking would raise, and on an
+            %   injected connection could abort the caller's transaction.
+            pid = string(missing);
+            if ~(obj.SchemaVersion >= 5)
+                return
+            end
+            T = obj.pSelect("SELECT " + obj.pT("fn_current_person") + "()::text AS person_id;");
+            if height(T) == 0
+                return
+            end
+            found = CarasLabDB.pColText(T.person_id);
+            if ~ismissing(found(1)) && strlength(found(1)) > 0
+                pid = found(1);
+            end
+        end
+
         function pWarnNoPerson(obj)
             %PWARNNOPERSON Warn when inserts will carry no person (CurrentPersonId missing).
             if ismissing(obj.CurrentPersonId)
                 warning("CarasLabDB:noCurrentPerson", ...
-                    "No current person: rows will be written with a NULL recorded_by / " + ...
-                    "created_by (the database still records the login). Pass PersonEmail=, " + ...
-                    "PersonId= or PersonName=, or call setPerson.");
+                    "No current person: no PersonEmail=, PersonId= or PersonName= was given " + ...
+                    "and this database login is not mapped to a lab person " + ...
+                    "(lab.person.db_login). Rows will be written with a NULL recorded_by / " + ...
+                    "created_by; the database still records the login. Name a person, call " + ...
+                    "setPerson, or ask the database administrator to map the login.");
             end
         end
 
@@ -1726,6 +2144,38 @@ classdef CarasLabDB < handle
             tokens = tokens(strlength(strip(tokens, "both", " ")) > 0);
             if ~isempty(tokens)
                 tokens = CarasLabDB.normalizeTag(tokens, AllowWildcard=true);
+            end
+        end
+
+        function arg = pVariableValueArg(name, value)
+            %PVARIABLEVALUEARG The value argument of lab.fn_set_variable for VALUE.
+            %   "p_number => <literal>" for a finite real numeric scalar,
+            %   "p_text => '<literal>'" for a non-blank string scalar or
+            %   char row. Anything else raises CarasLabDB:invalidVariableValue;
+            %   NAME only labels the message. The number is formatted by
+            %   sqlLiteral (shortest decimal that reads back as the same
+            %   double), so the numeric column stores the digits typed.
+            if isnumeric(value) && isscalar(value)
+                v = double(value);
+                if ~isreal(v) || ~isfinite(v)
+                    error("CarasLabDB:invalidVariableValue", ...
+                        "Variable '%s' needs a finite real number; NaN, Inf and complex " + ...
+                        "values are not stored. Use unsetVariable to clear a value.", name);
+                end
+                arg = "p_number => " + CarasLabDB.sqlLiteral(v);
+            elseif (isstring(value) && isscalar(value)) || ...
+                    (ischar(value) && (isrow(value) || isempty(value)))
+                t = string(value);
+                if ismissing(t) || strlength(strip(t)) == 0
+                    error("CarasLabDB:invalidVariableValue", ...
+                        "Variable '%s' needs a non-blank string. Use unsetVariable " + ...
+                        "to clear a value.", name);
+                end
+                arg = "p_text => " + CarasLabDB.sqlLiteral(t);
+            else
+                error("CarasLabDB:invalidVariableValue", ...
+                    "Variable '%s' takes one number or one string, not a %s of size %s.", ...
+                    name, class(value), mat2str(size(value)));
             end
         end
 
@@ -2023,6 +2473,41 @@ classdef CarasLabDB < handle
             d = tags;
             bare = startsWith(d, "tag:");
             d(bare) = extractAfter(d(bare), 4);
+        end
+
+        function names = normalizeVariableName(names)
+            %NORMALIZEVARIABLENAME Canonical spelling of one or more variable names, validated locally.
+            %   n = CarasLabDB.normalizeVariableName(" Probe   Depth ")   % -> "probe depth"
+            %   n = CarasLabDB.normalizeVariableName(["Housing", "ISI_ms"])
+            %
+            %   Mirrors lab.fn_canonical_variable: lower case, every run of
+            %   whitespace reduced to one space, and the spaces at either
+            %   end removed, so "Probe  Depth " and "probe depth" are one
+            %   variable everywhere. Nothing else is rewritten: a name that
+            %   then is not words of a-z, 0-9, _ and - separated by single
+            %   spaces and starting with a letter
+            %   (^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$), or is longer than 63
+            %   characters, raises CarasLabDB:invalidVariableName here,
+            %   before the database would reject it.
+            arguments
+                names string
+            end
+            for i = 1:numel(names)
+                raw = names(i);
+                if ismissing(raw)
+                    error("CarasLabDB:invalidVariableName", ...
+                        "A variable name is required (got <missing>).");
+                end
+                n = strip(regexprep(lower(raw), '\s+', ' '), "both", " ");
+                if strlength(n) > 63 || ...
+                        isempty(regexp(char(n), '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$', 'once'))
+                    error("CarasLabDB:invalidVariableName", ...
+                        "Invalid variable name '%s': use words of a-z, 0-9, _ and -, " + ...
+                        "separated by single spaces and starting with a letter, at most " + ...
+                        "63 characters (for example 'probe depth').", raw);
+                end
+                names(i) = n;
+            end
         end
     end
 

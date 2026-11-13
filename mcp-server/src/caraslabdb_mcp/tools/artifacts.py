@@ -6,6 +6,20 @@ from .. import db
 from . import OptText
 
 
+def _path(value, name):
+    """A path filter as the database stores paths: forward slashes, trimmed.
+
+    Mirrors lab.fn_normalize_path (btrim(replace(path, '\\', '/'))). A blank
+    path is refused: as a prefix it would match every file.
+    """
+    if value is None:
+        return None
+    value = value.replace("\\", "/").strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty; leave it out to apply no filter.")
+    return value
+
+
 def register(app):
     @app.tool()
     def get_artifacts(
@@ -16,6 +30,10 @@ def register(app):
         role: OptText = None,
         checksum: OptText = None,
         supersedes: OptText = None,
+        storage_root_id: Optional[int] = None,
+        relative_path: OptText = None,
+        relative_path_prefix: OptText = None,
+        format: OptText = None,
         created_from: OptText = None,
         created_before: OptText = None,
         tags: Optional[list[str]] = None,
@@ -23,18 +41,36 @@ def register(app):
         none_tags: Optional[list[str]] = None,
         active_only: bool = True,
         limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
     ) -> dict:
         """List artifacts (checksummed files on the NAS produced by an event).
 
         By default reads lab.artifact_active: current rows only, i.e.
-        artifacts that no correction has replaced. With active_only=False it
-        reads lab.artifact_version, the full correction history, and every
-        row then carries `is_current` (false for a row that was corrected
-        away) and `superseded_by` (the artifact_id of the correction that
-        replaced it, else null) -- never treat a row with is_current=false
-        as the current facts. Each row's own `supersedes` is the artifact_id
-        it replaced; to find the correction of artifact X use supersedes=X
-        with active_only=False. Ordered newest-first by created_at.
+        artifacts that no correction has replaced and that have not been
+        retracted (withdrawn as registered in error; see get_retractions).
+        With active_only=False it reads lab.artifact_version, the full
+        history, and every row then carries `is_current` (false for a row
+        that was corrected away or retracted), `superseded_by` (the
+        artifact_id of the correction that replaced it, else null) and
+        `is_retracted` -- never treat a row with is_current=false as the
+        current facts. Each row's own `supersedes` is the artifact_id it
+        replaced; to find the correction of artifact X use supersedes=X with
+        active_only=False. Ordered newest-first by created_at, then
+        artifact_id.
+
+        "Which artifact is this file?": a file is identified by
+        storage_root_id (see get_storage_roots) plus relative_path, the path
+        under that root with forward slashes and no leading slash, e.g.
+        "G-0421/sess01/raw.dat". relative_path is matched exactly, case
+        included, after backslashes are turned into forward slashes and
+        surrounding whitespace is removed (the database stores paths that
+        way, so a Windows path such as "G-0421\\sess01\\raw.dat" can be
+        passed as is -- but strip the storage root's own part, e.g. the
+        drive or share, first). relative_path_prefix lists everything under
+        a folder ("G-0421/sess01/"); it is normalised the same way and
+        matched literally ("_" and "%" are ordinary characters, not
+        wildcards). format is the file-format code ("dat", "npy", ...),
+        matched exactly. Or pass the file's checksum.
 
         checksum is a hex digest; case and surrounding whitespace are
         ignored (the database stores checksums lower-case), so the output of
@@ -59,22 +95,30 @@ def register(app):
         exist or does not apply to artifacts, is an error naming the tag --
         never an empty or unfiltered result.
 
-        Returns {"row_count": n, "limit": n, "truncated": bool, "rows":
-        [...]}. `truncated` true means more rows matched than were returned:
-        filter more narrowly or raise `limit` (max 1000).
+        Returns {"row_count", "limit", "truncated", "next_cursor", "rows"}.
+        `truncated` true means more rows matched than were returned: to get
+        the next page call again with the same arguments and
+        cursor=<next_cursor> (null when nothing is left); `limit` (max 1000)
+        caps each page. For counts and total sizes use
+        get_counts(question="artifacts_by_role").
         """
         if checksum is not None:
             # Stored lower-case (trg_artifact_normalize); PowerShell's
             # Get-FileHash, for one, prints upper-case.
             checksum = checksum.strip().lower()
+        relative_path = _path(relative_path, "relative_path")
+        relative_path_prefix = _path(relative_path_prefix, "relative_path_prefix")
         table = "lab.artifact_active" if active_only else "lab.artifact_version"
         return db.select_from(table, {
             "artifact_id": artifact_id, "produced_by_event_id": produced_by_event_id,
             "subject_id": subject_id, "session_id": session_id,
             "role": role, "checksum": checksum, "supersedes": supersedes,
+            "storage_root_id": storage_root_id, "relative_path": relative_path,
+            "format": format,
         }, limit=limit, order_by=db.ORDER_BY_ARTIFACT,
             time_ranges={"created_at": (created_from, created_before)},
-            tag_filters=("artifact", tags, any_tags, none_tags))
+            prefix_filters={"relative_path": relative_path_prefix},
+            tag_filters=("artifact", tags, any_tags, none_tags), paged=True, cursor=cursor)
 
     @app.tool()
     def get_event_inputs(
@@ -84,7 +128,7 @@ def register(app):
     ) -> dict:
         """List event<->artifact consumption edges (what artifacts an event read).
 
-        Reads lab.event_input exactly as recorded, superseded rows included:
+        Reads lab.event_input exactly as recorded, superseded and retracted rows included:
         there is no active_only toggle. An edge names the event and artifact
         rows that existed when it was written, so after a correction the
         edges of the superseded event remain next to those re-declared on
@@ -111,11 +155,12 @@ def register(app):
         artifact_id: OptText = None,
         latest_per_file: bool = False,
         limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
     ) -> dict:
         """List checksum verifications of artifacts (status ok/missing/mismatch).
 
         By default this is the verification log: one row per check, newest
-        first by verified_at, each recorded against one artifact row. A
+        first by verified_at (then verification_id), each recorded against one artifact row. A
         check belongs to the file, though, and a correction gives the same
         file a new artifact row -- so the log for the current row's id can
         be empty although the file was checked.
@@ -129,13 +174,16 @@ def register(app):
         verified. Ordered by artifact_id.
 
         artifact_id left out (or null) means "do not filter" -- i.e. every
-        artifact; the result is capped and reports `truncated` in the
-        returned {"row_count", "limit", "truncated", "rows"} envelope.
+        artifact. Returns {"row_count", "limit", "truncated", "next_cursor",
+        "rows"}: `truncated` true means more rows matched than were
+        returned; call again with the same arguments and
+        cursor=<next_cursor> for the next page (`limit`, max 1000, caps each
+        page).
         """
         if latest_per_file:
             return db.select_from("lab.artifact_verification_latest", {
                 "artifact_id": artifact_id,
-            }, limit=limit)
+            }, limit=limit, paged=True, cursor=cursor)
         return db.select_from("lab.artifact_verification", {
             "artifact_id": artifact_id,
-        }, limit=limit, order_by=db.ORDER_BY_VERIFICATION)
+        }, limit=limit, order_by=db.ORDER_BY_VERIFICATION, paged=True, cursor=cursor)

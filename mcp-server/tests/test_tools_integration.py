@@ -14,6 +14,7 @@ authentication for the temporary login it creates; it skips itself otherwise.
 """
 
 import asyncio
+import base64
 import json
 import os
 import uuid
@@ -30,9 +31,9 @@ from caraslabdb_mcp import db, schema_map  # noqa: E402  (PGDATABASE must be set
 from caraslabdb_mcp.server import app  # noqa: E402
 
 
-def call(name, **arguments):
+def call(tool, /, **arguments):
     """Call a tool through FastMCP's public API and return its result dict."""
-    result = asyncio.run(app.call_tool(name, arguments))
+    result = asyncio.run(app.call_tool(tool, arguments))
     if isinstance(result, tuple):          # (content blocks, structured result)
         result = result[1]
     if isinstance(result, dict):
@@ -141,21 +142,25 @@ def test_schema_map_matches_the_catalog(seed):
 
 def test_tool_surface_is_read_only_and_takes_no_identifiers(seed):
     tools = asyncio.run(app.list_tools())
-    assert len(tools) == 26
+    assert len(tools) == 31
     for tool in tools:
-        assert tool.name.startswith("get_") or tool.name == "find_by_tags", tool.name
+        assert tool.name.startswith("get_") or tool.name in ("find_by_tags", "find_by_variable"), \
+            tool.name
         assert not {"sql", "query", "table", "column", "columns", "where", "order_by"} \
             & set(tool.inputSchema["properties"]), tool.name
 
 
-def test_every_list_tool_is_bounded_and_puts_the_flags_first(seed):
+def test_every_list_tool_is_bounded_and_puts_the_flags_first(seed, seed5):
     required = {
         "find_by_tags": {"entity_kind": "event"},
         "get_entity_tags": {"entity_kind": "event", "entity_id": seed["sep"]},
         "get_artifact_lineage": {"artifact_id": seed["derived"]},
+        "get_variables": {"entity_kind": "session"},
+        "find_by_variable": {"entity_kind": "session", "name": seed5["depth"]},
+        "get_counts": {"question": "events_by_type"},
     }
     tools = [t.name for t in asyncio.run(app.list_tools()) if t.name != "get_event_detail"]
-    assert len(tools) == 25
+    assert len(tools) == 30
     for name in tools:
         args = required.get(name, {})
         res = call(name, limit=10**9, **args)
@@ -588,11 +593,25 @@ def ro_login(seed, monkeypatch):
             admin.execute(drop)
 
 
-def test_read_only_role_refuses_writes_without_the_transaction_layer(seed, ro_login):
+def test_read_only_role_refuses_writes_without_the_transaction_layer(seed, seed5, ro_login):
     # The tools work as a login that holds SELECT and nothing else...
     assert call("get_species")["row_count"] >= 1
     assert call("get_events", subject_id=seed["subject"], tags=[seed["topic"]])["row_count"] == 1
     assert call("get_integrity_report", limit=1)["limit"] == 1
+    # ...the schema-version-5 tools included.
+    assert call("get_variable_definitions", limit=1)["limit"] == 1
+    assert call("get_variables", entity_kind="session", name=seed5["depth"])["row_count"] == 2
+    assert call("find_by_variable", entity_kind="session", name=seed5["depth"],
+                at_least=1000)["row_count"] == 1
+    assert call("get_retractions", event_id=seed5["rec_x"])["row_count"] == 1
+    for question in ("events_by_type", "artifacts_by_role", "subjects_by_project_species",
+                     "sessions_per_subject", "current_tags_by_tag",
+                     "current_variables_by_variable"):
+        assert call("get_counts", question=question, limit=1)["limit"] == 1
+    first = call("get_events", subject_id=seed5["subject"], limit=1)
+    assert call("get_events", subject_id=seed5["subject"], limit=1,
+                cursor=first["next_cursor"])["row_count"] == 1
+    assert call("get_artifacts", relative_path_prefix=f"{seed5['subject']}/")["row_count"] == 4
     assert db.role_warning is None
     with db.read_only_cursor() as cur:
         cur.execute("SELECT current_user")
@@ -626,3 +645,405 @@ def test_fn_tag_is_refused_through_the_read_only_path(seed):
     leaked = [r["tag"] for r in call("get_tags", namespace="topic", limit=1000)["rows"]
               if f"refused{seed['tag']}" in r["tag"]]
     assert leaked == []
+
+
+# ---------------------------------------------------------------------------
+# Schema version 5: variables, retraction, counts, paging, file lookup
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def seed5():
+    """A third animal with variables, retractions, tied timestamps and odd paths."""
+    import psycopg
+
+    tag = uuid.uuid4().hex[:8]
+    sub = f"MCPV-{tag}"
+    ids = {"tag": tag, "subject": sub, "depth": f"mcp depth {tag}",
+           "housing": f"mcp housing {tag}", "gain": f"mcp gain {tag}",
+           "coat": f"mcp coat {tag}", "old": f"mcp old {tag}"}
+    with psycopg.connect(dbname=TEST_DB, autocommit=True) as conn:
+        q = conn.execute
+        proj = ids["project"] = q("INSERT INTO lab.project (name) VALUES (%s) RETURNING project_id",
+                                  [f"mcpv-{tag}"]).fetchone()[0]
+        root = ids["root"] = q("INSERT INTO lab.storage_root (name) VALUES (%s) RETURNING root_id",
+                               [f"nasv-{tag}"]).fetchone()[0]
+        q("INSERT INTO lab.subject (subject_id, project_id) VALUES (%s, %s)", [sub, proj])
+        s1, s2 = (q("INSERT INTO lab.session (subject_id, label, storage_root_id, relative_path) "
+                    "VALUES (%s, %s, %s, %s) RETURNING session_id",
+                    [sub, label, root, f"{sub}/{label}"]).fetchone()[0] for label in ("s1", "s2"))
+        ids["s1"], ids["s2"] = s1, s2
+
+        def recording(name):
+            # Every recording at the same instant: the pages must break the tie.
+            with conn.transaction():
+                ids[name] = q("INSERT INTO lab.event (event_type, session_id, occurred_at) "
+                              "VALUES ('recording', %s, '2026-10-01 12:00-04') RETURNING event_id",
+                              [s1]).fetchone()[0]
+                q("INSERT INTO lab.recording_event (event_id) VALUES (%s)", [ids[name]])
+
+        for name in ("rec_a", "rec_b", "rec_c", "rec_x"):
+            recording(name)
+
+        def artifact(name, path, role=None, size=None, event="rec_a"):
+            ids[name] = q(
+                "INSERT INTO lab.artifact (produced_by_event_id, session_id, storage_root_id, "
+                "relative_path, checksum, role, size_bytes, format) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'dat') RETURNING artifact_id",
+                [ids[event], s1, root, path, uuid.uuid4().hex * 2, role, size]).fetchone()[0]
+
+        artifact("art1", f"{sub}/s1/raw_1.dat", "raw", 100)
+        artifact("art2", f"{sub}/s1/x%_y.dat", "raw", 50)
+        artifact("art3", f"{sub}/s1/xab.dat")
+        artifact("art_bs", f" {sub}\\s1\\bs.dat ")          # stored as {sub}/s1/bs.dat
+        artifact("art_r", f"{sub}/s1/mistake.dat", "raw", 1000)
+        with conn.transaction():                            # two checks, one verified_at
+            for _ in range(2):
+                q("INSERT INTO lab.artifact_verification (artifact_id, status) VALUES (%s, 'ok')",
+                  [ids["art1"]])
+
+        def setv(kind, entity, name, number=None, text=None, units=None):
+            q("SELECT lab.fn_set_variable(%s, %s, %s, p_number => %s::numeric, p_text => %s, "
+              "p_units => %s)", [kind, str(entity), name, number, text, units])
+
+        # Defined with odd spacing and case; stored canonical.
+        setv("session", s1, f"  MCP  Depth {tag} ", "1200.50", units="um")
+        setv("session", s1, ids["depth"], "1250.25")
+        setv("session", s2, ids["depth"], "900")
+        setv("session", s2, ids["gain"], "3")
+        q("SELECT lab.fn_unset_variable('session', %s, %s)", [str(s2), ids["gain"]])
+        setv("subject", sub, ids["housing"], text="pair")
+        setv("event", ids["rec_a"], ids["depth"], "5")
+        setv("event", ids["rec_x"], ids["depth"], "7")
+        q("SELECT lab.fn_define_variable(%s, 'text', NULL, NULL, NULL, ARRAY['subject'])",
+          [ids["coat"]])
+        q("SELECT lab.fn_define_variable(%s)", [ids["old"]])
+        q("UPDATE lab.variable SET retired_at = now() WHERE name = %s", [ids["old"]])
+
+        q("SELECT lab.fn_retract('event', %s, 'entered twice')", [ids["rec_x"]])
+        q("SELECT lab.fn_retract('artifact', %s, 'registered by mistake')", [ids["art_r"]])
+    return {k: str(v) for k, v in ids.items()}
+
+
+def page_through(tool, /, page_size=1, max_pages=50, **arguments):
+    """Every row of a listing, fetched `page_size` rows at a time via next_cursor."""
+    got, cursor = [], None
+    for _ in range(max_pages):
+        res = call(tool, limit=page_size, **arguments, **({"cursor": cursor} if cursor else {}))
+        got.extend(res["rows"])
+        assert res["row_count"] == len(res["rows"]) <= page_size
+        if not res["truncated"]:
+            assert res["next_cursor"] is None
+            return got
+        cursor = res["next_cursor"]
+        assert isinstance(cursor, str) and cursor
+    raise AssertionError(f"{tool}: more than {max_pages} pages")
+
+
+@pytest.mark.parametrize("name, arguments, key", [
+    ("get_events", {"subject_id": "{subject}"}, "event_id"),
+    ("get_events", {"subject_id": "{subject}", "active_only": False}, "event_id"),
+    ("get_artifacts", {"subject_id": None, "session_id": "{s1}"}, "artifact_id"),
+    ("get_artifacts", {"session_id": "{s1}", "active_only": False}, "artifact_id"),
+    ("get_sessions", {"subject_id": "{subject}"}, "session_id"),
+    ("get_subjects", {"project_id": "{first_project}"}, "subject_id"),
+    ("get_artifact_verifications", {"artifact_id": "{art1}"}, "verification_id"),
+    ("get_variables", {"entity_kind": "session", "name": "{depth}"}, "value_id"),
+    ("get_variables", {"entity_kind": "session", "name": "{depth}", "current_only": False},
+     "value_id"),
+    ("get_variables", {"entity_kind": "event", "name": "{depth}", "active_only": False},
+     "value_id"),
+    ("find_by_variable", {"entity_kind": "session", "name": "{depth}"}, "value_id"),
+])
+def test_paging_returns_every_row_once_in_order(seed, seed5, name, arguments, key):
+    values = {**seed5, "first_project": seed["project"]}
+    arguments = {k: v.format(**values) if isinstance(v, str) else v
+                 for k, v in arguments.items() if v is not None}
+    whole = call(name, limit=1000, **arguments)
+    assert not whole["truncated"] and whole["row_count"] >= 2, (name, whole["row_count"])
+    paged = page_through(name, **arguments)
+    assert [r[key] for r in paged] == [r[key] for r in whole["rows"]]
+    assert len({r[key] for r in paged}) == len(paged)
+    # A page size that does not divide the total.
+    assert page_through(name, page_size=3, **arguments) == paged
+
+
+def test_paging_breaks_ties_and_tag_log_pages(seed, seed5):
+    rows = page_through("get_events", subject_id=seed5["subject"])
+    # All three active recordings share one occurred_at; event_id orders them.
+    assert len({r["occurred_at"] for r in rows}) == 1 and len(rows) == 3
+    assert [r["event_id"] for r in rows] == sorted(r["event_id"] for r in rows)
+    for include_history in (False, True):
+        assert page_through("get_entity_tags", entity_kind="event", entity_id=seed["sep"],
+                            include_history=include_history)[0]["tag"] == seed["topic"]
+    # The latest-per-file view pages over the whole database.
+    first_two = call("get_artifact_verifications", latest_per_file=True, limit=2)["rows"]
+    one = call("get_artifact_verifications", latest_per_file=True, limit=1)
+    two = call("get_artifact_verifications", latest_per_file=True, limit=1,
+               cursor=one["next_cursor"])
+    assert one["rows"] + two["rows"] == first_two
+
+
+def test_cursor_is_checked_and_only_ever_bound(seed5):
+    one = {"subject_id": seed5["subject"]}
+    events_cursor = call("get_events", limit=1, **one)["next_cursor"]
+    for bad in ("abc", "null", "e30", events_cursor[:-4]):
+        with pytest.raises(Exception, match="Invalid cursor"):
+            call("get_events", cursor=bad, **one)
+    # A cursor is tied to the ordering it came from.
+    with pytest.raises(Exception, match="Invalid cursor"):
+        call("get_artifacts", cursor=events_cursor)
+    # Forged values are bound and cast, never spliced into the SQL.
+    forged = base64.urlsafe_b64encode(json.dumps(
+        {"o": db.ORDER_BY_EVENT, "k": ["2026-01-01'); DROP TABLE lab.species; --",
+                                       str(uuid.uuid4())]}).encode()).decode()
+    with pytest.raises(Exception, match="timestamp|time zone|invalid input"):
+        call("get_events", cursor=forged, **one)
+    assert call("get_species")["row_count"] >= 1
+
+
+def test_paged_envelope_shape(seed5):
+    res = call("get_events", subject_id=seed5["subject"], limit=1)
+    assert list(res) == ["row_count", "limit", "truncated", "next_cursor", "rows"]
+    res = call("get_events", subject_id=seed5["subject"], limit=1000)
+    assert res["next_cursor"] is None
+    # Listings that cannot be paged carry no next_cursor at all.
+    assert "next_cursor" not in call("get_species")
+
+
+def test_variable_definitions(seed5):
+    rows = {r["name"]: r for r in call("get_variable_definitions", limit=1000)["rows"]}
+    depth = rows[seed5["depth"]]                         # defined as "  MCP  Depth ..."
+    assert depth["units"] == "um" and depth["value_type"] == "number"
+    assert sorted(depth["applies_to"]) == ["artifact", "event", "project", "session", "subject"]
+    assert seed5["old"] not in rows
+    assert seed5["old"] in {r["name"] for r in call("get_variable_definitions",
+                                                    include_retired=True, limit=1000)["rows"]}
+    sessions = {r["name"] for r in call("get_variable_definitions", entity_kind="session",
+                                        limit=1000)["rows"]}
+    assert seed5["depth"] in sessions and seed5["coat"] not in sessions
+    with pytest.raises(Exception, match="entity kind"):
+        call("get_variable_definitions", entity_kind="person")
+
+
+def test_get_variables_current_and_history(seed5):
+    s1, s2 = seed5["s1"], seed5["s2"]
+    current = call("get_variables", entity_kind="session", entity_id=s1)["rows"]
+    assert [(r["variable"], r["value_num"], r["units"]) for r in current] == [
+        (seed5["depth"], "1250.25", "um")]
+    assert current[0]["entity_id"] == s1 and current[0]["value"] == "1250.25"
+    # The id is normalised; the name is canonicalised by the database.
+    assert call("get_variables", entity_kind="session", entity_id=s1.upper(),
+                name=f"  MCP   DEPTH {seed5['tag']} ")["rows"] == current
+    log = call("get_variables", entity_kind="session", entity_id=s1, current_only=False)["rows"]
+    assert [(r["op"], r["value_num"]) for r in log] == [("set", "1200.50"), ("set", "1250.25")]
+    # An unset variable has no current value but keeps its history.
+    gain = {"entity_kind": "session", "entity_id": s2, "name": seed5["gain"]}
+    assert call("get_variables", **gain)["row_count"] == 0
+    assert [r["op"] for r in call("get_variables", current_only=False, **gain)["rows"]] == [
+        "set", "unset"]
+    across = call("get_variables", entity_kind="session", name=seed5["depth"])["rows"]
+    assert sorted((r["entity_id"], r["value_num"]) for r in across) == sorted(
+        [(s1, "1250.25"), (s2, "900")])
+    text = call("get_variables", entity_kind="subject", entity_id=seed5["subject"])["rows"]
+    assert [(r["variable"], r["value_text"], r["value_num"]) for r in text] == [
+        (seed5["housing"], "pair", None)]
+
+
+def test_get_variables_refuses_what_cannot_match(seed5):
+    with pytest.raises(Exception, match=r"No variable named 'mcp nosuch'.*" + seed5["depth"]):
+        call("get_variables", entity_kind="session", name="MCP  NoSuch")
+    with pytest.raises(Exception, match="applies to subject only, not to session"):
+        call("get_variables", entity_kind="session", name=seed5["coat"])
+    with pytest.raises(Exception, match="not one"):
+        call("get_variables", entity_kind="session", entity_id="G-0421")
+    with pytest.raises(Exception, match="entity kind"):
+        call("get_variables", entity_kind="dataset")
+    # The text "null" is a name like any other, not "no filter".
+    with pytest.raises(Exception, match="No variable named 'null'"):
+        call("get_variables", entity_kind="session", name="null")
+
+
+def test_variables_skip_retracted_entities_unless_named(seed5):
+    depth = {"entity_kind": "event", "name": seed5["depth"]}
+    assert [r["entity_id"] for r in call("get_variables", **depth)["rows"]] == [seed5["rec_a"]]
+    assert sorted(r["entity_id"] for r in call("get_variables", active_only=False,
+                                               **depth)["rows"]) == sorted(
+        [seed5["rec_a"], seed5["rec_x"]])
+    named = call("get_variables", entity_id=seed5["rec_x"], **depth)["rows"]
+    assert [r["value_num"] for r in named] == ["7"]
+    assert [r["entity_id"] for r in call("find_by_variable", **depth)["rows"]] == [seed5["rec_a"]]
+    assert call("find_by_variable", active_only=False, **depth)["row_count"] == 2
+
+
+def test_find_by_variable(seed5):
+    s1, s2 = seed5["s1"], seed5["s2"]
+
+    def found(**filters):
+        return [r["entity_id"] for r in call("find_by_variable", entity_kind="session",
+                                             name=seed5["depth"], **filters)["rows"]]
+
+    assert found(at_least=1000) == [s1]
+    assert found(at_most="900") == [s2]
+    assert found(equals="1250.250") == [s1]              # compared as numbers, exactly
+    assert found(equals=1250.25) == [s1]
+    assert found(equals=900, at_least=1000) == []
+    assert sorted(found()) == sorted([s1, s2])
+    assert sorted(found(equals=None)) == sorted([s1, s2])   # JSON null: no filter
+    for bad in ("null", "abc", "NaN", "Infinity", ""):
+        with pytest.raises(Exception, match="number"):
+            found(equals=bad)
+    with pytest.raises(Exception, match="use equals"):
+        found(text_equals="1200")
+    housing = {"entity_kind": "subject", "name": seed5["housing"]}
+    assert [r["entity_id"] for r in call("find_by_variable", text_equals="pair",
+                                         **housing)["rows"]] == [seed5["subject"]]
+    assert call("find_by_variable", text_equals="Pair", **housing)["row_count"] == 0
+    with pytest.raises(Exception, match="use text_equals"):
+        call("find_by_variable", at_least=1, **housing)
+    spec = {t.name: t.inputSchema for t in asyncio.run(app.list_tools())}["find_by_variable"]
+    assert spec["properties"]["equals"]["anyOf"] == [
+        {"type": "number"}, {"type": "string"}, {"type": "null"}]
+
+
+def test_retraction_is_visible_and_explained(seed5):
+    rec_x, art_r = seed5["rec_x"], seed5["art_r"]
+    rows = call("get_retractions", event_id=rec_x)["rows"]
+    assert [(r["entity_kind"], r["reason"]) for r in rows] == [("event", "entered twice")]
+    rows = call("get_retractions", entity_kind="artifact", artifact_id=art_r)["rows"]
+    assert [r["reason"] for r in rows] == ["registered by mistake"]
+    assert all(r["entity_kind"] == "event"
+               for r in call("get_retractions", entity_kind="event", limit=1000)["rows"])
+    for kind in ("subject", "null"):
+        with pytest.raises(Exception, match="only events and artifacts"):
+            call("get_retractions", entity_kind=kind)
+    # Left out of current reads; marked in full history.
+    assert call("get_events", event_id=rec_x)["row_count"] == 0
+    row = call("get_events", event_id=rec_x, active_only=False)["rows"][0]
+    assert row["is_retracted"] is True and row["is_current"] is False
+    assert row["superseded_by"] is None
+    assert call("get_artifacts", artifact_id=art_r)["row_count"] == 0
+    row = call("get_artifacts", artifact_id=art_r, active_only=False)["rows"][0]
+    assert row["is_retracted"] is True and row["is_current"] is False
+    # The detail tool says it is retracted, and why.
+    with pytest.raises(Exception, match="retracted .*'entered twice'"):
+        call("get_event_detail", event_id=rec_x)
+    row = call("get_event_detail", event_id=rec_x, active_only=False)
+    assert row["is_retracted"] is True and row["retraction_reason"] == "entered twice"
+    row = call("get_event_detail", event_id=seed5["rec_a"])
+    assert row["is_retracted"] is False and row["retraction_reason"] is None
+
+
+def test_integrity_docstring_lists_every_check(seed):
+    import re
+
+    import psycopg
+
+    with psycopg.connect(dbname=TEST_DB) as conn:
+        source = conn.execute(
+            "SELECT pg_get_functiondef('lab.fn_check_integrity()'::regprocedure)").fetchone()[0]
+    checks = set(re.findall(r"SELECT '(error|warning)', '([a-z_]+)'", source))
+    assert len(checks) == 13
+    doc = {t.name: t.description for t in asyncio.run(app.list_tools())}["get_integrity_report"]
+    assert "The 13 checks" in doc
+    for severity, name in checks:
+        assert f"- {name} ({severity})" in doc, name
+    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 13
+
+
+def test_artifact_file_lookup(seed5):
+    sub = seed5["subject"]
+
+    def ids(**filters):
+        return sorted(r["artifact_id"] for r in call("get_artifacts", **filters)["rows"])
+
+    assert ids(relative_path=f"{sub}/s1/raw_1.dat") == [seed5["art1"]]
+    # Windows separators and stray whitespace are normalised, as on insert.
+    assert ids(relative_path=f"  {sub}\\s1\\raw_1.dat\n") == [seed5["art1"]]
+    assert ids(relative_path=f"{sub}/s1/bs.dat") == [seed5["art_bs"]]
+    assert ids(relative_path=f"{sub}/s1/RAW_1.dat") == []
+    assert ids(relative_path=f"{sub}/s1/raw_1.dat",
+               storage_root_id=int(seed5["root"])) == [seed5["art1"]]
+    assert ids(relative_path=f"{sub}/s1/raw_1.dat", storage_root_id=int(seed5["root"]) + 1) == []
+    active = sorted([seed5["art1"], seed5["art2"], seed5["art3"], seed5["art_bs"]])
+    assert ids(relative_path_prefix=f"{sub}/s1/") == active
+    assert ids(relative_path_prefix=f"{sub}\\s1\\") == active
+    assert ids(relative_path_prefix=f"{sub}/s1/x") == sorted([seed5["art2"], seed5["art3"]])
+    # LIKE wildcards in the prefix are literal characters.
+    assert ids(relative_path_prefix=f"{sub}/s1/x%") == [seed5["art2"]]
+    assert ids(relative_path_prefix=f"{sub}/s1/raw%") == []
+    assert ids(relative_path_prefix=f"{sub}/s_/") == []
+    assert ids(relative_path_prefix=f"{sub}/s1/", format="dat") == active
+    assert ids(relative_path_prefix=f"{sub}/s1/", format="DAT") == []
+    assert ids(relative_path_prefix=f"{sub}/s1/", active_only=False) == sorted(
+        active + [seed5["art_r"]])
+    assert ids(relative_path="null") == []
+    for name in ("relative_path", "relative_path_prefix"):
+        with pytest.raises(Exception, match="must not be empty"):
+            call("get_artifacts", **{name: "  "})
+
+
+def test_get_counts(seed, seed5):
+    sub, proj = seed5["subject"], seed5["project"]
+
+    def counts(question, **filters):
+        res = call("get_counts", question=question, **filters)
+        assert res["question"] == question and list(res)[-1] == "rows"
+        return res["rows"]
+
+    assert counts("events_by_type", subject_id=sub) == [{"event_type": "recording", "n": 3}]
+    assert counts("events_by_type", subject_id=sub, active_only=False) == [
+        {"event_type": "recording", "n": 4}]
+    assert counts("events_by_type", project_id=proj.upper()) == [{"event_type": "recording", "n": 3}]
+    assert counts("artifacts_by_role", subject_id=sub) == [
+        {"role": "raw", "n": 2, "total_size_bytes": "150", "n_with_size": 2},
+        {"role": None, "n": 2, "total_size_bytes": None, "n_with_size": 0}]
+    assert counts("artifacts_by_role", project_id=proj, active_only=False)[0] == {
+        "role": "raw", "n": 3, "total_size_bytes": "1150", "n_with_size": 3}
+    assert counts("subjects_by_project_species", project_id=proj) == [
+        {"project_id": proj, "project_name": f"mcpv-{seed5['tag']}", "species_code": None, "n": 1}]
+    assert counts("sessions_per_subject", subject_id=sub) == [{"subject_id": sub, "n": 2}]
+    assert {r["subject_id"]: r["n"] for r in counts("sessions_per_subject",
+                                                    project_id=seed["project"])} == {
+        seed["subject"]: 1, seed["subject2"]: 1}
+    tags = {r["tag"]: r["n"] for r in counts("current_tags_by_tag", entity_kind="event",
+                                             limit=1000)}
+    assert tags[seed["topic"]] == 1
+    variables = {(r["entity_kind"], r["variable"]): r for r in counts(
+        "current_variables_by_variable", limit=1000)}
+    depth = variables[("session", seed5["depth"])]
+    assert (depth["n"], depth["min_value_num"], depth["max_value_num"], depth["units"]) == (
+        2, "900", "1250.25", "um")
+    assert variables[("event", seed5["depth"])]["n"] == 1
+    every = {(r["entity_kind"], r["variable"]): r["n"] for r in counts(
+        "current_variables_by_variable", active_only=False, limit=1000)}
+    assert every[("event", seed5["depth"])] == 2
+    with pytest.raises(Exception, match="Unknown question"):
+        call("get_counts", question="lab.event")
+    with pytest.raises(Exception, match="does not take project_id"):
+        call("get_counts", question="current_tags_by_tag", project_id=proj)
+    with pytest.raises(Exception, match="not one"):
+        call("get_counts", question="events_by_type", project_id="mcp")
+    with pytest.raises(Exception, match="entity kind"):
+        call("get_counts", question="current_tags_by_tag", entity_kind="person")
+
+
+def test_pageable_key_columns_are_not_null(seed):
+    import psycopg
+
+    # A NULL in a keyset column would make the page predicate skip rows.
+    tables = {"event": db.ORDER_BY_EVENT, "artifact": db.ORDER_BY_ARTIFACT,
+              "artifact_verification": db.ORDER_BY_VERIFICATION, "subject": db.ORDER_BY_SUBJECT,
+              "session": db.ORDER_BY_SESSION, "tag_assignment": db.ORDER_BY_TAG_ASSIGNMENT,
+              "variable_value": db.ORDER_BY_VARIABLE_VALUE}
+    with psycopg.connect(dbname=TEST_DB) as conn:
+        for table, order in tables.items():
+            for column, _, _ in db.PAGE_KEYS[order]:
+                nullable = conn.execute(
+                    "SELECT is_nullable FROM information_schema.columns WHERE table_schema = "
+                    "'lab' AND table_name = %s AND column_name = %s", [table, column]).fetchone()
+                assert nullable == ("NO",), (table, column)
+
+
+def test_persons_carry_db_login(seed):
+    row = call("get_persons", person_id=seed["person"])["rows"][0]
+    assert "db_login" in row and row["db_login"] is None

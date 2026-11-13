@@ -3,8 +3,15 @@ function db = loginDialog(obj)
 %
 %   Prefills the non-secret connection fields remembered in preferences; the
 %   password field is always blank and is never persisted. Loops until a
-%   connection succeeds or the user cancels. Connecting with no person email
-%   needs an explicit confirmation that entries will carry no person.
+%   connection succeeds or the user cancels.
+%
+%   The person email is optional. CarasLabDB resolves the person from the
+%   database login (lab.person.db_login, through lab.fn_current_person())
+%   when none is given, so a lab member whose login is linked to them only
+%   types a user name and a password. Only if, after connecting, the session
+%   still has no person (db.CurrentPersonId is missing) does the dialog ask
+%   for an explicit confirmation that entries will carry no person; "Go
+%   back" closes that connection and returns to the form.
 %
 %   See also CARASLABDBAPP, CARASLABDB.
 
@@ -41,14 +48,16 @@ function db = loginDialog(obj)
             "release (" + string(ME.message) + "). Your password will be " + ...
             "visible on screen as you type.";
     end
-    % Who is making the entries. It is what fills recorded_by / created_by,
-    % so it is asked for by name and a blank needs an explicit confirmation
+    % Who is making the entries: what fills recorded_by / created_by. Left
+    % blank, the person is the one the database login is linked to; a
+    % session that ends up with no person needs an explicit confirmation
     % (see onConnect).
     local_label(g, "Your email (person)");
     hEmail = uieditfield(g, "text", "Value", char(c.PersonEmail), ...
-        "Placeholder", "you@lab.edu - recorded on what you enter", ...
+        "Placeholder", "optional if your login is linked to you", ...
         "Tooltip", "Your email as registered in lab.person. Entries you make " + ...
-            "are recorded under this person.");
+            "are recorded under this person. Leave it blank to be recognised " + ...
+            "by your database login.");
 
     btnRow = uigridlayout(g, [1 2]);
     btnRow.Layout.Row = 7;
@@ -102,28 +111,13 @@ function db = loginDialog(obj)
             return
         end
 
-        % A session with no person records nobody on what it writes. That is
-        % allowed (the database still stores the login name), but only as a
-        % deliberate choice, never by leaving a field empty.
-        if strlength(email) == 0
-            answer = uiconfirm(f, ...
-                "No person email was entered." + newline + newline + ...
-                "Everything you add or correct in this session will be recorded " + ...
-                "with no person attached. The database still records the login " + ...
-                "name '" + user + "'." + newline + newline + ...
-                "Continue without a person?", ...
-                "No person set", ...
-                "Options", {'Go back', 'Continue without a person'}, ...
-                "DefaultOption", 1, "CancelOption", 1, "Icon", "warning");
-            if ~strcmp(answer, 'Continue without a person')
-                try
-                    focus(hEmail);
-                catch
-                end
-                return
-            end
-        end
-
+        % CarasLabDB resolves the person from the email if one was typed,
+        % else from the database login. When it resolves nobody it warns
+        % CarasLabDB:noCurrentPerson; this dialog asks instead (below), so
+        % the warning is silenced for the duration of the call.
+        newDb = [];
+        failure = "";
+        warnState = warning("off", "CarasLabDB:noCurrentPerson");
         try
             args = {"Username", user, "Password", pass, ...
                     "Server", server, "Port", port, "DatabaseName", dbname, ...
@@ -132,10 +126,10 @@ function db = loginDialog(obj)
                 args = [args, {"PersonEmail", email}];
             end
             newDb = CarasLabDB(args{:});
-            failure = "";
         catch ME
             failure = string(ME.message);
         end
+        warning(warnState);
 
         % Drop the plaintext password as soon as it has been used, whether or
         % not the connection succeeded — it is never needed again here.
@@ -145,6 +139,37 @@ function db = loginDialog(obj)
         if strlength(failure) > 0
             uialert(f, "Connection failed: " + failure, "Connect");
             return
+        end
+
+        % A session with no person records nobody on what it writes. That is
+        % allowed (the database still stores the login name), but only as a
+        % deliberate choice: it is asked here, once the connection has shown
+        % that the login is not linked to a person either.
+        if ismissing(newDb.CurrentPersonId)
+            answer = uiconfirm(f, ...
+                "No person is set for this session: no email was entered, and " + ...
+                "the login '" + user + "' is not linked to a person in the database." + ...
+                newline + newline + ...
+                "Everything you add or correct will be recorded with no person " + ...
+                "attached; the database still records the login name. Go back " + ...
+                "to enter your email, or ask the database administrator to link " + ...
+                "your login to you (lab.person.db_login)." + ...
+                newline + newline + ...
+                "Continue without a person?", ...
+                "No person set", ...
+                "Options", {'Go back', 'Continue without a person'}, ...
+                "DefaultOption", 1, "CancelOption", 1, "Icon", "warning");
+            if ~strcmp(answer, 'Continue without a person')
+                try
+                    delete(newDb);          % close the connection just opened
+                catch
+                end
+                try
+                    focus(hEmail);
+                catch
+                end
+                return
+            end
         end
         hPass.Value = '';
 

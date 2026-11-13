@@ -21,6 +21,15 @@ def register(app):
     ) -> dict:
         """List lab members, optionally filtered by id, email, name, or active status.
 
+        Each row is a lab.person: person_id (what recorded_by, created_by,
+        set_by, applied_by, retracted_by ... in other tables refer to),
+        full_name, email, role, is_active, created_at, and db_login -- the
+        PostgreSQL login this person connects to the database with (null if
+        none is mapped). db_login is what the *_login columns elsewhere
+        (recorded_login, created_login, applied_login, set_login, ...)
+        record, so it ties "who was connected" to a person; it is not a
+        password or credential.
+
         email matches case-insensitively, as the database's uniqueness rule
         does ("Dan@umd.edu" and "dan@umd.edu" are one person); full_name is
         matched exactly, case included.
@@ -110,13 +119,15 @@ def register(app):
         any_tags: Optional[list[str]] = None,
         none_tags: Optional[list[str]] = None,
         limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
     ) -> dict:
         """List subjects (animals), optionally filtered by id, project, species, sex, or tags.
 
         subject_id is the lab's own id for the animal and is matched exactly,
         case included ("G-0421" is not "g-0421"); sex is 'M', 'F' or 'U'.
         A filter left out (or null) is not applied -- it never means "IS NULL".
-        Ordered by subject_id.
+        Ordered by subject_id. Counts by project and species:
+        get_counts(question="subjects_by_project_species").
 
         Tag filters (current tags only; see get_tag_namespaces / get_tags):
         `tags` = the subject must have ALL of these, `any_tags` = at least
@@ -128,13 +139,16 @@ def register(app):
         exist or does not apply to subjects, is an error naming the tag --
         never an empty or unfiltered result.
 
-        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        Returns {"row_count", "limit", "truncated", "next_cursor", "rows"}.
+        `truncated` true means more rows matched than were returned: call
+        again with the same arguments and cursor=<next_cursor> for the next
+        page (null when nothing is left); `limit` (max 1000) caps each page.
         """
         return db.select_from("lab.subject", {
             "subject_id": subject_id, "project_id": project_id,
             "species_code": species_code, "sex": sex,
-        }, limit=limit, tag_filters=("subject", tags, any_tags, none_tags))
+        }, limit=limit, tag_filters=("subject", tags, any_tags, none_tags),
+            paged=True, cursor=cursor)
 
     @app.tool()
     def get_sessions(
@@ -146,12 +160,14 @@ def register(app):
         any_tags: Optional[list[str]] = None,
         none_tags: Optional[list[str]] = None,
         limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
     ) -> dict:
         """List sessions (NAS folders under a subject), optionally filtered.
 
         subject_id and label are matched exactly, case included. A filter
         left out (or null) is not applied -- it never means "IS NULL".
-        Ordered by subject_id, label.
+        Ordered by subject_id, label. Counts per subject:
+        get_counts(question="sessions_per_subject").
 
         Tag filters (current tags only; see get_tag_namespaces / get_tags):
         `tags` = the session must have ALL of these, `any_tags` = at least
@@ -163,13 +179,16 @@ def register(app):
         exist or does not apply to sessions, is an error naming the tag --
         never an empty or unfiltered result.
 
-        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        Returns {"row_count", "limit", "truncated", "next_cursor", "rows"}.
+        `truncated` true means more rows matched than were returned: call
+        again with the same arguments and cursor=<next_cursor> for the next
+        page (null when nothing is left); `limit` (max 1000) caps each page.
         """
         return db.select_from("lab.session", {
             "session_id": session_id, "subject_id": subject_id,
             "label": label, "storage_root_id": storage_root_id,
-        }, limit=limit, tag_filters=("session", tags, any_tags, none_tags))
+        }, limit=limit, tag_filters=("session", tags, any_tags, none_tags),
+            paged=True, cursor=cursor)
 
     @app.tool()
     def get_subject_current(

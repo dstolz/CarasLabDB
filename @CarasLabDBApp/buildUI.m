@@ -2,8 +2,10 @@ function buildUI(obj)
 %BUILDUI Construct the main window: toolbar, filter panel, tabs and tables.
 %
 %   Applies remembered geometry and the active-view toggle from preferences,
-%   builds the four browse tabs (Subjects/Sessions/Events/Artifacts) plus the
-%   Custom SQL tab, wires callbacks, and selects the last-used tab.
+%   builds the two toolbar rows (actions on the database as a whole, then
+%   actions on the selected row), the four browse tabs
+%   (Subjects/Sessions/Events/Artifacts) plus the Custom SQL tab, wires
+%   callbacks, and selects the last-used tab.
 %
 %   All obj-touching construction is done here in the primary method (a class
 %   method with access to private members and permission to reference the
@@ -24,16 +26,16 @@ function buildUI(obj)
         "CloseRequestFcn", @(s,e) obj.pOnClose(s,e), ...
         "KeyPressFcn", @(s,e) obj.onKeyPress(s,e));
 
-    root = uigridlayout(obj.Fig, [3 1]);
-    root.RowHeight = {40, '1x', 24};
+    root = uigridlayout(obj.Fig, [4 1]);
+    root.RowHeight = {30, 30, '1x', 24};
     root.ColumnWidth = {'1x'};
     root.RowSpacing = 4;
     root.Padding = [6 6 6 6];
 
-    % ---- toolbar ------------------------------------------------------------
+    % ---- toolbar, row 1: the database as a whole ----------------------------
     tb = uigridlayout(root, [1 9]);
     tb.Layout.Row = 1; tb.Layout.Column = 1;
-    tb.ColumnWidth = {90, 120, 100, 110, 110, 150, 80, '1x', 130};
+    tb.ColumnWidth = {80, 110, 90, 100, 100, 110, 90, '1x', 100};
     tb.Padding = [0 0 0 0];
 
     uibutton(tb, "Text", "Refresh", "Tooltip", "Refresh (Ctrl+R)", ...
@@ -46,18 +48,41 @@ function buildUI(obj)
         "ButtonPushedFcn", @(~,~) obj.onAddMenu("subject"));
     uibutton(tb, "Text", "Add Session", "Tooltip", "Add Session (Ctrl+Shift+N)", ...
         "ButtonPushedFcn", @(~,~) obj.onAddMenu("session"));
-    uibutton(tb, "Text", "Edit / Supersede", "Tooltip", "Edit / Supersede (Ctrl+D)", ...
-        "ButtonPushedFcn", @(s,e) obj.onEditSelected(s,e));
-    uibutton(tb, "Text", "Tags…", "Tooltip", "Tags of the selected row (Ctrl+T)", ...
-        "ButtonPushedFcn", @(s,e) obj.onEditTags(s,e));
+    uibutton(tb, "Text", "Husbandry…", ...
+        "Tooltip", "Enter today's weights and water for all animals (Ctrl+H)", ...
+        "ButtonPushedFcn", @(s,e) obj.onHusbandry(s,e));
+    uibutton(tb, "Text", "Integrity…", ...
+        "Tooltip", "Show the database integrity report (Ctrl+I)", ...
+        "ButtonPushedFcn", @(s,e) obj.onIntegrity(s,e));
     uilabel(tb, "Text", "");   % spacer
     obj.UI.ActiveOnly = uicheckbox(tb, "Text", "Active only", ...
         "Value", logical(obj.Prefs.UseActiveViews), ...
+        "Tooltip", "Show current rows only. Untick to see every version, " + ...
+            "including superseded and retracted rows.", ...
         "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
+
+    % ---- toolbar, row 2: the selected row -----------------------------------
+    rb = uigridlayout(root, [1 6]);
+    rb.Layout.Row = 2; rb.Layout.Column = 1;
+    rb.ColumnWidth = {90, 130, 80, 100, 90, '1x'};
+    rb.Padding = [0 0 0 0];
+
+    uilabel(rb, "Text", "Selected row:", "HorizontalAlignment", "right");
+    uibutton(rb, "Text", "Edit / Supersede", "Tooltip", "Edit / Supersede (Ctrl+D)", ...
+        "ButtonPushedFcn", @(s,e) obj.onEditSelected(s,e));
+    uibutton(rb, "Text", "Tags…", "Tooltip", "Tags of the selected row (Ctrl+T)", ...
+        "ButtonPushedFcn", @(s,e) obj.onEditTags(s,e));
+    uibutton(rb, "Text", "Variables…", ...
+        "Tooltip", "Variables (named values) of the selected row (Ctrl+L)", ...
+        "ButtonPushedFcn", @(s,e) obj.onEditVariables(s,e));
+    uibutton(rb, "Text", "Retract…", ...
+        "Tooltip", "Retract the selected event or artifact (Ctrl+Delete)", ...
+        "ButtonPushedFcn", @(s,e) obj.onRetract(s,e));
+    uilabel(rb, "Text", "");   % spacer
 
     % ---- body: filter panel | tab group ------------------------------------
     body = uigridlayout(root, [1 2]);
-    body.Layout.Row = 2; body.Layout.Column = 1;
+    body.Layout.Row = 3; body.Layout.Column = 1;
     body.ColumnWidth = {330, '1x'};
     body.Padding = [0 0 0 0];
     body.ColumnSpacing = 6;
@@ -200,10 +225,24 @@ function buildUI(obj)
 
     % ---- status bar ---------------------------------------------------------
     obj.UI.Status = uilabel(root, "Text", "Ready.", "HorizontalAlignment", "left");
-    obj.UI.Status.Layout.Row = 3; obj.UI.Status.Layout.Column = 1;
+    obj.UI.Status.Layout.Row = 4; obj.UI.Status.Layout.Column = 1;
+    % Who the entries of this session are recorded under, by name where the
+    % person can be read (the id alone says little to the person reading it).
     person = obj.Db.CurrentPersonId;
-    if ismissing(person), person = "(no person set)"; end
-    obj.pStatus("Connected · schema " + obj.Db.Schema + " · person " + person);
+    if ismissing(person)
+        who = "(no person set)";
+    else
+        who = person;
+        try
+            P = obj.Db.getPersons(PersonId = person);
+            if height(P) > 0
+                who = string(P.full_name(1));
+            end
+        catch
+            who = person;
+        end
+    end
+    obj.pStatus("Connected · schema " + obj.Db.Schema + " · person " + who);
 
     % ---- restore last tab, then populate filter columns --------------------
     keys = string({tg.Children.Tag});
