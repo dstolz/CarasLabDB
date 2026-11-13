@@ -7,18 +7,25 @@ that guide is about *installing* the system; this one is about *proving it works
 
 The goal of local testing is a throwaway `lab` database on `localhost` that you
 can create, exercise end-to-end through both the MATLAB class and the GUI, then
-drop — repeatedly — without touching production data. The schema and the MCP
-server have automated tests (`tests/schema_test.sql`, `mcp-server/tests/`, run
-in CI by `.github/workflows/tests.yml`); MATLAB and the GUI do not, so for
-those "testing" here means a disciplined manual walkthrough with explicit
-pass/fail checks.
+drop — repeatedly — without touching production data. The schema, the
+privileges, the migrations, the Python tools and the MCP server have
+automated tests (`tests/schema_test.sql`, `tests/roles_test.sql`,
+`tests/seed_v1.sql` + `tests/migrated_data_test.sql`,
+`tests/check_verify_artifacts.py`, `tests/check_lab_data.py`,
+`mcp-server/tests/`), which CI (`.github/workflows/tests.yml`) runs on
+PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
+`matlab.unittest` suite in `tests/matlab/` (§2.7) that runs locally only,
+because CI has no MATLAB; beyond it, "testing" them here means a disciplined
+manual walkthrough with explicit pass/fail checks.
 
 The parts this guide covers and how each is tested:
 
 | Part | What you verify | Needs a live DB? |
 |------|-----------------|------------------|
 | PostgreSQL schema (`design_docs/schema.sql`) | DDL loads; append-only triggers, views, and lineage function behave | — |
-| MATLAB interface (`@CarasLabDB`) + GUI (`@CarasLabDBApp`) | Connect, insert every event type, retrieve, supersede, read-only SQL guard | Yes |
+| Privileges (`design_docs/grants.sql`) | Members of `lab_rw` / `lab_ro` can do exactly what they should | — |
+| Tools (`tools/`) | Backup, restore and file verification work against `lab_test` | — |
+| MATLAB interface (`@CarasLabDB`) + GUI (`@CarasLabDBApp`) | Connect, insert every event type, retrieve, supersede, retract, variables, read-only SQL guard | Yes |
 | Web dashboard (`web/lab-dashboard.html`) | Renders from in-page synthetic data | No |
 
 The read-only MCP server (`mcp-server/`) has its own verification steps — stand
@@ -147,19 +154,31 @@ ORDER BY 1, 2;
   (`birth_event` … `analysis_event`).
 - **Provenance:** `artifact`, `event_input`, `artifact_verification`.
 - **Tags:** `tag_namespace`, `tag`, `tag_assignment` (see [tagging.md](tagging.md)).
+- **Variables:** `variable`, `variable_value` (see [variables.md](variables.md)).
+- **Retraction:** `retraction`.
 - **Audit and versioning:** `maintenance_log` (subject renames), `row_history`
-  (edits to the mutable tables) and `schema_version`.
-- **Views:** `event_active`, `artifact_active`, `provenance_edge`,
-  `subject_current`, `tag_current`, `entity_tags`.
+  (edits to the mutable tables) and `schema_version` (5 on a fresh install).
+- **Views:** `event_active`, `artifact_active`, `event_version`,
+  `artifact_version`, `artifact_verification_latest`, `provenance_edge`,
+  `subject_current`, `tag_current`, `entity_tags`, `variable_current`,
+  `entity_variables`.
 - **Functions:** the trigger functions `fn_forbid_mutation`,
   `fn_require_session_for_recording`, `fn_fill_subject_from_session`,
   `fn_supersede_same_type`, `fn_normalize_checksum`, `fn_normalize_path`,
-  `fn_artifact_unique_active`, `fn_forbid_provenance_cycle`,
-  `fn_log_row_change`, `fn_normalize_tag`, `fn_tag_guard`,
-  `fn_tag_namespace_guard`, `fn_tag_assignment_policy`; plus `fn_rename_subject`,
-  `fn_artifact_lineage`, `fn_check_integrity`, and the tag functions
-  `fn_canonical_tag`, `fn_register_tag`, `fn_tag`, `fn_tag_match`,
-  `fn_find_by_tags`.
+  `fn_artifact_unique_active`, `fn_artifact_matches_event`,
+  `fn_forbid_provenance_cycle`, `fn_log_row_change`, `fn_stamp_login`,
+  `fn_subject_id_guard`, `fn_normalize_tag`, `fn_tag_guard`,
+  `fn_tag_namespace_guard`, `fn_tag_assignment_policy`,
+  `fn_normalize_variable`, `fn_variable_guard`, `fn_variable_value_policy`,
+  `fn_carry_variables_on_supersede`, `fn_retraction_policy`; plus
+  `fn_rename_subject`, `fn_artifact_lineage`, the correction-chain helpers
+  `fn_event_current` / `fn_artifact_current` / `fn_event_versions` /
+  `fn_artifact_versions`, `fn_check_integrity`, `fn_current_person`,
+  `fn_retract`, the tag functions `fn_canonical_tag`, `fn_register_tag`,
+  `fn_tag`, `fn_tag_match`, `fn_find_by_tags`, `fn_tag_filter_problems`, and
+  the variable functions `fn_canonical_variable`, `fn_define_variable`,
+  `fn_set_variable`, `fn_unset_variable`, `fn_variable_number`,
+  `fn_variable_text`, `fn_carry_variables`.
 
 The list grows as the schema does — treat `schema.sql` as the authority and this
 as the "nothing obviously missing" check.
@@ -180,8 +199,8 @@ ORDER BY 1, 2;
 
 **Pass:** every append-only table — `event`, the eight `*_event` detail tables,
 `artifact`, `event_input`, and the logs `artifact_verification`,
-`maintenance_log`, `row_history`, `schema_version`, `tag_assignment` — carries *two*
-immutability triggers:
+`maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
+`variable_value`, `retraction` — carries *two* immutability triggers:
 `trg_immutable_<table>` (row-level, `UPDATE`/`DELETE`) and
 `trg_immutable_truncate_<table>` (statement-level, `TRUNCATE`, which row-level
 triggers cannot see). The validation and normalization triggers
@@ -189,12 +208,18 @@ triggers cannot see). The validation and normalization triggers
 `trg_artifact_fill_subject`, `trg_event_supersede_same_type`,
 `trg_artifact_normalize`, `trg_verification_normalize`,
 `trg_session_normalize_path`, `trg_artifact_normalize_path`,
-`trg_project_artifact_normalize_path`, `trg_artifact_unique_active`, `trg_event_input_acyclic`,
+`trg_project_artifact_normalize_path`, `trg_artifact_unique_active`,
+`trg_artifact_matches_event`, `trg_event_input_acyclic`, `trg_subject_id_guard`,
 `trg_tag_normalize`, `trg_tag_assignment_normalize`, `trg_tag_guard`,
-`trg_tag_namespace_guard` and `trg_tag_assignment_policy` are there too, as is
-one `trg_history_<table>` on each mutable table (`person`, `subject`, `session`,
-the project tables, the reference tables and the tag vocabulary tables
-`tag_namespace` and `tag`).
+`trg_tag_namespace_guard`, `trg_tag_assignment_policy`,
+`trg_variable_normalize`, `trg_variable_guard`, `trg_variable_value_policy`,
+`trg_event_carry_variables`, `trg_artifact_carry_variables`,
+`trg_retraction_policy` and the six `trg_*_stamp_login` triggers (on `event`,
+`artifact`, `artifact_verification`, `tag_assignment`, `retraction`,
+`variable_value`) are there too, as is one `trg_history_<table>` on each
+mutable table (`person`, `subject`, `session`, the project tables, the
+reference tables, the tag vocabulary tables `tag_namespace` and `tag`, and
+`variable`).
 
 The two normalizers are worth knowing about because they *accept* input a
 strict reading of the constraints would reject: a `relative_path` written
@@ -293,25 +318,89 @@ psql -U postgres -d lab_test -c "SELECT count(*) FROM lab.event WHERE notes = 'i
 > drop `lab_test` in §6.
 
 > Why `event` and not `person`: only the append-only log is trigger-protected —
-> `event`, every `*_event` detail table, `artifact`, and `event_input`. Reference
+> `event`, every `*_event` detail table, `artifact`, `event_input` and the log
+> tables. Reference
 > tables like `person` are intentionally mutable, so probing one would report a
 > false failure even on a correct schema.
 
-### 1.4 Create the application role and confirm least privilege
+### 1.4 Logins and least privilege
 
-Mirror what the server will run with — researchers connect as a non-superuser
-with the privileges from [`grants.sql`](grants.sql), the same script the
-deployment guides use:
+Mirror the production role model ([deployment-windows.md](deployment-windows.md)
+§0.1, §1.4): `lab_rw` and `lab_ro` are group roles, never logins, and each
+person connects with a login of their own. On a test rig the schema may be
+owned by `postgres`; production uses a non-superuser owner. Apply the grants,
+create a personal test login and map it to the person seeded in §1.3:
 
 ```powershell
-psql -U postgres -d lab_test -c "CREATE ROLE lab_rw LOGIN PASSWORD 'test-pw';"
 psql -U postgres -d lab_test -v ON_ERROR_STOP=1 -f design_docs/grants.sql
+psql -U postgres -d lab_test -c "CREATE ROLE test_rw LOGIN PASSWORD 'test-pw' IN ROLE lab_rw;"
+psql -U postgres -d lab_test -c "UPDATE lab.person SET db_login = 'test_rw' WHERE email = 'test@local';"
 ```
 
-Confirm this role can read and insert, can update a subject or session (the
-GUI's Edit Subject / Edit Session need that), and is blocked from updating an
-event by both privilege and trigger. Use it for the MATLAB tests below rather
-than `postgres`.
+Roles are cluster-wide, so on a second run `CREATE ROLE` reports that
+`test_rw` already exists; that is fine. Then, as `test_rw`:
+
+```powershell
+$env:PGPASSWORD = "test-pw"
+psql -h localhost -U test_rw -d lab_test -c "SELECT p.email FROM lab.person p WHERE p.person_id = lab.fn_current_person();"
+psql -h localhost -U test_rw -d lab_test -c "UPDATE lab.event SET notes = 'x' WHERE false;"
+```
+
+**Pass:** the first prints `test@local` (the login is mapped to the person,
+which is what fills `recorded_by` when a client names nobody); the second
+fails with `permission denied for table event`. Use `test_rw` for the MATLAB
+tests below rather than `postgres`.
+
+The scripted version is `tests/roles_test.sql`: it creates throw-away
+logins in `lab_rw` and `lab_ro`, acts as them, and checks everything a
+member and a reader may and may not do (attribution, variables, retraction,
+the subject-rename guard, `lab.person.db_login`, ...). It expects a database
+with no rows, so run it as a superuser against its own scratch database; it
+rolls itself back:
+
+```powershell
+createdb -U postgres lab_roles
+psql -U postgres -d lab_roles -X -q -v ON_ERROR_STOP=1 -f design_docs/schema.sql
+psql -U postgres -d lab_roles -X -q -v ON_ERROR_STOP=1 -f design_docs/grants.sql
+psql -U postgres -d lab_roles -X -v ON_ERROR_STOP=1 -f tests/roles_test.sql
+dropdb -U postgres lab_roles
+```
+
+**Pass:** it ends with `roles_test.sql: all assertions passed`.
+
+### 1.5 Test the tools: backup, restore, file verification, dashboard export
+
+`tools/backup_lab.py` and `tools/restore_lab.py` need only Python 3 and the
+PostgreSQL client programs, and run as a superuser (`postgres` here, with
+`PGPASSWORD` set as in §0.1, or a `pgpass.conf` entry):
+
+```powershell
+New-Item -ItemType Directory -Force C:\temp\labbackups | Out-Null     # it must exist
+python tools\backup_lab.py -U postgres --host localhost -d lab_test C:\temp\labbackups
+python tools\backup_lab.py -U postgres --host localhost --check 1 -d lab_test C:\temp\labbackups
+python tools\restore_lab.py -U postgres --host localhost C:\temp\labbackups\lab_test_<stamp>.dump lab_test_restored
+dropdb -U postgres lab_test_restored
+```
+
+**Pass:** the backup prints `backup_lab: OK: ...`; the check prints `... is
+recent and readable`; the restore ends with `restore_lab: OK` after a report
+whose row counts match the manifest. Add `--pg-bin "C:\Program
+Files\PostgreSQL\16\bin"` if the programs are not on the PATH.
+
+The file verifier and the live dashboard's export have end-to-end checks.
+`tests/check_verify_artifacts.py` writes rows, so give it its own database;
+it needs `pip install "psycopg[binary]"`:
+
+```powershell
+createdb -U postgres lab_verify
+psql -U postgres -d lab_verify -X -q -f design_docs/schema.sql
+$env:PGUSER = "postgres"; $env:PGDATABASE = "lab_verify"; python tests\check_verify_artifacts.py
+$env:PGDATABASE = "lab_test"; python tests\check_lab_data.py
+dropdb -U postgres lab_verify
+```
+
+**Pass:** `check_verify_artifacts: OK` and `check_lab_data: OK (...)`.
+`check_lab_data.py` rolls its fixture back, so `lab_test` is left as it was.
 
 ---
 
@@ -341,12 +430,12 @@ addpath('C:\src\CarasLabDB');
 
 ```matlab
 db = CarasLabDB( ...
-    Username     = "lab_rw", ...
+    Username     = "test_rw", ...
     Password     = "test-pw", ...
     Server       = "localhost", ...
     Port         = 5432, ...
     DatabaseName = "lab_test", ...
-    PersonEmail  = "test@local");     % must match the seeded person row
+    PersonEmail  = "test@local");     % optional: test_rw is mapped to this person (§1.4)
 assert(db.isOpen())
 ```
 
@@ -361,7 +450,7 @@ what they mean:
 ### 2.4 End-to-end walkthrough
 
 Run `examples/carasLabDB_demo.m`, editing the connection block at the top to
-point at `localhost` / `lab_test` / `lab_rw`. It exercises the full path the
+point at `localhost` / `lab_test` / `test_rw`. It exercises the full path the
 real system depends on:
 
 1. Reference/lookup rows (`addStorageRoot`, `addProbe`).
@@ -469,7 +558,7 @@ app = CarasLabDBApp();          % Option A: opens a login dialog
 % app = CarasLabDBApp(db);      % Option B: reuse an already-open connection
 ```
 
-Log in against `localhost` / `lab_test` / `lab_rw`, then verify each surface
+Log in against `localhost` / `lab_test` / `test_rw`, then verify each surface
 (mirrors `examples/carasLabDBApp_demo.m`):
 
 - [ ] Subjects / Sessions / Events / Artifacts tabs populate with the rows §2 inserted.
@@ -482,6 +571,13 @@ Log in against `localhost` / `lab_test` / `lab_rw`, then verify each surface
 - [ ] Select a row → "Edit / Supersede" performs an append-only correction.
 - [ ] The Tags field (e.g. `stage:preprocessed`) filters the table; Ctrl+T on a
       selected row opens the tag editor.
+- [ ] Ctrl+L on a selected row opens the variables editor; a value set there
+      appears in `lab.variable_current`.
+- [ ] Ctrl+Delete retracts the selected event or artifact (with a reason); it
+      leaves the table while "Active only" is on.
+- [ ] Ctrl+H opens the daily husbandry grid and writes the day's weights in
+      one go; Ctrl+I shows the integrity report.
+- [ ] Ctrl+? lists the shortcuts.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).
 
@@ -521,14 +617,21 @@ Run top to bottom against `lab_test` before you deploy to a server:
 - [ ] `schema.sql` loads clean with `ON_ERROR_STOP=1`.
 - [ ] Schema objects present (`\dt`, `\dv`, `\df` in the `lab` schema).
 - [ ] `UPDATE`/`DELETE` on an immutable row are rejected by `fn_forbid_mutation()`.
-- [ ] `lab_rw` role can `SELECT`/`INSERT`, can `UPDATE` a subject or session, cannot
-      `UPDATE` an event.
+- [ ] `test_rw` (a login in `lab_rw`) can `SELECT`/`INSERT`, cannot `UPDATE` an
+      event, and is resolved by `lab.fn_current_person()`; `tests/roles_test.sql`
+      passes on a fresh scratch database (§1.4).
+- [ ] Backup, `--check` and restore succeed, and `check_verify_artifacts.py` /
+      `check_lab_data.py` print OK (§1.5).
 - [ ] MATLAB `ver` / `Database_Toolbox` / `exist('postgresql')` all check out.
 - [ ] `CarasLabDB(...)` connects to `localhost`/`lab_test` and `isOpen()`.
 - [ ] `carasLabDB_demo.m` runs end-to-end; lineage and supersede work.
 - [ ] Every event type inserts and retrieves.
 - [ ] Tags: `setTag` replaces a `stage`, `findByTags` / `Tags=` find it, and a
       superseded event's correction carries its tags.
+- [ ] Variables: `setVariable` then `getVariables` shows the value, a second
+      `setVariable` updates it (`History=true` shows both), and a superseded
+      event's correction carries its variables; `retractEvent` hides an event
+      from `getEvents`; `checkIntegrity()` returns a table.
 - [ ] `runtests("tests/matlab")` passes with `CARASLABDB_MTEST_ADMIN` set (§2.7).
 - [ ] Read-only SQL guard rejects a write from both the class and the GUI.
 - [ ] `CarasLabDBApp` browses, filters, exports, adds, and supersedes.
@@ -553,11 +656,13 @@ removes all test data. Nothing you did here touches a production `lab` database.
 Once the checklist in §5 is green, the same steps map onto the server with two
 substitutions:
 
-1. Create the **real** `lab` database instead of `lab_test`, and (for a shared
+1. Create the **real** `lab` database instead of `lab_test`, owned by a
+   non-superuser owner that applies `schema.sql` and `grants.sql`
+   (`deployment-windows.md` §1.2–§1.3), and (for a shared
    server) enable network access — `listen_addresses`, `pg_hba.conf`, firewall —
-   per `deployment-windows.md` §1.4.
+   per `deployment-windows.md` §1.5.
 2. Point MATLAB and the GUI at the server hostname/IP instead of `localhost`, and
-   use the production `lab_rw` password.
+   each person's own login (see `deployment-windows.md` §1.4).
 
 Re-run the §2.3 connection smoke test and the §2.4 walkthrough (against a
 **scratch** subject you can leave in place or supersede) from a researcher

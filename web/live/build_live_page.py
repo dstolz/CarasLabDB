@@ -158,7 +158,7 @@ old_banner = t[t.find('  <div class="banner">'): t.find('</div>', t.find('  <div
 NEW_BANNER = ('  <div class="banner">\n'
     '    <span><b>Live view:</b> reading the <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">lab</code> '
     'schema through <code style="background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px">/api/data</code>. '
-    'Full history is loaded; use <b>Active only</b> to hide superseded rows.</span>\n'
+    'Full history is loaded; use <b>Active only</b> to hide superseded and retracted rows.</span>\n'
     '    <span><span class="link" id="btn-refresh" title="Refresh data (r)">↻ Refresh</span> &nbsp;·&nbsp; '
     '<span class="link" id="open-shortcuts" title="Keyboard shortcuts (?)">⌨ Shortcuts</span> &nbsp;·&nbsp; '
     '<span class="link" id="open-howto">How does this work? →</span></span>\n'
@@ -203,7 +203,16 @@ NEW_HOWTO = '''  <details class="howto" id="howto">
       and the whole append-only tag log (<code>tagAssignments</code>) are loaded, and each
       row's current tags are derived in the browser like <code>lab.tag_current</code>.
       Type tags such as <code>stage:raw -qc:fail topic:*</code> in the Tags filter
-      (<code>#</code> focuses it). Hit <b>↻ Refresh</b> to re-query the database.</p>
+      (<code>#</code> focuses it). User-defined variables come the same way: the
+      definitions (<code>variables</code>) and the whole value log
+      (<code>variableValues</code>, each value as the text the database stored), from
+      which the current values are derived like <code>lab.variable_current</code>.
+      Retracted events and files (<code>lab.retraction</code>) count as not active, as in
+      the <code>*_active</code> views. The Integrity panel summarises
+      <code>lab.fn_check_integrity()</code>; the server recomputes it every few minutes,
+      not on every load, because it is as expensive as the rest of the export.
+      The address bar always holds the tab, the filters and the open record, so a
+      record can be linked from a notebook. Hit <b>↻ Refresh</b> to re-query the database.</p>
       <p>Run it from the repo root (with the schema applied to database <code>lab</code>):</p>
       <pre>PGDATABASE=lab python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/</pre>

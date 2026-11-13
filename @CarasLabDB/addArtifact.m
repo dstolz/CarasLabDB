@@ -30,11 +30,16 @@ function artifactId = addArtifact(obj, opts)
 %       Supersedes, Attributes (jsonb), CreatedBy
 %
 %   With Supersedes=, the superseded artifact's current tags are copied onto
-%   the new row in the same transaction (as SUPERSEDEARTIFACT does).
+%   the new row in the same transaction (as SUPERSEDEARTIFACT does), and the
+%   database copies its current variables.
+%
+%   To register a file that is on disk without working out its relative
+%   path, checksum and size by hand, use ADDARTIFACTFROMFILE.
 %
 %   Returns the generated artifact_id (uuid string).
 %
-%   See also CARASLABDB, ADDEVENTINPUT, SUPERSEDEARTIFACT, ARTIFACTLINEAGE.
+%   See also CARASLABDB, ADDARTIFACTFROMFILE, ADDEVENTINPUT, SUPERSEDEARTIFACT,
+%   ARTIFACTLINEAGE.
 
     arguments
         obj (1,1) CarasLabDB
@@ -43,7 +48,7 @@ function artifactId = addArtifact(obj, opts)
         opts.RelativePath (1,1) string
         opts.Checksum (1,1) string
         opts.ChecksumAlgo (1,1) string = string(missing)
-        opts.SizeBytes double {mustBeInteger, mustBeScalarOrEmpty} = []
+        opts.SizeBytes double {mustBeInteger, mustBeNonnegative, mustBeScalarOrEmpty} = []
         opts.Role (1,1) string = string(missing)
         opts.Format (1,1) string = string(missing)
         opts.SubjectId (1,1) string = string(missing)

@@ -14,7 +14,7 @@ complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
 ## 1. Overview & ER diagram
 
-The schema has six layers:
+The schema has seven layers:
 
 1. **Reference tables** — mostly-static vocabulary and registries (`person`,
    `probe`, `pipeline`, `storage_root`, `species`, and the categorical lookups
@@ -33,6 +33,13 @@ The schema has six layers:
    and an append-only log (`tag_assignment`) of which labels were put on which
    event, artifact, subject, session or project. Current tags are derived from
    the log by a view (§3.7).
+7. **Variables** — user-defined named values (`probe depth` = 1250 µm on a
+   session): definitions (`variable`) and an append-only log of values set
+   and unset (`variable_value`), with current values derived by a view
+   (§3.8). Same shape as tags.
+
+Alongside the event log, `retraction` records events and artifacts withdrawn
+as entered in error (§4.3).
 
 ```mermaid
 erDiagram
@@ -79,6 +86,15 @@ erDiagram
     subject      |o--o{ tag_assignment   : tagged
     session      |o--o{ tag_assignment   : tagged
     project      |o--o{ tag_assignment   : tagged
+
+    variable     ||--o{ variable_value   : valued_as
+    event        |o--o{ variable_value   : carries
+    artifact     |o--o{ variable_value   : carries
+    subject      |o--o{ variable_value   : carries
+    session      |o--o{ variable_value   : carries
+    project      |o--o{ variable_value   : carries
+    event        |o--o| retraction       : withdrawn_by
+    artifact     |o--o| retraction       : withdrawn_by
 ```
 
 ---
@@ -104,6 +120,8 @@ erDiagram
   change. Structured, frequently-queried data gets real columns
   (`analysis_event.parameters`, `recording_event.hardware_config`,
   `probe.geometry` are the JSONB exceptions where the shape is genuinely open).
+  Named values that lab members want to set, read and compare, with units
+  and history, are variables (§3.8) rather than `attributes` keys.
 - **Timestamps** are `timestamptz`; store UTC. **Text** uses `text`, not
   `varchar(n)`.
 - **Everything is schema-qualified** (`lab.<table>`) so the DDL is
@@ -117,7 +135,7 @@ erDiagram
 
 | Table | Purpose |
 |---|---|
-| `person` | Lab members. Referenced by `event.recorded_by`, `surgery_event.surgeon_id`, and every `*_by` column. |
+| `person` | Lab members. Referenced by `event.recorded_by`, `surgery_event.surgeon_id`, and every `*_by` column. `db_login` names the database login the person connects with (unique where set); `lab.fn_current_person()` maps the connected login back to the person (§4). Only the administrator sets it: `grants.sql` withholds the column, and `UPDATE` on the table, from `lab_rw`. |
 | `storage_root` | Named NAS roots. Paths elsewhere are stored **relative** to a root so they resolve across machines/OSes; the per-OS mount point lives in client config, not the DB. |
 | `species` | Species vocabulary for `subject`. |
 | `probe` | Electrode/probe device registry, including channel geometry as JSONB. Referenced by surgeries (implant) and recordings (acquisition device). |
@@ -292,8 +310,9 @@ always one row.
 
 **`row_history`** — the previous and new value of every `UPDATE`, and the
 removed row of every `DELETE`, on the mutable tables (the reference tables,
-the project tables, `subject`, `session` and the tag vocabulary
-`tag_namespace` / `tag`). Those tables are edited in place
+the project tables, `subject`, `session`, the tag vocabulary
+`tag_namespace` / `tag` and the variable definitions `variable`). Those
+tables are edited in place
 by design; this table is what keeps such an edit from erasing the old value
 and who changed it. It is written by the `SECURITY DEFINER` trigger function
 `fn_log_row_change`, so clients need no privilege on it and cannot write it
@@ -404,14 +423,69 @@ raw SQL must do the same ([tagging.md](tagging.md) §8), and
 open). `stage` is where an artifact is in the pipeline and changes;
 `artifact.role` is what the file is and is fixed at registration.
 
+### 3.8 Variables
+
+Variables are named values — `probe depth` = 1250 µm on a recording session,
+`housing` = `pair` on an animal — on the same five entity kinds as tags, for
+the measurements and settings no fixed column anticipates. The user-facing
+rules are in [variables.md](variables.md).
+
+| Table | Purpose |
+|---|---|
+| `variable` | One row per variable: `name` (primary key; lower-case words separated by single spaces, `variable_name_ck`), `label`, `description`, `units`, `value_type` (`number`/`text`), `applies_to` (a non-empty `text[]` of the five kinds), `retired_at`. Mutable, recorded in `row_history`; `lab_rw` may insert and update it. |
+| `variable_value` | The **append-only log** of values set (`op = 'set'`) and cleared (`op = 'unset'`). Exactly one entity id column matches `entity_kind`, as in `tag_assignment`; a `set` row carries exactly one of `value_num` (`numeric`) / `value_text` (`variable_value_single_ck`), never NaN or infinity, never blank text. `set_at`, `set_by`, `set_login`, `note`. |
+
+**Same shape as tags, for the same reasons.** A value is true from when it is
+set until someone sets another, and "what was the depth before it was
+corrected, and who changed it" is worth keeping, so values are a log
+protected by `fn_forbid_mutation()` and there is no value column on any
+entity. `variable_current` takes the latest row per (entity, variable) by
+`value_id` (insertion order, not `set_at`, for the reason given for
+`tag_current`) and keeps it if it is a `set`; `entity_variables` aggregates
+an entity's current values into one `jsonb` object. There is no stored
+`entity_id`, for the subject-rename reason of §3.7, and the indexes mirror
+`tag_assignment`'s.
+
+**Policy in the database.** `trg_variable_value_policy` (`BEFORE INSERT`)
+rejects a value for an undefined variable, for a kind outside `applies_to`,
+of the wrong type, or an `unset` with nothing to unset; it serialises
+writers per (entity, variable) with a transaction-level advisory lock.
+`trg_variable_normalize` canonicalises a new definition (name, a label
+defaulting to the name, blank units as NULL). `trg_variable_guard` forbids
+renaming a variable and, once it has any value, freezes `value_type` and
+`units` and lets `applies_to` only grow: the units are part of what every
+stored value means.
+
+**Write and read functions.** `lab.fn_set_variable(kind, id, name, p_number
+| p_text, p_units, p_label, p_description, p_note, p_by)` is the one write
+path: it canonicalises the name, defines the variable on first use (type
+from the value given), refuses units that differ from the definition and a
+retired variable, and appends a `set`. `lab.fn_unset_variable` appends an
+`unset`; `lab.fn_define_variable` defines without setting; and
+`lab.fn_variable_number` / `lab.fn_variable_text` return one current value
+for use inside an ordinary query. All of them run with the caller's
+privileges, so `lab_ro` is stopped at the `INSERT`.
+
+**Corrections carry variables, in the database.** Unlike tags, which the
+MATLAB class carries, `trg_event_carry_variables` /
+`trg_artifact_carry_variables` (`AFTER INSERT`, through
+`lab.fn_carry_variables`) copy the predecessor's current values onto a
+superseding row, keeping each value's `set_at` and `set_by`, so every client
+and a correction typed into psql behave the same.
+
+**Attribution.** `set_login` is stamped by `trg_variable_value_stamp_login`
+like the other `*_login` columns (§4). `set_by` is filled with
+`fn_current_person()` by the write functions, not by the trigger, so a
+carried-forward value keeps the `set_by` it had.
+
 ---
 
 ## 4. Immutability & corrections
 
 Events are facts; facts do not change. The schema forbids `UPDATE` and `DELETE`
 on all event and artifact tables, `event_input`, and the logs
-`artifact_verification`, `maintenance_log`, `row_history`, `schema_version` and
-`tag_assignment` via `fn_forbid_mutation()`. A mistake is fixed
+`artifact_verification`, `maintenance_log`, `row_history`, `schema_version`,
+`tag_assignment`, `variable_value` and `retraction` via `fn_forbid_mutation()`. A mistake is fixed
 by **appending a superseding row** whose `supersedes` points at the row it
 replaces. The partial unique index on `supersedes` keeps history *linear* — a
 given row can be corrected by at most one successor, so there are no forks.
@@ -429,23 +503,35 @@ re-declaring its inputs. `fn_forbid_mutation()` says so in its error message
 rather than giving the generic "insert a superseding row" advice that cannot be
 followed there.
 
-A row is **active** when nothing supersedes it. The `event_active` and
-`artifact_active` views encapsulate that filter so callers never hand-roll it.
-`event_version` and `artifact_version` are the full-history counterparts:
-every row, with `superseded_by` and `is_current`, so that a reader of history
-cannot mistake a superseded row for a current one. `fn_event_current` /
+A row is **active** when nothing supersedes it and it has not been
+retracted (§4.3). The `event_active` and `artifact_active` views encapsulate
+that filter so callers never hand-roll it. `event_version` and
+`artifact_version` are the full-history counterparts: every row, with
+`superseded_by`, `is_retracted` and `is_current` (false for a superseded or
+a retracted row), so that a reader of history cannot mistake a row that is no
+longer in force for a current one. `fn_event_current` /
 `fn_artifact_current` return the current version of any row, and
 `fn_event_versions` / `fn_artifact_versions` its whole chain.
 
-**Who wrote a row.** `recorded_by`, `created_by`, `verified_by` and
-`applied_by` name a *person* and are supplied by the client. The database
-also records the *login* that was connected, in `event.recorded_login`,
-`artifact.created_login`, `artifact_verification.verified_login` and
-`tag_assignment.applied_login`: `trg_*_stamp_login` sets each to
-`session_user` whatever the client sends, the same guarantee `row_history`
-gives for the mutable tables. With one login per lab member that identifies
-the writer without client cooperation; with a shared login it identifies
-nobody. Rows written before schema version 4 have `NULL`. `recorded_at` and
+**Who wrote a row.** `recorded_by`, `created_by`, `verified_by`,
+`applied_by`, `retracted_by` and `set_by` name a *person*. The database also
+records the *login* that was connected, in `event.recorded_login`,
+`artifact.created_login`, `artifact_verification.verified_login`,
+`tag_assignment.applied_login`, `retraction.retracted_login` and
+`variable_value.set_login`: `trg_*_stamp_login` sets each to `session_user`
+whatever the client sends, the same guarantee `row_history` gives for the
+mutable tables. With one login per lab member that identifies the writer
+without client cooperation; with a shared login it identifies nobody. Rows
+written before schema version 4 have `NULL`.
+
+The two are tied by `person.db_login`: `lab.fn_current_person()` returns the
+person whose `db_login` is the connected login (NULL for a login mapped to
+nobody, such as a service login). Where the client names no person,
+`trg_*_stamp_login` fills the person column with it (and
+`fn_set_variable` / `fn_unset_variable` / `fn_define_variable` do for
+variables); a person the client does name is kept, because entering a record
+on someone's behalf is legitimate and the login column says who typed it.
+The MATLAB class uses the same function to resolve its current person. `recorded_at` and
 `created_at` default to the insert time but may be supplied (the MATLAB class
 exposes `RecordedAt=`), so they are the client's statement, not the
 database's.
@@ -504,7 +590,8 @@ before the detail insert leaves a typed event with no payload, which reads as a
 real event everywhere and renders as a blank row.
 
 `lab.fn_check_integrity()` is the scheduled check for that and related
-conditions — run it from cron; an empty result means healthy:
+conditions — run it on a schedule (the deployment guides' scheduled jobs);
+it has 13 checks, and an empty result means healthy:
 
 ```sql
 SELECT * FROM lab.fn_check_integrity();
@@ -522,6 +609,8 @@ SELECT * FROM lab.fn_check_integrity();
 | `artifact_event_mismatch` | warning | Active artifact filed under a different subject or session than the event that produced it; only possible for rows that predate `trg_artifact_matches_event` |
 | `input_not_carried_forward` | warning | Active event whose superseded predecessor consumed artifacts while it declares none, so lineage through it stops. A correction that re-declares a different, non-empty set of inputs is deliberate and not reported |
 | `tag_cardinality_violation` | error | An entity with more than one current tag in a single-valued namespace; only possible for assignments that raced before schema version 4 |
+| `artifact_producer_retracted` | warning | Active artifact whose producing event (in its current version) has been retracted; retract the file too, or supersede it with the event it belongs to |
+| `input_retracted` | warning | Active event that consumed an artifact whose current version has been retracted: the analysis rests on a file the lab has withdrawn |
 | `duplicate_active_path` | warning | Two active artifacts at one path; the NAS file can only be one of them |
 
 **Worked example — a recording logged with the wrong sample rate:**
@@ -571,7 +660,35 @@ move with it (`trg_artifact_matches_event` rejects them otherwise).
 What a correction does *not* need to do: re-verify the files (verification
 follows the file, §3.5) or touch the events that consumed them. Their
 `event_input` rows still name the superseded artifact — edges are immutable —
-and lineage resolves them (§5).
+and lineage resolves them (§5). Nor does it need to carry variables: the
+database copies them (§3.8).
+
+### 4.3 Retraction
+
+A correction replaces a statement of fact with a better one. Some rows
+should never have been written at all — an event entered twice, a file
+registered by mistake — and inventing a "corrected" successor for them would
+be a lie. `lab.retraction` records that an event or artifact is
+**withdrawn**, with a mandatory reason:
+
+```sql
+SELECT lab.fn_retract('event', '<event_id>', 'entered twice');
+SELECT lab.fn_retract('artifact', '<artifact_id>', 'registered under the wrong path');
+```
+
+The row, and everything that refers to it, stays in the database; the
+`*_active` views (and so `subject_current`, `fn_find_by_tags` and the
+clients' default reads) stop returning it, and `event_version` /
+`artifact_version` show it with `is_retracted = true`. `retraction` is
+append-only (one row per retracted row, `uq_retraction_event` /
+`uq_retraction_artifact`), and `trg_retraction_policy` accepts only the
+current version of a row, once. A retraction is permanent; to bring a
+retracted row back, **supersede** it: the successor is an ordinary active
+row. Retracting an event does not retract the files it produced or the
+events that consumed them; `fn_check_integrity()` reports those as
+`artifact_producer_retracted` and `input_retracted` until they are dealt
+with. `retracted_by` and `retracted_login` are filled like the other
+attribution columns.
 
 ---
 
@@ -637,18 +754,23 @@ createdb lab && psql -d lab -f design_docs/schema.sql
 `schema.sql` creates everything described above, in dependency order: the `lab`
 schema; the reference/lookup tables; the `project` tables; the `subject` /
 `session` dimensions; the base `event` and its eight detail tables; `artifact` /
-`event_input` / `artifact_verification`; the tag tables (`tag_namespace`, `tag`,
-`tag_assignment`); all indexes; the immutability
+`event_input` / `artifact_verification` / `retraction`; the tag tables
+(`tag_namespace`, `tag`, `tag_assignment`); the variable tables (`variable`,
+`variable_value`); all indexes; the immutability
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
 maintenance function, `maintenance_log`, `row_history` and `schema_version`;
 the `event_active` /
 `artifact_active` / `event_version` / `artifact_version` /
 `artifact_verification_latest` / `provenance_edge` / `subject_current` /
-`tag_current` / `entity_tags` views; `fn_artifact_lineage()` and the
+`tag_current` / `entity_tags` / `variable_current` / `entity_variables` views; `fn_artifact_lineage()` and the
 correction-chain helpers (`fn_event_current()`, `fn_artifact_current()`,
 `fn_event_versions()`, `fn_artifact_versions()`), the tag functions (`fn_tag()`,
 `fn_register_tag()`, `fn_tag_match()`, `fn_find_by_tags()`,
-`fn_canonical_tag()`, `fn_tag_filter_problems()`) and `fn_check_integrity()`;
+`fn_canonical_tag()`, `fn_tag_filter_problems()`), the variable functions
+(`fn_set_variable()`, `fn_unset_variable()`, `fn_define_variable()`,
+`fn_variable_number()`, `fn_variable_text()`, `fn_canonical_variable()`,
+`fn_carry_variables()`), `fn_current_person()`, `fn_retract()` and
+`fn_check_integrity()`;
 and the seed vocabulary
 (including the starting tag namespaces). It
 targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
@@ -693,6 +815,8 @@ type/idiom substitutions apply.
 - [schema.sql](schema.sql) — the canonical, runnable DDL.
 - [tagging.md](tagging.md) — the tag system: syntax, policy flags, filter
   grammar, corrections, and per-client usage.
+- [variables.md](variables.md) — user-defined variables: naming, units,
+  history, queries, corrections, and per-client usage.
 - [mcp-server.md](mcp-server.md) — the read-only MCP interface over this schema.
 - [testing-locally.md](testing-locally.md) — how to load and verify the schema
   on a scratch database.

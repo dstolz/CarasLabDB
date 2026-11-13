@@ -3,8 +3,9 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %
 %   Like SUPERSEDEEVENT, but for lab.artifact. Reads the old row, carries
 %   every column forward exactly as stored except artifact_id and created_at
-%   (regenerated), applies your overrides, sets supersedes to the old id and
-%   created_by to the current person, and inserts the new row.
+%   (regenerated) and created_login (stamped by the database), applies your
+%   overrides, sets supersedes to the old id and created_by to the current
+%   person, and inserts the new row.
 %
 %   newId = supersedeArtifact(db, oldArtifactId, ...
 %               Overrides=struct("checksum","ff00...", "size_bytes",123))
@@ -15,7 +16,8 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %       Overrides - struct of lab.artifact column -> new value
 %
 %   Override struct field names must be actual database column names. Any
-%   column not overridden is carried forward from the superseded row.
+%   column not overridden is carried forward from the superseded row. A field
+%   holding missing, string(missing), NaN, NaT or [] sets that column to NULL.
 %
 %   A correction may keep the same file (storage_root_id, relative_path,
 %   checksum) -- e.g. to fix role/format/session, or to re-point
@@ -27,7 +29,8 @@ function newArtifactId = supersedeArtifact(obj, oldArtifactId, opts)
 %   in lab.tag_assignment, noted "carried forward from <old id>"), in the
 %   same transaction as the insert, so the correction keeps matching the tag
 %   filters the original did. Retired tags cannot be assigned and are skipped
-%   with a CarasLabDB:retiredTagsNotCarried warning.
+%   with a CarasLabDB:retiredTagsNotCarried warning. The artifact's current
+%   variables are copied to the new row by the database itself.
 %
 %   Returns the new artifact_id (uuid string).
 %

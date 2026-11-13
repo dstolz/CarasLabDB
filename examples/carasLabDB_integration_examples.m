@@ -30,6 +30,11 @@ db = CarasLabDB( ...
 
 assert(db.isOpen(), "CarasLabDB failed to connect.");
 
+% With a database login of your own that the administrator has mapped to
+% you (lab.person.db_login), leave PersonEmail out: the current person is
+% then the login's (lab.fn_current_person()). Only a login mapped to nobody
+% warns CarasLabDB:noCurrentPerson.
+
 %% 1a. Reusing an existing connection
 % If your pipeline already opens its own Database Toolbox connection (e.g. a
 % shared connection pool in a larger app), inject it instead of letting
@@ -44,8 +49,10 @@ assert(db.isOpen(), "CarasLabDB failed to connect.");
 % db.setPerson(PersonEmail="another.person@umd.edu");
 
 %% 1c. Reading full history instead of just the latest (active) rows
-% By default get* methods read the *_active views (superseded rows hidden).
-% Flip this globally, or per call with ActiveOnly=false.
+% By default get* methods read the *_active views (superseded and retracted
+% rows hidden). Flip this globally, or per call with ActiveOnly=false;
+% getEvents / getArtifacts then return every version of every row with the
+% columns superseded_by, is_current and is_retracted.
 % db.UseActiveViews = false;              % global
 % db.getEvents(SubjectId="G-0421", ActiveOnly=false);   % per-call override
 
@@ -187,6 +194,32 @@ weightEventId = db.addHusbandryEvent( ...
     Measure    = "weight", ...
     WeightG    = 72.4);
 
+% 3g. A whole weigh-in sheet at once: one husbandry event per row that has
+% a value, written as one transaction (all rows or none). Rows with no value
+% (NaN) are skipped; ids(k) is missing for those.
+sheet = table([subjectId; "G-0422"], [71.9; NaN], ...
+    'VariableNames', {'subject_id', 'weight_g'});
+batchIds = db.addHusbandryBatch(sheet, OccurredAt=datetime("now", "TimeZone", "local"));
+
+% 3h. Registering a file from its path: the size, the SHA-256 and the path
+% relative to the storage root are worked out from the file. RootPath is
+% where storage root 1 is mounted on THIS computer. Check the first files
+% registered this way against a known hash (see help CarasLabDB.fileChecksum).
+% [lfpArtifactId, info] = db.addArtifactFromFile( ...
+%     "Z:\data\G-0421\2026-07-03_pen1\lfp.npy", ...
+%     ProducedByEventId=analysisEventId, StorageRootId=1, RootPath="Z:\data", ...
+%     Role="lfp", SubjectId=subjectId, SessionId=sessionId);
+
+% 3i. User-defined variables: a named number or string, with units, on any
+% event, artifact, subject, session or project. Defined on first use;
+% setting it again is an update (the log keeps every value).
+db.setVariable("session", sessionId, "Probe Depth", 1200, Units="um");
+db.setVariable("session", sessionId, "probe depth", 1350);          % update
+sessionVariables = db.getVariables("session", sessionId);           % current values
+depthLog         = db.getVariables("session", sessionId, History=true);
+allDepths        = db.getVariableValues("probe depth", Kind="session");
+% db.unsetVariable("session", sessionId, "probe depth", Note="wrong probe");
+
 %% 4. Correcting data (append-only: no UPDATE/DELETE on events/artifacts)
 % Events and artifacts are immutable — a database trigger blocks UPDATE and
 % DELETE outright. To fix a mistake, insert a new row whose `supersedes`
@@ -220,6 +253,18 @@ db.updateSubject(subjectId, Strain="Long-Evans", Notes="re-typed after review");
 % Clear= sets columns to NULL (database column names, from a fixed list):
 % db.updateSubject(subjectId, Clear=["genotype", "notes"]);
 % db.updateSession(sessionId, Clear="ended_at");
+
+% 4d. A row that should never have been recorded at all (entered twice,
+% registered by mistake) is retracted rather than corrected. It stays in the
+% database, with the reason, but leaves the *_active views.
+% db.retractEvent(duplicateEventId, "entered twice");
+% db.retractArtifact(wrongArtifactId, "registered under the wrong path");
+% retractions = db.getRetractions();
+
+% 4e. What needs attention, according to the database itself (errors first):
+% events without a detail row, files never verified, corrections that lost
+% their tags or inputs, files whose producing event was retracted, ...
+integrityFindings = db.checkIntegrity();
 
 %% 5. Error handling around inserts
 % pInsertEvent (used internally by every addXEvent method) already wraps the

@@ -16,7 +16,8 @@ function w = buildWhere(obj, tabDef, rows, quickText, quickRegex, tagText)
 %       Range    -> col >= <lo> [AND col <= <hi>]
 %
 %   Dates. On a date / timestamp column (tabDef.DateCols) a value written as a
-%   bare date, yyyy-MM-dd, stands for that whole day in the session time zone
+%   bare date, yyyy-MM-dd (2026-7-2 is read the same), stands for that whole
+%   day in the session time zone
 %   (the workstation's): Exact becomes col >= <d> AND col < <d>::date + 1, and
 %   the upper end of a Range becomes col < <hi>::date + 1, so "to 2026-07-02"
 %   includes everything that happened on 2 July. A value with a time of day
@@ -135,7 +136,9 @@ end
 
 function tf = local_isBareDate(val)
     %LOCAL_ISBAREDATE True for a date with no time of day, written yyyy-MM-dd.
-    tf = ~isempty(regexp(char(val), '^\d{4}-\d{2}-\d{2}$', 'once'));
+    %   One-digit months and days (2026-7-2) count too: Postgres reads them
+    %   as the same date, and they must not fall back to "midnight only".
+    tf = ~isempty(regexp(char(val), '^\d{4}-\d{1,2}-\d{1,2}$', 'once'));
 end
 
 function c = local_tagClause(tabDef, tagText, fnRef)

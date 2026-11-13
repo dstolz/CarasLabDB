@@ -5,16 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 A metadata/provenance system for the Caras Lab's extracellular electrophysiology
-data. It has five parts, plus `tools/verify_artifacts.py`, the scheduled job
-that hashes the files on the NAS and writes `lab.artifact_verification`:
+data. It has six parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
   redefine it. It installs the latest schema version; `design_docs/migrations/`
   upgrades existing databases, and `design_docs/grants.sql` holds the roles
-  and privileges every deployment guide applies. It includes the tag tables
-  (`tag_namespace`, `tag`, `tag_assignment`); `design_docs/tagging.md` is the
-  user-facing tag guide.
+  and privileges every deployment guide applies. Current schema version: 5
+  (`design_docs/migrations/005_variables_retraction_logins.sql`). It includes
+  the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
+  tables (`variable`, `variable_value`) and `retraction`;
+  `design_docs/tagging.md` and `design_docs/variables.md` are the user-facing
+  guides.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
@@ -32,9 +34,16 @@ that hashes the files on the NAS and writes `lab.artifact_verification`:
   against the `lab` schema) and assigns the result to `window.LAB_DATA` instead
   of generating it. The SQL emits the whole `LAB_DATA` shape as one JSON object
   — one array per table, each event with its detail row as `detail`, each
-  artifact with its latest `verification`, the tag vocabulary as
-  `tagNamespaces`/`tags` and the whole tag log as `tagAssignments` (current
-  tags are derived in the browser, like `tag_current`). `web/live/lab-dashboard-live.html`
+  artifact with its file's latest `verification`, the tag vocabulary as
+  `tagNamespaces`/`tags` and the whole tag log as `tagAssignments`, the
+  variable definitions as `variables` and the whole value log as
+  `variableValues` (values as text, exactly as stored), and `retractions`.
+  Current tags, current variable values and "active" are derived in the
+  browser, in the same way as `tag_current`, `variable_current` and the
+  `*_active` views. The `integrity` summary is not in `lab_data.sql`: it comes
+  from `web/live/lab_integrity.sql`, which `server.py` runs on its own
+  5-minute cache and splices into the payload (`server.py --dump` prints the
+  full payload). `web/live/lab-dashboard-live.html`
   is *generated* from the offline demo (swap the synthetic `<script>` for the
   loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
   offline demo's app logic changes, rather than editing it by hand. The
@@ -56,10 +65,26 @@ that hashes the files on the NAS and writes `lab.artifact_verification`:
   per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
   change must be mirrored there, and `db.SCHEMA_VERSION` bumped. See
   `design_docs/mcp-server.md`.
+- **`tools/`** — Python scripts, cross-platform, standard library only except
+  that the verifier needs psycopg: `backup_lab.py` (database + roles +
+  manifest, verified, prunes only after success, `--check HOURS` for
+  monitoring, `--copy-to` for an off-machine copy), `restore_lab.py` (roles +
+  database into a NEW database, checked against the manifest),
+  `verify_artifacts.py` (hashes the files under mounted storage roots and
+  appends `artifact_verification` rows; needs a login inheriting `lab_rw`).
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are
 short and are the intended entry point, not just reference material.
+
+**Production target:** a MECM-managed (Microsoft Endpoint Configuration
+Manager) Windows 11 machine used as the lab's server;
+`design_docs/deployment-windows.md` is the primary deployment guide (Linux and
+Synology guides are alternatives). Role model (`grants.sql`): the schema is
+owned by a dedicated non-superuser admin role that also applies migrations;
+`lab_rw` and `lab_ro` are group roles, never logins; each lab member has
+their own login `IN ROLE lab_rw`, and the dashboard and MCP server each have a
+login inheriting `lab_ro`. Never document or code a shared `lab_rw` login.
 
 ## Core design: events, not files
 
@@ -78,33 +103,46 @@ records:
 - **Immutability.** `UPDATE`/`DELETE` are blocked by triggers
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
-  `maintenance_log`, `row_history`, `schema_version` and `tag_assignment`.
+  `maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
+  `variable_value` and `retraction`.
   Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
-  replaces. `event_active` / `artifact_active` views filter to non-superseded
-  (current) rows; a partial unique index on `supersedes` keeps correction
+  replaces. `event_active` / `artifact_active` views filter to current rows
+  (neither superseded nor retracted); a partial unique index on `supersedes` keeps correction
   chains linear (no forks). An artifact correction may describe the same file
   as the row it replaces (that is how a corrected event's files are
   re-pointed); only one *active* row per file is allowed.
+- **Retraction** withdraws an event or artifact entered in error:
+  `lab.fn_retract('event'|'artifact', id, reason)` appends a `retraction`
+  row; the row stays, leaves the `*_active` views, and superseding it later
+  restores it (the successor is active). Not a substitute for a correction.
 - The mutable tables (reference, project, `subject`, `session`) are edited in
   place, and the `fn_log_row_change` triggers record every UPDATE/DELETE in
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
   (when the row was inserted) — they routinely differ.
 - **Who wrote a row.** `recorded_by` / `created_by` / `verified_by` /
-  `applied_by` name a person and come from the client. The database also
+  `applied_by` / `retracted_by` / `set_by` name a person. The database also
   stamps the login: `event.recorded_login`, `artifact.created_login`,
-  `artifact_verification.verified_login`, `tag_assignment.applied_login` are
-  set to `session_user` by the `trg_*_stamp_login` triggers whatever the
-  client sends (NULL on rows older than schema version 4). Clients never send
-  them and do not carry them forward in a correction.
+  `artifact_verification.verified_login`, `tag_assignment.applied_login`,
+  `retraction.retracted_login`, `variable_value.set_login` are set to
+  `session_user` by the `trg_*_stamp_login` triggers whatever the client
+  sends (NULL on rows older than schema version 4). Clients never send them
+  and do not carry them forward in a correction. `lab.person.db_login` maps a
+  login to a person (`lab.fn_current_person()`); the database fills the
+  person column from it when the client names nobody, and the MATLAB class
+  uses it to resolve the current person. Only the admin may set `db_login`
+  (`grants.sql`). Onboarding = a login `IN ROLE lab_rw` + a person row with
+  `db_login`; offboarding = `ALTER ROLE ... NOLOGIN`, never `DROP ROLE` (the
+  name is in the log). `lab_rw` cannot change `subject.subject_id`,
+  `UPDATE lab.person`, set `db_login`, or `INSERT lab.event_type`.
 - **Corrections and the graph.** Provenance edges are immutable, so after a
   correction they still name superseded rows. `fn_artifact_lineage(id, dir,
   follow_corrections := true)` therefore resolves every node to its current
   version by default (`fn_event_current` / `fn_artifact_current`,
   `fn_event_versions` / `fn_artifact_versions`); pass `false` for the rows as
   recorded. `event_version` / `artifact_version` are the full-history views
-  with `superseded_by` and `is_current`. Verification belongs to the *file*:
+  with `superseded_by`, `is_current` and `is_retracted`. Verification belongs to the *file*:
   `artifact_verification_latest` gives each artifact row the latest check of
   its (root, path, checksum) across every row describing it, so a correction
   does not lose a failed check. `trg_artifact_matches_event` requires an
@@ -141,6 +179,20 @@ records:
   computed in the views and functions. A correction does not inherit tags: the
   MATLAB class copies them forward, and `fn_check_integrity` warns
   `tag_not_carried_forward` otherwise.
+- **Variables** (user-defined named values, e.g. `probe depth` = 1200 um on
+  a session) use the same pattern as tags: mutable definitions (`variable`,
+  in `row_history`; name never changes, `value_type` and `units` frozen once
+  it has a value) and an append-only value log (`variable_value`, `set` /
+  `unset` rows); `variable_current` is the latest value per entity and
+  variable, `entity_variables` all of an entity's values as one jsonb object.
+  **`lab.fn_set_variable` is the write path** (defines on first use; setting
+  again is an update); `fn_unset_variable` clears; `fn_variable_number` /
+  `fn_variable_text` read one value inside a query. No stored `entity_id`,
+  for the tag reason above. A correction's variables are carried forward **by
+  trigger** (`trg_event_carry_variables` / `trg_artifact_carry_variables`),
+  not by the client — do not also copy them in MATLAB.
+- `lab.fn_check_integrity()` has 13 checks (see `database-design.md` §4.2);
+  a new invariant that a constraint cannot enforce gets a check there.
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
@@ -170,8 +222,9 @@ Key behaviors baked into the class:
 - Connects via the **native `postgresql()`** Database Toolbox interface (no
   ODBC/JDBC config).
 - Resolves a **"current person"** at construction (`PersonId`/`PersonEmail`/
-  `PersonName`) and auto-populates `created_by`/`recorded_by` on inserts
-  unless overridden per call.
+  `PersonName`, or else the person mapped to the login by
+  `lab.fn_current_person()`) and auto-populates `created_by`/`recorded_by` on
+  inserts unless overridden per call.
 - `UseActiveViews` (default `true`) controls whether `get*` methods read
   `*_active` views or full history; overridable per call with `ActiveOnly=`.
 - All SQL is built by hand and values are escaped via the static
@@ -213,7 +266,25 @@ Key behaviors baked into the class:
   transaction. `Supersedes=` on an `add*Event` method carries provenance the
   same way. Any insert that sets `supersedes` also copies the predecessor's
   current tags onto the successor (`pCarryTags`), skipping retired tags with
-  a warning. The database-stamped `*_login` columns are never carried.
+  a warning. The database-stamped `*_login` columns are never carried, and
+  variables are not copied by the class (the database's trigger does it).
+- Variables: `setVariable(kind, id, name, value, Units=, Label=,
+  Description=, Note=)`, `getVariables(kind, id, History=)` and
+  `defineVariable` (own files); `unsetVariable`, `getVariableValues(name,
+  Kind=)`, `getVariableDefinitions`, `updateVariableDefinition`,
+  `retireVariable` (inline). Writes go through `lab.fn_set_variable` /
+  `fn_unset_variable` / `fn_define_variable`; static `normalizeVariableName`
+  mirrors `fn_canonical_variable`.
+- Retraction and housekeeping: `retractEvent(id, reason)` /
+  `retractArtifact(id, reason)` (through `lab.fn_retract`), `checkIntegrity()`
+  (`lab.fn_check_integrity()`), `addHusbandryBatch(T, OccurredAt=)` (one
+  weigh-in sheet in one transaction), `addArtifactFromFile(path,
+  ProducedByEventId=, StorageRootId=, RootPath=)` (computes size and SHA-256).
+- The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
+  Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
+  retract action (Ctrl+Delete), a daily husbandry entry grid (Ctrl+H) and an
+  integrity view (Ctrl+I); Ctrl+? lists the shortcuts. Its settings persist
+  through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →
@@ -234,7 +305,7 @@ walkthrough script, not an automated test, and assumes a reachable database.
   `CarasLabDB.m` itself with large method bodies.
 - Any official MathWorks toolbox may be assumed available (this project
   relies on Database Toolbox).
-- Use `getprefs` and `setprefs` to store user-specific configuration for all GUIs.
+- Use `getpref` and `setpref` to store user-specific configuration for all GUIs.
 - All GUIs should be efficient and intuitive --- avoid unnecessary clicks.
 - All GUIs should include keyboard shortcuts for common actions (e.g., Ctrl+S to save), including Ctrl+? to display a help dialog with the current keyboard shortcuts. Use similar keyboard shortcuts across all GUIs for consistency.
 - Use `uidatepicker​` entry fields in the Matlab GUI.
@@ -261,6 +332,11 @@ to exercise the code:
 - **Artifact verifier**: `python tools/verify_artifacts.py --root
   <storage_root name>=<mount path>` (connection from the `PG*` environment;
   needs psycopg). It only reads files and appends verification rows.
+- **Backup / restore**: as a PostgreSQL superuser, `python
+  tools/backup_lab.py -d lab <dir>` (`--check 26` to test freshness,
+  `--copy-to <dir>` for a second copy), then `python tools/restore_lab.py
+  <dir>/lab_<stamp>.dump lab_restored` (never overwrites; exit 0 when the row
+  counts match the manifest).
 - **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
   tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
   integration tests)

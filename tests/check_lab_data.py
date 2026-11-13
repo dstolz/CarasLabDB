@@ -3,17 +3,21 @@
 
 Two passes, both exiting non-zero on the first problem:
 
-1. Through the live server's own data path (server.fetch_lab_data), against
-   whatever rows the database holds: every collection is present, and every
-   row of every collection has exactly the keys the page uses, with
-   timestamps in the form it parses.
+1. Through the live server's own data path (server.fetch_payload: lab_data.sql
+   plus the integrity summary of lab_integrity.sql, spliced in as
+   ``integrity``), against whatever rows the database holds: every
+   collection is present, and every row of every collection has exactly the
+   keys the page uses, with timestamps in the form it parses.
 2. Through ``psql``, against a known fixture inserted and rolled back in the
    same transaction as the export, so the result does not depend on what the
    database happens to contain (an empty table makes pass 1 vacuous). The
    fixture has a corrected event, a corrected artifact with a verification,
-   a provenance edge and a tag, and the values that come back are compared
-   with the ones that went in. Nothing is left behind. It needs ``psql`` on
-   PATH and a role that may insert; ``--no-fixture`` skips it.
+   a provenance edge, a tag, variables set, updated and unset (numbers whose
+   exact text matters among them) and a retraction, and the values that come
+   back are compared with the ones that went in; the integrity summary is
+   compared with lab.fn_check_integrity() run in the same transaction.
+   Nothing is left behind. It needs ``psql`` on PATH and a role that may
+   insert; ``--no-fixture`` skips it.
 
     PGDATABASE=lab_test python tests/check_lab_data.py
 """
@@ -66,9 +70,18 @@ ROW_KEYS = {
              "created_by"},
     "tagAssignments": {"assignment_id", "entity_kind", "entity_id", "tag", "op", "note",
                        "applied_at", "applied_by"},
+    "variables": {"name", "label", "description", "units", "value_type", "applies_to",
+                  "retired_at", "created_at", "created_by"},
+    "variableValues": {"value_id", "entity_kind", "entity_id", "variable", "op", "value",
+                       "value_type", "note", "set_at", "set_by", "set_login"},
+    "retractions": {"retraction_id", "entity_kind", "entity_id", "reason", "retracted_at",
+                    "retracted_by", "retracted_login"},
 }
 ARRAYS = tuple(ROW_KEYS) + ("roleMeta",)
 VERIFICATION_KEYS = {"status", "verified_at", "verified_artifact_id"}
+INTEGRITY_KEYS = {"computed_at", "example_limit", "checks"}
+CHECK_KEYS = {"severity", "check_name", "count", "examples"}
+ENTITY_KINDS = ("event", "artifact", "subject", "session", "project")
 
 # collection -> {timestamp key: may it be null}
 TIMESTAMPS = {
@@ -80,6 +93,9 @@ TIMESTAMPS = {
     "tagNamespaces": {"created_at": False},
     "tags": {"retired_at": True, "created_at": False},
     "tagAssignments": {"applied_at": False},
+    "variables": {"retired_at": True, "created_at": False},
+    "variableValues": {"set_at": False},
+    "retractions": {"retracted_at": False},
 }
 # UTC ISO-8601 with a literal Z, the one form the page compares as text.
 TS = re.compile(r"^\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{6})?Z$")
@@ -97,7 +113,7 @@ def check_shape(data, source):
     def bad(msg):
         fail("[%s] %s" % (source, msg))
 
-    expected = set(ARRAYS) | {"NOW"}
+    expected = set(ARRAYS) | {"NOW", "integrity"}
     if set(data) != expected:
         bad("keys differ: missing %s, extra %s"
             % (sorted(expected - set(data)), sorted(set(data) - expected)))
@@ -158,6 +174,69 @@ def check_shape(data, source):
         if not isinstance(r["tag"], str) or ":" not in r["tag"]:
             bad("tag assignment %s tag is %r" % (r["assignment_id"], r["tag"]))
 
+    for v in data["variables"]:
+        if v["value_type"] not in ("number", "text"):
+            bad("variable %r value_type is %r" % (v["name"], v["value_type"]))
+        if not isinstance(v["applies_to"], list):
+            bad("variable %r applies_to is not an array" % v["name"])
+    names = {v["name"] for v in data["variables"]}
+    last_id = 0
+    for r in data["variableValues"]:
+        vid = r["value_id"]
+        if isinstance(vid, bool) or not isinstance(vid, int) or vid <= last_id:
+            bad("variable value %r: value_id is not an integer in ascending order" % vid)
+        last_id = vid
+        if r["entity_kind"] not in ENTITY_KINDS or not isinstance(r["entity_id"], str):
+            bad("variable value %s has a bad entity" % vid)
+        if r["variable"] not in names:
+            bad("variable value %s names an unknown variable %r" % (vid, r["variable"]))
+        if r["op"] == "set":
+            # the value travels as the text the database stored, never a JSON number
+            if not isinstance(r["value"], str) or r["value"] == "":
+                bad("variable value %s: a 'set' row's value is %r, not text" % (vid, r["value"]))
+        elif r["op"] == "unset":
+            if r["value"] is not None:
+                bad("variable value %s: an 'unset' row carries %r" % (vid, r["value"]))
+        else:
+            bad("variable value %s op is %r" % (vid, r["op"]))
+        if r["value_type"] not in ("number", "text"):
+            bad("variable value %s value_type is %r" % (vid, r["value_type"]))
+    for r in data["retractions"]:
+        if r["entity_kind"] not in ("event", "artifact") or not isinstance(r["entity_id"], str):
+            bad("retraction %r has a bad entity" % r["retraction_id"])
+        if not isinstance(r["reason"], str) or not r["reason"].strip():
+            bad("retraction %r has no reason" % r["retraction_id"])
+
+    integ = data["integrity"]
+    if not isinstance(integ, dict):
+        bad("integrity is %r, not an object" % (integ,))
+    if "error" in integ:
+        bad("integrity summary unavailable: %s" % integ["error"])
+    if set(integ) != INTEGRITY_KEYS:
+        bad("integrity keys differ: %s" % sorted(integ))
+    if not TS.match(str(integ["computed_at"])):
+        bad("integrity.computed_at is %r" % integ["computed_at"])
+    limit = integ["example_limit"]
+    checks = integ["checks"]
+    if not isinstance(checks, list):
+        bad("integrity.checks is not an array")
+    order = [(0 if c.get("severity") == "error" else 1, c.get("check_name")) for c in checks]
+    if order != sorted(order):
+        bad("integrity checks are not errors first, then by name")
+    for c in checks:
+        if set(c) != CHECK_KEYS:
+            bad("integrity check keys differ: %s" % sorted(c))
+        if c["severity"] not in ("error", "warning"):
+            bad("check %s severity is %r" % (c["check_name"], c["severity"]))
+        if isinstance(c["count"], bool) or not isinstance(c["count"], int) or c["count"] < 1:
+            bad("check %s count is %r" % (c["check_name"], c["count"]))
+        ex = c["examples"]
+        if not isinstance(ex, list) or len(ex) != min(c["count"], limit):
+            bad("check %s: %d examples for %d rows (limit %r)"
+                % (c["check_name"], len(ex) if isinstance(ex, list) else -1, c["count"], limit))
+        if any(not isinstance(x, dict) or set(x) != {"subject", "detail"} for x in ex):
+            bad("check %s examples are not {subject, detail} objects" % c["check_name"])
+
 
 # --------------------------------------------------------------------------
 # Pass 2: a known fixture, inserted and rolled back around the export.
@@ -202,6 +281,18 @@ BEGIN
     INSERT INTO lab.analysis_event (event_id, status) VALUES (an, 'succeeded');
     INSERT INTO lab.event_input (event_id, artifact_id, role) VALUES (an, a2, 'raw');
     PERFORM lab.fn_tag('artifact', a2::text, 'stage:raw');
+    -- variables: a number whose text matters, updated; a text value, unset;
+    -- a number too long for a double
+    PERFORM lab.fn_set_variable('session', sess::text, 'check_lab_data depth', 1200,
+                                p_units => 'um', p_label => 'CLD depth');
+    PERFORM lab.fn_set_variable('session', sess::text, 'check_lab_data depth', 1350.50,
+                                p_note => 'remeasured');
+    PERFORM lab.fn_set_variable('subject', '%(subject)s', 'check_lab_data housing', p_text => 'pair');
+    PERFORM lab.fn_unset_variable('subject', '%(subject)s', 'check_lab_data housing');
+    PERFORM lab.fn_set_variable('artifact', a2::text, 'check_lab_data gain',
+                                12345678901234567890.123456789);
+    -- the analysis withdrawn
+    PERFORM lab.fn_retract('event', an, 'check_lab_data retraction');
 END
 $fx$;
 """ % {"subject": FX_SUBJECT, "path": FX_PATH, "occurred": FX_OCCURRED, "size": FX_SIZE}
@@ -212,18 +303,26 @@ def export_with_fixture():
     env.setdefault("PGDATABASE", "lab")
     env["PGTZ"] = server.SESSION_TIME_ZONE
     env["PGCLIENTENCODING"] = "UTF8"
-    script = "BEGIN;\n" + FIXTURE + server.SQL.rstrip() + "\nROLLBACK;\n"
+    # The export, the integrity summary and fn_check_integrity's own counts,
+    # all in the fixture's transaction: three lines of output.
+    script = ("BEGIN;\n" + FIXTURE + server.SQL.rstrip() + "\n"
+              + server.INTEGRITY_SQL.rstrip() + "\n"
+              + "SELECT coalesce(json_object_agg(severity || '/' || check_name, n), '{}'::json)"
+              " FROM (SELECT severity, check_name, count(*) AS n"
+              " FROM lab.fn_check_integrity() GROUP BY 1, 2) c;\n"
+              + "ROLLBACK;\n")
     proc = subprocess.run(["psql", "-tAXq", "-v", "ON_ERROR_STOP=1"], input=script,
                           capture_output=True, text=True, encoding="utf-8", env=env)
     if proc.returncode != 0:
         fail("[fixture] psql failed: " + (proc.stderr.strip() or "no message"))
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    if not lines:
-        fail("[fixture] psql returned no rows")
-    return json.loads(lines[-1])
+    if len(lines) < 3:
+        fail("[fixture] psql returned %d rows, expected 3" % len(lines))
+    data = json.loads(server.merge_payload(lines[-3], lines[-2]))
+    return data, json.loads(lines[-1])
 
 
-def check_fixture(data):
+def check_fixture(data, integrity_counts):
     def bad(msg):
         fail("[fixture] " + msg)
 
@@ -284,21 +383,52 @@ def check_fixture(data):
     if [(r["tag"], r["op"]) for r in tags] != [("stage:raw", "add")]:
         bad("the fixture's tag assignment came back as %r" % tags)
 
+    # variables: the log in order, each value as the exact text stored
+    defs = {v["name"]: v for v in data["variables"]}
+    depth = defs.get("check_lab_data depth")
+    if not depth or (depth["label"], depth["units"], depth["value_type"]) != ("CLD depth", "um", "number"):
+        bad("the fixture's variable definition came back as %r" % depth)
+    if not isinstance(depth["applies_to"], list) or "session" not in depth["applies_to"]:
+        bad("variable applies_to came back as %r" % depth["applies_to"])
+    mine = [(r["entity_kind"], r["entity_id"], r["variable"], r["op"], r["value"], r["note"])
+            for r in data["variableValues"] if r["variable"].startswith("check_lab_data ")]
+    want = [("session", sessions[0]["session_id"], "check_lab_data depth", "set", "1200", None),
+            ("session", sessions[0]["session_id"], "check_lab_data depth", "set", "1350.50", "remeasured"),
+            ("subject", FX_SUBJECT, "check_lab_data housing", "set", "pair", None),
+            ("subject", FX_SUBJECT, "check_lab_data housing", "unset", None, None),
+            ("artifact", a_new[0]["artifact_id"], "check_lab_data gain", "set",
+             "12345678901234567890.123456789", None)]
+    if mine != want:
+        bad("the fixture's variable log came back as %r" % mine)
+
+    # the retraction
+    rets = [r for r in data["retractions"] if r["entity_id"] == consumer[0]["event_id"]]
+    if [(r["entity_kind"], r["reason"]) for r in rets] != [("event", "check_lab_data retraction")]:
+        bad("the fixture's retraction came back as %r" % rets)
+
+    # the integrity summary agrees with lab.fn_check_integrity() itself
+    got = {"%s/%s" % (c["severity"], c["check_name"]): c["count"]
+           for c in data["integrity"]["checks"]}
+    if got != integrity_counts:
+        bad("integrity summary %r differs from lab.fn_check_integrity() %r"
+            % (got, integrity_counts))
+
 
 def main():
-    data = json.loads(server.fetch_lab_data(server.SQL))
+    data = json.loads(server.fetch_payload())
     check_shape(data, "database")
-    summary = "%d events, %d artifacts, %d tag assignments" % (
-        len(data["events"]), len(data["artifacts"]), len(data["tagAssignments"]))
+    summary = "%d events, %d artifacts, %d tag assignments, %d variable values, %d checks" % (
+        len(data["events"]), len(data["artifacts"]), len(data["tagAssignments"]),
+        len(data["variableValues"]), len(data["integrity"]["checks"]))
     if "--no-fixture" in sys.argv[1:]:
         print("check_lab_data: OK (%s; fixture pass skipped)" % summary)
         return
     if shutil.which("psql") is None:
         fail("psql is not on PATH, so the fixture pass cannot run "
              "(--no-fixture checks only the rows already in the database)")
-    fixture = export_with_fixture()
+    fixture, integrity_counts = export_with_fixture()
     check_shape(fixture, "fixture")
-    check_fixture(fixture)
+    check_fixture(fixture, integrity_counts)
     print("check_lab_data: OK (%s; fixture round trip verified)" % summary)
 
 

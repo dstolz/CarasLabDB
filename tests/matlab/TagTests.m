@@ -1297,6 +1297,14 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             tc.verifyEqual(tc.currentTags("event", v.newWEid), "qc:pass");
             tc.verifyCarried("event", v.newWEid, v.wEid);
             tc.verifySubstring(out, "active events: ");
+
+            % Its variables and retraction steps.
+            tc.verifySubstring(out, "rows with a probe depth: ");
+            T = db.getVariables("session", v.sid);
+            tc.verifyEqual(double(T.value_num(string(T.variable) == "probe depth")), 1350);
+            tc.verifyEqual(height(db.getVariables("session", v.sid, History=true)), 2);
+            tc.verifyEqual(height(db.getEvents(EventId=v.dupEid)), 0, "the duplicate weight was retracted");
+            tc.verifyEqual(string(db.getRetractions(EventId=v.dupEid).reason), "entered twice");
         end
     end
 

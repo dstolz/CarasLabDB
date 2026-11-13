@@ -54,6 +54,8 @@ function newEventId = supersedeEvent(obj, oldEventId, opts)
 %       the same tag filters. Retired tags cannot be assigned and are
 %       skipped with a CarasLabDB:retiredTagsNotCarried warning
 %       (fn_check_integrity then reports tag_not_carried_forward).
+%   The current variables of the event and of each re-pointed artifact are
+%   copied to the new rows by the database itself (see GETVARIABLES).
 %
 %   Returns the new event_id (uuid string).
 %

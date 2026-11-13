@@ -229,8 +229,9 @@ UPDATE lab.person SET is_active = false WHERE db_login = 'jdoe';
 `ALTER ROLE jdoe LOGIN` re-enables it. The privileges live on `lab_rw`, so
 no grant changes are needed either way.
 
-Seed the reference rows (`storage_root`, `species`, ...) before real use; as
-owner-only tables, those are inserted by the administrator.
+Seed the reference rows (`storage_root`, `species`, ...) before real use.
+Members may add rows to the reference tables, but only the owner can edit
+them afterwards (`lab_rw` has no `UPDATE` there).
 
 ### 1.5 Network access: `pg_hba.conf` and Windows Firewall
 
@@ -586,7 +587,9 @@ hashes. Standard library only.
     D:\CarasLabDB\backups
 ```
 
-- `D:\CarasLabDB\backups` must be on a different disk from the PostgreSQL
+- Both directories must exist before the first run (the script does not
+  create them).
+- `D:\CarasLabDB\backups` should be on a different disk from the PostgreSQL
   data directory if possible; the `--copy-to` directory must be **off the
   machine** (a file share the service account can write, or wherever IT
   keeps backups: **confirm with IT**).

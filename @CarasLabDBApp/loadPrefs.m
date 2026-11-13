@@ -69,4 +69,5 @@ function d = local_defaults()
     d.SqlHistory   = strings(0,1);
     d.LastSql      = "SELECT * FROM lab.subject_current;";
     d.LastTagFilter = "";                % Tags field, e.g. "stage:raw -qc:fail"
+    d.LowWeightPercent = 85;             % daily husbandry: flag a weight below this % of baseline
 end

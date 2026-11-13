@@ -169,8 +169,8 @@ ALTER ROLE jdoe NOLOGIN;
 UPDATE lab.person SET is_active = false WHERE db_login = 'jdoe';
 ```
 
-Seed your reference rows (`storage_root`, `species`, ...) as `lab_admin`
-before real use. Renaming a subject is `SELECT lab.fn_rename_subject('old',
+Seed your reference rows (`storage_root`, `species`, ...) before real use;
+members may add them, but only `lab_admin` can edit them afterwards. Renaming a subject is `SELECT lab.fn_rename_subject('old',
 'new')` as `lab_admin`; `lab_rw` cannot change a `subject_id`.
 
 ### 1.5 Allow network connections (only if the DB serves other machines)
