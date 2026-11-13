@@ -2,7 +2,8 @@
 -- Role and privilege assertions for design_docs/grants.sql
 -- ============================================================================
 -- Run as a superuser against a database that has had schema.sql and then
--- grants.sql applied:
+-- grants.sql applied and holds NO DATA (a scratch database, never the lab's:
+-- the assertions count rows and would fail, harmlessly, on one that has any):
 --
 --     psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/roles_test.sql
 --

@@ -34,9 +34,16 @@ data. It has six parts:
   against the `lab` schema) and assigns the result to `window.LAB_DATA` instead
   of generating it. The SQL emits the whole `LAB_DATA` shape as one JSON object
   — one array per table, each event with its detail row as `detail`, each
-  artifact with its latest `verification`, the tag vocabulary as
-  `tagNamespaces`/`tags` and the whole tag log as `tagAssignments` (current
-  tags are derived in the browser, like `tag_current`). `web/live/lab-dashboard-live.html`
+  artifact with its file's latest `verification`, the tag vocabulary as
+  `tagNamespaces`/`tags` and the whole tag log as `tagAssignments`, the
+  variable definitions as `variables` and the whole value log as
+  `variableValues` (values as text, exactly as stored), and `retractions`.
+  Current tags, current variable values and "active" are derived in the
+  browser, in the same way as `tag_current`, `variable_current` and the
+  `*_active` views. The `integrity` summary is not in `lab_data.sql`: it comes
+  from `web/live/lab_integrity.sql`, which `server.py` runs on its own
+  5-minute cache and splices into the payload (`server.py --dump` prints the
+  full payload). `web/live/lab-dashboard-live.html`
   is *generated* from the offline demo (swap the synthetic `<script>` for the
   loader, wrap the app IIFE as `window.__initDashboard`); regenerate it if the
   offline demo's app logic changes, rather than editing it by hand. The
