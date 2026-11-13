@@ -14,7 +14,7 @@ complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
 ## 1. Overview & ER diagram
 
-The schema has six layers:
+The schema has seven layers:
 
 1. **Reference tables** — mostly-static vocabulary and registries (`person`,
    `probe`, `pipeline`, `storage_root`, `species`, and the categorical lookups
@@ -33,6 +33,13 @@ The schema has six layers:
    and an append-only log (`tag_assignment`) of which labels were put on which
    event, artifact, subject, session or project. Current tags are derived from
    the log by a view (§3.7).
+7. **Variables** — user-defined named values (`probe depth` = 1250 µm on a
+   session): definitions (`variable`) and an append-only log of values set
+   and unset (`variable_value`), with current values derived by a view
+   (§3.8). Same shape as tags.
+
+Alongside the event log, `retraction` records events and artifacts withdrawn
+as entered in error (§4.3).
 
 ```mermaid
 erDiagram
@@ -79,6 +86,15 @@ erDiagram
     subject      |o--o{ tag_assignment   : tagged
     session      |o--o{ tag_assignment   : tagged
     project      |o--o{ tag_assignment   : tagged
+
+    variable     ||--o{ variable_value   : valued_as
+    event        |o--o{ variable_value   : carries
+    artifact     |o--o{ variable_value   : carries
+    subject      |o--o{ variable_value   : carries
+    session      |o--o{ variable_value   : carries
+    project      |o--o{ variable_value   : carries
+    event        |o--o| retraction       : withdrawn_by
+    artifact     |o--o| retraction       : withdrawn_by
 ```
 
 ---
@@ -104,6 +120,8 @@ erDiagram
   change. Structured, frequently-queried data gets real columns
   (`analysis_event.parameters`, `recording_event.hardware_config`,
   `probe.geometry` are the JSONB exceptions where the shape is genuinely open).
+  Named values that lab members want to set, read and compare, with units
+  and history, are variables (§3.8) rather than `attributes` keys.
 - **Timestamps** are `timestamptz`; store UTC. **Text** uses `text`, not
   `varchar(n)`.
 - **Everything is schema-qualified** (`lab.<table>`) so the DDL is
@@ -117,7 +135,7 @@ erDiagram
 
 | Table | Purpose |
 |---|---|
-| `person` | Lab members. Referenced by `event.recorded_by`, `surgery_event.surgeon_id`, and every `*_by` column. |
+| `person` | Lab members. Referenced by `event.recorded_by`, `surgery_event.surgeon_id`, and every `*_by` column. `db_login` names the database login the person connects with (unique where set); `lab.fn_current_person()` maps the connected login back to the person (§4). Only the administrator sets it: `grants.sql` withholds the column, and `UPDATE` on the table, from `lab_rw`. |
 | `storage_root` | Named NAS roots. Paths elsewhere are stored **relative** to a root so they resolve across machines/OSes; the per-OS mount point lives in client config, not the DB. |
 | `species` | Species vocabulary for `subject`. |
 | `probe` | Electrode/probe device registry, including channel geometry as JSONB. Referenced by surgeries (implant) and recordings (acquisition device). |
