@@ -831,8 +831,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             n0 = tc.Fx.counts();
             tc.verifyError(@() db.addTag("artifact", aid, ["topic:retry_first", "topic:retry_flaky"]), ...
                 "CarasLabDB:transactionInterrupted");
-            tc.verifyEqual(double(tc.Fx.scalar("SELECT last_value AS n FROM public.mt_retry_seq")), 2, ...
-                "the driver ran the failing statement a second time");
+            S = admin.runQuery("SELECT last_value AS n FROM public.mt_retry_seq");   % the admin owns it
+            tc.verifyEqual(double(S.n), 2, "the driver ran the failing statement a second time");
             tc.verifyEqual(tc.Fx.counts(), n0, "an interrupted transaction left rows behind");
             tc.verifyEmpty(tc.currentTags("artifact", aid));
             tc.verifyEqual(string(db.Connection.AutoCommit), "on");
