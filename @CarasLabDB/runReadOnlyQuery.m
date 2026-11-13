@@ -5,6 +5,9 @@ function T = runReadOnlyQuery(obj, sql)
 %   in a Postgres "READ ONLY" transaction so any write (INSERT/UPDATE/DELETE/
 %   DDL) in the statement is rejected by the database itself. The transaction
 %   is always rolled back, so nothing is committed regardless of content.
+%   After the statement it checks that the transaction is still the
+%   read-only one; if it is not, the result is withheld
+%   (CarasLabDB:notReadOnly).
 %
 %   This is the safe execution path for user-supplied SQL (e.g. the Custom SQL
 %   panel of @CarasLabDBApp), complementing any caller-side syntactic guard.
@@ -38,22 +41,40 @@ function T = runReadOnlyQuery(obj, sql)
     end
     restore = onCleanup(@() obj.pRestoreAutoCommit(conn, priorAutoCommit));
     conn.AutoCommit = 'off';
+    readOnly = false;
     try
-        % START TRANSACTION rather than SET TRANSACTION: the latter errors if
-        % no transaction block is open yet, and whether the native postgresql()
-        % interface has already opened one is driver-dependent.
-        execute(conn, "START TRANSACTION READ ONLY;");
+        % The driver opens the transaction itself when AutoCommit is turned
+        % off, so this is SET TRANSACTION, not START TRANSACTION (a second
+        % START draws "there is already a transaction in progress").
+        execute(conn, "SET TRANSACTION READ ONLY;");
         % An unbounded query from the Custom SQL panel (a cartesian product, a
         % catastrophic regex, pg_sleep) would otherwise pin a backend and block
         % MATLAB in fetch() with no way to cancel.
         execute(conn, "SET LOCAL statement_timeout = '60s';");
         T = fetch(conn, sql);
+        % Both settings last only as long as the transaction they were made
+        % in. If the driver ended that transaction and ran the statement in
+        % another, this says so.
+        R = fetch(conn, "SELECT current_setting('transaction_read_only') AS read_only");
+        readOnly = height(R) == 1 && isequal(CarasLabDB.pColText(R.read_only(1)), "on");
         rollback(conn);
     catch ME
+        % After a failed statement the driver has already rolled back and
+        % has no transaction open; the SELECT gives ROLLBACK one to end, so
+        % the server does not log "there is no transaction in progress".
+        try
+            execute(conn, "SELECT 1;");
+        catch
+        end
         try
             rollback(conn);
         catch
         end
         rethrow(ME);
+    end
+    if ~readOnly
+        error("CarasLabDB:notReadOnly", ...
+            "The statement did not run inside the read-only transaction, so its " + ...
+            "result is withheld. Anything it changed has been rolled back.");
     end
 end

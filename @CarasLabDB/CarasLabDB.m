@@ -320,11 +320,15 @@ classdef CarasLabDB < handle
     methods
         function T = runQuery(obj, sql)
             %RUNQUERY Execute a SELECT (or any row-returning) statement, return a table.
+            %   A trailing semicolon is removed before the statement is sent:
+            %   the driver first wraps it as "SELECT * FROM (<sql>) as temp
+            %   LIMIT 0" to learn the column types, and with the semicolon
+            %   that is a syntax error in the server's log for every query.
             arguments
                 obj (1,1) CarasLabDB
                 sql (1,1) string
             end
-            T = fetch(obj.Connection, sql);
+            T = obj.pSelect(sql);
         end
 
         function runCommand(obj, sql)
@@ -1123,7 +1127,7 @@ classdef CarasLabDB < handle
                 opts.SetBy (1,1) string = string(missing)
             end
             name = CarasLabDB.normalizeVariableName(name);
-            R = obj.pSelect("SELECT " + obj.pT("fn_unset_variable") + "(" + ...
+            R = obj.pWrite("SELECT " + obj.pT("fn_unset_variable") + "(" + ...
                 obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + ", " + ...
                 obj.sqlLiteral(name) + ", " + obj.sqlLiteral(opts.Note) + ", " + ...
                 obj.sqlLiteral(obj.pCreatedBy(opts.SetBy)) + "::uuid) AS value_id;");
@@ -1394,7 +1398,27 @@ classdef CarasLabDB < handle
         end
 
         function T = pSelect(obj, sql)
-            T = fetch(obj.Connection, sql);
+            %PSELECT A read: one SELECT, as a table. Never used for a statement that writes.
+            %   The Database Toolbox learns a result's column types by first
+            %   sending "SELECT * FROM (<sql>) as temp LIMIT 0". A trailing
+            %   semicolon makes that probe a syntax error, which the server
+            %   logs for every query; so it is removed here.
+            T = fetch(obj.Connection, regexprep(sql, ";\s*$", ""));
+        end
+
+        function T = pWrite(obj, sql)
+            %PWRITE One statement that writes and returns rows; always inside a transaction.
+            %   INSERT / UPDATE ... RETURNING and SELECT lab.fn_...() are sent
+            %   through here. Inside a transaction that has already executed
+            %   a statement the driver does not send its LIMIT 0 probe (see
+            %   PSELECT), so the statement reaches the server once, as
+            %   written, and no failed probe is logged. Outside PTRANSACT
+            %   this starts a transaction of its own.
+            if strcmpi(string(obj.Connection.AutoCommit), "off")
+                T = fetch(obj.Connection, sql);
+            else
+                T = obj.pTransact(@() fetch(obj.Connection, sql));
+            end
         end
 
         function pExec(obj, sql)
@@ -1414,7 +1438,7 @@ classdef CarasLabDB < handle
             [cols, vals] = obj.pColsVals(s);
             sql = "INSERT INTO " + tableRef + " (" + strjoin(cols, ", ") + ...
                 ") VALUES (" + strjoin(vals, ", ") + ") RETURNING " + string(returningCol) + ";";
-            T = obj.pSelect(sql);
+            T = obj.pWrite(sql);
             if height(T) == 0
                 error("CarasLabDB:insertFailed", "Insert into %s returned no rows.", tableRef);
             end
@@ -1448,7 +1472,7 @@ classdef CarasLabDB < handle
             assignments = cols + " = " + vals;
             sql = "UPDATE " + tableRef + " SET " + strjoin(assignments, ", ") + ...
                 " WHERE " + whereClause + " RETURNING " + keyCol + ";";
-            n = height(obj.pSelect(sql));
+            n = height(obj.pWrite(sql));
         end
 
         function eventId = pInsertEvent(obj, base, detailTable, detail, opts)
@@ -1588,7 +1612,7 @@ classdef CarasLabDB < handle
                 error("CarasLabDB:reasonRequired", ...
                     "A reason is required to retract an %s: say why the row is withdrawn.", kind);
             end
-            R = obj.pSelect("SELECT " + obj.pT("fn_retract") + "(" + ...
+            R = obj.pWrite("SELECT " + obj.pT("fn_retract") + "(" + ...
                 obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + "::uuid, " + ...
                 obj.sqlLiteral(reason) + ", " + ...
                 obj.sqlLiteral(obj.pCreatedBy(by)) + "::uuid) AS retraction_id;");
@@ -1653,7 +1677,18 @@ classdef CarasLabDB < handle
             %   statements go through obj.Connection with AutoCommit off; the
             %   prior AutoCommit mode is restored however this exits (onCleanup).
             %   Every multi-statement write of this class goes through here, so
-            %   none of them can commit half its rows.
+            %   none of them can commit half its rows; so does every single
+            %   statement that writes and returns rows (PWRITE).
+            %
+            %   The transaction is marked when it starts and the mark is
+            %   checked before COMMIT. When a statement fails, the Database
+            %   Toolbox rolls the transaction back by itself and starts
+            %   another, unannounced, for whatever is sent next. Code that
+            %   carried on after such a failure would otherwise commit the
+            %   second half of its work without the first; with the check the
+            %   commit is refused (CarasLabDB:transactionInterrupted) and
+            %   nothing is written. Do not catch a database error inside FN
+            %   and continue.
             arguments
                 obj (1,1) CarasLabDB
                 fn (1,1) function_handle
@@ -1670,13 +1705,35 @@ classdef CarasLabDB < handle
                     "progress on this connection. Commit or roll it back first.");
             end
             conn.AutoCommit = 'off';
+            [~, marker] = fileparts(tempname);
+            marker = "tx_" + string(marker);
             try
+                % The transaction's first statement. SET LOCAL lasts exactly
+                % as long as the transaction it is issued in. It is sent with
+                % execute, after which the driver no longer precedes a fetch
+                % with its LIMIT 0 probe (see PSELECT).
+                execute(conn, "SET LOCAL caraslabdb.txn = " + obj.sqlLiteral(marker) + ";");
                 out = fn();
+                M = fetch(conn, "SELECT current_setting('caraslabdb.txn', true) AS marker");
+                if height(M) ~= 1 || ~isequal(CarasLabDB.pColText(M.marker(1)), marker)
+                    error("CarasLabDB:transactionInterrupted", ...
+                        "The transaction was rolled back part-way (a statement in it " + ...
+                        "failed), so it was not committed and nothing was written. " + ...
+                        "Correct the cause and repeat the whole operation.");
+                end
                 commit(conn);
             catch ME
-                % A failing rollback (dead connection, already-aborted
-                % transaction) must not replace the constraint violation the
-                % caller actually needs to see.
+                % After a failed statement the driver has already rolled
+                % back, and it opens the next transaction only when another
+                % statement is sent; a ROLLBACK now would draw "there is no
+                % transaction in progress" from the server. The SELECT makes
+                % sure there is one to roll back.
+                try
+                    execute(conn, "SELECT 1;");
+                catch
+                end
+                % A failing rollback (dead connection) must not replace the
+                % constraint violation the caller actually needs to see.
                 try
                     rollback(conn);
                 catch
@@ -1761,7 +1818,7 @@ classdef CarasLabDB < handle
 
         function id = pFnTag(obj, kind, entityId, tag, op, note, by)
             %PFNTAG One call of lab.fn_tag; returns the assignment_id it wrote.
-            R = obj.pSelect("SELECT " + obj.pT("fn_tag") + "(" + ...
+            R = obj.pWrite("SELECT " + obj.pT("fn_tag") + "(" + ...
                 obj.sqlLiteral(kind) + ", " + obj.sqlLiteral(entityId) + ", " + ...
                 obj.sqlLiteral(tag) + ", " + obj.sqlLiteral(op) + ", " + ...
                 obj.sqlLiteral(note) + ", " + obj.sqlLiteral(by) + "::uuid) AS assignment_id;");

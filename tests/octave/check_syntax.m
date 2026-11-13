@@ -11,7 +11,8 @@ function check_syntax(root)
 %   file parsed.
   warning('off', 'all');
   files = [glob(fullfile(root, '@CarasLabDB', '*.m')); glob(fullfile(root, '@CarasLabDBApp', '*.m')); ...
-           glob(fullfile(root, 'tests', 'matlab', '*.m')); glob(fullfile(root, 'examples', '*.m'))];
+           glob(fullfile(root, 'tests', '*.m')); glob(fullfile(root, 'tests', 'matlab', '*.m')); ...
+           glob(fullfile(root, 'tests', 'matlab', '*', '*.m')); glob(fullfile(root, 'examples', '*.m'))];
   classes = {'CarasLabDB', 'CarasLabDBApp'};
   nbad = 0;
   nchecked = 0;

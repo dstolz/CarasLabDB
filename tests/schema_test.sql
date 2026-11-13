@@ -1090,5 +1090,24 @@ SELECT pg_temp.assert(
         = '00000000-0000-0000-0000-0000000000a1',
     'a row that names no person is attributed to the login''s person; a named person is kept');
 
+-- ---------------------------------------------------------------------------
+-- Client metadata probes
+-- ---------------------------------------------------------------------------
+-- MATLAB's Database Toolbox learns a result's column types by first sending a
+-- statement as "SELECT * FROM (<statement>) as temp LIMIT 0". Such a probe
+-- around a call of a write function must write nothing.
+CREATE TEMP TABLE probe_before AS
+SELECT (SELECT count(*) FROM lab.variable_value) AS n_values,
+       (SELECT count(*) FROM lab.variable)       AS n_variables,
+       (SELECT count(*) FROM lab.tag_assignment) AS n_tags;
+SELECT * FROM (SELECT lab.fn_set_variable('subject', 'G2-renamed', 'probe test', 1.0) AS value_id) as temp LIMIT 0;
+SELECT * FROM (SELECT 1 AS ok FROM lab.fn_set_variable('subject', 'G2-renamed', 'probe test', 2.0)) as temp LIMIT 0;
+SELECT * FROM (SELECT lab.fn_tag('subject', 'G2-renamed', 'topic:probe_test', 'add') AS assignment_id) as temp LIMIT 0;
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.variable_value) = (SELECT n_values FROM probe_before)
+    AND (SELECT count(*) FROM lab.variable) = (SELECT n_variables FROM probe_before)
+    AND (SELECT count(*) FROM lab.tag_assignment) = (SELECT n_tags FROM probe_before),
+    'a LIMIT 0 probe around a write function writes nothing');
+
 ROLLBACK;
 \echo 'schema_test.sql: all assertions passed'

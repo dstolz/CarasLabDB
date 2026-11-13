@@ -155,3 +155,62 @@ jobs:
 
       - name: Parse every MATLAB file
         run: python3 tests/check_matlab_syntax.py
+
+  # The MATLAB class and GUI, run in MATLAB. The repository is public, so the
+  # The MATLAB class and GUI, run in MATLAB (tests/matlab, about five minutes
+  # per release). MathWorks actions license MATLAB and the Database Toolbox
+  # without a token because the repository is public; a private repository
+  # would need a batch licensing token in MLM_LICENSE_TOKEN. The PostgreSQL
+  # service lets the database-backed tests run: tests/matlab/LabScratchDb.m
+  # creates and drops its own scratch database. The GUI tests open uifigures,
+  # which need a display; Xvfb provides one.
+  matlab:
+    name: MATLAB tests (${{ matrix.release }})
+    # Pinned: MathWorks lists the Ubuntu versions each release supports, and
+    # ubuntu-latest moves ahead of them.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # R2024b is the oldest release the class supports.
+        release: [R2024b, R2025a, latest]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      CARASLABDB_MTEST_ADMIN: postgres
+      CARASLABDB_MTEST_ADMIN_PASSWORD: postgres
+      CARASLABDB_MTEST_HOST: localhost
+      CARASLABDB_MTEST_PORT: "5432"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the psql client and a virtual display
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-client xvfb
+
+      - name: Start the virtual display
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v3
+        with:
+          release: ${{ matrix.release }}
+          products: Database_Toolbox
+          cache: true
+
+      - name: Run the MATLAB tests
+        uses: matlab-actions/run-command@v3
+        timeout-minutes: 15
+        with:
+          command: addpath("tests"); run_matlab_tests

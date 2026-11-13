@@ -804,6 +804,61 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             tc.verifyTrue(ismember("topic:after_failure", tc.currentTags("event", e)));
         end
 
+        function retriedStatementCannotHalfCommit(tc)
+            % When a fetch fails inside a transaction the Database Toolbox
+            % rolls the transaction back, starts another and runs the
+            % statement again. Here the second of two tags fails once and
+            % then succeeds. Without the transaction mark of pTransact the
+            % first tag would be lost, the second committed, and the call
+            % would report success. With it nothing is written.
+            db = tc.requireDb();
+            admin = tc.Fx.Admin;
+            w = tc.Fx.makeWorld("retry", 1);
+            aid = w.ArtifactIds(1);
+            db.registerTag("topic:retry_first");
+            db.registerTag("topic:retry_flaky");
+            admin.runCommand("CREATE SEQUENCE public.mt_retry_seq");
+            tc.addTeardown(@() admin.runCommand("DROP SEQUENCE IF EXISTS public.mt_retry_seq"));
+            admin.runCommand("CREATE FUNCTION public.mt_retry_once() RETURNS trigger " + ...
+                "LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$ " + ...
+                "BEGIN IF NEW.tag = 'topic:retry_flaky' AND pg_catalog.nextval('public.mt_retry_seq') = 1 " + ...
+                "THEN RAISE EXCEPTION 'fails the first time only (test)'; END IF; RETURN NEW; END $f$");
+            tc.addTeardown(@() admin.runCommand("DROP FUNCTION IF EXISTS public.mt_retry_once()"));
+            admin.runCommand("CREATE TRIGGER mt_retry_once BEFORE INSERT ON lab.tag_assignment " + ...
+                "FOR EACH ROW EXECUTE FUNCTION public.mt_retry_once()");
+            tc.addTeardown(@() admin.runCommand("DROP TRIGGER IF EXISTS mt_retry_once ON lab.tag_assignment"));
+
+            n0 = tc.Fx.counts();
+            tc.verifyError(@() db.addTag("artifact", aid, ["topic:retry_first", "topic:retry_flaky"]), ...
+                "CarasLabDB:transactionInterrupted");
+            S = admin.runQuery("SELECT last_value AS n FROM public.mt_retry_seq");   % the admin owns it
+            tc.verifyEqual(double(S.n), 2, "the driver ran the failing statement a second time");
+            tc.verifyEqual(tc.Fx.counts(), n0, "an interrupted transaction left rows behind");
+            tc.verifyEmpty(tc.currentTags("artifact", aid));
+            tc.verifyEqual(string(db.Connection.AutoCommit), "on");
+
+            % Repeating the whole operation, as the message says, works.
+            db.addTag("artifact", aid, ["topic:retry_first", "topic:retry_flaky"]);
+            tc.verifyEqual(tc.currentTags("artifact", aid), ["topic:retry_first"; "topic:retry_flaky"]);
+        end
+
+        function readOnlyQueryRefusesWrites(tc)
+            % runReadOnlyQuery returns rows; a write is refused by the
+            % database itself, nothing is written, AutoCommit is back on.
+            db = tc.requireDb();
+            T = db.runReadOnlyQuery("SELECT count(*) AS n FROM lab.event_type;");
+            tc.verifyGreaterThan(double(T.n), 0);
+            n0 = tc.Fx.counts();
+            err = tc.errorOf(@() db.runReadOnlyQuery( ...
+                "INSERT INTO lab.tag (tag) VALUES ('topic:must_not_exist') RETURNING tag"));
+            tc.verifySubstring(string(err.message), "read-only transaction");
+            tc.verifyEqual(tc.Fx.counts(), n0, "the refused write left rows behind");
+            tc.verifyEqual(string(db.Connection.AutoCommit), "on");
+            % The connection is usable for the next call.
+            T = db.runReadOnlyQuery("SELECT count(*) AS n FROM lab.tag WHERE tag = 'topic:must_not_exist'");
+            tc.verifyEqual(double(T.n), 0);
+        end
+
         function retiredTagIsSkippedWithWarning(tc)
             % Section 5: a retired tag on the predecessor is skipped with
             % CarasLabDB:retiredTagsNotCarried; integrity reports the gap.
@@ -1141,6 +1196,49 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             err = tc.errorOf(@() db.getArtifacts(NotTags="qc:fial"));
             tc.verifySubstring(string(err.message), "qc:fial: tag qc:fial is not registered");
         end
+
+        function writesRunInACheckedTransaction(tc)
+            % A statement that writes and returns rows is sent inside a
+            % transaction that is marked first and whose mark is read back
+            % before COMMIT. A read is sent on its own, without the trailing
+            % semicolon that makes the driver's LIMIT 0 probe a syntax error.
+            [db, conn] = TagTests.recordingDb();
+            id = "00000000-0000-0000-0000-000000000002";
+            conn.Results("fn_tag(") = table(7, 'VariableNames', {'assignment_id'});
+            ids = db.addTag("artifact", id, "topic:x");
+            tc.verifyEqual(ids, 7);
+            tc.assertSize(conn.Log, [1 1]);
+            tc.verifySubstring(conn.Log(1), "lab.fn_tag('artifact', '" + id + "', 'topic:x', 'add'");
+            tc.verifyTrue(endsWith(conn.Log(1), ";"), "a write is sent exactly as written");
+            tc.assertSize(conn.Control, [2 1]);
+            tc.verifyTrue(startsWith(conn.Control(1), "SET LOCAL caraslabdb.txn = '"));
+            tc.verifySubstring(conn.Control(2), "current_setting('caraslabdb.txn', true)");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [1 0]);
+            tc.verifyEqual(string(conn.AutoCommit), "on");
+
+            % The mark does not come back when the driver has rolled the
+            % transaction back part-way: the commit is refused.
+            conn.clearLog();
+            conn.LoseTransaction = true;
+            tc.verifyError(@() db.addTag("artifact", id, "topic:y"), "CarasLabDB:transactionInterrupted");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [0 1]);
+            tc.verifyEqual(string(conn.AutoCommit), "on");
+            conn.LoseTransaction = false;
+
+            conn.clearLog();
+            db.runQuery("SELECT 1 AS one;  ");
+            tc.assertSize(conn.Log, [1 1]);
+            tc.verifyEqual(conn.Log(1), "SELECT 1 AS one");
+            try
+                db.getTagNamespaces();
+            catch
+                % only the statement matters here
+            end
+            tc.assertSize(conn.Log, [2 1]);
+            tc.verifyFalse(endsWith(strtrim(conn.Log(2)), ";"), "a read keeps no trailing semicolon");
+            tc.verifyEmpty(conn.Control, "a read opens no transaction");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [0 0]);
+        end
     end
 
     methods (Test, TestTags = {'Database'})
@@ -1260,8 +1358,11 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             demo = regexprep(demo, 'Port(\s*)=\s*\d+', "Port$1= " + s.Port, "once");
             demo = regexprep(demo, 'DatabaseName(\s*)=\s*"[^"]*"', "DatabaseName$1= """ + s.DatabaseName + """", "once");
             demo = regexprep(demo, 'PersonEmail(\s*)=\s*"[^"]*"', "PersonEmail$1= """ + s.PersonEmail + """", "once");
+            % Five of the six lines always change; the port's only when the
+            % server is not on the demo's own 5432.
             changed = splitlines(demo) ~= splitlines(src);
-            tc.assertEqual(nnz(changed), 6, "only the six connection settings are adapted");
+            tc.assertEqual(nnz(changed), 5 + double(s.Port ~= 5432), ...
+                "only the six connection settings are adapted");
 
             folder = tc.applyFixture(matlab.unittest.fixtures.TemporaryFolderFixture).Folder;
             file = fullfile(folder, "carasLabDB_demo_mtest.m");

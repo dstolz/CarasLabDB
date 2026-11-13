@@ -42,7 +42,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-PATTERNS = ("@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "tests/matlab/*.m", "examples/*.m")
+PATTERNS = ("@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "tests/*.m", "tests/matlab/*.m",
+            "tests/matlab/*/*.m", "examples/*.m")
 
 ARGUMENTS = re.compile(r"^\s*arguments\s*(\([A-Za-z, ]*\))?\s*(%.*)?$")
 BLOCK_END = re.compile(r"^\s*end\s*(%.*)?$")
