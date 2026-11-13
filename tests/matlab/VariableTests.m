@@ -153,6 +153,37 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
             end
         end
 
+        function callerTextStaysInsideLiterals(tc)
+            % No identifier is built from caller text: hostile ids, values,
+            % notes and reasons reach the SQL only inside quoted literals.
+            [db, conn] = VariableTests.recordingDb();
+            bad = "x'); DROP TABLE lab.variable; --";
+            calls = {
+                @() db.setVariable("subject", bad, "depth", bad, Units=bad, Label=bad, ...
+                        Description=bad, Note=bad, SetBy=bad)
+                @() db.unsetVariable("subject", bad, "depth", Note=bad)
+                @() db.getVariables("subject", bad)
+                @() db.getVariables("event", bad, History=true)
+                @() db.defineVariable("depth", Units=bad, Label=bad, Description=bad)
+                @() db.updateVariableDefinition("depth", Label=bad, Description=bad)
+                @() db.retractEvent(bad, bad)
+                @() db.retractArtifact(bad, bad, RetractedBy=bad)
+                @() db.getRetractions(EventId=bad, ArtifactId=bad)};
+            for i = 1:numel(calls)
+                try
+                    calls{i}();
+                catch
+                    % The fake connection returns empty results; only the SQL matters.
+                end
+            end
+            tc.assertSize(conn.Log, [numel(calls) 1]);
+            tc.verifyTrue(all(contains(conn.Log, "DROP TABLE lab.variable")), "the hostile text was sent");
+            for sql = conn.Log'
+                outside = regexprep(sql, "E?'(?:[^']|'')*'", "''");
+                tc.verifyFalse(contains(outside, "DROP", IgnoreCase=true), sql);
+            end
+        end
+
         function personComesFromTheLogin(tc)
             % With no PersonId / PersonEmail / PersonName the current person
             % is the one lab.fn_current_person() returns; only when that is

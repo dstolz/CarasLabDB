@@ -127,6 +127,13 @@ classdef CarasLabDBApp < handle
             if ~isempty(obj.Fig) && isvalid(obj.Fig)
                 delete(obj.Fig);
             end
+            try
+                % The integrity report is the one window that is not modal,
+                % so it can outlive the main window; it would then hold a
+                % closed connection.
+                delete(findall(groot, "Type", "figure", "Tag", "CarasLabDBApp:integrity"));
+            catch
+            end
             if obj.OwnsDb && ~isempty(obj.Db) && isvalid(obj.Db)
                 delete(obj.Db);
             end

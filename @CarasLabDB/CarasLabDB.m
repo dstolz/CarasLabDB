@@ -1144,7 +1144,8 @@ classdef CarasLabDB < handle
             %
             %   Kind= keeps one kind of row. ActiveOnly (default:
             %   UseActiveViews) leaves out superseded and retracted events
-            %   and artifacts, whose values their corrections carry.
+            %   and artifacts; a correction carries its predecessor's
+            %   values, so without it a corrected row would be listed twice.
             %
             %   See also SETVARIABLE, GETVARIABLES, GETVARIABLEDEFINITIONS.
             arguments
