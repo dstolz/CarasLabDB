@@ -1265,9 +1265,17 @@ try{
       // the last weight before restriction starts is the baseline
       const pre = events.filter(e=>e.subject_id===s.subject_id && e.event_type==='husbandry' && e.detail.weight_g!=null && T(e.occurred_at) < T(sg.occurred_at) - 18*DAY);
       const b = pre.length ? pre[pre.length-1] : fw;
-      setVar('subject', s.subject_id, 'baseline weight', (+b.detail.weight_g).toFixed(1), T(b.occurred_at)+HOUR, personOf(b.recorded_by));
-      if(chance(0.2)) setVar('subject', s.subject_id, 'baseline weight', (+b.detail.weight_g + rf(-1.5,1.5)).toFixed(1),
-        T(b.occurred_at)+ri(2,6)*DAY, PI, 'Re-baselined after a week of free feeding.');
+      let base = +b.detail.weight_g;
+      setVar('subject', s.subject_id, 'baseline weight', base.toFixed(1), T(b.occurred_at)+HOUR, personOf(b.recorded_by));
+      if(chance(0.2)){
+        base = +(base + rf(-1.5,1.5)).toFixed(1);
+        setVar('subject', s.subject_id, 'baseline weight', base.toFixed(1), T(b.occurred_at)+ri(2,6)*DAY, PI, 'Re-baselined after a week of free feeding.');
+      }
+      // weighed before every session while on water restriction: the
+      // percent-of-baseline the weight plot shows
+      sessions.filter(x=>x.subject_id===s.subject_id).forEach(x=>
+        addEvent('husbandry', {subject_id:s.subject_id, occurred_at:T(x.started_at)-2*HOUR, recorded_by:people[4],
+          detail:{measure:'weight', weight_g:+(base*rf(0.81,0.93)).toFixed(1), health_status:'normal'}}));
     }
   });
   const housingUnset = subjects.find(s=>varLog.some(r=>r.entity_id===s.subject_id && r.variable==='housing'));

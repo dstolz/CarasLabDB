@@ -17,11 +17,13 @@ function applyFilters(obj)
 %
 %   A Tags filter is checked with lab.fn_tag_filter_problems before the
 %   query runs. lab.fn_tag_match treats an unknown tag as "no row has it",
-%   so a typo in an excluded tag (-qc:fial) would silently exclude nothing;
-%   a namespace that does not exist or does not apply to this tab's rows, or
-%   a tag that is not registered, is reported instead (as CarasLabDB's get*
-%   methods do with CarasLabDB:tagFilterProblem) and the table is left as it
-%   was.
+%   so a typo in an excluded tag (-qc:fial) would silently exclude nothing.
+%   A namespace that does not exist, or a tag that is not registered, is
+%   therefore reported in an alert (as CarasLabDB's get* methods do with
+%   CarasLabDB:tagFilterProblem) and the table is left as it was. A tag whose
+%   namespace exists but does not apply to this tab's rows is not a typo --
+%   the Tags field is shared by all tabs -- so the query runs and the status
+%   line says why the tag cannot match here.
 %
 %   See also CARASLABDBAPP/BUILDWHERE, CARASLABDBAPP/REFRESHACTIVETAB.
 
@@ -49,9 +51,10 @@ function applyFilters(obj)
         return
     end
 
-    % A tag filter that cannot mean what it says is refused, not run.
-    problem = local_tagFilterProblem(obj.Db, obj.pQualify("fn_tag_filter_problems"), ...
-        d.Entity, tagText);
+    % A tag filter with an unknown namespace or tag is refused, not run; one
+    % that merely does not apply to this tab's rows is explained (TAGHINT).
+    [problem, tagHint] = local_tagFilterProblem(obj.Db, ...
+        obj.pQualify("fn_tag_filter_problems"), d.Entity, tagText);
     if strlength(problem) > 0
         obj.pStatus("Filter error: " + replace(problem, newline, " "));
         uialert(obj.Fig, problem, "Invalid filter");
@@ -98,7 +101,9 @@ function applyFilters(obj)
     tagNote = "";
     if strlength(strtrim(tagText)) > 0
         tagNote = " · tags: " + strtrim(tagText);
-        if n == 0
+        if strlength(tagHint) > 0
+            tagNote = tagNote + " (" + tagHint + ")";
+        elseif n == 0
             tagNote = tagNote + " (no row matches)";
         end
     end
@@ -119,17 +124,30 @@ function T = local_placeColumns(d, T)
     end
 end
 
-function problem = local_tagFilterProblem(db, fnRef, kind, tagText)
-    %LOCAL_TAGFILTERPROBLEM What is wrong with the Tags filter, or "" if nothing.
+function [problem, hint] = local_tagFilterProblem(db, fnRef, kind, tagText)
+    %LOCAL_TAGFILTERPROBLEM What is wrong with the Tags filter, if anything.
     %   Asks lab.fn_tag_filter_problems (FNREF, schema-qualified, internal)
     %   about every token of TAGTEXT for rows of KIND (the tab's Entity, a
     %   fixed internal value). Tokens were already validated by buildWhere;
-    %   they are canonicalised again here and passed as SQL literals. If the
-    %   check itself cannot be run, "" is returned and the filter is applied
-    %   as before.
+    %   they are canonicalised again here and passed as SQL literals.
+    %
+    %   PROBLEM (for an alert; the query is then not run) names each token
+    %   whose namespace does not exist or whose tag is not registered.
+    %   HINT (for the status line; the query runs) is set instead when the
+    %   only finding is a namespace that does not apply to KIND rows, which
+    %   the database words "tags of namespace X apply to ... only, not to
+    %   KIND". Both are "" for a sound filter, and when the check itself
+    %   cannot be run (the filter is then applied as before).
     problem = "";
+    hint = "";
+    if ismissing(tagText)
+        return
+    end
     toks = string(regexp(char(tagText), '\S+', 'match'));
-    toks = regexprep(toks, '^-', '');
+    if isempty(toks)
+        return
+    end
+    toks = regexprep(toks, '^-', '');       % "-tok" excludes; the tag is "tok"
     toks = toks(strlength(toks) > 0);
     if isempty(toks)
         return
@@ -145,12 +163,19 @@ function problem = local_tagFilterProblem(db, fnRef, kind, tagText)
         if ~istable(R) || height(R) == 0
             return
         end
-        found = reshape(string(R.token), 1, []) + ": " + reshape(string(R.problem), 1, []);
-        problem = "The Tags filter cannot match " + kind + " rows as written:" + ...
-            newline + strjoin("  " + found, newline) + newline + ...
-            "Correct the tag; the tag editor (Ctrl+T) lists the vocabulary.";
+        tok = reshape(string(R.token), 1, []);
+        why = reshape(string(R.problem), 1, []);
+        inapplicable = contains(why, " apply to ");
+        if any(~inapplicable)
+            problem = "The Tags filter cannot match " + kind + " rows as written:" + ...
+                newline + strjoin("  " + tok(~inapplicable) + ": " + why(~inapplicable), newline) + ...
+                newline + "Correct the tag; the tag editor (Ctrl+T) lists the vocabulary.";
+        else
+            hint = strjoin(why, "; ");
+        end
     catch
         problem = "";
+        hint = "";
     end
 end
 

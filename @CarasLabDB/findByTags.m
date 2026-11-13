@@ -16,8 +16,9 @@ function ids = findByTags(obj, kind, opts)
 %   whose tag is not registered, raises CarasLabDB:tagFilterProblem: a typo
 %   would otherwise match nothing and, in NotTags=, exclude nothing.
 %
-%   ActiveOnly (default: UseActiveViews) skips superseded events and
-%   artifacts, like the *_active views; it has no effect on other kinds.
+%   ActiveOnly (default: UseActiveViews) skips superseded and retracted
+%   events and artifacts, like the *_active views; it has no effect on other
+%   kinds.
 %
 %   Returns the ids as a string column vector in id order (strings(0,1) when
 %   nothing matches). For the rows themselves, pass the same filter to the

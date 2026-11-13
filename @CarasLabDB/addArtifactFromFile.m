@@ -18,8 +18,8 @@ function [artifactId, info] = addArtifactFromFile(obj, filePath, opts)
 %       ("Z:\data" on one machine, "/Volumes/data" on another), so that the
 %       stored path resolves on every machine. A file that is not under
 %       RootPath raises CarasLabDB:fileNotUnderRoot. On Windows the
-%       comparison ignores letter case; the stored path keeps the spelling
-%       the file system reports.
+%       comparison ignores letter case, and the stored path is spelled as
+%       the name is on disk, not as it was typed.
 %   Nothing is written if any of these steps fails, and the file is only
 %   read, never changed.
 %
@@ -111,6 +111,19 @@ function [absPath, isFolder] = local_absolutePath(name)
     end
     absPath = string(attributes.Name);
     isFolder = logical(attributes.directory);
+    % Windows ignores letter case, so a name as typed can differ from the
+    % name on disk -- and a path stored with the wrong case would not resolve
+    % on a machine whose mount is case-sensitive. The canonical path is the
+    % one on disk. (Not done elsewhere: there it would replace a symbolic
+    % link by its target.)
+    if ispc && usejava('jvm')
+        try
+            javaFile = java.io.File(char(absPath));
+            absPath = string(char(javaFile.getCanonicalPath()));
+        catch
+            % keep the path as fileattrib reported it
+        end
+    end
 end
 
 function relativePath = local_relativePath(fileAbs, rootAbs)
