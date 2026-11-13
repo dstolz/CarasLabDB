@@ -239,9 +239,24 @@ function showHusbandryEntry(obj)
 
     function onSave()
         %ONSAVE Save button (or Ctrl+S): validate, summarise, confirm, write once.
+        %   One save at a time, and none after a successful one: a second
+        %   Ctrl+S or click that arrives while the summary is shown or the
+        %   batch is being written must not write again.
         if busy || savedCount > 0
             return
         end
+        busy = true;
+        try
+            saveNow();
+        catch saveFault
+            busy = false;
+            rethrow(saveFault);
+        end
+        busy = false;
+    end
+
+    function saveNow()
+        %SAVENOW The body of ONSAVE (which guards against re-entry).
         [entries, problems] = local_parse(tbl.Data, subj);
         refreshMarks();
         if ~isempty(problems)
@@ -285,15 +300,12 @@ function showHusbandryEntry(obj)
         end
 
         batchTbl = local_batchTable(subj, entries, rows);
-        busy = true;
         try
             newIds = db.addHusbandryBatch(batchTbl, OccurredAt=when, Measure=measure);
         catch saveErr
-            busy = false;
             uialert(f, "Nothing was saved: " + string(saveErr.message), "Save failed");
             return
         end
-        busy = false;
         savedCount = max(numel(newIds), numel(rows));
         savedWhen = whenText;
         uiresume(f);
@@ -559,7 +571,14 @@ function x = local_num(col)
             end
         end
     else
-        x = str2double(reshape(string(col), [], 1));
+        % Text: read like any other number in the app (no bare str2double).
+        t = reshape(string(col), [], 1);
+        x = nan(numel(t), 1);
+        for i = 1:numel(t)
+            if ~ismissing(t(i))
+                x(i) = CarasLabDBApp.parseNumber(t(i));
+            end
+        end
     end
 end
 

@@ -200,6 +200,7 @@ function showVariableEditor(obj, kind, entityId)
             unitsLbl.Text = "";
             valEd.Value = '';
             hint.Text = "Choose a variable to set its value on this row, or press New… to define one.";
+            hint.Tooltip = "";
             return
         end
         unitsLbl.Text = char(pick.TypeUnits(p));
@@ -219,6 +220,7 @@ function showVariableEditor(obj, kind, entityId)
             about = about + ": " + pick.Desc(p);
         end
         hint.Text = about + " · " + state;
+        hint.Tooltip = hint.Text;           % the line can be longer than the window
     end
 
     function onPick(e)
@@ -350,13 +352,13 @@ function showVariableEditor(obj, kind, entityId)
         %   hook (acceptNew) writes both with one setVariable call while the
         %   form is still open, so a refusal loses nothing typed.
         specs = [ ...
-            local_spec("Name", "Name", "text", "probe depth"), ...
-            local_spec("Label", "Label (shown to people)", "text", "Probe Depth - blank = the name"), ...
+            local_spec("Name", "Name", "text", "e.g. probe depth"), ...
+            local_spec("Label", "Label (shown to people)", "text", "e.g. Probe Depth (blank = the name)"), ...
             local_spec("Type", "Type", "enum", ""), ...
-            local_spec("Units", "Units", "text", "um, g, dB SPL - blank = none"), ...
+            local_spec("Units", "Units", "text", "e.g. um, g, dB SPL (blank = none)"), ...
             local_spec("Description", "Description", "text", "what the variable means"), ...
             local_spec("Value", "Value on this row", "text", "its first value"), ...
-            local_spec("Note", "Note", "text", "optional")];
+            local_spec("Note", "Note", "text", "optional, stored with the value")];
         specs(3).Choices = ["number", "text"];
         specs(3).Value = "number";
         newName = "";
@@ -638,7 +640,14 @@ function x = local_num(col)
             end
         end
     else
-        x = str2double(reshape(string(col), [], 1));
+        % Text: read like any other number in the app (no bare str2double).
+        t = reshape(string(col), [], 1);
+        x = nan(numel(t), 1);
+        for i = 1:numel(t)
+            if ~ismissing(t(i))
+                x(i) = CarasLabDBApp.parseNumber(t(i));
+            end
+        end
     end
 end
 

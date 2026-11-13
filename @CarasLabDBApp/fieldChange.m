@@ -112,7 +112,13 @@ function x = local_origNumber(orig)
     if isnumeric(orig) && isscalar(orig)
         x = double(orig);
     elseif ischar(orig) || (isstring(orig) && isscalar(orig) && ~ismissing(orig))
-        x = str2double(orig);
+        % Read the text the way the form reads its number fields back
+        % (CarasLabDBApp.parseNumber): never through a bare str2double.
+        try
+            x = CarasLabDBApp.parseNumber(string(orig));
+        catch
+            x = NaN;
+        end
     end
 end
 
