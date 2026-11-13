@@ -804,6 +804,23 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             tc.verifyTrue(ismember("topic:after_failure", tc.currentTags("event", e)));
         end
 
+        function readOnlyQueryRefusesWrites(tc)
+            % runReadOnlyQuery returns rows; a write is refused by the
+            % database itself, nothing is written, AutoCommit is back on.
+            db = tc.requireDb();
+            T = db.runReadOnlyQuery("SELECT count(*) AS n FROM lab.event_type;");
+            tc.verifyGreaterThan(double(T.n), 0);
+            n0 = tc.Fx.counts();
+            err = tc.errorOf(@() db.runReadOnlyQuery( ...
+                "INSERT INTO lab.tag (tag) VALUES ('topic:must_not_exist') RETURNING tag"));
+            tc.verifySubstring(string(err.message), "read-only transaction");
+            tc.verifyEqual(tc.Fx.counts(), n0, "the refused write left rows behind");
+            tc.verifyEqual(string(db.Connection.AutoCommit), "on");
+            % The connection is usable for the next call.
+            T = db.runReadOnlyQuery("SELECT count(*) AS n FROM lab.tag WHERE tag = 'topic:must_not_exist'");
+            tc.verifyEqual(double(T.n), 0);
+        end
+
         function retiredTagIsSkippedWithWarning(tc)
             % Section 5: a retired tag on the predecessor is skipped with
             % CarasLabDB:retiredTagsNotCarried; integrity reports the gap.
@@ -1140,6 +1157,49 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             end
             err = tc.errorOf(@() db.getArtifacts(NotTags="qc:fial"));
             tc.verifySubstring(string(err.message), "qc:fial: tag qc:fial is not registered");
+        end
+
+        function writesRunInACheckedTransaction(tc)
+            % A statement that writes and returns rows is sent inside a
+            % transaction that is marked first and whose mark is read back
+            % before COMMIT. A read is sent on its own, without the trailing
+            % semicolon that makes the driver's LIMIT 0 probe a syntax error.
+            [db, conn] = TagTests.recordingDb();
+            id = "00000000-0000-0000-0000-000000000002";
+            conn.Results("fn_tag(") = table(7, 'VariableNames', {'assignment_id'});
+            ids = db.addTag("artifact", id, "topic:x");
+            tc.verifyEqual(ids, 7);
+            tc.assertSize(conn.Log, [1 1]);
+            tc.verifySubstring(conn.Log(1), "lab.fn_tag('artifact', '" + id + "', 'topic:x', 'add'");
+            tc.verifyTrue(endsWith(conn.Log(1), ";"), "a write is sent exactly as written");
+            tc.assertSize(conn.Control, [2 1]);
+            tc.verifyTrue(startsWith(conn.Control(1), "SET LOCAL caraslabdb.txn = '"));
+            tc.verifySubstring(conn.Control(2), "current_setting('caraslabdb.txn', true)");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [1 0]);
+            tc.verifyEqual(string(conn.AutoCommit), "on");
+
+            % The mark does not come back when the driver has rolled the
+            % transaction back part-way: the commit is refused.
+            conn.clearLog();
+            conn.LoseTransaction = true;
+            tc.verifyError(@() db.addTag("artifact", id, "topic:y"), "CarasLabDB:transactionInterrupted");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [0 1]);
+            tc.verifyEqual(string(conn.AutoCommit), "on");
+            conn.LoseTransaction = false;
+
+            conn.clearLog();
+            db.runQuery("SELECT 1 AS one;  ");
+            tc.assertSize(conn.Log, [1 1]);
+            tc.verifyEqual(conn.Log(1), "SELECT 1 AS one");
+            try
+                db.getTagNamespaces();
+            catch
+                % only the statement matters here
+            end
+            tc.assertSize(conn.Log, [2 1]);
+            tc.verifyFalse(endsWith(strtrim(conn.Log(2)), ";"), "a read keeps no trailing semicolon");
+            tc.verifyEmpty(conn.Control, "a read opens no transaction");
+            tc.verifyEqual([conn.Commits, conn.Rollbacks], [0 0]);
         end
     end
 

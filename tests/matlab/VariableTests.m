@@ -153,6 +153,58 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
             end
         end
 
+        function fetchedWritesAreInTransactionsAndReadsAreBare(tc)
+            % What the Database Toolbox does with a fetch decides how each
+            % statement must be sent (see CarasLabDB.pSelect / pWrite): a
+            % statement that writes and returns rows goes inside a
+            % transaction, and any other fetch has no trailing semicolon.
+            [db, conn] = VariableTests.recordingDb();
+            id = VariableTests.FakeId;
+            calls = {
+                @() db.addPerson(FullName="P")
+                @() db.addProject(Name="p")
+                @() db.addStorageRoot(Name="r")
+                @() db.addSession(SubjectId="S-1", Label="l", StorageRootId=1, RelativePath="a/b")
+                @() db.updateSubject("S-1", Strain="x")
+                @() db.updateSession(id, Rig="r")
+                @() db.addTag("artifact", id, "topic:x")
+                @() db.removeTag("artifact", id, ["topic:x", "topic:y"])
+                @() db.retireTag("topic:x")
+                @() db.setVariable("session", id, "depth", 1)
+                @() db.unsetVariable("session", id, "depth")
+                @() db.defineVariable("depth")
+                @() db.retractEvent(id, "entered twice")
+                @() db.getEvents()
+                @() db.getArtifacts(SubjectId="S-1")
+                @() db.getVariables("session", id)
+                @() db.getEntityTags("artifact", id)
+                @() db.checkIntegrity()
+                @() db.artifactLineage(id)
+                @() db.runQuery("SELECT 1 AS one;")};
+            writes = ["INSERT ", "UPDATE ", "DELETE ", "fn_tag(", "fn_set_variable(", ...
+                "fn_unset_variable(", "fn_define_variable(", "fn_retract(", "fn_rename_subject("];
+            for i = 1:numel(calls)
+                conn.clearLog();
+                try
+                    calls{i}();
+                catch
+                    % only what was sent matters here
+                end
+                tc.assertNotEmpty(conn.Log, func2str(calls{i}));
+                for k = find(conn.LogVia == "fetch")'
+                    sql = conn.Log(k);
+                    if contains(sql, writes)
+                        tc.verifyTrue(conn.LogInTransaction(k), ...
+                            "a write fetched outside a transaction: " + sql);
+                    else
+                        tc.verifyFalse(endsWith(strtrim(sql), ";"), ...
+                            "a read sent with a trailing semicolon: " + sql);
+                    end
+                end
+            end
+            tc.verifyEqual(string(conn.AutoCommit), "on");
+        end
+
         function callerTextStaysInsideLiterals(tc)
             % No identifier is built from caller text: hostile ids, values,
             % notes and reasons reach the SQL only inside quoted literals.
