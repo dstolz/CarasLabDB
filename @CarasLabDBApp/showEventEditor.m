@@ -10,7 +10,14 @@ function showEventEditor(obj, mode, eventType, eventId)
 %   getEventDetail and a superseding correction is inserted via supersedeEvent
 %   (the original row is retained, hidden by the *_active view).
 %
-%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDB/SUPERSEDEEVENT.
+%   The supersede form names the event it corrects (id, type, subject,
+%   occurred_at) in its first line. Only the fields the user changed are sent
+%   as overrides; a prefilled field that is emptied is cleared (written as
+%   NULL) unless the database requires it, in which case the form says so. If
+%   nothing was changed, nothing is written.
+%
+%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
+%   CARASLABDB/SUPERSEDEEVENT.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -79,23 +86,31 @@ function showEventEditor(obj, mode, eventType, eventId)
         eventType = string(D.event_type(1));
         fields = local_fields(eventType, D);                % prefilled
 
-        res = CarasLabDBApp.pFormDialog("Supersede " + eventType + " event (correction)", fields);
+        % The form names the row it corrects (id, type, subject, time), so
+        % the user can see that it is the one they selected.
+        res = CarasLabDBApp.pFormDialog("Supersede " + eventType + " event (correction)", ...
+            fields, local_header(eventId, eventType, D));
         if ~res.OK, return; end
 
         try
-            [occ, notes, notesProvided, eventOv, detailOv] = ...
-                local_overrides(fields, res.Values);
+            [occ, eventOv, detailOv] = local_overrides(fields, res.Values, eventType);
         catch ME
             uialert(obj.Fig, string(ME.message), "Invalid input");
+            return
+        end
+
+        % supersedeEvent inserts a correction even when nothing differs, so
+        % an untouched form must not reach it.
+        if isnat(occ) && isempty(fieldnames(eventOv)) && isempty(fieldnames(detailOv))
+            obj.pStatus("No changes to save: event " + eventId + " was not superseded.");
+            uialert(obj.Fig, "No changes to save. Nothing was written.", ...
+                "Supersede", "Icon", "info");
             return
         end
 
         opts = {"EventOverrides", eventOv, "DetailOverrides", detailOv};
         if ~isnat(occ)
             opts = [{"OccurredAt", occ}, opts];
-        end
-        if notesProvided
-            opts = [{"Notes", notes}, opts];
         end
 
         try
@@ -140,105 +155,115 @@ function args = local_addArgs(fields, values)
     args = {};
     for i = 1:numel(fields)
         f = fields(i);
-        [provided, v] = local_convert(f, values.(char(f.Key)), false);
-        if provided
+        [action, v] = local_convert(f, values.(char(f.Key)), false);
+        if action == "set"
             args(end+1:end+2) = {f.Arg, v};
         end
     end
 end
 
-function [occ, notes, notesProvided, eventOv, detailOv] = local_overrides(fields, values)
-    %LOCAL_OVERRIDES Split provided form values into supersede override structs.
+function [occ, eventOv, detailOv] = local_overrides(fields, values, eventType)
+    %LOCAL_OVERRIDES Turn the edited form into supersedeEvent overrides.
+    %   Only what the user altered is returned: OCC (NaT unless Occurred at
+    %   was changed), EVENTOV for lab.event columns and DETAILOV for the
+    %   detail table, both keyed by column name. An untouched field is left
+    %   out, so supersedeEvent carries it forward exactly as stored; sending
+    %   it back would rewrite it through the widget's rendering of it (a
+    %   datetime to whole seconds, JSON re-spaced, a number re-parsed).
+    %
+    %   A field that was prefilled and is now blank is a request to clear
+    %   it: its override is string(missing), which supersedeEvent writes as
+    %   NULL. Clearing a column the database requires is refused here, with
+    %   the field's name, rather than surfacing as a constraint violation.
     occ = NaT;
-    notes = string(missing);
-    notesProvided = false;
     eventOv = struct();
     detailOv = struct();
-    baseCols = ["subject_id","session_id","attributes"];
+    baseCols = ["subject_id","session_id","notes","attributes"];
+    required = local_requiredCols(eventType);
 
     for i = 1:numel(fields)
         f = fields(i);
-        % A supersede prefills every field from the row being corrected, so
-        % only send back what the user actually altered. An untouched field is
-        % then carried forward by supersedeEvent exactly as stored; sending it
-        % back would rewrite it through the widget's rendering of it (a
-        % datetime to whole seconds, JSON re-spaced, a number re-parsed).
-        [provided, v] = local_convert(f, values.(char(f.Key)), true);
-        if ~provided
+        [action, v] = local_convert(f, values.(char(f.Key)), true);
+        if action == "keep"
             continue
         end
-        switch f.Key
-            case "OccurredAt"
-                occ = v;
-            case "Notes"
-                notes = v;
-                notesProvided = true;
-            otherwise
-                if ismember(f.Col, baseCols)
-                    eventOv.(char(f.Col)) = v;
-                else
-                    detailOv.(char(f.Col)) = v;
-                end
+        if action == "clear"
+            if ismember(f.Col, required)
+                error("CarasLabDBApp:requiredField", ...
+                    "%s is required for a %s event and cannot be cleared.", ...
+                    f.Label, eventType);
+            end
+            v = string(missing);          % supersedeEvent writes NULL
+        end
+        if f.Key == "OccurredAt"
+            occ = v;                      % never a clear: occurred_at is required
+        elseif ismember(f.Col, baseCols)
+            eventOv.(char(f.Col)) = v;
+        else
+            detailOv.(char(f.Col)) = v;
         end
     end
 end
 
-function [provided, v] = local_convert(f, raw, onlyIfChanged)
-    %LOCAL_CONVERT Coerce a raw widget value to its typed form; report if set.
-    %   ONLYIFCHANGED suppresses "provided" for a value that still matches the
-    %   value the form was prefilled with (f.Value).
-    switch f.Type
-        case "number"
-            v = raw;                 % double, NaN when blank
-            provided = ~isnan(v) && ~(onlyIfChanged && local_sameNumber(v, f.Value));
-        case "bool"
-            v = logical(raw);
-            provided = ~(onlyIfChanged && islogical(f.Value) && isscalar(f.Value) ...
-                && f.Value == v);
-        case "datetime"
-            v = raw;
-            if isnat(v)
-                provided = false; return
-            end
-            v.TimeZone = "local";
-            provided = ~(onlyIfChanged && local_sameInstant(v, f.Value));
-        otherwise                    % text / textarea / enum
-            v = strtrim(string(raw));
-            provided = strlength(v) > 0 ...
-                && ~(onlyIfChanged && v == local_prefillText(f.Value));
-            if ~provided
-                return
-            end
-            if local_isBoolEnum(f)
-                v = (v == "true");
-            elseif local_isJson(f)
-                v = local_parseJson(v, f.Label);
-            end
+function cols = local_requiredCols(eventType)
+    %LOCAL_REQUIREDCOLS Columns of an event that may not be set to NULL.
+    %   From design_docs/schema.sql: occurred_at and attributes are NOT NULL;
+    %   every event except an analysis needs a subject
+    %   (event_subject_required_ck); a recording needs a session
+    %   (trg_require_session_for_recording) and a modality; a husbandry event
+    %   a measure; an analysis its parameters.
+    cols = ["occurred_at", "attributes"];
+    if eventType ~= "analysis"
+        cols(end+1) = "subject_id";
+    end
+    switch eventType
+        case "recording"
+            cols = [cols, "session_id", "modality"];
+        case "husbandry"
+            cols(end+1) = "measure";
+        case "analysis"
+            cols(end+1) = "parameters";
     end
 end
 
-function tf = local_sameNumber(v, orig)
-    %LOCAL_SAMENUMBER True when a number field still holds its prefilled value.
-    %   pFormDialog prefills numbers with the shortest text that parses back
-    %   to the same double, so an untouched field reads back exactly equal.
-    tf = isnumeric(orig) && isscalar(orig) && double(orig) == v;
+function [action, v] = local_convert(f, raw, isEdit)
+    %LOCAL_CONVERT What to do with one form value: "set", "clear" or "keep".
+    %   CarasLabDBApp.fieldChange decides (see there); a value to set is then
+    %   converted to what the database column takes: a true/false dropdown to
+    %   a logical, JSON text validated.
+    [action, v] = CarasLabDBApp.fieldChange(f, raw, isEdit);
+    if action == "set" && isstring(v)
+        if local_isBoolEnum(f)
+            v = (v == "true");
+        elseif local_isJson(f)
+            v = local_parseJson(v, f.Label);
+        end
+    end
 end
 
-function t = local_prefillText(orig)
-    %LOCAL_PREFILLTEXT The text a text/textarea/enum field was prefilled with,
-    %   normalized the way pFormDialog reads it back (lines joined with
-    %   newline, trimmed), so an untouched field compares equal.
-    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
-        t = "";
-        return
-    end
+function h = local_header(eventId, eventType, D)
+    %LOCAL_HEADER One line naming the event being corrected.
+    parts = ["event " + eventId, eventType];
     try
-        t = strtrim(strjoin(splitlines(string(orig)), newline));
+        vars = string(D.Properties.VariableNames);
+        if ismember("subject_id", vars)
+            s = local_scalar(D.subject_id);
+            if (ischar(s) || (isstring(s) && isscalar(s) && ~ismissing(s))) ...
+                    && strlength(string(s)) > 0
+                parts(end+1) = "subject " + string(s);
+            end
+        end
+        if ismember("occurred_at", vars)
+            t = local_scalar(D.occurred_at);
+            if isdatetime(t) && ~isnat(t)
+                t.Format = "yyyy-MM-dd HH:mm:ss";
+                parts(end+1) = "occurred " + string(t);
+            end
+        end
     catch
-        % Not representable as text: treat the field as changed, so its
-        % value is sent rather than silently dropped.
-        t = string(missing);
+        % The id and type alone still identify the row.
     end
+    h = strjoin(parts, "  ·  ");
 end
 
 function tf = local_isJson(f)
@@ -251,31 +276,6 @@ function tf = local_isBoolEnum(f)
     %   true/false dropdown whose blank choice leaves the column unset.
     tf = f.Type == "enum" && ...
         isequal(sort(reshape(string(f.Choices), 1, [])), ["false", "true"]);
-end
-
-function tf = local_sameInstant(v, orig)
-    %LOCAL_SAMEINSTANT True when a form datetime still equals what it was
-    %   prefilled with. The form only surfaces whole seconds, so compare there.
-    tf = false;
-    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
-        return
-    end
-    try
-        if isdatetime(orig)
-            o = orig;
-        else
-            o = datetime(string(orig), "TimeZone", "local");
-        end
-    catch
-        return
-    end
-    if ~isscalar(o) || isnat(o)
-        return
-    end
-    if isempty(o.TimeZone)
-        o.TimeZone = "local";
-    end
-    tf = abs(seconds(v - o)) < 1;
 end
 
 function v = local_parseJson(str, label)

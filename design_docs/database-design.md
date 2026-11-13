@@ -231,13 +231,38 @@ general (any event may consume artifacts) but in practice is populated by
 analysis events. `artifact.produced_by_event_id` + `event_input` are the two
 edges of the provenance DAG. `trg_event_input_acyclic` keeps it a DAG: an
 event cannot consume an artifact that already derives from that event (found
-by walking `fn_artifact_lineage(…, 'up')`, to the same depth cap of 64).
+by walking `fn_artifact_lineage(…, 'up')`, to the same depth cap of 64). The
+walk is made twice, over the rows as recorded and with every node resolved to
+its current version (§5), because a correction can close a loop in the second
+graph that the recorded rows do not contain. Edge inserts are serialised by a
+transaction-level advisory lock, so two concurrent transactions cannot each
+add one half of a loop.
+
+**An artifact is filed with the event that produced it.**
+`trg_artifact_matches_event` rejects an artifact whose `subject_id` or
+`session_id` differs from its producing event's. Either side may leave one
+unset (a cross-animal analysis has no subject), but where both name a subject
+or a session they must agree; otherwise a file is listed under animal A while
+its recording is about animal B. Rows that predate the trigger are reported
+as `artifact_event_mismatch` (§4.2).
 
 **`artifact_verification`** — an *append-only log* of integrity checks. Because
 `artifact` rows are immutable, periodic checksum re-verification is recorded here
 (`ok` / `missing` / `mismatch`) instead of mutating the artifact. A `mismatch`
 must carry the `observed_checksum`, since that is the only thing that makes the
 row actionable.
+
+**Verification belongs to the file, not to the artifact row.** A correction
+inserts a new artifact row for the same `(storage_root_id, relative_path,
+checksum)`, and a row keyed only by `artifact_id` would then start with a
+clean slate: a known `mismatch` would silently become "never verified". The
+view `artifact_verification_latest` therefore gives, for every artifact row,
+the latest check of its *file* across all rows that describe it
+(`verified_artifact_id` is the row the check was recorded against), and
+`fn_check_integrity()` reads that view. A correction that changes the path or
+the checksum describes a different file and correctly starts unverified.
+[`tools/verify_artifacts.py`](../tools/verify_artifacts.py) is the scheduled
+job that reads the files on the NAS and writes this log.
 
 **Checksums are format-checked.** `checksum` must be hex of exactly the width
 the declared `checksum_algo` produces (`md5` = 32, `sha256`/`blake3` = 64), and
@@ -281,9 +306,11 @@ directly. `changed_by` is `session_user`, the login that connected, which
 version is `max(version)`. `schema.sql` installs the latest version directly;
 an existing database is upgraded by the scripts in
 [`migrations/`](migrations/), each of which records its own row. A fresh
-install and an upgraded database end with identical schemas. The MATLAB class
-and the MCP server read the version at connect time and warn when it is not
-the one they were written for.
+install and an upgraded database end with identical schemas. Both clients read
+the version at connect time: the MATLAB class, which writes, refuses to
+connect to a version it was not written for (unless told
+`AllowSchemaMismatch=true`), and the read-only MCP server attaches a warning
+to every result.
 
 All three are append-only (§4).
 
@@ -308,11 +335,14 @@ otherwise, and "who changed `stage` from `raw` to `sorted`, and when" is worth
 keeping. So `tag_assignment` follows the schema's own rule — never add a
 mutable column where append would do. It is protected by `fn_forbid_mutation()`
 (§4), and there is no "current tags" column on any entity. The view
-`tag_current` takes the latest row per (entity, tag) by `applied_at DESC,
-assignment_id DESC` (ties are real: the `remove` and `add` of a replace share a
-transaction timestamp) and keeps it if it is an `add`; `entity_tags` aggregates
-that into sorted arrays per entity. `display_tag` strips the `tag:` prefix so
-every client renders bare tags the same way.
+`tag_current` takes the latest row per (entity, tag) by `assignment_id` —
+insertion order — and keeps it if it is an `add`; `entity_tags` aggregates
+that into sorted arrays per entity. It is deliberately not ordered by
+`applied_at`: that is the start time of the writing transaction and can be
+supplied by the client, so a `remove` the policy trigger accepted could carry
+an earlier `applied_at` than the `add` it removes and would then do nothing.
+`display_tag` strips the `tag:` prefix so every client renders bare tags the
+same way.
 
 **Why there is no stored `entity_id` column.** An entity-id text column
 (`COALESCE(event_id::text, …)`) would be convenient, but renaming a subject
@@ -339,9 +369,12 @@ renamed; `trg_tag_namespace_guard` freezes a namespace's `mutability` and
 assigned, and freezes the reserved `tag` namespace from the start. That freeze,
 not an admin gate, is what prevents policy drift: any `lab_rw` member may create
 a namespace, since the flags are editable by members anyway and a gate would be
-theatre. The single-cardinality check is trigger-based, so — like
-`trg_artifact_unique_active` — two concurrent sessions can both pass it
-([tagging.md](tagging.md) §9).
+theatre. The checks are trigger-based, so — like `trg_artifact_unique_active`
+— they are made safe under concurrent writers by a transaction-level advisory
+lock, here on (entity, namespace): without it two sessions could each pass the
+single-cardinality check and both commit, which in an immutable namespace
+could never be repaired. `fn_check_integrity()` reports any such state as
+`tag_cardinality_violation` ([tagging.md](tagging.md) §9).
 
 **Write and read functions.** `lab.fn_tag` is the one write path every client
 uses: it canonicalises, auto-registers a new value in an open namespace, and
@@ -350,6 +383,11 @@ plus an `add` in one call. `lab.fn_register_tag` registers without applying.
 `lab.fn_tag_match` is the single definition of filter semantics (all / any /
 none, `ns:*` wildcard, bare tokens, empty list = no constraint), shared by the
 MATLAB getters, the GUI and the MCP server; `lab.fn_find_by_tags` wraps it.
+`fn_tag_match` treats a token nothing carries as simply unmatched, which is
+right for matching but makes a typo silent (`NotTags="qc:fial"` excludes
+nothing), so `lab.fn_tag_filter_problems(kind, tokens)` reports an unknown
+namespace, an unregistered tag, or a namespace that does not apply to the
+entity kind, and the clients call it once per query and refuse the filter.
 Function ACLs are deliberately not set in `schema.sql`, so `lab_rw` and `lab_ro`
 both keep the default `EXECUTE`, and `lab_ro` is stopped at the `INSERT`.
 
@@ -393,6 +431,35 @@ followed there.
 
 A row is **active** when nothing supersedes it. The `event_active` and
 `artifact_active` views encapsulate that filter so callers never hand-roll it.
+`event_version` and `artifact_version` are the full-history counterparts:
+every row, with `superseded_by` and `is_current`, so that a reader of history
+cannot mistake a superseded row for a current one. `fn_event_current` /
+`fn_artifact_current` return the current version of any row, and
+`fn_event_versions` / `fn_artifact_versions` its whole chain.
+
+**Who wrote a row.** `recorded_by`, `created_by`, `verified_by` and
+`applied_by` name a *person* and are supplied by the client. The database
+also records the *login* that was connected, in `event.recorded_login`,
+`artifact.created_login`, `artifact_verification.verified_login` and
+`tag_assignment.applied_login`: `trg_*_stamp_login` sets each to
+`session_user` whatever the client sends, the same guarantee `row_history`
+gives for the mutable tables. With one login per lab member that identifies
+the writer without client cooperation; with a shared login it identifies
+nobody. Rows written before schema version 4 have `NULL`. `recorded_at` and
+`created_at` default to the insert time but may be supplied (the MATLAB class
+exposes `RecordedAt=`), so they are the client's statement, not the
+database's.
+
+**Trigger functions pin their `search_path`.** A subject rename (§4.1)
+cascades into the append-only tables, and PostgreSQL runs a cascaded `UPDATE`
+— and the triggers it fires — as the *owner* of the referencing table, while
+an unpinned function resolves names with the *caller's* search path, in which
+`pg_temp` comes first for type names. A client able to start the cascade
+could therefore have had its own code run as the owner. Every trigger
+function is declared `SET search_path = pg_catalog, pg_temp` and refers to
+`lab` objects by qualified name; `tests/roles_test.sql` asserts both. For the
+same reason the schema should be owned by a dedicated non-superuser role, not
+by `postgres`.
 
 ### 4.1 The one sanctioned mutation: renaming a subject
 
@@ -418,6 +485,15 @@ change to *what happened*, which is why it is the only exception. It is also
 why `tag_assignment` has no derived `entity_id` column (§3.7). The function
 is `REVOKE`d from `PUBLIC`; grant it only to an admin role.
 
+Two things keep the rename behind that function. `grants.sql` gives `lab_rw`
+`UPDATE` on the descriptive columns of `subject` only, not on `subject_id`;
+and `trg_subject_id_guard` refuses a change of `subject_id` by any role that
+may not execute `fn_rename_subject`, so the `EXECUTE` grant is the whole
+permission even where the table grants are wider. Without them a member could
+set the three settings by hand and rename an animal with a plain `UPDATE`,
+leaving no `maintenance_log` row. Under the flag a `NULL` subject id is never
+filled in: only a change from `rename_from` to `rename_to` passes.
+
 ### 4.2 Integrity report
 
 Class-table inheritance leaves one hole no constraint can close: the composite
@@ -438,11 +514,14 @@ SELECT * FROM lab.fn_check_integrity();
 |---|---|---|
 | `event_missing_detail` | error | Typed event whose detail row was never written |
 | `event_missing_subject` | warning | Non-analysis event with no subject; only possible for rows that predate `event_subject_required_ck` in a migrated database |
-| `artifact_verification_failed` | error | Latest integrity check was `missing` or `mismatch` |
+| `artifact_verification_failed` | error | Latest integrity check of the artifact's file was `missing` or `mismatch` (by file, so it survives a correction of the artifact row) |
 | `event_recorded_before_occurred` | warning | `occurred_at` more than a day after `recorded_at` — usually a client timezone bug |
-| `artifact_never_verified` | warning | Active artifact with no verification on record |
+| `artifact_never_verified` | warning | Active artifact whose file has no verification on record |
 | `artifact_producer_superseded` | warning | Active artifact whose producing event has been corrected; the corrected event lists no files until the artifact is re-pointed |
 | `tag_not_carried_forward` | warning | Active event or artifact whose superseded predecessor has current tags that the successor lacks; the correction drops out of the tag filters the original matched. Reported against the successor, listing the missing tags |
+| `artifact_event_mismatch` | warning | Active artifact filed under a different subject or session than the event that produced it; only possible for rows that predate `trg_artifact_matches_event` |
+| `input_not_carried_forward` | warning | Active event whose superseded predecessor consumed artifacts while it declares none, so lineage through it stops. A correction that re-declares a different, non-empty set of inputs is deliberate and not reported |
+| `tag_cardinality_violation` | error | An entity with more than one current tag in a single-valued namespace; only possible for assignments that raced before schema version 4 |
 | `duplicate_active_path` | warning | Two active artifacts at one path; the NAS file can only be one of them |
 
 **Worked example — a recording logged with the wrong sample rate:**
@@ -484,7 +563,15 @@ and detail rows, the event's `event_input` edges, the re-pointed artifacts, and
 the current tags of the event and of each re-pointed artifact. A correction
 written in SQL like the above must carry the tags itself, or
 `tag_not_carried_forward` reports it; the `INSERT … SELECT` is in
-[tagging.md](tagging.md) §8.
+[tagging.md](tagging.md) §8. It must likewise copy the event's `event_input`
+rows to the new event (`input_not_carried_forward`), and if the correction
+moves the event to another subject or session the re-pointed artifacts must
+move with it (`trg_artifact_matches_event` rejects them otherwise).
+
+What a correction does *not* need to do: re-verify the files (verification
+follows the file, §3.5) or touch the events that consumed them. Their
+`event_input` rows still name the superseded artifact — edges are immutable —
+and lineage resolves them (§5).
 
 ---
 
@@ -495,8 +582,27 @@ lineage of an artifact answers "everything that contributed to producing this
 file": the artifact was produced by an event, that event consumed input
 artifacts, each of which was produced by an earlier event, and so on.
 
-`fn_artifact_lineage(artifact_id, 'up'|'down')` walks it with a recursive CTE
-(depth-guarded for safety). Ancestors:
+`fn_artifact_lineage(artifact_id, 'up'|'down', follow_corrections)` walks it
+with a recursive CTE (depth-guarded for safety).
+
+**By default it follows corrections.** Provenance edges are immutable, so
+after a correction they still name the superseded rows: an analysis that
+consumed raw file `a1` keeps its edge to `a1` when `a1` is corrected to `a2`.
+Walked as recorded, nothing is derived from `a2`, and the ancestry of the
+analysis output ends at a row `artifact_active` hides. With
+`follow_corrections` (the default) each node therefore stands for its whole
+correction chain and every id returned is a current one:
+
+- an artifact is produced by the *current version* of its producing event;
+- an event's inputs are those its current version declares (a correction
+  re-declares them, so it is authoritative), each resolved to its current
+  artifact;
+- an artifact's consumers are the current events with an edge to *any* of its
+  versions, and their outputs the active artifacts produced by any version of
+  the event.
+
+Pass `false` to walk the rows exactly as recorded, superseded ones included —
+the audit view of what was written. Ancestors, as recorded:
 
 ```sql
 WITH RECURSIVE lin AS (
@@ -536,10 +642,14 @@ schema; the reference/lookup tables; the `project` tables; the `subject` /
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
 maintenance function, `maintenance_log`, `row_history` and `schema_version`;
 the `event_active` /
-`artifact_active` / `provenance_edge` / `subject_current` / `tag_current` /
-`entity_tags` views; `fn_artifact_lineage()`, the tag functions (`fn_tag()`,
+`artifact_active` / `event_version` / `artifact_version` /
+`artifact_verification_latest` / `provenance_edge` / `subject_current` /
+`tag_current` / `entity_tags` views; `fn_artifact_lineage()` and the
+correction-chain helpers (`fn_event_current()`, `fn_artifact_current()`,
+`fn_event_versions()`, `fn_artifact_versions()`), the tag functions (`fn_tag()`,
 `fn_register_tag()`, `fn_tag_match()`, `fn_find_by_tags()`,
-`fn_canonical_tag()`) and `fn_check_integrity()`; and the seed vocabulary
+`fn_canonical_tag()`, `fn_tag_filter_problems()`) and `fn_check_integrity()`;
+and the seed vocabulary
 (including the starting tag namespaces). It
 targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
 `pgcrypto` fallback line is included for older servers).

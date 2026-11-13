@@ -1,11 +1,15 @@
 function runCustomSQL(obj)
 %RUNCUSTOMSQL Execute the Custom SQL editor's query, read-only, with history.
 %
-%   Safety comes from CarasLabDB.runReadOnlyQuery, which runs the statement
-%   inside a Postgres READ ONLY transaction: that is what actually prevents a
-%   write. The syntactic guard below is a typo-catcher that fails fast with a
-%   readable message; it is not a security boundary and must not be relied on
-%   as one.
+%   CarasLabDB.runReadOnlyQuery runs the statement inside a Postgres READ ONLY
+%   transaction that is rolled back; that is what stops a single statement
+%   from writing. The syntactic guard below admits one SELECT/WITH statement
+%   and refuses what its scanner cannot parse (dollar-quoted text, \'), so
+%   that a second statement cannot be hidden from it; a string that carried
+%   its own COMMIT would leave the read-only transaction. Together they
+%   prevent accidental writes. They are not an access control: what a user
+%   may read or change is decided by the database login, so use a read-only
+%   login where that matters.
 %
 %   Successful queries are pushed onto the recall history (persisted in prefs)
 %   and results are shown in the results table (exportable via Export → WS).
@@ -57,6 +61,22 @@ function [ok, why] = local_isReadOnly(sql)
     %   actually enforces read-only access; this only produces a clearer
     %   message for the common mistakes.
     ok = false;
+
+    % The scanner below knows '...' literals, "..." identifiers and comments.
+    % It does not know dollar-quoted text or backslash-escaped quotes, and a
+    % statement using either can hide a ';' and a second statement from it.
+    % What it cannot parse it must not pass, so both are refused outright.
+    if ~isempty(regexp(char(sql), '\$([A-Za-z_][A-Za-z_0-9]*)?\$', 'once'))
+        why = "Dollar-quoted text ($$...$$ or $tag$...$tag$) is not accepted in the " + ...
+              "Custom SQL panel. Write the value as an ordinary '...' literal.";
+        return
+    end
+    if contains(sql, "\'")
+        why = "A backslash followed by a quote (\') is not accepted in the Custom SQL " + ...
+              "panel. Inside a literal, write a quote as two quotes ('').";
+        return
+    end
+
     scratch = local_stripNoise(sql);
     scratch = regexprep(scratch, ';\s*$', '');   % one trailing semicolon is fine
 

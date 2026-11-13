@@ -537,6 +537,79 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
     end
 
     % =====================================================================
+    % Browse filters and columns (not tag-specific; they share this fixture)
+    % =====================================================================
+    methods (Test)
+        function quickSearchMatchesWildcardCharactersLiterally(tc)
+            % "%" and "_" typed in the quick subject search are ordinary
+            % characters, not LIKE wildcards: "%" used to match every row.
+            tc.Fx.makeWorld("gui-like", 0);
+            m = tc.mainParts();
+            tc.chooseTab("subjects");
+            tc.press(m.Clear);
+            ids = LabScratchDb.column(m.Tables.subjects.Data, "subject_id");
+            tc.assertNotEmpty(ids, "the subjects tab lists this test's subject");
+            q = findall(m.Fig, "Type", "uieditfield", "Placeholder", "subject_id contains…");
+            tc.assertNumElements(q, 1);
+            for ch = ["%", "_"]
+                tc.type(q, ch);
+                tc.verifyEmpty(TagGuiTests.alerts(), "no alert for '" + ch + "'");
+                got = LabScratchDb.column(m.Tables.subjects.Data, "subject_id");
+                tc.verifyEqual(sort(got), sort(ids(contains(ids, ch))), ...
+                    "'" + ch + "' lists exactly the ids that contain it");
+            end
+        end
+
+        function exactDateFilterCoversTheWholeDay(tc)
+            % Exact on a timestamp column with a bare date (yyyy-MM-dd)
+            % keeps the events of that day; it used to match midnight only.
+            w = tc.Fx.makeWorld("gui-date", 0);
+            m = tc.mainParts();
+            tc.chooseTab("events");
+            tc.press(m.Clear);
+            T = m.Tables.events.Data;
+            r = find(string(T.event_id) == w.EventId, 1);
+            tc.assertNotEmpty(r, "this test's event is listed");
+            tc.assumeTrue(isdatetime(T.occurred_at), "occurred_at is not read as a datetime");
+            day = string(T.occurred_at(r), "yyyy-MM-dd");
+
+            % One filter row: its column and mode dropdowns and value field
+            % share a parent.
+            val = findall(m.Fig, "Type", "uieditfield", "Placeholder", "value");
+            tc.assertNotEmpty(val);
+            val = val(1);
+            dds = findall(val.Parent, "Type", "uidropdown");
+            isMode = arrayfun(@(d) any(strcmp(d.Items, 'Exact')), dds);
+            tc.assertEqual(nnz(isMode), 1);
+            tc.choose(dds(~isMode), "occurred_at");
+            tc.choose(dds(isMode), "Exact");
+            tc.type(val, day);
+
+            tc.verifyEmpty(TagGuiTests.alerts());
+            got = LabScratchDb.column(m.Tables.events.Data, "event_id");
+            tc.verifyTrue(ismember(w.EventId, got), ...
+                "Exact " + day + " lists the event that occurred that day");
+            shown = m.Tables.events.Data.occurred_at;
+            tc.verifyTrue(all(string(shown, "yyyy-MM-dd") == day), ...
+                "and only events of that day");
+        end
+
+        function eventsTabShowsRecordedLoginNextToRecordedBy(tc)
+            % The database login that inserted an event (recorded_login,
+            % schema version 4) is shown right after recorded_by.
+            tc.Fx.makeWorld("gui-login", 0);
+            m = tc.mainParts();
+            tc.chooseTab("events");
+            tc.press(m.Clear);
+            vars = string(m.Tables.events.Data.Properties.VariableNames);
+            i = find(vars == "recorded_by", 1);
+            tc.assertNotEmpty(i, "the events table has a recorded_by column");
+            tc.assertGreaterThan(numel(vars), i);
+            tc.verifyEqual(vars(i + 1), "recorded_login");
+        end
+    end
+
+    % =====================================================================
     % Helpers
     % =====================================================================
     methods (Access = private)

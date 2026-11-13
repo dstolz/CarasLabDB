@@ -87,8 +87,8 @@ VALUES ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000
 -- ---------------------------------------------------------------------------
 -- Version and baseline behaviour
 -- ---------------------------------------------------------------------------
-SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 3,
-                      'schema_version is 3');
+SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 5,
+                      'schema_version is 5');
 
 SELECT pg_temp.assert(
     (SELECT subject_id FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e1') = 'G1',
@@ -589,6 +589,506 @@ SELECT pg_temp.assert(
                                      'artifact_producer_superseded', 'duplicate_active_path',
                                      'tag_not_carried_forward')),
     'no structural integrity errors in the fixture');
+
+-- ===========================================================================
+-- Schema version 4
+-- ===========================================================================
+-- Fixture at this point: recording e1 is superseded by e7; its raw file f1 by
+-- f7 and then by an active row with role 'derived'; analysis e2 consumed f1
+-- and produced f2; f1 carries one 'mismatch' verification; subject G1 has
+-- been renamed G1-renamed.
+
+-- ---------------------------------------------------------------------------
+-- Correction chains
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.assert(
+    lab.fn_event_current('00000000-0000-0000-0000-0000000000e1') = '00000000-0000-0000-0000-0000000000e7'
+    AND lab.fn_event_current('00000000-0000-0000-0000-0000000000e7') = '00000000-0000-0000-0000-0000000000e7'
+    AND lab.fn_event_current(NULL) IS NULL,
+    'fn_event_current follows the chain to its end');
+SELECT pg_temp.assert(
+    (SELECT array_agg(v) FROM lab.fn_event_versions('00000000-0000-0000-0000-0000000000e1') v)
+    = ARRAY['00000000-0000-0000-0000-0000000000e7', '00000000-0000-0000-0000-0000000000e1']::uuid[],
+    'fn_event_versions lists the chain, current version first');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.fn_artifact_versions('00000000-0000-0000-0000-0000000000f7')) = 3
+    AND lab.fn_artifact_current('00000000-0000-0000-0000-0000000000f1')
+        = (SELECT artifact_id FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat'),
+    'fn_artifact_versions / fn_artifact_current cover a three-row chain');
+SELECT pg_temp.assert(
+    (SELECT superseded_by::text || '|' || is_current FROM lab.event_version
+      WHERE event_id = '00000000-0000-0000-0000-0000000000e1')
+    = '00000000-0000-0000-0000-0000000000e7|false'
+    AND (SELECT superseded_by IS NULL AND is_current FROM lab.event_version
+          WHERE event_id = '00000000-0000-0000-0000-0000000000e7')
+    AND (SELECT count(*) FROM lab.artifact_version WHERE NOT is_current) = 2,
+    'event_version / artifact_version mark superseded rows and name the successor');
+
+-- ---------------------------------------------------------------------------
+-- Lineage follows corrections
+-- ---------------------------------------------------------------------------
+-- e2's edge still names f1, the superseded raw file. As recorded, nothing is
+-- derived from the current raw row; following corrections, f2 is.
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.fn_artifact_lineage(
+        (SELECT artifact_id FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat'),
+        'down', false)) = 1,
+    'as recorded, the current raw artifact has no descendants');
+SELECT pg_temp.assert(
+    (SELECT string_agg(depth || ':' || coalesce(event_id::text, '-') || ':' || artifact_id, ' '
+                       ORDER BY depth)
+     FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f7', 'down'))
+    = '0:-:' || (SELECT artifact_id FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat')
+      || ' 1:00000000-0000-0000-0000-0000000000e2:00000000-0000-0000-0000-0000000000f2',
+    'following corrections, lineage down from any version reaches f2 and starts at the current row');
+SELECT pg_temp.assert(
+    (SELECT event_id FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f2', 'up', false)
+      WHERE depth = 1) = '00000000-0000-0000-0000-0000000000e1',
+    'as recorded, lineage up from f2 ends at superseded e1');
+SELECT pg_temp.assert(
+    (SELECT event_id::text || '|' || artifact_id FROM lab.fn_artifact_lineage(
+        '00000000-0000-0000-0000-0000000000f2', 'up') WHERE depth = 1)
+    = '00000000-0000-0000-0000-0000000000e7|'
+      || (SELECT artifact_id FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat'),
+    'following corrections, lineage up from f2 names current e7 and the current raw row');
+-- A correction must not close a loop in the resolved graph: e7 (the current
+-- version of the recording) cannot consume f2, which derives from it.
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.event_input (event_id, artifact_id)
+       VALUES ('00000000-0000-0000-0000-0000000000e7', '00000000-0000-0000-0000-0000000000f2')$q$,
+    'cyclic');
+
+-- ---------------------------------------------------------------------------
+-- Verification belongs to the file, not to the artifact row
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.artifact_verification_latest
+      WHERE status = 'mismatch'
+        AND verified_artifact_id = '00000000-0000-0000-0000-0000000000f1') = 3,
+    'all three rows describing the raw file share its latest verification');
+SELECT pg_temp.assert(
+    (SELECT subject FROM lab.fn_check_integrity() WHERE check_name = 'artifact_verification_failed')
+    = (SELECT artifact_id::text FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat')
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() i
+                    JOIN lab.artifact_active a ON a.artifact_id::text = i.subject
+                    WHERE i.check_name = 'artifact_never_verified'
+                      AND a.relative_path = 'G1/s1/raw.dat'),
+    'a failed check survives the correction: reported on the active row, not as never verified');
+INSERT INTO lab.artifact_verification (artifact_id, status, verified_at)
+VALUES ('00000000-0000-0000-0000-0000000000f7', 'ok', now() + interval '1 second');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name = 'artifact_verification_failed'),
+    'a later ok check of the same file, on any of its rows, clears the failure');
+
+-- ---------------------------------------------------------------------------
+-- The login is stamped by the database
+-- ---------------------------------------------------------------------------
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at, recorded_login)
+VALUES ('00000000-0000-0000-0000-0000000000d1', 'husbandry', 'G2', now(), 'someone_else');
+INSERT INTO lab.husbandry_event (event_id, measure, weight_g)
+VALUES ('00000000-0000-0000-0000-0000000000d1', 'weight', 61.5);
+INSERT INTO lab.tag_assignment (entity_kind, subject_id, tag, op, applied_login)
+VALUES ('subject', 'G2', 'tst_open:x', 'add', 'someone_else');
+SELECT pg_temp.assert(
+    (SELECT recorded_login FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000d1')
+    = session_user
+    AND NOT EXISTS (SELECT 1 FROM lab.event WHERE recorded_login IS DISTINCT FROM session_user)
+    AND NOT EXISTS (SELECT 1 FROM lab.artifact WHERE created_login IS DISTINCT FROM session_user)
+    AND NOT EXISTS (SELECT 1 FROM lab.artifact_verification
+                    WHERE verified_login IS DISTINCT FROM session_user)
+    AND NOT EXISTS (SELECT 1 FROM lab.tag_assignment
+                    WHERE applied_login IS DISTINCT FROM session_user)
+    AND (SELECT applied_login FROM lab.tag_current
+          WHERE entity_kind = 'subject' AND entity_id = 'G2' AND tag = 'tst_open:x') = session_user,
+    'the *_login columns hold session_user whatever the client sends');
+
+-- ---------------------------------------------------------------------------
+-- An artifact is filed with the event that produced it
+-- ---------------------------------------------------------------------------
+INSERT INTO lab.session (session_id, subject_id, label, storage_root_id, relative_path)
+VALUES ('00000000-0000-0000-0000-0000000000c3', 'G1-renamed', 's2',
+        (SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'), 'G1/s2');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, checksum, subject_id)
+       VALUES ('00000000-0000-0000-0000-0000000000e7', 1, 'G2/stray.dat', repeat('1a', 32), 'G2')$q$,
+    'is filed under subject G2');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, checksum, session_id)
+       VALUES ('00000000-0000-0000-0000-0000000000e7', 1, 'G1/s2/stray.dat', repeat('1b', 32),
+               '00000000-0000-0000-0000-0000000000c3')$q$,
+    'is filed under session 00000000-0000-0000-0000-0000000000c3');
+-- An analysis with no subject may produce a per-animal file.
+INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, checksum, subject_id)
+VALUES ('00000000-0000-0000-0000-0000000000e2',
+        (SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'),
+        'G2/summary.csv', repeat('1c', 32), 'G2');
+-- Rows that predate the trigger are reported.
+ALTER TABLE lab.artifact DISABLE TRIGGER trg_artifact_matches_event;
+INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, relative_path,
+                          checksum, subject_id)
+VALUES ('00000000-0000-0000-0000-0000000000fa', '00000000-0000-0000-0000-0000000000e7',
+        (SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'),
+        'G2/legacy.dat', repeat('1d', 32), 'G2');
+ALTER TABLE lab.artifact ENABLE TRIGGER trg_artifact_matches_event;
+SELECT pg_temp.assert(
+    (SELECT subject FROM lab.fn_check_integrity() WHERE check_name = 'artifact_event_mismatch')
+    = '00000000-0000-0000-0000-0000000000fa',
+    'integrity check reports an artifact filed under another subject than its event');
+
+-- ---------------------------------------------------------------------------
+-- The rename hatch does not fill in a NULL subject
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.expect_error(
+    $q$SELECT set_config('lab.maintenance', 'subject_rename', true);
+       SELECT set_config('lab.rename_from', 'no-such-animal', true);
+       SELECT set_config('lab.rename_to', 'G2', true);
+       UPDATE lab.event SET subject_id = 'G2'
+       WHERE event_id = '00000000-0000-0000-0000-0000000000e2'$q$,
+    'admits only the subject-id relabelling');
+
+-- ---------------------------------------------------------------------------
+-- Current tags follow insertion order, not applied_at
+-- ---------------------------------------------------------------------------
+INSERT INTO lab.tag (tag) VALUES ('tst_open:future');
+INSERT INTO lab.tag_assignment (entity_kind, subject_id, tag, op, applied_at)
+VALUES ('subject', 'G2', 'tst_open:future', 'add', '2099-01-01');
+SELECT lab.fn_tag('subject', 'G2', 'tst_open:future', 'remove');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.tag_current
+                WHERE entity_kind = 'subject' AND entity_id = 'G2' AND tag = 'tst_open:future'),
+    'a remove takes effect even when the add carries a later applied_at');
+
+-- A single-valued namespace holding two current tags is reported.
+ALTER TABLE lab.tag_assignment DISABLE TRIGGER trg_tag_assignment_policy;
+INSERT INTO lab.tag_assignment (entity_kind, subject_id, tag, op)
+VALUES ('subject', 'G2', 'cohort:a', 'add');
+INSERT INTO lab.tag (tag) VALUES ('cohort:b');
+INSERT INTO lab.tag_assignment (entity_kind, subject_id, tag, op)
+VALUES ('subject', 'G2', 'cohort:b', 'add');
+ALTER TABLE lab.tag_assignment ENABLE TRIGGER trg_tag_assignment_policy;
+SELECT pg_temp.assert(
+    (SELECT severity || '|' || subject || '|' || detail FROM lab.fn_check_integrity()
+      WHERE check_name = 'tag_cardinality_violation')
+    = 'error|G2|subject has 2 current tags in single-valued namespace cohort: cohort:a, cohort:b',
+    'integrity check reports two current tags in a single-valued namespace');
+
+-- ---------------------------------------------------------------------------
+-- Tag filters are checked against the vocabulary
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.assert(
+    (SELECT string_agg(token || ' => ' || problem, '; ' ORDER BY token)
+     FROM lab.fn_tag_filter_problems('artifact',
+            ARRAY['qc:fial', ' Stage:Raw ', 'nosuch:*', 'cohort:a', ' ', NULL,
+                  'Auditory_Cortex', 'qc:*', 'topic:never_used']))
+    = 'cohort:a => tags of namespace cohort apply to subject, session only, not to artifact; '
+      'nosuch:* => tag namespace nosuch does not exist; '
+      'qc:fial => tag qc:fial is not registered (values of qc: fail, maybe, pass, pending); '
+      'topic:never_used => tag topic:never_used is not registered, so nothing can carry it',
+    'fn_tag_filter_problems names unknown namespaces, inapplicable namespaces and unregistered tags');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_tag_filter_problems('artifact',
+                    ARRAY['stage:raw', 'stage:*', 'auditory_cortex', '']))
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_tag_filter_problems('subject', NULL)),
+    'a sound filter, or none, has no problems');
+
+-- ---------------------------------------------------------------------------
+-- A correction that drops every input is reported
+-- ---------------------------------------------------------------------------
+INSERT INTO lab.event (event_id, event_type, occurred_at, supersedes)
+VALUES ('00000000-0000-0000-0000-0000000000e8', 'analysis', '2026-09-02 10:00-04',
+        '00000000-0000-0000-0000-0000000000e2');
+INSERT INTO lab.analysis_event (event_id, status) VALUES
+    ('00000000-0000-0000-0000-0000000000e8', 'succeeded');
+SELECT pg_temp.assert(
+    (SELECT detail FROM lab.fn_check_integrity()
+      WHERE check_name = 'input_not_carried_forward'
+        AND subject = '00000000-0000-0000-0000-0000000000e8')
+    = 'supersedes event 00000000-0000-0000-0000-0000000000e2, which consumed 1 artifact(s), '
+      'but declares no inputs',
+    'integrity check reports a correction that declares no inputs');
+-- Until e8 declares its inputs, e2's outputs hang off a consumer that is no
+-- longer current, so nothing is derived from the raw file.
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f1', 'down')) = 1,
+    'a correction with no inputs is authoritative: the old edge no longer counts');
+INSERT INTO lab.event_input (event_id, artifact_id)
+VALUES ('00000000-0000-0000-0000-0000000000e8', '00000000-0000-0000-0000-0000000000f1');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name = 'input_not_carried_forward')
+    AND (SELECT string_agg(event_id::text, ',' ORDER BY artifact_id)
+         FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f1', 'down')
+         WHERE depth = 1)
+        = '00000000-0000-0000-0000-0000000000e8,00000000-0000-0000-0000-0000000000e8',
+    'once the inputs are re-declared, lineage reaches e2''s files through current event e8');
+
+-- ===========================================================================
+-- Schema version 5: user-defined variables, retraction, logins
+-- ===========================================================================
+-- Fixture at this point: subjects G1-renamed and G2; sessions c1 and c3
+-- (G1-renamed) and c2 (G2); recording e7 is current (e1 superseded); analysis
+-- e8 is current (e2 superseded) and consumed raw file f1, whose current row
+-- is the active artifact at G1/s1/raw.dat; f2 (spikes) is active.
+
+-- ---------------------------------------------------------------------------
+-- Variables: define on first use, update by setting again, read the latest
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.assert(lab.fn_canonical_variable(E' Probe \t Depth\n') = 'probe depth',
+                      'fn_canonical_variable folds case and whitespace');
+SELECT lab.fn_set_variable('session', '00000000-0000-0000-0000-0000000000c1', ' Probe  Depth ', 1200,
+                           p_units => 'um', p_label => 'Probe Depth',
+                           p_description => 'Depth of the probe tip below the pia',
+                           p_by => '00000000-0000-0000-0000-0000000000a1');
+SELECT pg_temp.assert(
+    (SELECT label || '|' || units || '|' || value_type || '|' || description || '|' || created_by
+     FROM lab.variable WHERE name = 'probe depth')
+    = 'Probe Depth|um|number|Depth of the probe tip below the pia|00000000-0000-0000-0000-0000000000a1',
+    'a variable is defined on first use, with its label, units, type and description');
+-- An update is a second row; the first stays in the log.
+SELECT lab.fn_set_variable('session', '00000000-0000-0000-0000-0000000000c1', 'probe depth', 1350.50,
+                           p_note => 'advanced 150 um');
+SELECT pg_temp.assert(
+    (SELECT value || '|' || units || '|' || label || '|' || note FROM lab.variable_current
+      WHERE entity_kind = 'session' AND variable = 'probe depth')
+    = '1350.50|um|Probe Depth|advanced 150 um'
+    AND (SELECT string_agg(value_num::text, ',' ORDER BY value_id) FROM lab.variable_value
+          WHERE variable = 'probe depth') = '1200,1350.50'
+    AND lab.fn_variable_number('session', '00000000-0000-0000-0000-0000000000C1', 'Probe Depth') = 1350.50,
+    'setting a variable again updates it: the latest value is current, the history is kept, '
+    'and the digits typed are the digits stored');
+SELECT pg_temp.assert(
+    (SELECT set_login = session_user AND set_at IS NOT NULL FROM lab.variable_current
+      WHERE entity_kind = 'session' AND variable = 'probe depth'),
+    'a value records when it was set and the login that set it');
+
+-- A text variable, and all of an entity's variables as one object.
+SELECT lab.fn_set_variable('subject', 'G2', 'housing', p_text => 'pair');
+SELECT lab.fn_set_variable('subject', 'G2', 'baseline weight', 71.9, p_units => 'g');
+SELECT pg_temp.assert(
+    lab.fn_variable_text('subject', 'G2', 'housing') = 'pair'
+    AND lab.fn_variable_number('subject', 'G2', 'housing') IS NULL
+    AND lab.fn_variable_text('subject', 'G2', 'baseline weight') = '71.9'
+    AND lab.fn_variable_number('subject', 'G2', 'no such variable') IS NULL
+    AND (SELECT variables FROM lab.entity_variables
+          WHERE entity_kind = 'subject' AND entity_id = 'G2')
+        = '{"housing": "pair", "baseline weight": 71.9}'::jsonb,
+    'text and number variables read back through the helper functions and entity_variables');
+
+-- What is refused.
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('session', '00000000-0000-0000-0000-0000000000c1', 'probe depth', 1.35, p_units => 'mm')$q$,
+    'is recorded in um, not in mm');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('session', '00000000-0000-0000-0000-0000000000c1', 'probe depth', p_text => 'deep')$q$,
+    'holds a number');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'housing', 2)$q$, 'holds text');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'housing')$q$, 'exactly one value');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'housing', 1, 'pair')$q$, 'exactly one value');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'Bad!Name', 1)$q$, 'not a valid variable name');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('animal', 'G2', 'housing', p_text => 'x')$q$, 'entity kind must be');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'baseline weight', 'NaN'::numeric)$q$,
+    'variable_value_number_ck');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'housing', p_text => '   ')$q$,
+    'variable_value_text_ck');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.variable_value (entity_kind, subject_id, variable, value_num)
+       VALUES ('subject', 'G2', 'never defined', 1)$q$, 'is not defined');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.variable_value (entity_kind, subject_id, variable, value_num, value_text)
+       VALUES ('subject', 'G2', 'housing', 1, 'pair')$q$, 'variable_value_single_ck');
+SELECT lab.fn_define_variable('litter size', 'number', NULL, 'Litter size', NULL, ARRAY['subject']);
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('session', '00000000-0000-0000-0000-0000000000c1', 'litter size', 5)$q$,
+    'applies to subject only, not to session');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_define_variable('probe depth', 'number', 'mm')$q$, 'already defined as a number in um');
+SELECT pg_temp.assert(lab.fn_define_variable(' PROBE depth ', 'number', 'um') = 'probe depth',
+                      'defining an existing variable the same way is not an error');
+
+-- Unset: the entity then has no current value; a second unset has nothing to do.
+SELECT lab.fn_unset_variable('subject', 'G2', 'Housing', 'entered on the wrong animal');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.variable_current
+                WHERE entity_kind = 'subject' AND entity_id = 'G2' AND variable = 'housing')
+    AND (SELECT string_agg(op, ',' ORDER BY value_id) FROM lab.variable_value
+          WHERE variable = 'housing') = 'set,unset',
+    'an unset variable has no current value and its history is kept');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_unset_variable('subject', 'G2', 'housing')$q$, 'nothing to unset');
+
+-- The definition: never renamed; units and type frozen once it has a value;
+-- label and description editable and recorded.
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.variable SET name = 'depth' WHERE name = 'probe depth'$q$, 'cannot be renamed');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.variable SET units = 'mm' WHERE name = 'probe depth'$q$, 'units are frozen');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.variable SET value_type = 'text' WHERE name = 'probe depth'$q$, 'units are frozen');
+UPDATE lab.variable SET units = 'pups' WHERE name = 'litter size';     -- no values yet: allowed
+UPDATE lab.variable SET label = 'Probe depth (tip)' WHERE name = 'probe depth';
+SELECT pg_temp.assert(
+    (SELECT old_row ->> 'label' || '>' || (new_row ->> 'label') FROM lab.row_history
+      WHERE table_name = 'variable' AND row_key ->> 'name' = 'probe depth')
+    = 'Probe Depth>Probe depth (tip)'
+    AND (SELECT label FROM lab.variable_current WHERE variable = 'probe depth') = 'Probe depth (tip)',
+    'a definition edit is recorded in row_history and shows on the current value');
+UPDATE lab.variable SET retired_at = now() WHERE name = 'litter size';
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_variable('subject', 'G2', 'litter size', 5)$q$, 'was retired');
+
+-- The value log is append-only.
+SELECT pg_temp.expect_error($q$UPDATE lab.variable_value SET value_num = 1$q$, 'append-only log');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.variable_value$q$, 'not allowed');
+SELECT pg_temp.expect_error($q$TRUNCATE lab.variable_value$q$, 'not allowed');
+
+-- A correction starts with its predecessor's variables, each keeping the time
+-- and person it was set by.
+SELECT lab.fn_set_variable('event', '00000000-0000-0000-0000-0000000000e7', 'attenuation', 20,
+                           p_units => 'dB', p_by => '00000000-0000-0000-0000-0000000000a1');
+INSERT INTO lab.event (event_id, event_type, session_id, occurred_at, supersedes)
+VALUES ('00000000-0000-0000-0000-0000000000e9', 'recording',
+        '00000000-0000-0000-0000-0000000000c1', '2026-09-01 14:00-04',
+        '00000000-0000-0000-0000-0000000000e7');
+INSERT INTO lab.recording_event (event_id, sample_rate_hz, n_channels)
+VALUES ('00000000-0000-0000-0000-0000000000e9', 30000, 32);
+SELECT pg_temp.assert(
+    (SELECT n.value || '|' || n.note || '|' || (n.set_at = o.set_at) || '|' || n.set_by
+     FROM lab.variable_current n, lab.variable_current o
+     WHERE n.entity_kind = 'event' AND n.entity_id = '00000000-0000-0000-0000-0000000000e9'
+       AND o.entity_kind = 'event' AND o.entity_id = '00000000-0000-0000-0000-0000000000e7'
+       AND n.variable = 'attenuation' AND o.variable = 'attenuation')
+    = '20|carried forward from 00000000-0000-0000-0000-0000000000e7|true|'
+      '00000000-0000-0000-0000-0000000000a1',
+    'a superseding event carries its predecessor''s variables, with their set_at and set_by');
+
+-- Variables follow a renamed subject (the cascade passes the rename hatch).
+SELECT lab.fn_rename_subject('G2', 'G2-renamed');
+SELECT pg_temp.assert(
+    lab.fn_variable_number('subject', 'G2-renamed', 'baseline weight') = 71.9
+    AND NOT EXISTS (SELECT 1 FROM lab.variable_value WHERE subject_id = 'G2'),
+    'variables follow a renamed subject');
+
+-- ---------------------------------------------------------------------------
+-- Retraction
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e7', 'entered twice')$q$,
+    'has been superseded by 00000000-0000-0000-0000-0000000000e9');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e9', '  ')$q$,
+    'retraction_reason_ck');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_retract('subject', '00000000-0000-0000-0000-0000000000e9', 'x')$q$,
+    'only an event or an artifact');
+
+-- Two more weights for one animal, dated after every other event in the
+-- fixture; the later one is retracted.
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at) VALUES
+    ('00000000-0000-0000-0000-0000000000d2', 'husbandry', 'G2-renamed', '2098-01-01 09:00-04'),
+    ('00000000-0000-0000-0000-0000000000d3', 'husbandry', 'G2-renamed', '2099-01-01 09:00-04');
+INSERT INTO lab.husbandry_event (event_id, measure, weight_g) VALUES
+    ('00000000-0000-0000-0000-0000000000d2', 'weight', 70.2),
+    ('00000000-0000-0000-0000-0000000000d3', 'weight', 702);
+SELECT pg_temp.assert(
+    (SELECT latest_weight_g FROM lab.subject_current WHERE subject_id = 'G2-renamed') = 702,
+    'before retraction the mistyped weight is the latest');
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-0000000000d3', 'topic:retract_me');
+SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000d3', 'weight mistyped: 702 for 70.2',
+                      '00000000-0000-0000-0000-0000000000a1');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.event_active WHERE event_id = '00000000-0000-0000-0000-0000000000d3')
+    AND EXISTS (SELECT 1 FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000d3')
+    AND (SELECT is_retracted AND NOT is_current AND superseded_by IS NULL FROM lab.event_version
+          WHERE event_id = '00000000-0000-0000-0000-0000000000d3')
+    AND (SELECT latest_weight_g FROM lab.subject_current WHERE subject_id = 'G2-renamed') = 70.2
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_find_by_tags('event', ARRAY['topic:retract_me']))
+    AND EXISTS (SELECT 1 FROM lab.fn_find_by_tags('event', ARRAY['topic:retract_me'], NULL, NULL, false)),
+    'a retracted event stays in the log but is not active: views, subject_current and tag '
+    'search leave it out');
+SELECT pg_temp.assert(
+    (SELECT reason || '|' || retracted_by || '|' || (retracted_login = session_user)
+     FROM lab.retraction WHERE event_id = '00000000-0000-0000-0000-0000000000d3')
+    = 'weight mistyped: 702 for 70.2|00000000-0000-0000-0000-0000000000a1|true',
+    'a retraction records why, who and the login');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000d3', 'again')$q$,
+    'already retracted');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.retraction$q$, 'not allowed');
+SELECT pg_temp.expect_error($q$UPDATE lab.retraction SET reason = 'x'$q$, 'append-only log');
+
+-- Superseding a retracted row brings it back as an ordinary correction.
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at, supersedes)
+VALUES ('00000000-0000-0000-0000-0000000000d4', 'husbandry', 'G2-renamed', '2099-01-02 09:00-04',
+        '00000000-0000-0000-0000-0000000000d3');
+INSERT INTO lab.husbandry_event (event_id, measure, weight_g)
+VALUES ('00000000-0000-0000-0000-0000000000d4', 'weight', 70.4);
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.event_active WHERE event_id = '00000000-0000-0000-0000-0000000000d4')
+    AND (SELECT latest_weight_g FROM lab.subject_current WHERE subject_id = 'G2-renamed') = 70.4,
+    'superseding a retracted event restores it as a correction');
+
+-- A retracted file: gone from the active view and from lineage, and the
+-- event that consumed it is reported.
+SELECT lab.fn_retract('artifact', '00000000-0000-0000-0000-0000000000f2', 'sorted from the wrong file');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.artifact_active WHERE artifact_id = '00000000-0000-0000-0000-0000000000f2')
+    AND (SELECT is_retracted FROM lab.artifact_version
+          WHERE artifact_id = '00000000-0000-0000-0000-0000000000f2')
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f1', 'down')
+                    WHERE artifact_id = '00000000-0000-0000-0000-0000000000f2'),
+    'a retracted artifact is not active and drops out of lineage that follows corrections');
+SELECT lab.fn_retract('artifact',
+                      (SELECT artifact_id FROM lab.artifact_active WHERE relative_path = 'G1/s1/raw.dat'),
+                      'recorded from the wrong rig');
+SELECT pg_temp.assert(
+    (SELECT subject || '|' || (detail LIKE '%recorded from the wrong rig') FROM lab.fn_check_integrity()
+      WHERE check_name = 'input_retracted') = '00000000-0000-0000-0000-0000000000e8|true',
+    'integrity check reports the current analysis that consumed a retracted file');
+SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e8', 'analysis of a withdrawn file');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+            WHERE check_name = 'artifact_producer_retracted'
+              AND detail LIKE 'produced by event 00000000-0000-0000-0000-0000000000e8, which was retracted:%')
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'input_retracted'),
+    'integrity check reports active files of a retracted event, resolved through its versions');
+
+-- ---------------------------------------------------------------------------
+-- People and logins
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.assert(lab.fn_current_person() IS NULL, 'an unmapped login resolves to no person');
+UPDATE lab.person SET db_login = session_user WHERE person_id = '00000000-0000-0000-0000-0000000000a1';
+SELECT pg_temp.assert(lab.fn_current_person() = '00000000-0000-0000-0000-0000000000a1',
+                      'fn_current_person resolves the connected login');
+INSERT INTO lab.person (person_id, full_name) VALUES ('00000000-0000-0000-0000-0000000000a2', 'Other');
+SELECT pg_temp.expect_error(
+    $q$UPDATE lab.person SET db_login = session_user
+       WHERE person_id = '00000000-0000-0000-0000-0000000000a2'$q$, 'uq_person_db_login');
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at) VALUES
+    ('00000000-0000-0000-0000-0000000000d5', 'husbandry', 'G2-renamed', now());
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at, recorded_by) VALUES
+    ('00000000-0000-0000-0000-0000000000d6', 'husbandry', 'G2-renamed', now(),
+     '00000000-0000-0000-0000-0000000000a2');
+INSERT INTO lab.husbandry_event (event_id, measure) VALUES
+    ('00000000-0000-0000-0000-0000000000d5', 'health_check'),
+    ('00000000-0000-0000-0000-0000000000d6', 'health_check');
+SELECT lab.fn_set_variable('subject', 'G2-renamed', 'baseline weight', 72.0);
+SELECT pg_temp.assert(
+    (SELECT recorded_by FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000d5')
+        = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT recorded_by FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000d6')
+        = '00000000-0000-0000-0000-0000000000a2'
+    AND (SELECT set_by FROM lab.variable_current
+          WHERE entity_kind = 'subject' AND variable = 'baseline weight')
+        = '00000000-0000-0000-0000-0000000000a1',
+    'a row that names no person is attributed to the login''s person; a named person is kept');
 
 ROLLBACK;
 \echo 'schema_test.sql: all assertions passed'

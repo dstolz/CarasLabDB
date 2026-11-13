@@ -8,9 +8,18 @@ function eventId = addEndpointEvent(obj, opts)
 %   Required:
 %       OccurredAt   - datetime the endpoint occurred (timestamptz)
 %   Common event Name=Value:
-%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes
+%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Endpoint-specific Name=Value:
 %       Method, PerfusionFixative, TissueCollected (logical), Disposition
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -27,6 +36,7 @@ function eventId = addEndpointEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- endpoint detail ---
         opts.Method (1,1) string = string(missing)
         opts.PerfusionFixative (1,1) string = string(missing)
@@ -44,5 +54,6 @@ function eventId = addEndpointEvent(obj, opts)
     end
     detail = obj.pSet(detail, "disposition",        opts.Disposition);
 
-    eventId = obj.pInsertEvent(base, obj.pT("endpoint_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("endpoint_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

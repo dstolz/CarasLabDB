@@ -5,8 +5,13 @@ description = "Read-only MCP server exposing the CarasLabDB lab schema to LLM ag
 requires-python = ">=3.10"
 dependencies = [
     # mcp 2.x renamed FastMCP (mcp.server.fastmcp) to MCPServer; this server
-    # is written against the 1.x API.
-    "mcp>=1.2.0,<2",
+    # is written against the 1.x API. The floor is the release the test suite
+    # was last run against: early 1.x releases (1.2.0, for one) no longer
+    # import with a current pydantic, and tools/__init__.py's OptText relies
+    # on how FastMCP pre-parses string arguments, which the tests pin.
+    "mcp>=1.30.0,<2",
+    # Imported directly (tools/__init__.py); mcp itself requires pydantic 2.
+    "pydantic>=2,<3",
     "psycopg[binary]>=3.1",
 ]
 

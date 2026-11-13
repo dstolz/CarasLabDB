@@ -8,9 +8,18 @@ function eventId = addHistologyEvent(obj, opts)
 %   Required:
 %       OccurredAt   - datetime the histology was performed (timestamptz)
 %   Common event Name=Value:
-%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes
+%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Histology-specific Name=Value:
 %       Technique, TargetRegion, Stain, Microscope
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -27,6 +36,7 @@ function eventId = addHistologyEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- histology detail ---
         opts.Technique (1,1) string = string(missing)
         opts.TargetRegion (1,1) string = string(missing)
@@ -42,5 +52,6 @@ function eventId = addHistologyEvent(obj, opts)
     detail = obj.pSet(detail, "stain",         opts.Stain);
     detail = obj.pSet(detail, "microscope",    opts.Microscope);
 
-    eventId = obj.pInsertEvent(base, obj.pT("histology_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("histology_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

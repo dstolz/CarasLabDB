@@ -7,9 +7,11 @@ classdef RecordingConnection < handle
 %   ... call db methods ...
 %   conn.Log          % every statement sent, in order
 %
-%   It answers the two queries CarasLabDB's constructor sends (the
-%   schema_version probe and version, reported as the version the class
-%   expects) and returns an empty table for every other fetch, so a method
+%   It answers the queries CarasLabDB's constructor sends -- the
+%   schema_version probe, the version (SchemaVersion, by default the one the
+%   class expects) and the check that a supplied PersonId exists -- and
+%   lab.fn_tag_filter_problems (TagFilterProblems, by default no rows: every
+%   filter is sound). Every other fetch returns an empty table, so a method
 %   that reaches the database gets as far as its first use of a result.
 %   No server is involved, so the tests that use it run without the
 %   Database Toolbox -- on any release the class supports.
@@ -19,6 +21,8 @@ classdef RecordingConnection < handle
     properties
         AutoCommit = 'on'
         Message = ""
+        SchemaVersion = CarasLabDB.SchemaVersionExpected   % reported by the version query
+        TagFilterProblems = table()     % reported by lab.fn_tag_filter_problems (token, problem)
     end
 
     properties (SetAccess = private)
@@ -35,7 +39,12 @@ classdef RecordingConnection < handle
             if contains(sql, "to_regclass")
                 T = table(true, 'VariableNames', {'present'});
             elseif contains(sql, "max(version)")
-                T = table(CarasLabDB.SchemaVersionExpected, 'VariableNames', {'v'});
+                T = table(obj.SchemaVersion, 'VariableNames', {'v'});
+            elseif contains(sql, "person WHERE person_id = ")
+                % The check that a supplied PersonId exists: it does.
+                T = table("00000000-0000-0000-0000-000000000001", 'VariableNames', {'person_id'});
+            elseif contains(sql, "fn_tag_filter_problems")
+                T = obj.TagFilterProblems;
             else
                 T = table();
             end

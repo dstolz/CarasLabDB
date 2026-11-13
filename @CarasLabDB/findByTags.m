@@ -12,6 +12,10 @@ function ids = findByTags(obj, kind, opts)
 %   rows are candidates too, so a NotTags=-only filter finds them, and a call
 %   with no tokens at all returns every row of the kind.
 %
+%   A token whose namespace does not exist or does not apply to KIND, or
+%   whose tag is not registered, raises CarasLabDB:tagFilterProblem: a typo
+%   would otherwise match nothing and, in NotTags=, exclude nothing.
+%
 %   ActiveOnly (default: UseActiveViews) skips superseded events and
 %   artifacts, like the *_active views; it has no effect on other kinds.
 %
@@ -29,6 +33,10 @@ function ids = findByTags(obj, kind, opts)
         opts.NotTags string = strings(1, 0)
         opts.ActiveOnly (1,1) logical = obj.UseActiveViews
     end
+
+    % Validates every token, then refuses a filter that names an unknown
+    % namespace or tag before the query runs (lab.fn_tag_filter_problems).
+    obj.pCheckTagFilter(kind, opts.Tags, opts.AnyTags, opts.NotTags);
 
     sql = "SELECT entity_id FROM " + obj.pT("fn_find_by_tags") + "(" + ...
         obj.sqlLiteral(kind) + ", " + ...

@@ -8,7 +8,13 @@ function showSessionEditor(obj, mode, sessionId)
 %   CarasLabDB.updateSession. session_id and the owning subject_id are set only
 %   on add and are read-only when editing.
 %
-%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDB/ADDSESSION, CARASLABDB/UPDATESESSION.
+%   Editing writes only what the user changed. Started at, Ended at, Rig and
+%   Notes are cleared (updateSession's Clear=) when emptied; Label, Storage
+%   root id and Relative path are required. If nothing was changed, nothing
+%   is written.
+%
+%   See also CARASLABDBAPP/PFORMDIALOG, CARASLABDBAPP/FIELDCHANGE,
+%   CARASLABDB/ADDSESSION, CARASLABDB/UPDATESESSION.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -70,7 +76,7 @@ function showSessionEditor(obj, mode, sessionId)
     if ~res.OK, return; end
 
     try
-        args = local_args(fields, res.Values, isEdit);
+        [args, clearCols] = local_args(fields, res.Values, isEdit);
     catch ME
         uialert(obj.Fig, string(ME.message), "Invalid input");
         return
@@ -78,6 +84,13 @@ function showSessionEditor(obj, mode, sessionId)
 
     try
         if isEdit
+            if isempty(args) && isempty(clearCols)
+                obj.pStatus("No changes to save for session " + sessionId + ".");
+                return
+            end
+            if ~isempty(clearCols)
+                args = [args, {"Clear", clearCols}];
+            end
             obj.Db.updateSession(sessionId, args{:});
             obj.pStatus("Updated session " + sessionId);
         else
@@ -97,18 +110,30 @@ function showSessionEditor(obj, mode, sessionId)
 end
 
 % =============================================================================
-function args = local_args(fields, values, isEdit)
+function [args, clearCols] = local_args(fields, values, isEdit)
+    %LOCAL_ARGS Name=Value arguments for addSession / updateSession.
+    %   Adding: every non-blank field. Editing: only the fields the user
+    %   changed (ARGS), plus the columns of fields that were prefilled and
+    %   are now blank (CLEARCOLS, for updateSession's Clear=). An untouched
+    %   field is never written back. Emptying a field the database requires
+    %   is an error that names the field.
     args = {};
+    clearCols = strings(1, 0);
+    clearable = ["started_at","ended_at","rig","notes"];
     for i = 1:numel(fields)
         f = fields(i);
         if isEdit && f.Key == "SubjectId"
             continue   % subject is fixed for an existing session
         end
-        % When editing, the form arrives prefilled; a datetime that still
-        % matches its prefill is not an edit and must not be written back.
-        [provided, v] = local_convert(f, values.(char(f.Key)), isEdit);
-        if provided
+        [action, v] = CarasLabDBApp.fieldChange(f, values.(char(f.Key)), isEdit);
+        if action == "set"
             args(end+1:end+2) = {f.Arg, v};
+        elseif action == "clear"
+            if ~ismember(f.Col, clearable)
+                error("CarasLabDBApp:requiredField", ...
+                    "%s is required and cannot be cleared.", f.Label);
+            end
+            clearCols(end+1) = f.Col;
         end
     end
 end
@@ -119,56 +144,11 @@ function req = local_missingRequired(fields, values)
     for i = 1:numel(fields)
         f = fields(i);
         if ~ismember(f.Key, required), continue; end
-        [provided, ~] = local_convert(f, values.(char(f.Key)), false);
-        if ~provided
+        [action, ~] = CarasLabDBApp.fieldChange(f, values.(char(f.Key)), false);
+        if action ~= "set"
             req(end+1) = f.Label; %#ok<AGROW>
         end
     end
-end
-
-function [provided, v] = local_convert(f, raw, onlyIfChanged)
-    %LOCAL_CONVERT Coerce a raw widget value; ONLYIFCHANGED suppresses
-    %   "provided" for a datetime still equal to what was prefilled.
-    switch f.Type
-        case "number"
-            v = raw;
-            provided = ~isnan(v);
-        case "datetime"
-            v = raw;
-            if isnat(v)
-                provided = false; return
-            end
-            v.TimeZone = "local";
-            provided = ~(onlyIfChanged && local_sameInstant(v, f.Value));
-        otherwise
-            v = strtrim(string(raw));
-            provided = strlength(v) > 0;
-    end
-end
-
-function tf = local_sameInstant(v, orig)
-    %LOCAL_SAMEINSTANT True when a form datetime still equals its prefill.
-    %   The form surfaces whole seconds only, so compare at that resolution.
-    tf = false;
-    if isempty(orig) || (isstring(orig) && isscalar(orig) && ismissing(orig))
-        return
-    end
-    try
-        if isdatetime(orig)
-            o = orig;
-        else
-            o = datetime(string(orig), "TimeZone", "local");
-        end
-    catch
-        return
-    end
-    if ~isscalar(o) || isnat(o)
-        return
-    end
-    if isempty(o.TimeZone)
-        o.TimeZone = "local";
-    end
-    tf = abs(seconds(v - o)) < 1;
 end
 
 % ---- helpers -----------------------------------------------------------------

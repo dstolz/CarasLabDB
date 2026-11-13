@@ -180,16 +180,18 @@ it and returns the canonical spelling, under the same open/closed rule as
 `lab.tag_assignment` is an **append-only log**: one row per tag `add`ed or
 `remove`d, never updated or deleted (like `event`). There is no "current tags"
 column anywhere. An entity's current tags are the **latest row per
-(entity, tag)**, ordered by `applied_at DESC, assignment_id DESC`, kept when
-that row is an `add`. Ties on `applied_at` are real — `now()` is the
-transaction start, so the `remove` and `add` of a replace share a timestamp —
-which is why the tiebreak is the insertion order, `assignment_id`.
+(entity, tag)** in insertion order (`assignment_id`), kept when that row is an
+`add`. `applied_at` is not used to decide which row is latest: `now()` is the
+start of the writing transaction and a client may supply the column, so a
+`remove` that the policy trigger accepted could carry an earlier `applied_at`
+than the `add` it removes. Writers are serialised per (entity, namespace)
+(§9), so insertion order is the order in which the policy accepted the rows.
 
 Two views expose this:
 
 | View | Rows |
 |---|---|
-| `lab.tag_current` | One per current tag: `entity_kind`, `entity_id` (text), the typed id columns, `tag`, `namespace`, `value`, `display_tag`, `note`, `applied_at`, `applied_by`. |
+| `lab.tag_current` | One per current tag: `entity_kind`, `entity_id` (text), the typed id columns, `tag`, `namespace`, `value`, `display_tag`, `note`, `applied_at`, `applied_by`, `applied_login` (the database login that wrote the row, set by the database). |
 | `lab.entity_tags` | One per entity that has at least one current tag: `entity_kind`, `entity_id`, and parallel sorted arrays `tags` and `display_tags`. |
 
 The history of an entity is `SELECT … FROM lab.tag_assignment WHERE …` — every
@@ -223,6 +225,23 @@ returns the matching `entity_id`s (text, id order). Untagged entities are
 candidates too, so a `none_of`-only query finds them. For events and artifacts
 `active_only` skips superseded rows, like the `*_active` views; it has no
 effect on the other kinds. An unknown `kind` raises.
+
+**Typos in a filter.** `fn_tag_match` treats a token that nothing carries as
+simply unmatched. That is the right rule for matching, but it makes a typo
+silent, and in the dangerous direction: `none_of => ['qc:fial']` excludes
+nothing and returns the failed recordings. `lab.fn_tag_filter_problems(kind,
+tokens)` is the check for that. It returns one row per faulty token — a
+namespace that does not exist, a namespace whose tags cannot be put on that
+entity kind, or (unless the token is `ns:*`) a tag that is not registered —
+and no rows for a sound filter. The MATLAB getters, the GUI and the MCP
+server call it once per query and refuse a filter that has problems, so the
+vocabulary catches typos on read as it does on write.
+
+```sql
+SELECT * FROM lab.fn_tag_filter_problems('artifact', ARRAY['stage:raw', 'qc:fial', 'cohort:a']);
+--  qc:fial  | tag qc:fial is not registered (values of qc: fail, pass, pending)
+--  cohort:a | tags of namespace cohort apply to subject, session only, not to artifact
+```
 
 ```sql
 -- sorted artifacts about tonotopy that are not marked failed
@@ -290,16 +309,28 @@ The same applies to re-pointing an artifact at a corrected event (the example
 in [database-design.md](database-design.md) §4.2): each superseding artifact
 needs its own carry.
 
-## 9. Concurrency caveat
+## 9. Concurrency
 
-The single-cardinality check is a **trigger, not a constraint** — the same class
-of limitation as `trg_artifact_unique_active`. Two concurrent transactions can
-each find no current tag in a `single` namespace for the same entity, each
-insert one, and both commit, leaving two current values. Clients tag
-interactively, one entity at a time, so this is documented rather than
-guarded with a lock. `lab.tag_current` shows both rows if it happens; fix it by
-`remove`ing the wrong one. A concurrent duplicate `add` of the *same* tag is
-harmless: the latest row wins and the entity still has one current row for it.
+The policy checks are a **trigger, not a constraint**, so on their own they
+would not hold under concurrent writers: two transactions could each find no
+current tag in a `single` namespace for the same entity, each insert one, and
+both commit. In a mutable namespace that leaves two current values; in an
+immutable one (`cohort`, `condition`) it could never be repaired, because
+neither tag may be removed.
+
+`trg_tag_assignment_policy` therefore takes a transaction-level advisory lock
+on (entity kind, entity id, namespace) before it checks anything. The second
+writer waits for the first to commit or roll back and then checks against what
+was committed, so it is refused like any sequential duplicate. The lock is
+held to the end of the transaction; tagging the same entity from two
+long-running transactions makes one wait for the other.
+
+`lab.fn_check_integrity()` reports an entity with more than one current tag in
+a single-valued namespace as `tag_cardinality_violation`. That can only be
+left over from assignments made before schema version 4. In a mutable
+namespace, `remove` the wrong one; in an immutable one there is no client-side
+repair, and the lab's database administrator has to decide which assignment
+stands.
 
 ## 10. Using tags from each client
 

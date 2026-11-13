@@ -9,9 +9,18 @@ function eventId = addHusbandryEvent(obj, opts)
 %       Measure      - what was measured ('weight','health_check',
 %                      'water_restriction', ...); NOT NULL in the schema
 %   Common event Name=Value:
-%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes
+%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Husbandry-specific Name=Value:
 %       WeightG, WaterMl, HealthStatus
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -28,6 +37,7 @@ function eventId = addHusbandryEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- husbandry detail ---
         opts.Measure (1,1) string
         opts.WeightG (1,1) double = NaN
@@ -42,5 +52,6 @@ function eventId = addHusbandryEvent(obj, opts)
     detail = obj.pSet(detail, "water_ml",      opts.WaterMl);
     detail = obj.pSet(detail, "health_status", opts.HealthStatus);
 
-    eventId = obj.pInsertEvent(base, obj.pT("husbandry_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("husbandry_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

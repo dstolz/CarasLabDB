@@ -24,7 +24,9 @@ function artifactId = addArtifact(obj, opts)
 %                           mismatch it cannot explain.
 %   Optional Name=Value:
 %       ChecksumAlgo ("sha256"|"md5"|"blake3"; default sha256 in DB),
-%       SizeBytes, Role (artifact_role.code), Format, SubjectId, SessionId,
+%       SizeBytes (a whole number of bytes), Role (artifact_role.code), Format,
+%       SubjectId, SessionId (where given they must be the producing event's:
+%       the database rejects a file filed under another animal or session),
 %       Supersedes, Attributes (jsonb), CreatedBy
 %
 %   With Supersedes=, the superseded artifact's current tags are copied onto
@@ -41,7 +43,7 @@ function artifactId = addArtifact(obj, opts)
         opts.RelativePath (1,1) string
         opts.Checksum (1,1) string
         opts.ChecksumAlgo (1,1) string = string(missing)
-        opts.SizeBytes (1,1) double = NaN
+        opts.SizeBytes double {mustBeInteger, mustBeScalarOrEmpty} = []
         opts.Role (1,1) string = string(missing)
         opts.Format (1,1) string = string(missing)
         opts.SubjectId (1,1) string = string(missing)

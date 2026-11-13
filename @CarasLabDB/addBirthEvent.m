@@ -7,9 +7,18 @@ function eventId = addBirthEvent(obj, opts)
 %       OccurredAt   - datetime the birth occurred (timestamptz)
 %   Common event Name=Value:
 %       SubjectId, SessionId, Notes, Attributes (jsonb),
-%       RecordedBy, RecordedAt, Supersedes
+%       RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Birth-specific Name=Value:
 %       DamSubjectId, SireSubjectId, LitterId, BirthWeightG
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -26,6 +35,7 @@ function eventId = addBirthEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- birth detail ---
         opts.DamSubjectId (1,1) string = string(missing)
         opts.SireSubjectId (1,1) string = string(missing)
@@ -41,5 +51,6 @@ function eventId = addBirthEvent(obj, opts)
     detail = obj.pSet(detail, "litter_id",       opts.LitterId);
     detail = obj.pSet(detail, "birth_weight_g",  opts.BirthWeightG);
 
-    eventId = obj.pInsertEvent(base, obj.pT("birth_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("birth_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

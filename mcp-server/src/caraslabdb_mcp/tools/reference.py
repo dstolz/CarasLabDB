@@ -6,54 +6,54 @@ a caller should never have to know which tables are "small" to know whether
 it saw all the rows.
 """
 
-from typing import Optional
-
 from .. import db
+from . import OptText
 
 
 def register(app):
     @app.tool()
     def get_species(limit: int = db.DEFAULT_LIMIT) -> dict:
-        """List all species reference rows (code, common_name).
+        """List all species reference rows (code, common_name), ordered by code.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows exist than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.species", {}, limit=limit)
 
     @app.tool()
     def get_storage_roots(limit: int = db.DEFAULT_LIMIT) -> dict:
-        """List all NAS storage roots (root_id, name, description).
+        """List all NAS storage roots (root_id, name, description), ordered by root_id.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows exist than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.storage_root", {}, limit=limit)
 
     @app.tool()
     def get_probes(
-        probe_id: Optional[str] = None,
+        probe_id: OptText = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
-        """List probes, optionally filtered by probe_id.
+        """List probes, optionally filtered by probe_id; ordered by probe_id.
 
-        probe_id left as None is not applied as a filter -- it never means
-        "IS NULL". Returns {"rows", "row_count", "limit", "truncated"};
+        probe_id left out (or null) is not applied as a filter -- it never
+        means "IS NULL". Returns {"row_count", "limit", "truncated", "rows"};
         `truncated` true means more rows matched than were returned.
         """
         return db.select_from("lab.probe", {"probe_id": probe_id}, limit=limit)
 
     @app.tool()
     def get_pipelines(
-        pipeline_id: Optional[str] = None,
-        name: Optional[str] = None,
+        pipeline_id: OptText = None,
+        name: OptText = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """List analysis pipelines, optionally filtered by pipeline_id or name.
 
-        A filter left as None is not applied -- it never means "IS NULL".
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows matched than were returned.
+        name is matched exactly, case included. A filter left out (or null)
+        is not applied -- it never means "IS NULL". Ordered by name. Returns
+        {"row_count", "limit", "truncated", "rows"}; `truncated` true means
+        more rows matched than were returned.
         """
         return db.select_from("lab.pipeline", {
             "pipeline_id": pipeline_id, "name": name,
@@ -63,8 +63,9 @@ def register(app):
     def get_event_types(limit: int = db.DEFAULT_LIMIT) -> dict:
         """List the 8 known event type codes/labels (birth, surgery, recording, ...).
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows exist than were returned (raise `limit`, max 1000).
+        Ordered by code. Returns {"row_count", "limit", "truncated", "rows"};
+        `truncated` true means more rows exist than were returned (raise
+        `limit`, max 1000).
         """
         return db.select_from("lab.event_type", {}, limit=limit)
 
@@ -72,8 +73,9 @@ def register(app):
     def get_artifact_roles(limit: int = db.DEFAULT_LIMIT) -> dict:
         """List artifact role codes/labels (raw, spikes, lfp, waveforms, ...).
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows exist than were returned (raise `limit`, max 1000).
+        Ordered by code. Returns {"row_count", "limit", "truncated", "rows"};
+        `truncated` true means more rows exist than were returned (raise
+        `limit`, max 1000).
         """
         return db.select_from("lab.artifact_role", {}, limit=limit)
 
@@ -81,7 +83,8 @@ def register(app):
     def get_acquisition_systems(limit: int = db.DEFAULT_LIMIT) -> dict:
         """List acquisition system codes/labels (intan_rhx, open_ephys, ...).
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows exist than were returned (raise `limit`, max 1000).
+        Ordered by code. Returns {"row_count", "limit", "truncated", "rows"};
+        `truncated` true means more rows exist than were returned (raise
+        `limit`, max 1000).
         """
         return db.select_from("lab.acquisition_system", {}, limit=limit)

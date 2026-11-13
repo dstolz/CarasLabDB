@@ -12,11 +12,20 @@ function eventId = addRecordingEvent(obj, opts)
 %       OccurredAt   - datetime the recording occurred (timestamptz)
 %   Common event Name=Value:
 %       SubjectId, SessionId (required in practice), Notes, Attributes,
-%       RecordedBy, RecordedAt, Supersedes
+%       RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Recording-specific Name=Value:
 %       AcquisitionSystemCode, ProbeId,
 %       Modality ("ephys"|"video"|"behavior"|"multimodal"),
 %       SampleRateHz, NChannels, DurationS, StimulusProtocol, HardwareConfig (jsonb)
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -33,6 +42,7 @@ function eventId = addRecordingEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- recording detail ---
         opts.AcquisitionSystemCode (1,1) string = string(missing)
         opts.ProbeId (1,1) string = string(missing)
@@ -58,5 +68,6 @@ function eventId = addRecordingEvent(obj, opts)
     detail = obj.pSet(detail, "stimulus_protocol",       opts.StimulusProtocol);
     detail = obj.pSet(detail, "hardware_config",         opts.HardwareConfig);
 
-    eventId = obj.pInsertEvent(base, obj.pT("recording_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("recording_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

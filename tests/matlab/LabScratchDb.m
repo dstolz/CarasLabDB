@@ -226,13 +226,14 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
 
         function T = integrity(fx, subjects, checks)
             %INTEGRITY lab.fn_check_integrity() rows about SUBJECTS, of the checks CHECKS.
-            %   CHECKS defaults to the two a correction can leave behind;
+            %   CHECKS defaults to the ones a correction can leave behind;
             %   artifact_never_verified, which every new test file raises, is
             %   not one of them.
             arguments
                 fx (1,1) LabScratchDb
                 subjects string
-                checks string = ["tag_not_carried_forward", "artifact_producer_superseded"]
+                checks string = ["tag_not_carried_forward", "artifact_producer_superseded", ...
+                                 "input_not_carried_forward", "artifact_event_mismatch"]
             end
             T = fx.Db.runQuery("SELECT * FROM lab.fn_check_integrity() WHERE subject = ANY (" + ...
                 LabScratchDb.textArray(subjects) + ") AND check_name = ANY (" + ...
@@ -336,6 +337,9 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
                 "DatabaseName=d, PersonEmail=e);"));
             [~, fx.ConnectWarningId] = lastwarn();
             fx.Db = dbObj;
+            % The administrator connects as no lab person, on purpose.
+            ws = warning("off", "CarasLabDB:noCurrentPerson");
+            restoreWarning = onCleanup(@() warning(ws)); %#ok<NASGU>
             fx.Admin = CarasLabDB(Username=fx.AdminUser, Password=fx.AdminPassword, ...
                 Server=fx.Host, Port=fx.Port, DatabaseName=fx.DbName);
             fx.RootId = fx.Db.addStorageRoot(Name="mtest-root", Description="MATLAB tag tests");

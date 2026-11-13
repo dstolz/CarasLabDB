@@ -13,11 +13,20 @@ function eventId = addAnalysisEvent(obj, opts)
 %   Required:
 %       OccurredAt   - datetime the run is logged against (timestamptz)
 %   Common event Name=Value:
-%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes
+%       SubjectId, SessionId, Notes, Attributes, RecordedBy, RecordedAt, Supersedes,
+%       CarryInputs (with Supersedes=; see below)
 %   Analysis-specific Name=Value:
 %       PipelineId, PipelineName, CodeVersion, Parameters (jsonb),
 %       Environment (jsonb), StartedAt, FinishedAt,
 %       Status ("running"|"succeeded"|"failed")
+%
+%   Supersedes=oldEventId makes this event a correction of that one. It then
+%   takes over the old event's provenance in the same transaction, exactly as
+%   SUPERSEDEEVENT does: the old event's input edges are copied to this
+%   event (CarryInputs=false copies none -- declare the right ones with
+%   ADDEVENTINPUT), every active artifact the old event produced is
+%   re-pointed at this event and filed under its subject and session, and
+%   the old event's current tags are carried forward.
 %
 %   Returns the generated event_id (uuid string).
 %
@@ -34,6 +43,7 @@ function eventId = addAnalysisEvent(obj, opts)
         opts.RecordedBy (1,1) string = string(missing)
         opts.RecordedAt (1,1) datetime = NaT
         opts.Supersedes (1,1) string = string(missing)
+        opts.CarryInputs (1,1) logical = true
         % --- analysis detail ---
         opts.PipelineId (1,1) string = string(missing)
         opts.PipelineName (1,1) string = string(missing)
@@ -59,5 +69,6 @@ function eventId = addAnalysisEvent(obj, opts)
     detail = obj.pSet(detail, "finished_at",   opts.FinishedAt);
     detail = obj.pSet(detail, "status",        opts.Status);
 
-    eventId = obj.pInsertEvent(base, obj.pT("analysis_event"), detail);
+    eventId = obj.pInsertEvent(base, obj.pT("analysis_event"), detail, ...
+        CarryInputs=opts.CarryInputs);
 end

@@ -7,24 +7,27 @@ None-filter notes are repeated in each one rather than stated once here.
 from typing import Optional
 
 from .. import db
+from . import OptText
 
 
 def register(app):
     @app.tool()
     def get_persons(
-        person_id: Optional[str] = None,
-        email: Optional[str] = None,
-        full_name: Optional[str] = None,
+        person_id: OptText = None,
+        email: OptText = None,
+        full_name: OptText = None,
         is_active: Optional[bool] = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """List lab members, optionally filtered by id, email, name, or active status.
 
         email matches case-insensitively, as the database's uniqueness rule
-        does ("Dan@umd.edu" and "dan@umd.edu" are one person).
-        A filter left as None is not applied -- it never means "IS NULL".
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        does ("Dan@umd.edu" and "dan@umd.edu" are one person); full_name is
+        matched exactly, case included.
+        A filter left out (or null) is not applied -- it never means "IS NULL".
+        Ordered by full_name. Returns {"row_count", "limit", "truncated",
+        "rows"}; `truncated` true means more rows matched than were returned
+        (raise `limit`, max 1000).
         """
         return db.select_from("lab.person", {
             "person_id": person_id,
@@ -33,8 +36,8 @@ def register(app):
 
     @app.tool()
     def get_projects(
-        project_id: Optional[str] = None,
-        name: Optional[str] = None,
+        project_id: OptText = None,
+        name: OptText = None,
         is_active: Optional[bool] = None,
         tags: Optional[list[str]] = None,
         any_tags: Optional[list[str]] = None,
@@ -43,7 +46,8 @@ def register(app):
     ) -> dict:
         """List projects, optionally filtered by id, name, active status, or tags.
 
-        A filter left as None is not applied -- it never means "IS NULL".
+        name is matched exactly, case included. A filter left out (or null)
+        is not applied -- it never means "IS NULL". Ordered by name.
 
         Tag filters (current tags only; see get_tag_namespaces / get_tags):
         `tags` = the project must have ALL of these, `any_tags` = at least
@@ -51,9 +55,11 @@ def register(app):
         lowercase (e.g. ["topic:x", "auditory_cortex"]); a bare tag with no colon
         means `tag:<x>`; "namespace:*" matches any tag in that namespace
         (none_tags=["topic:*"] = no topic tag). Unset or empty lists are not
-        applied.
+        applied. A tag that is not registered, or whose namespace does not
+        exist or does not apply to projects, is an error naming the tag --
+        never an empty or unfiltered result.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.project", {
@@ -62,15 +68,16 @@ def register(app):
 
     @app.tool()
     def get_project_members(
-        project_id: Optional[str] = None,
-        person_id: Optional[str] = None,
+        project_id: OptText = None,
+        person_id: OptText = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """List project<->person membership rows, optionally filtered by either id.
 
-        A filter left as None is not applied -- it never means "IS NULL".
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        A filter left out (or null) is not applied -- it never means "IS NULL".
+        Ordered by project_id, person_id. Returns {"row_count", "limit",
+        "truncated", "rows"}; `truncated` true means more rows matched than
+        were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.project_member", {
             "project_id": project_id, "person_id": person_id,
@@ -78,15 +85,16 @@ def register(app):
 
     @app.tool()
     def get_project_artifacts(
-        project_id: Optional[str] = None,
-        kind: Optional[str] = None,
+        project_id: OptText = None,
+        kind: OptText = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
-        """List project-level documents/links (files, google_doc, google_sheet, url).
+        """List project-level documents/links (file, google_doc, google_sheet, url, other).
 
-        A filter left as None is not applied -- it never means "IS NULL".
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
-        means more rows matched than were returned (raise `limit`, max 1000).
+        A filter left out (or null) is not applied -- it never means "IS NULL".
+        Ordered by project_id, title. Returns {"row_count", "limit",
+        "truncated", "rows"}; `truncated` true means more rows matched than
+        were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.project_artifact", {
             "project_id": project_id, "kind": kind,
@@ -94,10 +102,10 @@ def register(app):
 
     @app.tool()
     def get_subjects(
-        subject_id: Optional[str] = None,
-        project_id: Optional[str] = None,
-        species_code: Optional[str] = None,
-        sex: Optional[str] = None,
+        subject_id: OptText = None,
+        project_id: OptText = None,
+        species_code: OptText = None,
+        sex: OptText = None,
         tags: Optional[list[str]] = None,
         any_tags: Optional[list[str]] = None,
         none_tags: Optional[list[str]] = None,
@@ -105,7 +113,10 @@ def register(app):
     ) -> dict:
         """List subjects (animals), optionally filtered by id, project, species, sex, or tags.
 
-        A filter left as None is not applied -- it never means "IS NULL".
+        subject_id is the lab's own id for the animal and is matched exactly,
+        case included ("G-0421" is not "g-0421"); sex is 'M', 'F' or 'U'.
+        A filter left out (or null) is not applied -- it never means "IS NULL".
+        Ordered by subject_id.
 
         Tag filters (current tags only; see get_tag_namespaces / get_tags):
         `tags` = the subject must have ALL of these, `any_tags` = at least
@@ -113,9 +124,11 @@ def register(app):
         lowercase (e.g. ["cohort:a", "topic:x"]); a bare tag with no colon
         means `tag:<x>`; "namespace:*" matches any tag in that namespace
         (none_tags=["topic:*"] = no topic tag). Unset or empty lists are not
-        applied.
+        applied. A tag that is not registered, or whose namespace does not
+        exist or does not apply to subjects, is an error naming the tag --
+        never an empty or unfiltered result.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.subject", {
@@ -125,9 +138,9 @@ def register(app):
 
     @app.tool()
     def get_sessions(
-        session_id: Optional[str] = None,
-        subject_id: Optional[str] = None,
-        label: Optional[str] = None,
+        session_id: OptText = None,
+        subject_id: OptText = None,
+        label: OptText = None,
         storage_root_id: Optional[int] = None,
         tags: Optional[list[str]] = None,
         any_tags: Optional[list[str]] = None,
@@ -136,7 +149,9 @@ def register(app):
     ) -> dict:
         """List sessions (NAS folders under a subject), optionally filtered.
 
-        A filter left as None is not applied -- it never means "IS NULL".
+        subject_id and label are matched exactly, case included. A filter
+        left out (or null) is not applied -- it never means "IS NULL".
+        Ordered by subject_id, label.
 
         Tag filters (current tags only; see get_tag_namespaces / get_tags):
         `tags` = the session must have ALL of these, `any_tags` = at least
@@ -144,9 +159,11 @@ def register(app):
         lowercase (e.g. ["cohort:a", "qc:pass"]); a bare tag with no colon
         means `tag:<x>`; "namespace:*" matches any tag in that namespace
         (none_tags=["qc:*"] = not yet QC'd). Unset or empty lists are not
-        applied.
+        applied. A tag that is not registered, or whose namespace does not
+        exist or does not apply to sessions, is an error naming the tag --
+        never an empty or unfiltered result.
 
-        Returns {"rows", "row_count", "limit", "truncated"}; `truncated` true
+        Returns {"row_count", "limit", "truncated", "rows"}; `truncated` true
         means more rows matched than were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.session", {
@@ -156,14 +173,15 @@ def register(app):
 
     @app.tool()
     def get_subject_current(
-        subject_id: Optional[str] = None,
+        subject_id: OptText = None,
         limit: int = db.DEFAULT_LIMIT,
     ) -> dict:
         """Subject dimension enriched with latest weight and endpoint status.
 
-        subject_id left as None is not applied as a filter -- it returns every
-        subject, not subjects with a NULL id. Returns {"rows", "row_count",
-        "limit", "truncated"}; `truncated` true means more rows matched than
+        subject_id is matched exactly, case included; left out (or null) it
+        is not applied as a filter -- every subject is returned, not subjects
+        with a NULL id. Ordered by subject_id. Returns {"row_count", "limit",
+        "truncated", "rows"}; `truncated` true means more rows matched than
         were returned (raise `limit`, max 1000).
         """
         return db.select_from("lab.subject_current", {

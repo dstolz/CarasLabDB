@@ -34,10 +34,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
     % =====================================================================
     methods (Test, TestTags = {'Database'})
         function connectsAsLabRwMember(tc)
-            % Section 0: schema version 3, no version warning, person resolved,
+            % Section 0: schema version 5, no version warning, person resolved,
             % and the connection is a lab_rw member, not a superuser.
             db = tc.requireDb();
-            tc.verifyEqual(db.SchemaVersion, 3);
+            tc.verifyEqual(db.SchemaVersion, 5);
             tc.verifyEqual(db.SchemaVersion, CarasLabDB.SchemaVersionExpected);
             tc.verifyNotEqual(tc.Fx.ConnectWarningId, "CarasLabDB:schemaVersionMismatch");
             tc.verifyFalse(contains(tc.Fx.ConnectOutput, "Warning"), tc.Fx.ConnectOutput);
@@ -785,8 +785,9 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             tc.verifyEqual(tc.Fx.counts(), n0, "early failure left rows behind");
             tc.verifyEqual(string(db.Connection.AutoCommit), "on");
 
-            % The documented concurrency gap (tagging.md section 9): two
-            % sessions each add a stage value to a2 at once and both commit.
+            % Two current stage values on a2: a state schema version 4 no
+            % longer lets racing writers create, but an older database can
+            % hold (lab.fn_check_integrity: tag_cardinality_violation).
             tc.makeTwoCurrentStages(a2);
             stages = tc.currentTags("artifact", a2);
             tc.verifyEqual(stages(startsWith(stages, "stage:")), ["stage:raw"; "stage:sorted"]);
@@ -1027,7 +1028,17 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
                 @() db.addArtifact(ProducedByEventId=id, StorageRootId=1, RelativePath="a/b.dat", ...
                         Checksum=LabScratchDb.checksum(1))
                 @() db.addRecordingEvent(OccurredAt=t)
-                @() db.addRecordingEvent(OccurredAt=t, NChannels=16)};
+                @() db.addRecordingEvent(OccurredAt=t, NChannels=16)
+                @() db.addRecordingEvent(OccurredAt=t, Supersedes=id, CarryInputs=false)
+                @() db.supersedeEvent(id, CarryInputs=false)
+                @() db.addArtifact(ProducedByEventId=id, StorageRootId=1, RelativePath="a/c.dat", ...
+                        Checksum=LabScratchDb.checksum(2), SizeBytes=10)
+                @() db.artifactLineage(id)
+                @() db.artifactLineage(id, Direction="down", FollowCorrections=false)
+                @() db.updateSubject("S-1", Notes="x")
+                @() db.updateSubject("S-1", ProjectId=id, Clear=["strain", "notes"])
+                @() db.updateSession(id, Rig="r")
+                @() db.updateSession(id, Clear="ended_at")};
             for i = 1:numel(calls)
                 try
                     calls{i}();
@@ -1039,6 +1050,196 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
                     tc.verifyFalse(isValidation, func2str(calls{i}) + ": " + ME.message);
                 end
             end
+        end
+    end
+
+    % =====================================================================
+    % 7b. Schema version 4: construction checks, corrections, filters, edits
+    % =====================================================================
+    methods (Test, TestTags = {'NoDatabase'})
+        function missingValuesAreSqlNull(tc)
+            % An override field holding any "no value" marker is written as NULL.
+            for v = {missing, string(missing), NaN, NaT, []}
+                tc.verifyEqual(CarasLabDB.sqlLiteral(v{1}), "NULL", class(v{1}));
+            end
+        end
+
+        function constructionChecks(tc)
+            % The schema name, the schema version and the identity are
+            % checked when the object is built.
+            pid = "00000000-0000-0000-0000-000000000001";
+            tc.verifyError(@() CarasLabDB(Connection=RecordingConnection(), PersonId=pid, ...
+                Schema="lab; DROP TABLE x"), "CarasLabDB:invalidSchema");
+            tc.verifyWarning(@() CarasLabDB(Connection=RecordingConnection()), ...
+                "CarasLabDB:noCurrentPerson");
+            old = RecordingConnection();
+            old.SchemaVersion = CarasLabDB.SchemaVersionExpected - 1;
+            tc.verifyError(@() CarasLabDB(Connection=old, PersonId=pid), ...
+                "CarasLabDB:schemaVersionMismatch");
+            tc.verifyWarning(@() CarasLabDB(Connection=old, PersonId=pid, AllowSchemaMismatch=true), ...
+                "CarasLabDB:schemaVersionMismatch");
+        end
+
+        function newOptionsReachTheSql(tc)
+            % FollowCorrections=, the Checksum= normalisation and Clear= in
+            % the statements sent.
+            [db, conn] = TagTests.recordingDb();
+            id = "00000000-0000-0000-0000-000000000002";
+            db.artifactLineage(id);
+            db.artifactLineage(id, Direction="down", FollowCorrections=false);
+            tc.assertSize(conn.Log, [2 1]);
+            tc.verifySubstring(conn.Log(1), "'up', true)");
+            tc.verifySubstring(conn.Log(2), "'down', false)");
+
+            conn.clearLog();
+            db.getArtifacts(Checksum="  ABCDEF0123  ");
+            tc.verifySubstring(conn.Log(1), "checksum = 'abcdef0123'");
+
+            % The fake connection updates no row, hence the "not found".
+            conn.clearLog();
+            tc.verifyError(@() db.updateSubject("S-1", Sex="F", Clear=["notes", "strain", "notes"]), ...
+                "CarasLabDB:subjectNotFound");
+            tc.verifyError(@() db.updateSession(id, Clear=["rig", "ended_at"]), ...
+                "CarasLabDB:sessionNotFound");
+            tc.assertSize(conn.Log, [2 1]);
+            tc.verifySubstring(conn.Log(1), ...
+                "SET sex = 'F', notes = NULL, strain = NULL WHERE subject_id = 'S-1'");
+            tc.verifySubstring(conn.Log(2), "SET rig = NULL, ended_at = NULL WHERE session_id = ");
+
+            conn.clearLog();
+            tc.verifyError(@() db.updateSubject("S-1", Notes="x", Clear="notes"), "CarasLabDB:clearAndSet");
+            tc.verifyError(@() db.updateSubject("S-1", Clear="subject_id"), "CarasLabDB:invalidValue");
+            tc.verifyError(@() db.updateSession(id, Clear="label"), "CarasLabDB:invalidValue");
+            tc.verifyEmpty(conn.Log, "a refused Clear= sent SQL");
+        end
+
+        function tagFilterProblemsAreRaisedBeforeTheQuery(tc)
+            % Each filtered query first asks lab.fn_tag_filter_problems once;
+            % a row from it raises CarasLabDB:tagFilterProblem and the query
+            % itself is not sent.
+            [db, conn] = TagTests.recordingDb();
+            db.getArtifacts(Tags="stage:raw", NotTags=["qc:fail", "stage:raw"]);
+            tc.assertSize(conn.Log, [2 1]);
+            tc.verifySubstring(conn.Log(1), "lab.fn_tag_filter_problems('artifact', " + ...
+                "ARRAY['stage:raw', 'qc:fail']::text[])");
+            tc.verifySubstring(conn.Log(2), "lab.fn_tag_match('artifact', artifact_id::text, ");
+
+            conn.TagFilterProblems = table("qc:fial", "tag qc:fial is not registered", ...
+                'VariableNames', {'token', 'problem'});
+            calls = {
+                @() db.getArtifacts(NotTags="qc:fial")
+                @() db.getEvents(Tags="qc:fial")
+                @() db.getSubjects(AnyTags="qc:fial")
+                @() db.getSessions(Tags="qc:fial")
+                @() db.getProjects(Tags="qc:fial")
+                @() db.findByTags("artifact", NotTags="qc:fial")};
+            for i = 1:numel(calls)
+                conn.clearLog();
+                tc.verifyError(calls{i}, "CarasLabDB:tagFilterProblem", func2str(calls{i}));
+                tc.verifySize(conn.Log, [1 1], "only the check is sent: " + func2str(calls{i}));
+            end
+            err = tc.errorOf(@() db.getArtifacts(NotTags="qc:fial"));
+            tc.verifySubstring(string(err.message), "qc:fial: tag qc:fial is not registered");
+        end
+    end
+
+    methods (Test, TestTags = {'Database'})
+        function unknownFilterTokensAreErrors(tc)
+            % A typo in a filter used to match nothing (and in NotTags= to
+            % exclude nothing); the database now names the fault.
+            db = tc.requireDb();
+            calls = {
+                @() db.getArtifacts(NotTags="qc:fial")
+                @() db.getArtifacts(Tags="topic:mt_never_registered")
+                @() db.getEvents(AnyTags=["qc:pass", "mt_nope:x"])
+                @() db.getSubjects(Tags="stage:raw")
+                @() db.findByTags("session", Tags="stage:*")};
+            for i = 1:numel(calls)
+                tc.verifyError(calls{i}, "CarasLabDB:tagFilterProblem", func2str(calls{i}));
+            end
+            tc.verifyClass(db.getArtifacts(Tags="qc:*", NotTags="stage:raw", Limit=1), "table");
+        end
+
+        function correctionMovesFilesAndCarriesProvenance(tc)
+            % A correction that moves an event to another animal's session
+            % files the re-pointed artifacts there. Supersedes= on an add
+            % method carries the same provenance as supersedeEvent, and
+            % CarryInputs=false leaves the inputs to the caller.
+            db = tc.requireDb();
+            [w, up] = tc.carryWorld("move");
+            other = tc.Fx.makeWorld("moveto", 0);
+            newE = db.supersedeEvent(w.EventId, EventOverrides=struct( ...
+                "subject_id", other.SubjectId, "session_id", other.SessionId));
+            A = db.getArtifacts(ProducedByEventId=newE);
+            tc.assertEqual(height(A), 2);
+            tc.verifyTrue(all(string(A.subject_id) == other.SubjectId), "files follow the subject");
+            tc.verifyTrue(all(string(A.session_id) == other.SessionId), "files follow the session");
+            tc.verifyEqual(LabScratchDb.column(db.getEventInputs(EventId=newE), "artifact_id"), up);
+            tc.verifyEmpty(tc.Fx.integrity([newE; string(A.artifact_id)]));
+
+            t = datetime(2026, 10, 5, 9, 0, 0, "TimeZone", "UTC");
+            newE2 = db.addRecordingEvent(OccurredAt=t, SubjectId=other.SubjectId, ...
+                SessionId=other.SessionId, Supersedes=newE, NChannels=16, CarryInputs=false);
+            tc.verifyEqual(height(db.getEventInputs(EventId=newE2)), 0, "CarryInputs=false");
+            tc.verifyEqual(height(db.getArtifacts(ProducedByEventId=newE2)), 2, "files re-pointed");
+            tc.verifyEqual(tc.currentTags("event", newE2), tc.currentTags("event", w.EventId));
+            I = tc.Fx.integrity(newE2, "input_not_carried_forward");
+            tc.verifyEqual(height(I), 1, "the missing inputs are reported until re-declared");
+            db.addEventInput(EventId=newE2, ArtifactId=up, Role="raw");
+            tc.verifyEmpty(tc.Fx.integrity(newE2, "input_not_carried_forward"));
+
+            newE3 = db.addRecordingEvent(OccurredAt=t, SubjectId=other.SubjectId, ...
+                SessionId=other.SessionId, Supersedes=newE2, NChannels=16);
+            tc.verifyEqual(LabScratchDb.column(db.getEventInputs(EventId=newE3), "artifact_id"), up);
+            tc.verifyEqual(height(db.getArtifacts(ProducedByEventId=newE3)), 2);
+            tc.verifyEmpty(tc.Fx.integrity(newE3));
+        end
+
+        function lineageFollowsCorrections(tc)
+            % artifactLineage returns current versions by default and the rows
+            % as recorded with FollowCorrections=false.
+            db = tc.requireDb();
+            [w, up] = tc.carryWorld("lineage");
+            up2 = db.supersedeArtifact(up, Overrides=struct("format", "dat2"));
+            cur = string(db.artifactLineage(w.ArtifactIds(1)).artifact_id);
+            rec = string(db.artifactLineage(w.ArtifactIds(1), FollowCorrections=false).artifact_id);
+            tc.verifyTrue(ismember(up2, cur) && ~ismember(up, cur), "current versions");
+            tc.verifyTrue(ismember(up, rec) && ~ismember(up2, rec), "as recorded");
+            down = string(db.artifactLineage(up2, Direction="down").artifact_id);
+            tc.verifyTrue(all(ismember(w.ArtifactIds, down)), "derived files reachable from the correction");
+        end
+
+        function personIdentityIsChecked(tc)
+            % setPerson refuses an unknown id and an ambiguous name, and the
+            % current person stays as it was.
+            db = tc.requireDb();
+            me = db.CurrentPersonId;
+            twin = "MT Twin " + tc.Fx.next();
+            db.addPerson(FullName=twin);
+            db.addPerson(FullName=twin);
+            tc.verifyError(@() db.setPerson(PersonName=twin), "CarasLabDB:personAmbiguous");
+            tc.verifyError(@() db.setPerson(PersonId="00000000-0000-0000-0000-00000000dead"), ...
+                "CarasLabDB:personNotFound");
+            tc.verifyEqual(db.CurrentPersonId, me);
+            db.setPerson(PersonId=me);
+            tc.verifyEqual(db.CurrentPersonId, me);
+        end
+
+        function updateClearsColumnsAndMovesSubject(tc)
+            % updateSubject / updateSession: Clear= writes NULL, and
+            % updateSubject(ProjectId=) moves the subject to another project.
+            db = tc.requireDb();
+            w = tc.Fx.makeWorld("clear", 0);
+            other = tc.Fx.makeWorld("clearto", 0);
+            db.updateSubject(w.SubjectId, Strain="x", Notes="n");
+            db.updateSubject(w.SubjectId, Clear="notes", ProjectId=other.ProjectId);
+            tc.verifyTrue(logical(tc.Fx.scalar("SELECT (notes IS NULL AND strain = 'x' AND project_id = " + ...
+                LabScratchDb.quote(other.ProjectId) + ") AS ok FROM lab.subject WHERE subject_id = " + ...
+                LabScratchDb.quote(w.SubjectId))));
+            db.updateSession(w.SessionId, Rig="rig-1", Notes="n");
+            db.updateSession(w.SessionId, Clear=["rig", "notes"]);
+            tc.verifyTrue(logical(tc.Fx.scalar("SELECT (rig IS NULL AND notes IS NULL) AS ok " + ...
+                "FROM lab.session WHERE session_id = " + LabScratchDb.quote(w.SessionId))));
         end
     end
 
@@ -1167,16 +1368,20 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
         end
 
         function makeTwoCurrentStages(tc, aid)
-            %MAKETWOCURRENTSTAGES Two current stage tags on AID, as two racing writers would leave.
+            %MAKETWOCURRENTSTAGES Two current stage tags on AID, a state only an older database holds.
+            %   Since schema version 4 the single-valued check takes an
+            %   advisory lock, so two racing writers can no longer both
+            %   commit: the second waits for the first, which in this
+            %   single-threaded test would be forever. The table's owner
+            %   writes the two rows with the policy trigger switched off.
             admin = tc.Fx.Admin;
-            c = admin.Connection;
-            c.AutoCommit = 'off';
-            restore = onCleanup(@() TagTests.endTransaction(c));
+            toggle = "ALTER TABLE lab.tag_assignment %s TRIGGER trg_tag_assignment_policy";
+            admin.runCommand(sprintf(toggle, "DISABLE"));
+            restore = onCleanup(@() admin.runCommand(sprintf(toggle, "ENABLE"))); %#ok<NASGU>
             ins = "INSERT INTO lab.tag_assignment (entity_kind, artifact_id, tag, op, note) " + ...
                 "VALUES ('artifact', " + LabScratchDb.quote(aid) + ", ";
-            admin.runCommand(ins + "'stage:raw', 'add', 'concurrent writer 1')");
-            tc.Fx.Db.runCommand(ins + "'stage:sorted', 'add', 'concurrent writer 2')");
-            commit(c);
+            admin.runCommand(ins + "'stage:raw', 'add', 'pre-v4 writer 1')");
+            admin.runCommand(ins + "'stage:sorted', 'add', 'pre-v4 writer 2')");
         end
 
         function f = filterWorld(tc)

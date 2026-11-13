@@ -82,7 +82,9 @@ if height(sess) > 0
     artifacts = db.getArtifacts(SessionId=sess.session_id(1));
 end
 
-% 2g. Full upstream provenance of a derived file (walks event_input edges)
+% 2g. Full upstream provenance of a derived file (walks event_input edges).
+% The ids returned are the current versions of each node: corrections made
+% since are followed. FollowCorrections=false returns the rows as recorded.
 if exist("artifacts", "var") && height(artifacts) > 0
     lineage = db.artifactLineage(artifacts.artifact_id(1), Direction="up");
 end
@@ -134,6 +136,8 @@ recEventId = db.addRecordingEvent( ...
     DurationS             = 1800, ...
     HardwareConfig        = struct("gain", 200, "reference", "common_median"));
 
+% SubjectId / SessionId, where given, must be the producing event's: the
+% database rejects a file filed under another animal or session.
 rawArtifactId = db.addArtifact( ...
     ProducedByEventId = recEventId, ...
     StorageRootId     = 1, ...
@@ -199,7 +203,9 @@ fprintf("weight event %s superseded by %s\n", weightEventId, correctedWeightEven
 % with a corrected checksum, or fixing its role). A correction may keep the
 % same file; the database only refuses a second *active* row for one file.
 % supersedeEvent (4a) already re-points the files an event produced at the
-% corrected event, so there is no need to do that by hand.
+% corrected event (and files them under its subject and session), so there
+% is no need to do that by hand. Supersedes= on an addXEvent method does the
+% same.
 % correctedArtifactId = db.supersedeArtifact(rawArtifactId, ...
 %     Overrides = struct("checksum", ...
 %         "4da8f728d65b6887cace643d842d3007e4a7765ab3c3caebd7844288ddf23648"));
@@ -211,6 +217,9 @@ fprintf("weight event %s superseded by %s\n", weightEventId, correctedWeightEven
 % lab.row_history.
 db.updateSubject(subjectId, Strain="Long-Evans", Notes="re-typed after review");
 % db.updateSession(sessionId, Notes="rig clock resynced mid-session");
+% Clear= sets columns to NULL (database column names, from a fixed list):
+% db.updateSubject(subjectId, Clear=["genotype", "notes"]);
+% db.updateSession(sessionId, Clear="ended_at");
 
 %% 5. Error handling around inserts
 % pInsertEvent (used internally by every addXEvent method) already wraps the
