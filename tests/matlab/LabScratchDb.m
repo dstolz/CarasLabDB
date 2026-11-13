@@ -366,18 +366,18 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
             % Connection settings go in through the environment (restored
             % afterwards), so the command line holds only the database name
             % and the file name.
-            names = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", ...
-                     "PGCONNECT_TIMEOUT", "PATH"];
+            names = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGCONNECT_TIMEOUT", "PATH"];
+            wasSet = false(size(names));
             saved = strings(size(names));
             for i = 1:numel(names)
+                wasSet(i) = isenv(names(i));
                 saved(i) = string(getenv(names(i)));
             end
-            restore = onCleanup(@() LabScratchDb.setEnv(names, saved));
+            restore = onCleanup(@() LabScratchDb.restoreEnv(names, wasSet, saved));
             setenv("PGHOST", fx.Host);
             setenv("PGPORT", string(fx.Port));
             setenv("PGUSER", fx.AdminUser);
             setenv("PGPASSWORD", fx.AdminPassword);
-            setenv("PGDATABASE", "");
             setenv("PGCONNECT_TIMEOUT", "10");
             if strlength(fx.PgBin) > 0
                 setenv("PATH", fx.PgBin + pathsep + saved(end));
@@ -403,9 +403,17 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
     end
 
     methods (Static, Access = private)
-        function setEnv(names, values)
+        function restoreEnv(names, wasSet, values)
+            %RESTOREENV Put the environment back as RUNPSQL found it.
+            %   A variable that was not set is removed again, not set to "":
+            %   the Database Toolbox connects through the same PG* variables,
+            %   and an empty PGCONNECT_TIMEOUT is "invalid integer value".
             for i = 1:numel(names)
-                setenv(names(i), values(i));
+                if wasSet(i)
+                    setenv(names(i), values(i));
+                else
+                    unsetenv(names(i));
+                end
             end
         end
     end
