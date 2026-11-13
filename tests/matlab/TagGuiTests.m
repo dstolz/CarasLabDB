@@ -15,6 +15,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 %   opens it from the test (Ctrl+T, the toolbar button, or showTagEditor)
 %   while a timer finds the window, runs the test's steps against it and
 %   closes it; what the steps observe is checked once the editor returns.
+%   Inside a timer callback matlab.uitest does not wait for the app to
+%   handle a gesture, so those steps use typeIn / pressOn / chooseIn /
+%   dismissAlert, which do the gesture and then wait until the control's
+%   callback has returned and the control shows what was typed or chosen.
 %
 %   Keyboard shortcuts: matlab.uitest has no key-press gesture, so a
 %   shortcut is tested by calling the window's KeyPressFcn with the event
@@ -38,6 +42,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
     properties (Constant)
         TimeLimit = 150     % seconds one test may run before its windows are closed
+        GestureLimit = 20   % seconds the app may take to handle one gesture
     end
 
     methods (TestClassSetup)
@@ -243,11 +248,11 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("namespaces") = reshape(string(ed.Ns.ItemsData), [], 1);
                 obs("lastNamespace") = string(ed.Ns.ItemsData{end});
                 obs("valueEditable") = logical(ed.Value.Editable);
-                tc.choose(ed.Ns, "stage");
+                tc.chooseIn(ed.Ns, "stage");
                 obs("stageValues") = reshape(string(ed.Value.Items), [], 1);
                 obs("stageHint") = string(ed.Hint.Text);
                 obs("setEnabledForStage") = logical(ed.Set.Enable);
-                tc.choose(ed.Ns, "topic");
+                tc.chooseIn(ed.Ns, "topic");
                 obs("setEnabledForTopic") = logical(ed.Set.Enable);
                 TagGuiTests.key(ed.Fig, "escape", {});
                 obs("escResumed") = TagGuiTests.resumed(ed.Fig);
@@ -278,33 +283,33 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
             function local_edit(tc, ed, obs)
                 cur = @() tc.currentTags("artifact", aid);
-                tc.type(ed.Value, "topic:gui_add");
-                tc.press(ed.Add);
+                tc.typeIn(ed.Value, "topic:gui_add");
+                tc.pressOn(ed.Add);
                 obs("afterAdd") = cur();
                 obs("statusAdd") = string(ed.Status.Text);
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "raw");
-                tc.press(ed.Set);
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "raw");
+                tc.pressOn(ed.Set);
                 obs("afterSet1") = cur();
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "sorted");
-                tc.press(ed.Set);
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "sorted");
+                tc.pressOn(ed.Set);
                 obs("afterSet2") = cur();
                 obs("rowsAfterSet2") = height(db.getEntityTags("artifact", aid, History=true));
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "sorted");
-                tc.press(ed.Set);
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "sorted");
+                tc.pressOn(ed.Set);
                 obs("statusSetAgain") = string(ed.Status.Text);
                 obs("rowsAfterSetAgain") = height(db.getEntityTags("artifact", aid, History=true));
-                tc.choose(ed.Table, [find(TagGuiTests.listed(ed) == "topic:gui_add"), 1]);
-                tc.press(ed.Remove);
+                tc.chooseIn(ed.Table, [find(TagGuiTests.listed(ed) == "topic:gui_add"), 1]);
+                tc.pressOn(ed.Remove);
                 obs("afterRemove") = cur();
-                tc.choose(ed.Ns, "tag (bare)");
-                tc.type(ed.Value, "gui_bare2");
-                tc.press(ed.Add);
+                tc.chooseIn(ed.Ns, "tag (bare)");
+                tc.typeIn(ed.Value, "gui_bare2");
+                tc.pressOn(ed.Add);
                 obs("afterBare") = cur();
                 obs("listedBare") = TagGuiTests.listed(ed);
-                tc.press(ed.Close);
+                tc.pressOn(ed.Close);
             end
         end
 
@@ -332,35 +337,30 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
             function local_type(tc, ed, obs)
                 rows = @() height(db.getEntityTags("artifact", aid, History=true));
-                tc.type(ed.Value, "topic:typed_only");
+                tc.typeIn(ed.Value, "topic:typed_only");
                 obs("nsAfterTopic") = string(ed.Ns.Value);
                 obs("statusTopic") = string(ed.Status.Text);
-                tc.type(ed.Value, "stage:raw");
+                tc.typeIn(ed.Value, "stage:raw");
                 obs("nsAfterStage") = string(ed.Ns.Value);
                 obs("statusStage") = string(ed.Status.Text);
                 obs("valueKept") = string(ed.Value.Value);
                 obs("rowsAfterTyping") = rows();
                 % type, then Remove with nothing selected in the list (the
                 % typed tag is registered but not on this artifact)
-                TagGuiTests.diag(ed, "T1 before typing stage:sorted");
-                tc.type(ed.Value, "stage:sorted");
-                TagGuiTests.diag(ed, "T1 after typing stage:sorted");
+                tc.typeIn(ed.Value, "stage:sorted");
                 setappdata(groot, "TagGuiTests_alerts", []);
-                tc.press(ed.Remove);
-                TagGuiTests.diag(ed, "T1 after press Remove");
-                pause(1); drawnow;
-                TagGuiTests.diag(ed, "T1 one second later");
+                tc.pressOn(ed.Remove);
                 a = TagGuiTests.alerts();
                 obs("removeAlert") = strjoin([a.Message], newline);
-                tc.dismissAlertDialog(ed.Fig);
+                tc.dismissAlert(ed.Fig);
                 obs("rowsAfterRemove") = rows();
                 % type, then click the list
-                tc.type(ed.Value, "topic:typed_2");
-                tc.choose(ed.Table, [1 1]);
+                tc.typeIn(ed.Value, "topic:typed_2");
+                tc.chooseIn(ed.Table, [1 1]);
                 obs("rowsAfterList") = rows();
                 % type, then Close
-                tc.type(ed.Value, "topic:typed_4");
-                tc.press(ed.Close);
+                tc.typeIn(ed.Value, "topic:typed_4");
+                tc.pressOn(ed.Close);
             end
         end
 
@@ -378,10 +378,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyEqual(tc.currentTags("artifact", aid), "topic:other");
 
             function local_rm(tc, ed, obs)
-                tc.type(ed.Value, "topic:keep");
+                tc.typeIn(ed.Value, "topic:keep");
                 obs("selection") = ed.Table.Selection;
-                tc.press(ed.Remove);
-                tc.press(ed.Close);
+                tc.pressOn(ed.Remove);
+                tc.pressOn(ed.Close);
             end
         end
 
@@ -406,18 +406,18 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             function local_keys(tc, ed, obs)
                 cur = @() tc.currentTags("artifact", aid);
                 ctrl = {'control'};
-                tc.type(ed.Value, "topic:k1");
+                tc.typeIn(ed.Value, "topic:k1");
                 TagGuiTests.key(ed.Fig, "return", ctrl);
                 obs("ctrlEnter") = cur();
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "raw");
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "raw");
                 TagGuiTests.key(ed.Fig, "s", ctrl, char(19));
                 obs("ctrlS") = cur();
-                tc.choose(ed.Ns, "topic");
-                tc.type(ed.Value, "k2");
+                tc.chooseIn(ed.Ns, "topic");
+                tc.typeIn(ed.Value, "k2");
                 TagGuiTests.key(ed.Fig, "s", ctrl, char(19));
                 obs("ctrlSMulti") = cur();
-                tc.choose(ed.Table, [find(TagGuiTests.listed(ed) == "topic:k1"), 1]);
+                tc.chooseIn(ed.Table, [find(TagGuiTests.listed(ed) == "topic:k1"), 1]);
                 TagGuiTests.key(ed.Fig, "delete", {});
                 obs("delete") = cur();
                 db.addTag("artifact", aid, "topic:behind_its_back");
@@ -428,7 +428,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 TagGuiTests.key(ed.Fig, "slash", ctrl, '?');
                 a = TagGuiTests.alerts();
                 obs("help") = strjoin([a.Message], newline);
-                tc.dismissAlertDialog(ed.Fig);
+                tc.dismissAlert(ed.Fig);
                 TagGuiTests.key(ed.Fig, "escape", {});
                 obs("escResumed") = TagGuiTests.resumed(ed.Fig);
             end
@@ -458,47 +458,38 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyEqual(tc.currentTags("event", w.EventId), "qc:pass");
 
             function local_immutable(tc, ed, obs)
-                TagGuiTests.diag(ed, "T2 start, listed=" + strjoin(TagGuiTests.listed(ed), ","));
-                tc.choose(ed.Table, [find(TagGuiTests.listed(ed) == "cohort:a"), 1]);
-                TagGuiTests.diag(ed, "T2 after choose row");
-                pause(1); drawnow;
-                TagGuiTests.diag(ed, "T2 one second later");
-                tc.press(ed.Remove);
-                TagGuiTests.diag(ed, "T2 after press Remove");
+                tc.chooseIn(ed.Table, [find(TagGuiTests.listed(ed) == "cohort:a"), 1]);
+                tc.pressOn(ed.Remove);
                 local_alert(tc, ed, obs);
-                TagGuiTests.diag(ed, "T2 after dismissing the alert, items=" + strjoin(string(ed.Ns.Items), ","));
-                tc.choose(ed.Ns, "topic");
-                TagGuiTests.diag(ed, "T2 after choose ns topic");
-                tc.type(ed.Value, "still_usable");
-                TagGuiTests.diag(ed, "T2 after typing still_usable");
-                tc.press(ed.Add);
-                TagGuiTests.diag(ed, "T2 after press Add");
-                tc.press(ed.Close);
+                tc.chooseIn(ed.Ns, "topic");
+                tc.typeIn(ed.Value, "still_usable");
+                tc.pressOn(ed.Add);
+                tc.pressOn(ed.Close);
             end
             function local_closed(tc, ed, obs)
-                tc.type(ed.Value, "stage:not_a_stage");
-                tc.press(ed.Set);
+                tc.typeIn(ed.Value, "stage:not_a_stage");
+                tc.pressOn(ed.Set);
                 local_alert(tc, ed, obs);
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "raw");
-                tc.press(ed.Set);
-                tc.press(ed.Close);
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "raw");
+                tc.pressOn(ed.Set);
+                tc.pressOn(ed.Close);
             end
             function local_applies(tc, ed, obs)
-                tc.type(ed.Value, "stage:raw");
-                tc.press(ed.Add);
+                tc.typeIn(ed.Value, "stage:raw");
+                tc.pressOn(ed.Add);
                 local_alert(tc, ed, obs);
-                tc.choose(ed.Ns, "qc");
-                tc.choose(ed.Value, "pass");
-                tc.press(ed.Set);
-                tc.press(ed.Close);
+                tc.chooseIn(ed.Ns, "qc");
+                tc.chooseIn(ed.Value, "pass");
+                tc.pressOn(ed.Set);
+                tc.pressOn(ed.Close);
             end
             function local_alert(tc, ed, obs)
                 a = TagGuiTests.alerts();
                 tc.assertNotEmpty(a, "no alert was shown");
                 obs("title") = a(end).Title;
                 obs("message") = a(end).Message;
-                tc.dismissAlertDialog(ed.Fig);       % fails if no real alert is open
+                tc.dismissAlert(ed.Fig);       % fails if no real alert is open
                 setappdata(groot, "TagGuiTests_alerts", []);
             end
         end
@@ -629,10 +620,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 "the filtered table no longer shows the row");
 
             function local_set(tc, ed)
-                tc.choose(ed.Ns, "stage");
-                tc.choose(ed.Value, "sorted");
-                tc.press(ed.Set);
-                tc.press(ed.Close);
+                tc.chooseIn(ed.Ns, "stage");
+                tc.chooseIn(ed.Value, "sorted");
+                tc.pressOn(ed.Set);
+                tc.pressOn(ed.Close);
             end
         end
     end
@@ -772,24 +763,24 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 list = findall(f, "Type", "uitable");
                 names = reshape(string(list.Data.Name), [], 1);
                 obs("listed") = names;
-                tc.choose(list, [find(names == "gui probe depth", 1), 1]);
+                tc.chooseIn(list, [find(names == "gui probe depth", 1), 1]);
                 box = findall(f, "Type", "uieditfield", "Placeholder", "value");
                 saveBtn = findall(f, "Type", "uibutton", "Text", "Save");
                 obs("prefilled") = string(box.Value);
-                tc.type(box, "1300,5");
+                tc.typeIn(box, "1300,5");
                 obs("afterTyping") = value();
                 setappdata(groot, "TagGuiTests_alerts", []);
-                tc.press(saveBtn);
+                tc.pressOn(saveBtn);
                 a = TagGuiTests.alerts();
                 obs("commaAlert") = strjoin([a.Message], newline);
-                tc.dismissAlertDialog(f);
+                tc.dismissAlert(f);
                 obs("afterComma") = value();
-                tc.type(box, "1300.5");
-                tc.press(saveBtn);
+                tc.typeIn(box, "1300.5");
+                tc.pressOn(saveBtn);
                 obs("afterSave") = value();
                 obs("rowsAfterSave") = logRows();
-                tc.press(saveBtn);              % the box now shows the saved value
-                tc.dismissAlertDialog(f);       % "... is already ...: nothing was written"
+                tc.pressOn(saveBtn);              % the box now shows the saved value
+                tc.dismissAlert(f);       % "... is already ...: nothing was written"
                 obs("rowsAfterSameValue") = logRows();
                 TagGuiTests.key(f, "escape", {});
                 obs("escResumed") = TagGuiTests.resumed(f);
@@ -906,6 +897,48 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.assertTrue(isKey(obs, "__ran"), "the window '" + prefix + "...' did not open");
         end
 
+        % ------------------------------------------------------------------
+        % Gestures for steps that run inside a timer callback (WITHEDITOR,
+        % WITHWINDOW). There matlab.uitest does not wait for the app: a
+        % gesture returns before the window has delivered it, so the next
+        % line would act on the previous state. Each of these performs the
+        % gesture and then waits until the app has handled it.
+        % ------------------------------------------------------------------
+        function typeIn(tc, comp, text)
+            %TYPEIN tc.type, then wait until COMP holds TEXT and its callback has returned.
+            mark = TagGuiTests.track(comp, "ValueChangedFcn");
+            tc.type(comp, text);
+            TagGuiTests.await(mark, @() string(comp.Value) == string(text), "typing '" + string(text) + "'");
+        end
+
+        function pressOn(tc, comp)
+            %PRESSON tc.press on a button, then wait until its callback has returned.
+            mark = TagGuiTests.track(comp, "ButtonPushedFcn");
+            tc.press(comp);
+            TagGuiTests.await(mark, [], "pressing '" + string(comp.Text) + "'");
+        end
+
+        function chooseIn(tc, comp, item)
+            %CHOOSEIN tc.choose on a drop-down or a table, then wait for the choice to arrive.
+            if isa(comp, "matlab.ui.control.Table")
+                mark = TagGuiTests.track(comp, "CellSelectionCallback");
+                tc.choose(comp, item);
+                TagGuiTests.await(mark, @() ~isempty(comp.Selection) && comp.Selection(1) == item(1), ...
+                    "selecting row " + item(1));
+            else
+                want = TagGuiTests.itemValue(comp, item);
+                mark = TagGuiTests.track(comp, "ValueChangedFcn");
+                tc.choose(comp, item);
+                TagGuiTests.await(mark, @() string(comp.Value) == want, "choosing '" + string(item) + "'");
+            end
+        end
+
+        function dismissAlert(tc, fig)
+            %DISMISSALERT tc.dismissAlertDialog (fails if no alert is open), then let the window settle.
+            tc.dismissAlertDialog(fig);
+            TagGuiTests.quiet(fig);
+        end
+
         function endWatchdog(tc, watchdog)
             %ENDWATCHDOG Stop the test's time limit, and fail the test if it was reached.
             if isvalid(watchdog)
@@ -985,16 +1018,132 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             delete(figs);
         end
 
-        function diag(ed, label)
-            %DIAG TEMPORARY: print the editor's state (to be removed).
-            a = TagGuiTests.alerts();
-            last = "";
-            if ~isempty(a)
-                last = " last='" + a(end).Title + "' / '" + a(end).Message + "'";
+        function mark = track(comp, prop)
+            %TRACK Wrap COMP's callback PROP so that AWAIT can tell when it has run.
+            mark = containers.Map();
+            orig = comp.(prop);
+            mark("comp") = comp;
+            mark("prop") = prop;
+            mark("orig") = orig;
+            comp.(prop) = @(src, evt) TagGuiTests.tracked(mark, orig, src, evt);
+        end
+
+        function tracked(mark, orig, src, evt)
+            %TRACKED The wrapper installed by TRACK: run the app's callback, note its return.
+            mark("called") = true;
+            try
+                if ~isempty(orig)
+                    orig(src, evt);
+                end
+            catch ME
+                mark("returned") = true;
+                rethrow(ME);
             end
-            fprintf("DIAGGUI %s | ns=%s value='%s' selection=%s status='%s' remove=%s set=%s alerts=%d%s\n", ...
-                label, string(ed.Ns.Value), string(ed.Value.Value), mat2str(ed.Table.Selection), ...
-                string(ed.Status.Text), string(ed.Remove.Enable), string(ed.Set.Enable), numel(a), last);
+            mark("returned") = true;
+        end
+
+        function await(mark, reached, what)
+            %AWAIT Wait until the tracked callback has returned and REACHED() holds.
+            %   REACHED may be [] (a button: the callback's return is all
+            %   there is to wait for). A gesture that changes nothing fires
+            %   no callback; then REACHED holding for a second is enough.
+            %   The app's own callback is put back afterwards.
+            comp = mark("comp");
+            fig = ancestor(comp, "figure");
+            t0 = tic;
+            heldSince = NaN;
+            while true
+                drawnow;
+                pause(0.05);
+                ok = true;
+                if ~isempty(reached)
+                    try
+                        ok = logical(reached());
+                    catch
+                        ok = false;
+                    end
+                end
+                if ok && isnan(heldSince)
+                    heldSince = toc(t0);
+                elseif ~ok
+                    heldSince = NaN;
+                end
+                if ok && (isKey(mark, "returned") || ...
+                        (~isKey(mark, "called") && ~isempty(reached) && toc(t0) - heldSince > 1))
+                    break
+                end
+                if toc(t0) > TagGuiTests.GestureLimit
+                    TagGuiTests.untrack(mark);
+                    error("TagGuiTests:gestureNotHandled", ...
+                        "The app did not finish handling %s within %d s (callback called: %d, returned: %d, expected state reached: %d).", ...
+                        what, TagGuiTests.GestureLimit, isKey(mark, "called"), isKey(mark, "returned"), ok);
+                end
+            end
+            TagGuiTests.untrack(mark);
+            TagGuiTests.quiet(fig);
+        end
+
+        function untrack(mark)
+            comp = mark("comp");
+            if isvalid(comp)
+                comp.(mark("prop")) = mark("orig");
+            end
+        end
+
+        function quiet(fig)
+            %QUIET Wait until FIG's controls have stopped changing (0.3 s unchanged; 5 s at most).
+            last = "";
+            same = 0;
+            t0 = tic;
+            while same < 6 && toc(t0) < 5
+                drawnow;
+                pause(0.05);
+                now = TagGuiTests.fingerprint(fig);
+                if now == last
+                    same = same + 1;
+                else
+                    same = 0;
+                    last = now;
+                end
+            end
+        end
+
+        function s = fingerprint(fig)
+            %FINGERPRINT The visible state of FIG's controls and the alerts shown, as text.
+            parts = "alerts=" + numel(TagGuiTests.alerts());
+            if ~isempty(fig) && isvalid(fig)
+                for h = reshape(findall(fig), 1, [])
+                    for prop = ["Value", "Text", "Selection", "Enable"]
+                        if isprop(h, prop)
+                            try
+                                parts(end+1) = prop + "=" + string(jsonencode(h.(prop))); %#ok<AGROW>
+                            catch
+                                parts(end+1) = prop + "=?"; %#ok<AGROW>
+                            end
+                        end
+                    end
+                    if isprop(h, "Data")
+                        parts(end+1) = "rows=" + size(h.Data, 1); %#ok<AGROW>
+                    end
+                end
+            end
+            s = strjoin(parts, "|");
+        end
+
+        function v = itemValue(comp, item)
+            %ITEMVALUE The Value a drop-down has once the item labelled ITEM is chosen.
+            v = string(item);
+            if ~isempty(comp.ItemsData)
+                k = find(string(comp.Items) == string(item), 1);
+                if ~isempty(k)
+                    data = comp.ItemsData;
+                    if iscell(data)
+                        v = string(data{k});
+                    else
+                        v = string(data(k));
+                    end
+                end
+            end
         end
 
         function f = findWindow(prefix)
