@@ -382,8 +382,10 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
             if strlength(fx.PgBin) > 0
                 setenv("PATH", fx.PgBin + pathsep + saved(end));
             end
-            % Nothing here may wait for a person: no password prompt (-w),
-            % no pager, and no input from MATLAB's own standard input.
+            % Nothing here may wait for a person. On Linux MATLAB runs the
+            % command on a pseudo-terminal, where psql starts its pager and
+            % waits for a key that never comes: so no pager, no input from
+            % the terminal, and no password prompt (-w).
             cmd = "psql -X -q -A -t -w -P pager=off -v ON_ERROR_STOP=1 -d " + db + ...
                 " -f """ + file + """";
             if ispc

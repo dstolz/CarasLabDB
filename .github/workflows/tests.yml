@@ -207,31 +207,17 @@ jobs:
           products: Database_Toolbox
           cache: true
 
-      # TEMPORARY diagnostics (to be removed before this is merged): what a
-      # command started by MATLAB's system() sees, and a record of the
-      # processes under MATLAB while the tests run.
-      - name: "DIAG: watch the process tree"
-        run: |
-          nohup bash -c 'for i in $(seq 1 150); do { date -u +%T; ps -eo pid,ppid,stat,tty,etimes,args --forest | grep -v -e "ps -eo" -e "sleep 10"; } > /tmp/ps_snapshot.txt.new 2>&1; mv /tmp/ps_snapshot.txt.new /tmp/ps_snapshot.txt; sleep 10; done' >/dev/null 2>&1 &
-
       - name: Run the MATLAB tests
         uses: matlab-actions/run-command@v3
         timeout-minutes: 15
         with:
           command: addpath("tests"); run_matlab_tests
 
-      - name: "DIAG: system() and psql from MATLAB"
+      # TEMPORARY diagnostic (to be removed before this is merged).
+      - name: "DIAG: transactions on the native connection"
         if: always()
         uses: matlab-actions/run-command@v3
         timeout-minutes: 5
         continue-on-error: true
-        env:
-          PGPASSWORD: postgres
         with:
-          command: addpath("tests"); diag_system_probe
-
-      - name: "DIAG: last process snapshot"
-        if: always()
-        run: |
-          sed -n '1p' /tmp/ps_snapshot.txt || true
-          grep -n -i -e matlab -e psql -e bash -e perl -e less -e pager -e " sh " -e env /tmp/ps_snapshot.txt | cut -c1-260 | tail -n 40 || true
+          command: addpath("tests"); diag_tx_probe
