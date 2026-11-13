@@ -33,7 +33,7 @@ classdef LabScratchDb < matlab.unittest.fixtures.Fixture
 %   touch an existing lab_mtest or lab_mtest_rw unless it carries this
 %   fixture's marker comment (left by an interrupted earlier run).
 %
-%   See also TAGTESTS, TAGGUITESTS.
+%   See also TAGTESTS, VARIABLETESTS, TAGGUITESTS.
 
     properties (Constant)
         DbName      = "lab_mtest"
