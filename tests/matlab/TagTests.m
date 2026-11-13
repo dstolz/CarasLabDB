@@ -1260,8 +1260,11 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             demo = regexprep(demo, 'Port(\s*)=\s*\d+', "Port$1= " + s.Port, "once");
             demo = regexprep(demo, 'DatabaseName(\s*)=\s*"[^"]*"', "DatabaseName$1= """ + s.DatabaseName + """", "once");
             demo = regexprep(demo, 'PersonEmail(\s*)=\s*"[^"]*"', "PersonEmail$1= """ + s.PersonEmail + """", "once");
+            % Five of the six lines always change; the port's only when the
+            % server is not on the demo's own 5432.
             changed = splitlines(demo) ~= splitlines(src);
-            tc.assertEqual(nnz(changed), 6, "only the six connection settings are adapted");
+            tc.assertEqual(nnz(changed), 5 + double(s.Port ~= 5432), ...
+                "only the six connection settings are adapted");
 
             folder = tc.applyFixture(matlab.unittest.fixtures.TemporaryFolderFixture).Folder;
             file = fullfile(folder, "carasLabDB_demo_mtest.m");

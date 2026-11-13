@@ -342,9 +342,14 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("rowsAfterTyping") = rows();
                 % type, then Remove with nothing selected in the list (the
                 % typed tag is registered but not on this artifact)
+                TagGuiTests.diag(ed, "T1 before typing stage:sorted");
                 tc.type(ed.Value, "stage:sorted");
+                TagGuiTests.diag(ed, "T1 after typing stage:sorted");
                 setappdata(groot, "TagGuiTests_alerts", []);
                 tc.press(ed.Remove);
+                TagGuiTests.diag(ed, "T1 after press Remove");
+                pause(1); drawnow;
+                TagGuiTests.diag(ed, "T1 one second later");
                 a = TagGuiTests.alerts();
                 obs("removeAlert") = strjoin([a.Message], newline);
                 tc.dismissAlertDialog(ed.Fig);
@@ -453,12 +458,21 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyEqual(tc.currentTags("event", w.EventId), "qc:pass");
 
             function local_immutable(tc, ed, obs)
+                TagGuiTests.diag(ed, "T2 start, listed=" + strjoin(TagGuiTests.listed(ed), ","));
                 tc.choose(ed.Table, [find(TagGuiTests.listed(ed) == "cohort:a"), 1]);
+                TagGuiTests.diag(ed, "T2 after choose row");
+                pause(1); drawnow;
+                TagGuiTests.diag(ed, "T2 one second later");
                 tc.press(ed.Remove);
+                TagGuiTests.diag(ed, "T2 after press Remove");
                 local_alert(tc, ed, obs);
+                TagGuiTests.diag(ed, "T2 after dismissing the alert, items=" + strjoin(string(ed.Ns.Items), ","));
                 tc.choose(ed.Ns, "topic");
+                TagGuiTests.diag(ed, "T2 after choose ns topic");
                 tc.type(ed.Value, "still_usable");
+                TagGuiTests.diag(ed, "T2 after typing still_usable");
                 tc.press(ed.Add);
+                TagGuiTests.diag(ed, "T2 after press Add");
                 tc.press(ed.Close);
             end
             function local_closed(tc, ed, obs)
@@ -969,6 +983,18 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             setappdata(groot, "TagGuiTests_timedOut", msg);
             fprintf("%s\n", msg);
             delete(figs);
+        end
+
+        function diag(ed, label)
+            %DIAG TEMPORARY: print the editor's state (to be removed).
+            a = TagGuiTests.alerts();
+            last = "";
+            if ~isempty(a)
+                last = " last='" + a(end).Title + "' / '" + a(end).Message + "'";
+            end
+            fprintf("DIAGGUI %s | ns=%s value='%s' selection=%s status='%s' remove=%s set=%s alerts=%d%s\n", ...
+                label, string(ed.Ns.Value), string(ed.Value.Value), mat2str(ed.Table.Selection), ...
+                string(ed.Status.Text), string(ed.Remove.Enable), string(ed.Set.Enable), numel(a), last);
         end
 
         function f = findWindow(prefix)
