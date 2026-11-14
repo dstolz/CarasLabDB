@@ -34,10 +34,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
     % =====================================================================
     methods (Test, TestTags = {'Database'})
         function connectsAsLabRwMember(tc)
-            % Section 0: schema version 5, no version warning, person resolved,
+            % Section 0: schema version 1, no version warning, person resolved,
             % and the connection is a lab_rw member, not a superuser.
             db = tc.requireDb();
-            tc.verifyEqual(db.SchemaVersion, 5);
+            tc.verifyEqual(db.SchemaVersion, 1);
             tc.verifyEqual(db.SchemaVersion, CarasLabDB.SchemaVersionExpected);
             tc.verifyNotEqual(tc.Fx.ConnectWarningId, "CarasLabDB:schemaVersionMismatch");
             tc.verifyFalse(contains(tc.Fx.ConnectOutput, "Warning"), tc.Fx.ConnectOutput);
@@ -785,8 +785,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
             tc.verifyEqual(tc.Fx.counts(), n0, "early failure left rows behind");
             tc.verifyEqual(string(db.Connection.AutoCommit), "on");
 
-            % Two current stage values on a2: a state schema version 4 no
-            % longer lets racing writers create, but an older database can
+            % Two current stage values on a2: a state pre-launch schema
+            % version 4 stopped racing writers from creating, but an older database can
             % hold (lab.fn_check_integrity: tag_cardinality_violation).
             tc.makeTwoCurrentStages(a2);
             stages = tc.currentTags("artifact", a2);
@@ -1109,7 +1109,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
     end
 
     % =====================================================================
-    % 7b. Schema version 4: construction checks, corrections, filters, edits
+    % 7b. Pre-launch schema version 4: construction checks, corrections, filters, edits
     % =====================================================================
     methods (Test, TestTags = {'NoDatabase'})
         function missingValuesAreSqlNull(tc)
@@ -1478,7 +1478,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagTests < matlab.unittest.TestCa
 
         function makeTwoCurrentStages(tc, aid)
             %MAKETWOCURRENTSTAGES Two current stage tags on AID, a state only an older database holds.
-            %   Since schema version 4 the single-valued check takes an
+            %   Since pre-launch schema version 4 the single-valued check takes an
             %   advisory lock, so two racing writers can no longer both
             %   commit: the second waits for the first, which in this
             %   single-threaded test would be forever. The table's owner

@@ -160,10 +160,10 @@ psql -X -v ON_ERROR_STOP=1 -h localhost -U lab_admin -d lab -f design_docs/grant
 
 `schema.sql` prints a series of `NOTICE: trigger ... does not exist,
 skipping` lines; they are expected. With `ON_ERROR_STOP=1` any real error
-stops it with a non-zero exit. It installs schema version 5:
+stops it with a non-zero exit. It installs schema version 1:
 
 ```powershell
-psql -X -h localhost -U lab_admin -d lab -c "SELECT max(version) FROM lab.schema_version;"   # 5
+psql -X -h localhost -U lab_admin -d lab -c "SELECT max(version) FROM lab.schema_version;"   # 1
 psql -X -h localhost -U lab_admin -d lab -c "\dt lab.*"
 ```
 
@@ -626,13 +626,15 @@ set PGUSER=lab_verifier
 The service account needs read access to the share; a mapped drive letter
 such as `Z:\` belongs to a signed-in user's session, so use the UNC path. A
 root whose directory is missing or empty is refused, so an unmounted share
-does not record every file as missing. `--older-than-days 7` checks only
+does not record every file as missing. Only present files are checked: one
+recorded as replaced, moved or deleted (`lab.artifact_disposition`) is not
+where its row says, by design. `--older-than-days 7` checks only
 files not verified in the last week and `--limit N` caps one run. Exit code
 1 means at least one file is missing or mismatched.
 
 ### 4.3 Integrity report
 
-`lab.fn_check_integrity()` returns one row per problem (13 checks; see
+`lab.fn_check_integrity()` returns one row per problem (14 checks; see
 [database-design.md](database-design.md) §4.2); an empty result is healthy.
 Any login can run it; use `lab_dashboard`. Save this as
 `C:\src\CarasLabDB\deploy\integrity.sql` (a file of your own). It prints every
@@ -716,7 +718,9 @@ login with its password.
 
 ## 6. Upgrade runbook (schema migrations)
 
-A new schema version arrives as a numbered script in `design_docs/migrations/`
+This runbook applies from launch on; until then the schema stays at version
+1 and there are no migrations. A new schema version arrives as a numbered
+script in `design_docs/migrations/` (from `002`)
 together with matching versions of the MATLAB class and the MCP server. The
 MATLAB class refuses to connect to a database at a schema version it was not
 written for, so the database and every client move together.
@@ -738,12 +742,12 @@ written for, so the database and every client move together.
 
    ```powershell
    psql -X -v ON_ERROR_STOP=1 -1 -h localhost -U lab_admin -d lab `
-       -f design_docs/migrations/005_variables_retraction_logins.sql
+       -f design_docs/migrations/<NNN>_<name>.sql
    ```
 
    Read the script's header first: it says what changes and what to do
-   afterwards (005, for instance, asks the administrator to set
-   `lab.person.db_login` for every member, §1.4).
+   afterwards (for instance, setting `lab.person.db_login` for every member,
+   §1.4).
 4. **Re-run `grants.sql`** as `lab_admin` (§1.3). This also gives `CONNECT`
    back to `lab_rw` and `lab_ro`.
 5. **Check.** `SELECT max(version) FROM lab.schema_version;` and
@@ -811,7 +815,7 @@ text)` to that person's login only, never to `lab_rw`.
       Automatic.
 - [ ] The schema and grants were applied by `lab_admin`, and
       `SELECT max(version) FROM lab.schema_version` returns the version the
-      clients expect (5).
+      clients expect (1).
 - [ ] A member's own login can connect from a workstation, insert, and
       `SELECT lab.fn_current_person()` returns their `person_id`; the same
       login cannot `UPDATE lab.person` and cannot rename a subject.

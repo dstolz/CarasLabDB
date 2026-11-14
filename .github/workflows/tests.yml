@@ -1,4 +1,4 @@
-# Schema, privilege, migration, live-dashboard, verifier and MCP server checks
+# Schema, privilege, live-dashboard, verifier and MCP server checks
 # against every supported PostgreSQL major version. Nothing here needs MATLAB:
 # the MATLAB tests in tests/matlab/ run locally only
 # (design_docs/testing-locally.md).
@@ -35,15 +35,8 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
-      # The last commit whose schema.sql is version 1 (no lab.schema_version).
-      # The migrations are checked by upgrading that schema with every
-      # script in design_docs/migrations/ and comparing the result with a
-      # fresh install of the current one.
-      SCHEMA_V1_COMMIT: "1778007"
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # SCHEMA_V1_COMMIT must be reachable
 
       - uses: actions/setup-python@v5
         with:
@@ -76,43 +69,6 @@ jobs:
       # lab_ro, which is the only way to see what the grants actually allow.
       - name: Role and privilege assertions
         run: psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/roles_test.sql
-
-      - name: v1 plus migrations matches a fresh install
-        run: |
-          git show "$SCHEMA_V1_COMMIT:design_docs/schema.sql" > "$RUNNER_TEMP/schema_v1.sql"
-          createdb lab_fresh
-          createdb lab_migrated
-          psql -X -q -v ON_ERROR_STOP=1 -d lab_fresh -f design_docs/schema.sql
-          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated -f "$RUNNER_TEMP/schema_v1.sql"
-          for m in design_docs/migrations/*.sql; do
-            echo "applying $m"
-            psql -X -q -v ON_ERROR_STOP=1 -1 -d lab_migrated -f "$m"
-          done
-          # pg_dump runs inside the service container so its version matches
-          # the server's; its \restrict / \unrestrict lines carry a random key.
-          dump() {
-            docker exec "${{ job.services.postgres.id }}" \
-              pg_dump -U postgres --schema-only -d "$1" | grep -v '^\\\(un\)\?restrict '
-          }
-          dump lab_fresh > "$RUNNER_TEMP/fresh.sql"
-          dump lab_migrated > "$RUNNER_TEMP/migrated.sql"
-          diff -u "$RUNNER_TEMP/fresh.sql" "$RUNNER_TEMP/migrated.sql"
-          psql -X -v ON_ERROR_STOP=1 -d lab_migrated -f tests/schema_test.sql
-          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated -f design_docs/grants.sql
-          psql -X -v ON_ERROR_STOP=1 -d lab_migrated -f tests/roles_test.sql
-
-      # The comparison above upgrades an empty database. This upgrades one
-      # that holds version-1 rows, including ones later versions would reject.
-      - name: Migrations on a version-1 database with data
-        run: |
-          createdb lab_migrated_data
-          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated_data -f "$RUNNER_TEMP/schema_v1.sql"
-          psql -X -q -v ON_ERROR_STOP=1 -d lab_migrated_data -f tests/seed_v1.sql
-          for m in design_docs/migrations/*.sql; do
-            echo "applying $m"
-            psql -X -q -v ON_ERROR_STOP=1 -1 -d lab_migrated_data -f "$m"
-          done
-          psql -X -v ON_ERROR_STOP=1 -d lab_migrated_data -f tests/migrated_data_test.sql
 
       - name: Artifact verifier, end to end
         run: |

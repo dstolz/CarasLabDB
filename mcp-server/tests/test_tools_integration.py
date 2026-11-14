@@ -142,7 +142,7 @@ def test_schema_map_matches_the_catalog(seed):
 
 def test_tool_surface_is_read_only_and_takes_no_identifiers(seed):
     tools = asyncio.run(app.list_tools())
-    assert len(tools) == 31
+    assert len(tools) == 32
     for tool in tools:
         assert tool.name.startswith("get_") or tool.name in ("find_by_tags", "find_by_variable"), \
             tool.name
@@ -160,7 +160,7 @@ def test_every_list_tool_is_bounded_and_puts_the_flags_first(seed, seed5):
         "get_counts": {"question": "events_by_type"},
     }
     tools = [t.name for t in asyncio.run(app.list_tools()) if t.name != "get_event_detail"]
-    assert len(tools) == 30
+    assert len(tools) == 31
     for name in tools:
         args = required.get(name, {})
         res = call(name, limit=10**9, **args)
@@ -648,7 +648,7 @@ def test_fn_tag_is_refused_through_the_read_only_path(seed):
 
 
 # ---------------------------------------------------------------------------
-# Schema version 5: variables, retraction, counts, paging, file lookup
+# Pre-launch schema version 5: variables, retraction, counts, paging, file lookup
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -942,12 +942,12 @@ def test_integrity_docstring_lists_every_check(seed):
         source = conn.execute(
             "SELECT pg_get_functiondef('lab.fn_check_integrity()'::regprocedure)").fetchone()[0]
     checks = set(re.findall(r"SELECT '(error|warning)', '([a-z_]+)'", source))
-    assert len(checks) == 13
+    assert len(checks) == 14
     doc = {t.name: t.description for t in asyncio.run(app.list_tools())}["get_integrity_report"]
-    assert "The 13 checks" in doc
+    assert "The 14 checks" in doc
     for severity, name in checks:
         assert f"- {name} ({severity})" in doc, name
-    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 13
+    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 14
 
 
 def test_artifact_file_lookup(seed5):
@@ -1047,3 +1047,42 @@ def test_pageable_key_columns_are_not_null(seed):
 def test_persons_carry_db_login(seed):
     row = call("get_persons", person_id=seed["person"])["rows"][0]
     assert "db_login" in row and row["db_login"] is None
+
+
+def test_dispositions_say_where_a_file_is(seed):
+    """A file replaced at its path leaves present_only=True; its row stays active."""
+    import psycopg
+
+    tag = uuid.uuid4().hex[:8]
+    with psycopg.connect(dbname=TEST_DB, autocommit=True) as conn:
+        q = conn.execute
+        root = q("SELECT storage_root_id FROM lab.artifact WHERE artifact_id = %s",
+                 [seed["artifact"]]).fetchone()[0]
+        path = f"{seed['subject']}/s1/out-{tag}.mat"
+
+        def artifact(checksum):
+            return str(q("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, "
+                         "relative_path, checksum) VALUES (%s, %s, %s, %s) RETURNING artifact_id",
+                         [seed["sep"], root, path, checksum]).fetchone()[0])
+
+        old = artifact(uuid.uuid4().hex + uuid.uuid4().hex)
+        new = artifact(uuid.uuid4().hex + uuid.uuid4().hex)
+        q("INSERT INTO lab.artifact_disposition (artifact_id, disposition, "
+          "successor_artifact_id, occurred_at) VALUES (%s, 'replaced', %s, now())", [old, new])
+
+    present = {r["artifact_id"] for r in call(
+        "get_artifacts", relative_path=path, present_only=True)["rows"]}
+    active = {r["artifact_id"] for r in call("get_artifacts", relative_path=path)["rows"]}
+    assert present == {new} and active == {old, new}
+    log = call("get_artifact_dispositions", artifact_id=old)["rows"]
+    assert [(r["disposition"], r["successor_artifact_id"]) for r in log] == [("replaced", new)]
+    assert log[0]["recorded_login"]
+    latest = call("get_artifact_dispositions", artifact_id=old, latest_per_file=True)["rows"]
+    assert latest[0]["disposed_artifact_id"] == old
+    assert call("get_artifact_dispositions", artifact_id=new)["row_count"] == 0
+    assert call("get_artifact_dispositions", disposition="replaced", limit=1000)["row_count"] >= 1
+    with pytest.raises(Exception, match="disposition must be"):
+        call("get_artifact_dispositions", disposition="lost")
+    with pytest.raises(Exception, match="present_only"):
+        call("get_artifacts", present_only=True, active_only=False)
+

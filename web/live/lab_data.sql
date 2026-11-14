@@ -8,7 +8,7 @@
 --   people, probes, pipelines, storageRoots, species, projects,
 --   projectMembers, projectArtifacts, subjects, sessions, events,
 --   artifacts, eventInputs, eventTypeMeta, roleMeta, tagNamespaces, tags,
---   tagAssignments, variables, variableValues, retractions, NOW
+--   tagAssignments, variables, variableValues, retractions, dispositions, NOW
 --
 -- The integrity summary (`integrity`) is NOT computed here: it is
 -- lab_integrity.sql, which server.py runs on its own, longer-lived cache
@@ -43,7 +43,7 @@
 --     session zone's offset; server.py pins that zone to UTC, and PGTZ=UTC
 --     does the same for psql.
 --   * recorded_login / created_login are the database logins that inserted
---     the row (NULL on rows older than schema version 4).
+--     the row (NULL only on rows older than pre-launch schema version 4).
 --   * Variables: `variables` are the definitions (lab.variable, applies_to as
 --     a JSON array); `variableValues` is the whole append-only log
 --     (lab.variable_value) in value_id order, each row naming its entity as
@@ -57,6 +57,12 @@
 --   * Retractions: `retractions` is lab.retraction. A retracted event or
 --     artifact is not active, exactly as in lab.event_active /
 --     lab.artifact_active; the dashboard applies that client-side.
+--   * Dispositions: `dispositions` is lab.artifact_disposition, the log of
+--     what became of files (replaced, moved, deleted, restored). It belongs
+--     to the file (storage root, path, checksum); the dashboard takes each
+--     file's latest row by disposition_id, as lab.artifact_disposition_latest,
+--     and a row is present (lab.artifact_present) when it is active and its
+--     file was not replaced, moved or deleted since.
 --
 -- This file is a single statement. Run it standalone to produce a static
 -- export (without the integrity summary):
@@ -276,6 +282,16 @@ retractions AS (
         'retracted_by', retracted_by, 'retracted_login', retracted_login
     ) ORDER BY retraction_id), '[]'::json) AS j
     FROM lab.retraction
+),
+dispositions AS (
+    SELECT coalesce(json_agg(json_build_object(
+        'disposition_id', disposition_id, 'artifact_id', artifact_id,
+        'disposition', disposition, 'successor_artifact_id', successor_artifact_id,
+        'occurred_at', to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'recorded_at', to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+        'recorded_by', recorded_by, 'recorded_login', recorded_login, 'note', note
+    ) ORDER BY disposition_id), '[]'::json) AS j
+    FROM lab.artifact_disposition
 )
 SELECT json_build_object(
     'NOW',              (extract(epoch FROM now()) * 1000)::bigint,
@@ -299,9 +315,10 @@ SELECT json_build_object(
     'tagAssignments',   tag_assignments.j,
     'variables',        variables.j,
     'variableValues',   variable_values.j,
-    'retractions',      retractions.j
+    'retractions',      retractions.j,
+    'dispositions',     dispositions.j
 ) AS lab_data
 FROM people, probes, pipelines, storage_roots, species, projects,
      project_members, project_artifacts, subjects, sessions, events,
      artifacts, event_inputs, event_type_meta, role_meta, tag_namespaces,
-     tags, tag_assignments, variables, variable_values, retractions;
+     tags, tag_assignments, variables, variable_values, retractions, dispositions;

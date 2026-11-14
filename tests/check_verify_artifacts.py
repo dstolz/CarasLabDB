@@ -7,9 +7,10 @@ write to (it commits rows; use a throw-away database):
     createdb lab_verify && psql -X -q -d lab_verify -f design_docs/schema.sql
     PGDATABASE=lab_verify python tests/check_verify_artifacts.py
 
-Registers five files -- one intact, one with a wrong checksum, one that does
-not exist, one on a storage root that is not mounted, and one whose artifact
-row has been corrected -- runs the verifier, and checks what it recorded and
+Registers six files -- one intact, one with a wrong checksum, one that does
+not exist, one on a storage root that is not mounted, one whose artifact
+row has been corrected, and one recorded as deleted (lab.artifact_disposition)
+-- runs the verifier, and checks what it recorded and
 what lab.fn_check_integrity() then reports. Exits non-zero on the first
 problem.
 """
@@ -91,6 +92,10 @@ fixed_old = register("fixed.dat", mounted, "sha256", digest("sha256", contents["
                      role="raw")
 fixed = register("fixed.dat", mounted, "sha256", digest("sha256", contents["fixed.dat"]),
                  supersedes=fixed_old, role="derived")
+# Recorded as deleted: not on disk, and not to be checked or reported.
+deleted = register("deleted.dat", mounted, "sha256", digest("sha256", b"cleaned up\n"))
+cur.execute("INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at) "
+            "VALUES (%s, 'deleted', now())", (deleted,))
 
 with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as empty:
     os.makedirs(os.path.join(tmp, subject))
@@ -143,7 +148,7 @@ with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as empt
 
     cur.execute("SELECT check_name, subject FROM lab.fn_check_integrity() "
                 "WHERE check_name IN ('artifact_verification_failed', 'artifact_never_verified') "
-                "AND subject = ANY (%s)", ([good, bad, gone, offline, fixed, fixed_old],))
+                "AND subject = ANY (%s)", ([good, bad, gone, offline, fixed, fixed_old, deleted],))
     report = sorted(cur.fetchall())
     want = sorted([("artifact_verification_failed", bad), ("artifact_verification_failed", gone),
                    ("artifact_never_verified", offline)])

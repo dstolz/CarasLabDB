@@ -8,9 +8,8 @@ that guide is about *installing* the system; this one is about *proving it works
 The goal of local testing is a throwaway `lab` database on `localhost` that you
 can create, exercise end-to-end through both the MATLAB class and the GUI, then
 drop — repeatedly — without touching production data. The schema, the
-privileges, the migrations, the Python tools and the MCP server have
+privileges, the Python tools and the MCP server have
 automated tests (`tests/schema_test.sql`, `tests/roles_test.sql`,
-`tests/seed_v1.sql` + `tests/migrated_data_test.sql`,
 `tests/check_verify_artifacts.py`, `tests/check_lab_data.py`,
 `mcp-server/tests/`), which CI (`.github/workflows/tests.yml`) runs on
 PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
@@ -159,7 +158,7 @@ ORDER BY 1, 2;
 - **Variables:** `variable`, `variable_value` (see [variables.md](variables.md)).
 - **Retraction:** `retraction`.
 - **Audit and versioning:** `maintenance_log` (subject renames), `row_history`
-  (edits to the mutable tables) and `schema_version` (5 on a fresh install).
+  (edits to the mutable tables) and `schema_version` (1 on a fresh install).
 - **Views:** `event_active`, `artifact_active`, `event_version`,
   `artifact_version`, `artifact_verification_latest`, `provenance_edge`,
   `subject_current`, `tag_current`, `entity_tags`, `variable_current`,

@@ -88,7 +88,7 @@ return `next_cursor`: pass it back as `cursor` with the same arguments for
 the next page (keyset paging on the listing's stable order; `limit` still
 caps each page).
 
-The server is written for schema version 5 (`lab.schema_version`). Against a
+The server is written for schema version 1 (`lab.schema_version`). Against a
 database at another version it logs a warning and adds a `schema_warning`
 string to every result, since its hard-coded column lists may then return
 incomplete rows.

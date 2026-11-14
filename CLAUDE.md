@@ -9,12 +9,16 @@ data. It has six parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
-  redefine it. It installs the latest schema version; `design_docs/migrations/`
-  upgrades existing databases, and `design_docs/grants.sql` holds the roles
-  and privileges every deployment guide applies. Current schema version: 5
-  (`design_docs/migrations/005_variables_retraction_logins.sql`). It includes
+  redefine it. It installs the current schema version, and
+  `design_docs/grants.sql` holds the roles and privileges every deployment
+  guide applies. Current schema version: **1**. The database has not been
+  launched, so changes are made in `schema.sql` directly, at version 1, with no
+  migration. `design_docs/migrations/pre-launch/` archives the upgrade scripts
+  of the pre-launch numbering (they took a first prototype to what was then
+  version 5, the schema now called 1); nothing applies or tests them. It includes
   the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
-  tables (`variable`, `variable_value`) and `retraction`;
+  tables (`variable`, `variable_value`), `retraction` and
+  `artifact_disposition`;
   `design_docs/tagging.md` and `design_docs/variables.md` are the user-facing
   guides.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
@@ -37,7 +41,8 @@ data. It has six parts:
   artifact with its file's latest `verification`, the tag vocabulary as
   `tagNamespaces`/`tags` and the whole tag log as `tagAssignments`, the
   variable definitions as `variables` and the whole value log as
-  `variableValues` (values as text, exactly as stored), and `retractions`.
+  `variableValues` (values as text, exactly as stored), `retractions` and
+  `dispositions`.
   Current tags, current variable values and "active" are derived in the
   browser, in the same way as `tag_current`, `variable_current` and the
   `*_active` views. The `integrity` summary is not in `lab_data.sql`: it comes
@@ -63,7 +68,8 @@ data. It has six parts:
   The schema's table and column names are hard-coded — the event-detail
   tables/columns in `src/caraslabdb_mcp/schema_map.py`, the rest in the
   per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
-  change must be mirrored there, and `db.SCHEMA_VERSION` bumped. See
+  change must be mirrored there (and, after launch, `db.SCHEMA_VERSION`
+  bumped). See
   `design_docs/mcp-server.md`.
 - **`tools/`** — Python scripts, cross-platform, standard library only except
   that the verifier needs psycopg: `backup_lab.py` (database + roles +
@@ -104,7 +110,7 @@ records:
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
   `maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
-  `variable_value` and `retraction`.
+  `variable_value`, `retraction` and `artifact_disposition`.
   Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
   replaces. `event_active` / `artifact_active` views filter to current rows
@@ -116,7 +122,19 @@ records:
   `lab.fn_retract('event'|'artifact', id, reason)` appends a `retraction`
   row; the row stays, leaves the `*_active` views, and superseding it later
   restores it (the successor is active). Not a substitute for a correction.
-- The mutable tables (reference, project, `subject`, `session`) are edited in
+- **File disposition** records what became of a registered file:
+  `lab.artifact_disposition` (`replaced` / `moved` / `deleted` / `restored`,
+  with a successor row for a move, and for a replacement when it is
+  registered) is an append-only log that belongs to the *file* (root, path,
+  checksum), like verifications; `artifact_disposition_latest` is each file's
+  state and `artifact_present` the active rows whose file is still where the
+  row says. The row stays active -- a disposition is neither a correction
+  (lineage would follow it to the new bytes) nor a retraction -- and
+  `trg_artifact_disposition_policy` (advisory lock per file) allows a
+  disposition only while the file is present and `restored` only while it is
+  not. The integrity checks of files (`artifact_verification_failed`,
+  `artifact_never_verified`, `duplicate_active_path`) read `artifact_present`,
+  and `tools/verify_artifacts.py` checks only present files.- The mutable tables (reference, project, `subject`, `session`) are edited in
   place, and the `fn_log_row_change` triggers record every UPDATE/DELETE in
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
@@ -127,7 +145,7 @@ records:
   `artifact_verification.verified_login`, `tag_assignment.applied_login`,
   `retraction.retracted_login`, `variable_value.set_login` are set to
   `session_user` by the `trg_*_stamp_login` triggers whatever the client
-  sends (NULL on rows older than schema version 4). Clients never send them
+  sends (NULL only on rows older than pre-launch schema version 4). Clients never send them
   and do not carry them forward in a correction. `lab.person.db_login` maps a
   login to a person (`lab.fn_current_person()`); the database fills the
   person column from it when the client names nobody, and the MATLAB class
@@ -191,23 +209,27 @@ records:
   for the tag reason above. A correction's variables are carried forward **by
   trigger** (`trg_event_carry_variables` / `trg_artifact_carry_variables`),
   not by the client — do not also copy them in MATLAB.
-- `lab.fn_check_integrity()` has 13 checks (see `database-design.md` §4.2);
+- `lab.fn_check_integrity()` has 14 checks (see `database-design.md` §4.2);
   a new invariant that a constraint cannot enforce gets a check there.
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
-`(event_id, event_type)` composite-FK trick. A schema change also needs: a new
-numbered script in `design_docs/migrations/` that inserts its
-`lab.schema_version` row; the same change in `schema.sql` with its seeded
-version bumped (a fresh install and an upgraded database must give identical
-`pg_dump --schema-only` output — so a column added to an existing table goes
-last in its `CREATE TABLE`, where `ALTER TABLE ADD COLUMN` puts it, and a
-`SELECT *` view over that table is re-created in the migration);
-`CarasLabDB.SchemaVersionExpected` and the MCP server's `db.SCHEMA_VERSION`
-bumped; `grants.sql` updated if the new table needs anything beyond
-read/insert; assertions in `tests/schema_test.sql`; and, for anything a role
-may or may not do, in `tests/roles_test.sql`. Function and view bodies in a
-migration must be byte-identical to `schema.sql`.
+`(event_id, event_type)` composite-FK trick. A schema change also needs:
+`grants.sql` updated if the new table needs anything beyond read/insert;
+assertions in `tests/schema_test.sql`; and, for anything a role may or may not
+do, in `tests/roles_test.sql`.
+
+Until launch, the change is made in `schema.sql` only and the version stays 1.
+From launch on, it also needs: a new numbered script in
+`design_docs/migrations/` (from `002`) that inserts its `lab.schema_version`
+row; the seeded version in `schema.sql` bumped (a fresh install and an
+upgraded database must give identical `pg_dump --schema-only` output — so a
+column added to an existing table goes last in its `CREATE TABLE`, where
+`ALTER TABLE ADD COLUMN` puts it, and a `SELECT *` view over that table is
+re-created in the migration); `CarasLabDB.SchemaVersionExpected` and the MCP
+server's `db.SCHEMA_VERSION` bumped; and a CI check that the migrations
+reproduce a fresh install. Function and view bodies in a migration must be
+byte-identical to `schema.sql`.
 
 ## The MATLAB interface (`@CarasLabDB`)
 
@@ -294,9 +316,34 @@ Key behaviors baked into the class:
   (`lab.fn_check_integrity()`), `addHusbandryBatch(T, OccurredAt=)` (one
   weigh-in sheet in one transaction), `addArtifactFromFile(path,
   ProducedByEventId=, StorageRootId=, RootPath=)` (computes size and SHA-256).
+- Clients that record work while the server may be unreachable (the
+  ephys_analysis toolbox): ids minted by the caller (`EventId=` on every
+  `add*Event`, `ArtifactId=` on `addArtifact`/`addArtifactFromFile`,
+  `SessionId=` on `addSession`; `pCheckUuid`), and `recordEvent(type,
+  EventId=, Digest=, ...)` (own file), which writes an analysis, recording or
+  behavior event with its inputs and output files in one `pTransact` and is
+  safe to send again: the digest is stored in `event.attributes.client_digest`;
+  the same id and digest is "existing", another digest
+  `CarasLabDB:idConflict`; a file already registered with the same bytes at
+  the same path is reused and listed in `attributes.unchanged_outputs`;
+  `MissingInputs="skip"` leaves out inputs not yet in the database
+  (`addEventInput(..., IfExists="skip")` adds them later). Its Detail and
+  Outputs field names are checked against fixed column lists. Every datetime
+  it is given must be zoned (`CarasLabDB:unzonedTime`).
+  `CarasLabDB.jsonText(text)` (a `CarasLabDBJson` value, at the repository
+  root) sends JSON text to a jsonb column as written, never through
+  `jsonencode`. The constructor takes `ConnectTimeout=` (sets
+  `PGCONNECT_TIMEOUT` for the `postgresql()` call only), `StatementTimeout=`
+  and `LockTimeout=` (session settings). `getArtifacts` takes
+  `StorageRootId=`, `RelativePath=`, `PathPrefix=`, `PresentOnly=`;
+  `getSessions` `RelativePath=`. `addArtifactDisposition` /
+  `getArtifactDispositions(LatestPerFile=)` (inline) write and read the
+  disposition log; `recordEvent` records an output's `replaces` row as
+  `replaced` and a reused file that was gone as `restored`.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
-  retract action (Ctrl+Delete), a daily husbandry entry grid (Ctrl+H) and an
+  retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
+  daily husbandry entry grid (Ctrl+H) and an
   integrity view (Ctrl+I); Ctrl+? lists the shortcuts. Its settings persist
   through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
 
@@ -328,10 +375,8 @@ walkthrough script, not an automated test, and assumes a reachable database.
 
 CI (`.github/workflows/tests.yml`) runs on PostgreSQL 14, 15, 16 and 17. It
 applies the schema, runs `tests/schema_test.sql`, applies `grants.sql` twice
-and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), checks
-that a v1 database plus the migrations matches a fresh install, upgrades a v1
-database that holds rows (`tests/seed_v1.sql`,
-`tests/migrated_data_test.sql`), runs the artifact verifier end to end
+and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), runs the
+artifact verifier end to end
 (`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
 and runs the MCP server's pytest suite. The `matlab` job runs

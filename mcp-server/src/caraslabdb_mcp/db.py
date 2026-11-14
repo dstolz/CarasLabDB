@@ -66,7 +66,7 @@ MAX_LIMIT = 1000
 # (schema_map.py, the per-tool filters) were written against. A database at
 # another version may return incomplete rows rather than an error, so a
 # mismatch is logged and repeated in every result as `schema_warning`.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 1
 
 # Inclusive lower / exclusive upper bound operators for `time_ranges`.
 _RANGE_OPS = (">=", "<")
@@ -88,6 +88,8 @@ ORDER_BY_VARIABLE_VALUE = "value_id"
 # Unique: one current value per (entity, variable).
 ORDER_BY_VARIABLE_CURRENT = "entity_kind, entity_id, variable"
 ORDER_BY_RETRACTION = "retracted_at DESC, retraction_id DESC"
+ORDER_BY_DISPOSITION = "disposition_id DESC"
+ORDER_BY_DISPOSITION_LATEST = "artifact_id"
 ORDER_BY_SUBJECT = "subject_id"
 ORDER_BY_SESSION = "subject_id, label"
 ORDER_BY_VERIFICATION_LATEST = "artifact_id"
@@ -119,6 +121,7 @@ DEFAULT_ORDER_BY = {
     "lab.artifact": ORDER_BY_ARTIFACT,
     "lab.artifact_active": ORDER_BY_ARTIFACT,
     "lab.artifact_version": ORDER_BY_ARTIFACT,
+    "lab.artifact_present": ORDER_BY_ARTIFACT,
     "lab.event_input": "event_id, artifact_id",
     "lab.artifact_verification": ORDER_BY_VERIFICATION,
     "lab.artifact_verification_latest": ORDER_BY_VERIFICATION_LATEST,
@@ -132,6 +135,8 @@ DEFAULT_ORDER_BY = {
     "lab.variable_value": ORDER_BY_VARIABLE_VALUE,
     "lab.variable_current": ORDER_BY_VARIABLE_CURRENT,
     "lab.retraction": ORDER_BY_RETRACTION,
+    "lab.artifact_disposition": ORDER_BY_DISPOSITION,
+    "lab.artifact_disposition_latest": ORDER_BY_DISPOSITION_LATEST,
 }
 DEFAULT_ORDER_BY.update({t: "event_id" for t in schema_map.EVENT_DETAIL_TABLE.values()})
 
@@ -153,6 +158,7 @@ PAGE_KEYS = {
                             ("verification_id", True, "bigint")),
     ORDER_BY_VERIFICATION_LATEST: (("artifact_id", False, "uuid"),),
     ORDER_BY_TAG_ASSIGNMENT: (("assignment_id", True, "bigint"),),
+    ORDER_BY_DISPOSITION: (("disposition_id", True, "bigint"),),
     ORDER_BY_TAG_CURRENT: (("tag", False, "text"), ("assignment_id", False, "bigint")),
     ORDER_BY_SUBJECT: (("subject_id", False, "text"),),
     ORDER_BY_SESSION: (("subject_id", False, "text"), ("label", False, "text")),
@@ -405,7 +411,8 @@ def _check_schema_version(conn):
     global schema_warning
     cur = conn.cursor()
     try:
-        # Version 1 had no schema_version table; probe rather than fail.
+        # The first pre-launch schema had no schema_version table; probe
+        # rather than fail.
         cur.execute("SELECT to_regclass('lab.schema_version') IS NOT NULL")
         version = None
         if cur.fetchone()[0]:
@@ -416,7 +423,7 @@ def _check_schema_version(conn):
     if version == SCHEMA_VERSION:
         schema_warning = None
         return
-    found = ("unknown (no lab.schema_version table, i.e. version 1)"
+    found = ("unknown (no lab.schema_version table: a pre-launch prototype)"
              if version is None else str(version))
     schema_warning = (
         f"Database schema version is {found}; this MCP server is written for "

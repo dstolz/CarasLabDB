@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Verify the files behind lab.artifact against their registered checksums.
 
-For every active artifact whose storage root is mounted on this machine, read
-the file, compute its checksum with the algorithm the artifact was registered
+For every present artifact (active, and not recorded in
+lab.artifact_disposition as replaced, moved or deleted) whose storage root is
+mounted on this machine, read the file, compute its checksum with the algorithm the artifact was registered
 with, and append one row to lab.artifact_verification:
 
     ok        the file is there and its checksum matches
@@ -44,14 +45,15 @@ import sys
 
 CHUNK = 4 * 1024 * 1024
 
-# Latest check of each active artifact's *file* (lab.artifact_verification_latest
+# Latest check of each present artifact's *file* (lab.artifact_verification_latest
 # looks across every artifact row describing the same file, so a corrected
-# artifact is not treated as never verified). Never-verified files first, then
-# the ones checked longest ago.
+# artifact is not treated as never verified). A file recorded as replaced,
+# moved or deleted is not where its row says, by design, so it is not checked.
+# Never-verified files first, then the ones checked longest ago.
 SELECT_SQL = """
 SELECT a.artifact_id::text, r.name, a.relative_path, a.checksum, a.checksum_algo,
        a.size_bytes
-FROM lab.artifact_active a
+FROM lab.artifact_present a
 JOIN lab.storage_root r ON r.root_id = a.storage_root_id
 LEFT JOIN lab.artifact_verification_latest v ON v.artifact_id = a.artifact_id
 WHERE (%(older)s::interval IS NULL

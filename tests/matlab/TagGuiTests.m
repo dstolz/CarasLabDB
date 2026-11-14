@@ -566,15 +566,36 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             % Variables, Retract, Husbandry and Integrity each have a toolbar
             % button, and Ctrl+? lists their shortcuts.
             m = tc.mainParts();
-            for txt = ["Variables…", "Retract…", "Husbandry…", "Integrity…"]
+            for txt = ["Variables…", "Retract…", "File…", "Husbandry…", "Integrity…"]
                 tc.verifyNumElements(findall(m.Fig, "Type", "uibutton", "Text", txt), 1, txt);
             end
             TagGuiTests.key(m.Fig, "slash", {'control'}, '?');
             a = TagGuiTests.alerts();
             tc.assertNumElements(a, 1);
-            for shortcut = ["Ctrl+L ", "Ctrl+Delete ", "Ctrl+H ", "Ctrl+I ", "Ctrl+D ", "Ctrl+E "]
+            for shortcut = ["Ctrl+L ", "Ctrl+Delete ", "Ctrl+Shift+F ", "Ctrl+H ", "Ctrl+I ", "Ctrl+D ", "Ctrl+E "]
                 tc.verifySubstring(a.Message, shortcut);
             end
+            tc.dismissAlertDialog(m.Fig);
+        end
+
+        function fileDispositionNeedsASelectedArtifact(tc)
+            % Ctrl+Shift+F (what became of a file) acts on a selected
+            % artifact only; without one, or on another tab, a message says so.
+            m = tc.mainParts();
+            tc.chooseTab("artifacts");
+            m.Tables.artifacts.Selection = [];
+            TagGuiTests.key(m.Fig, "f", {'control', 'shift'}, char(6));
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifyEqual(a.Title, "File disposition");
+            tc.verifyEqual(a.Message, "Select a row first.");
+            tc.dismissAlertDialog(m.Fig);
+            setappdata(groot, "TagGuiTests_alerts", []);
+            tc.chooseTab("events");
+            TagGuiTests.key(m.Fig, "f", {'control', 'shift'}, char(6));
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifySubstring(a.Message, "Artifacts tab");
             tc.dismissAlertDialog(m.Fig);
         end
 
@@ -688,7 +709,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
         function eventsTabShowsRecordedLoginNextToRecordedBy(tc)
             % The database login that inserted an event (recorded_login,
-            % schema version 4) is shown right after recorded_by.
+            % pre-launch schema version 4) is shown right after recorded_by.
             tc.Fx.makeWorld("gui-login", 0);
             m = tc.mainParts();
             tc.chooseTab("events");

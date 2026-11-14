@@ -1,7 +1,7 @@
 # MATLAB checklist: what CI runs, and what still needs a person
 
 The MATLAB class (`@CarasLabDB`) and GUI (`@CarasLabDBApp`) were extended for
-schema versions 4 and 5 in an environment that had no MATLAB. Since then the
+pre-launch schema versions 4 and 5 in an environment that had no MATLAB. Since then the
 test suite in `tests/matlab` has been run **in MATLAB, in CI**: R2024b, R2025a
 and R2026b on Linux, against PostgreSQL 16, all tests passing
 (`.github/workflows/tests.yml`, job `matlab`). That first execution found and

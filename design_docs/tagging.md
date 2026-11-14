@@ -330,7 +330,7 @@ long-running transactions makes one wait for the other.
 
 `lab.fn_check_integrity()` reports an entity with more than one current tag in
 a single-valued namespace as `tag_cardinality_violation`. That can only be
-left over from assignments made before schema version 4. In a mutable
+left over from assignments made before pre-launch schema version 4. In a mutable
 namespace, `remove` the wrong one; in an immutable one there is no client-side
 repair, and the lab's database administrator has to decide which assignment
 stands.

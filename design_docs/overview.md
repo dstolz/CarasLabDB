@@ -40,10 +40,10 @@ reading an analysis event rather than reverse-engineering a folder.
 
 | Component | Role |
 |---|---|
-| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag and variable definitions and their value logs, retractions |
+| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag and variable definitions and their value logs, retractions, file dispositions |
 | NAS storage | Actual data, laid out as `subject/session/...` |
-| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...), variables (`setVariable`, `getVariables`, ...) and retraction (`retractEvent`, `retractArtifact`) |
-| MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, a daily husbandry grid and the integrity report |
+| MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...), variables (`setVariable`, `getVariables`, ...), retraction (`retractEvent`, `retractArtifact`) and file dispositions (`addArtifactDisposition`) |
+| MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, file dispositions (Ctrl+Shift+F), a daily husbandry grid and the integrity report |
 | Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
 | MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag and variable lookups |
@@ -86,6 +86,11 @@ flowchart LR
   have been recorded (entered twice, registered by mistake), with a reason.
   The row stays in the database but is no longer active; superseding it
   later brings it back.
+- **File disposition.** What became of a registered file: replaced (other
+  bytes at its path now), moved, deleted, or restored. The artifact row stays
+  a true record of what was produced, so analyses that read the file keep
+  pointing at it; the disposition says where the file is now. Like a
+  verification it belongs to the file, not to one row.
 - **Provenance DAG.** The graph of `event → artifact → analysis → artifact`.
   See the recursive lineage query in [Database design](database-design.md).
 - **Tag.** A hashtag-style `namespace:value` label (`stage:raw`, `cohort:a`,

@@ -556,7 +556,7 @@ try{
     </div>
     <div class="card integ-card" id="integrity-card">
       <h3>Integrity</h3>
-      <div class="card-sub" id="integrity-sub">lab.fn_check_integrity() and the verification state of the active files</div>
+      <div class="card-sub" id="integrity-sub">lab.fn_check_integrity() and the verification state of the present files</div>
       <div id="integrity-body"></div>
     </div>
     <div class="card tags-card">
@@ -741,7 +741,7 @@ window.__initDashboard = function(){
   ['people','probes','pipelines','storageRoots','species','projects','projectMembers',
    'projectArtifacts','subjects','sessions','events','artifacts','eventInputs',
    'eventTypeMeta','roleMeta','tagNamespaces','tags','tagAssignments',
-   'variables','variableValues','retractions'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
+   'variables','variableValues','retractions','dispositions'].forEach(k=>{ if(!Array.isArray(D[k])) D[k]=[]; });
   const NOW = D.NOW;
 
   // ---- lookups ----
@@ -784,6 +784,26 @@ window.__initDashboard = function(){
   // 'retracted' wins over 'superseded': a withdrawn row is withdrawn whatever replaced it
   const eventState = e => retractedEvents.has(e.event_id) ? 'retracted' : supersededEvents.has(e.event_id) ? 'superseded' : 'active';
   const artifactState = a => retractedArtifacts.has(a.artifact_id) ? 'retracted' : supersededArtifacts.has(a.artifact_id) ? 'superseded' : 'active';
+
+  // What became of each file (lab.artifact_disposition). A disposition
+  // belongs to the file -- storage root, path, checksum -- so every row that
+  // describes the file shares it; the latest by disposition_id is the file's
+  // state, as in lab.artifact_disposition_latest. A row is present
+  // (lab.artifact_present) when it is active and its file has not been
+  // replaced, moved or deleted since (or was restored since).
+  // fileKey (below, with the storage totals) is the file's identity.
+  let fileDisposition = null;          // file key -> latest lab.artifact_disposition row, built on first use
+  const dispositionOf = a => {
+    if(!fileDisposition){
+      const fileOfArtifact = new Map(D.artifacts.map(x=>[x.artifact_id, fileKey(x)]));
+      fileDisposition = new Map();
+      D.dispositions.forEach(d=>{ const k=fileOfArtifact.get(d.artifact_id); if(k===undefined) return;
+        const cur=fileDisposition.get(k); if(!cur || d.disposition_id>cur.disposition_id) fileDisposition.set(k,d); });
+    }
+    const d=fileDisposition.get(fileKey(a)); return d && d.disposition!=='restored' ? d : null; };
+  const isArtifactPresent = a => isArtifactActive(a) && !dispositionOf(a);
+  const filePill = a => { const d=dispositionOf(a);
+    return d ? `<span class="pill warning" title="${esc(d.note||'')}">${esc(d.disposition)}</span>` : `<span class="pill ok">present</span>`; };
 
   // Correction chains. uq_event_supersedes / uq_artifact_supersedes keep each
   // chain linear, so every row has exactly one current version: the end of
@@ -1841,6 +1861,7 @@ window.__initDashboard = function(){
         verification:(a.verification||{}).status||'',
         verified_at:(a.verification||{}).verified_at?fmtDate(a.verification.verified_at):'',
         state:artifactState(a),
+        file:(dispositionOf(a)||{}).disposition||'present',
         retraction_reason:(retractionOf('artifact',a.artifact_id)||{}).reason||'' })),
       // the current value of every variable on the project and on each row
       // above, one line per value (the value exactly as stored, as text)
@@ -2045,6 +2066,7 @@ window.__initDashboard = function(){
       {key:'_verif',label:'Verify',sortVal:a=>a.verification.status,
         render:a=>`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span>`},
       {key:'_state',label:'State',sortVal:a=>artifactState(a),render:a=>statePill('artifact',a)},
+      {key:'_file',label:'File',sortVal:a=>(dispositionOf(a)||{}).disposition||'present',render:a=>filePill(a)},
       tagCol('artifact'),
       ...varCol('artifact'),
       {key:'_prov',label:'',sortable:false,render:a=>`<span class="link">lineage →</span>`}
@@ -2201,14 +2223,15 @@ window.__initDashboard = function(){
   // D.integrity is a summary of lab.fn_check_integrity() (web/live/
   // lab_integrity.sql): per check its severity, its row count and at most
   // example_limit example rows. It is lab-wide and ignores the filters, like
-  // the verification tiles above it, which count the ACTIVE artifacts by
-  // their file's latest check.
+  // the verification tiles above it, which count the PRESENT artifacts (active,
+  // and their file not recorded as replaced, moved or deleted) by their
+  // file's latest check.
   const CHECK_HELP = {
     event_missing_detail:'Typed events whose detail row was never written',
     event_missing_subject:'Non-analysis events with no subject',
-    artifact_verification_failed:'Active files whose latest integrity check failed',
+    artifact_verification_failed:'Present files whose latest integrity check failed',
     event_recorded_before_occurred:'Events recorded more than a day before they occurred',
-    artifact_never_verified:'Active files that have never been checked',
+    artifact_never_verified:'Present files that have never been checked',
     artifact_producer_superseded:'Active files still attached to a corrected event',
     tag_not_carried_forward:'Corrections that dropped their predecessor’s tags',
     artifact_event_mismatch:'Files filed under a different subject or session than their event',
@@ -2216,7 +2239,8 @@ window.__initDashboard = function(){
     tag_cardinality_violation:'More than one current tag in a single-valued namespace',
     artifact_producer_retracted:'Active files whose producing event was retracted',
     input_retracted:'Active events that consumed a retracted file',
-    duplicate_active_path:'Two active files at one path'
+    duplicate_active_path:'Two present files at one path',
+    disposed_file_found:'Files recorded as gone that a later check found intact'
   };
   function integrityExample(x){
     const sub=String(x.subject==null?'':x.subject);
@@ -2225,13 +2249,13 @@ window.__initDashboard = function(){
   }
   function renderIntegrity(){
     const body=document.getElementById('integrity-body'), sub=document.getElementById('integrity-sub');
-    const act=D.artifacts.filter(isArtifactActive);
+    const act=D.artifacts.filter(isArtifactPresent);
     const vc={ok:0,mismatch:0,missing:0,unverified:0};
     act.forEach(a=>{ const st=(a.verification||{}).status||'unverified'; vc[st in vc?st:'unverified']++; });
     let h=`<div class="integ-tiles">`+
       [['ok','Verified ok','ok'],['mismatch','Checksum mismatch','bad'],['missing','Missing','bad'],['unverified','Never verified','warn']]
-        .map(([k,l,c])=>`<div class="integ-tile ${vc[k]?c:''}" data-verif="${k}" title="Show these active artifacts" style="cursor:pointer"><div class="n">${fmtNum(vc[k])}</div><div class="l">${l}</div></div>`).join('')+
-      `</div><div class="muted" style="font-size:12px;margin:-8px 0 12px">${fmtNum(act.length)} active artifacts, by the latest check of each one’s file; click a tile to list them.</div>`;
+        .map(([k,l,c])=>`<div class="integ-tile ${vc[k]?c:''}" data-verif="${k}" title="Show these artifacts" style="cursor:pointer"><div class="n">${fmtNum(vc[k])}</div><div class="l">${l}</div></div>`).join('')+
+      `</div><div class="muted" style="font-size:12px;margin:-8px 0 12px">${fmtNum(act.length)} present artifacts, by the latest check of each one’s file; click a tile to list them.</div>`;
     const I=D.integrity;
     if(!I || typeof I!=='object'){
       h+=`<div class="lineage-empty">The integrity report is not part of this data. The live server adds it (web/live/lab_integrity.sql); <code>lab_data.sql</code> run on its own does not.</div>`;
@@ -2598,6 +2622,10 @@ window.__initDashboard = function(){
       ['Verification',`<span class="pill ${cssTok(a.verification.status)}">${esc(a.verification.status)}</span> <span class="muted">${fmtDate(a.verification.verified_at)}</span>`,true],
       ['Produced by', ev?`<span class="link" data-open-event="${esc(ev.event_id)}">${esc(etName(ev.event_type))} · ${fmtDate(ev.occurred_at)}</span>`:'—',true],
       ['State',statePill('artifact',a),true],
+      ['File', (()=>{ const d=dispositionOf(a); if(!d) return filePill(a);
+        const next = d.successor_artifact_id && artifactById.has(d.successor_artifact_id)
+          ? ` · <span class="link" data-open-artifact="${esc(d.successor_artifact_id)}">${d.disposition==='moved'?'where it is now':'what replaced it'}</span>` : '';
+        return `${filePill(a)} <span class="muted">${fmtDate(d.occurred_at)} · ${esc(personName(d.recorded_by))}${d.note?' · '+esc(d.note):''}</span>${next}`; })(), true],
       ...retractionRows('artifact',aid),
       ['Supersedes', a.supersedes&&artifactById.has(a.supersedes) ? `<span class="link" data-open-artifact="${esc(a.supersedes)}">previous version</span>` : null, true],
       ['Superseded by', artifactSuccessor.has(aid) ? `<span class="link" data-open-artifact="${esc(artifactSuccessor.get(aid))}">${artifactCurrent(aid)===artifactSuccessor.get(aid)?'current version':'next version'}</span>` : null, true],
