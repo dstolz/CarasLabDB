@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session forms</title>
+<link rel="stylesheet" href="forms.css">
+<script src="forms.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">Caras Lab <span class="brand-sub">Session forms</span></div>
+  <nav class="tabs" id="tabs" hidden>
+    <button type="button" data-view="enter" class="tab" title="Alt+1">Enter data</button>
+    <button type="button" data-view="templates" class="tab" title="Alt+2">Templates</button>
+    <button type="button" data-view="outbox" class="tab" title="Alt+3">Unsent <span id="outbox-count" class="count">0</span></button>
+  </nav>
+  <div class="top-right">
+    <span id="net" class="net" title="Whether the forms server answers">…</span>
+    <span id="who" class="who"></span>
+    <button type="button" id="btn-help" class="ghost" title="Keyboard shortcuts (Ctrl+?)">?</button>
+    <button type="button" id="btn-theme" class="ghost" title="Light / dark">◐</button>
+    <button type="button" id="btn-logout" class="ghost" hidden>Sign out</button>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<main>
+  <!-- Sign-in -->
+  <section id="view-login" class="view" hidden>
+    <form id="login-form" class="card narrow" autocomplete="on">
+      <h1>Sign in</h1>
+      <p class="muted">With your own database login, the one you use from MATLAB. Everything you enter is recorded under it.</p>
+      <label>Login <input id="login-name" name="username" autocomplete="username" required></label>
+      <label>Password <input id="login-pass" name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <!-- Enter data -->
+  <section id="view-enter" class="view" hidden>
+    <div class="card subject-bar">
+      <label class="grow">Subject
+        <input id="subject-search" placeholder="Type a subject id (Ctrl+K)" autocomplete="off" spellcheck="false">
+      </label>
+      <ul id="subject-results" class="results" hidden></ul>
+    </div>
+    <div id="subject-panel" hidden></div>
+    <div id="entry-panel" hidden></div>
+    <div id="history-panel" hidden></div>
+  </section>
+
+  <!-- Templates -->
+  <section id="view-templates" class="view" hidden>
+    <div id="template-list"></div>
+    <div id="builder" hidden></div>
+  </section>
+
+  <!-- Outbox -->
+  <section id="view-outbox" class="view" hidden>
+    <div class="card">
+      <h2>Unsent entries</h2>
+      <p class="muted">Entries are kept in this browser until the server confirms them, and sent again automatically when it can be reached. They are sent only while their author is signed in. A download is a copy to keep, not a way to send them.</p>
+      <p id="storage-note" class="warn" hidden></p>
+      <div class="row gap">
+        <button type="button" id="btn-send-now">Send now</button>
+        <button type="button" id="btn-download-json">Download (JSON)</button>
+        <button type="button" id="btn-download-csv">Download (CSV)</button>
+      </div>
+      <div id="outbox-list"></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="dialog"></dialog>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
