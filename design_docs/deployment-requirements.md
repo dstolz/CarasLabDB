@@ -174,7 +174,8 @@ of the provenance record.
 
 **Maintenance** — routine PostgreSQL patching is fine at any time outside
 working hours; clients reconnect on their next action. The lab should be told
-in advance of planned downtime because there is no offline mode (§3, concern 6).
+in advance of planned downtime: only clients that queue (§3, concern 6) keep
+recording while the server is down.
 
 ---
 
@@ -256,10 +257,12 @@ known; items marked *IT decision* need input before go-live.
    no migrations yet. The lab admin login applies them; the runbook is
    `deployment-windows.md` §6.
 
-6. **Single instance, no offline mode.** *(IT decision)* Clients write
-   directly to the database and have no local queue. If the server is down,
-   metadata cannot be recorded until it is back, although recordings on the
-   rigs continue unaffected. We do not think this justifies a high-availability
+6. **Single instance; clients may queue.** *(IT decision)* The database is
+   one instance. The MATLAB class writes directly to it, but a client may
+   keep what it has to record while the server is down and send it later:
+   the ephys_analysis toolbox does this, and `recordEvent` makes such a late
+   send safe to repeat. Records a client does not queue cannot be made until
+   the server is back, although recordings on the rigs continue unaffected. We do not think this justifies a high-availability
    setup, but IT should tell us the expected recovery time for a VM failure so
    the lab can plan around it. Backups need only daily granularity.
 

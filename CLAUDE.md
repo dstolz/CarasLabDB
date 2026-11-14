@@ -302,6 +302,27 @@ Key behaviors baked into the class:
   (`lab.fn_check_integrity()`), `addHusbandryBatch(T, OccurredAt=)` (one
   weigh-in sheet in one transaction), `addArtifactFromFile(path,
   ProducedByEventId=, StorageRootId=, RootPath=)` (computes size and SHA-256).
+- Clients that record work while the server may be unreachable (the
+  ephys_analysis toolbox): ids minted by the caller (`EventId=` on every
+  `add*Event`, `ArtifactId=` on `addArtifact`/`addArtifactFromFile`,
+  `SessionId=` on `addSession`; `pCheckUuid`), and `recordEvent(type,
+  EventId=, Digest=, ...)` (own file), which writes an analysis, recording or
+  behavior event with its inputs and output files in one `pTransact` and is
+  safe to send again: the digest is stored in `event.attributes.client_digest`;
+  the same id and digest is "existing", another digest
+  `CarasLabDB:idConflict`; a file already registered with the same bytes at
+  the same path is reused and listed in `attributes.unchanged_outputs`;
+  `MissingInputs="skip"` leaves out inputs not yet in the database
+  (`addEventInput(..., IfExists="skip")` adds them later). Its Detail and
+  Outputs field names are checked against fixed column lists. Every datetime
+  it is given must be zoned (`CarasLabDB:unzonedTime`).
+  `CarasLabDB.jsonText(text)` (a `CarasLabDBJson` value, at the repository
+  root) sends JSON text to a jsonb column as written, never through
+  `jsonencode`. The constructor takes `ConnectTimeout=` (sets
+  `PGCONNECT_TIMEOUT` for the `postgresql()` call only), `StatementTimeout=`
+  and `LockTimeout=` (session settings). `getArtifacts` takes
+  `StorageRootId=`, `RelativePath=`, `PathPrefix=`; `getSessions`
+  `RelativePath=`.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
   retract action (Ctrl+Delete), a daily husbandry entry grid (Ctrl+H) and an

@@ -7,7 +7,8 @@ CI has no MATLAB, and Octave cannot run this code: it has no string type,
 datetime, table, Database Toolbox, uifigure components or matlab.unittest.
 What Octave can do is parse, so this is a syntax check and nothing more: it
 catches an unbalanced parenthesis, a malformed statement or a stray token in
-any file under @CarasLabDB/, @CarasLabDBApp/, tests/matlab/ and examples/.
+any file at the repository root or under @CarasLabDB/, @CarasLabDBApp/,
+tests/matlab/ and examples/.
 It does not check that the code works. design_docs/matlab-first-run-checklist.md
 is the list of things that must be checked in MATLAB itself.
 
@@ -42,7 +43,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-PATTERNS = ("@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "tests/*.m", "tests/matlab/*.m",
+PATTERNS = ("*.m", "@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "tests/*.m", "tests/matlab/*.m",
             "tests/matlab/*/*.m", "examples/*.m")
 
 ARGUMENTS = re.compile(r"^\s*arguments\s*(\([A-Za-z, ]*\))?\s*(%.*)?$")

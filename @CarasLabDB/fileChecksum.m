@@ -9,10 +9,13 @@ function checksum = fileChecksum(filePath, opts)
 %   result is the form lab.artifact.checksum stores: lower-case hex of the
 %   exact width of the algorithm.
 %
-%   NOT YET RUN. This function was written where no MATLAB was available and
-%   has never been executed. Before relying on it, compare its result for a
-%   few files -- including an empty one and one larger than 8 MiB -- with a
-%   known-good tool and make sure they are identical:
+%   Checked in CI, on Linux in MATLAB R2024b, R2025a and the latest release,
+%   against published SHA-256 and MD5 values: the bytes 'abc', an empty file,
+%   and a file of 8 MiB + 5 bytes, longer than one chunk
+%   (VariableTests/fileChecksumMatchesKnownHashes). It has not been compared
+%   on Windows or on a real recording. Before relying on it there, compare
+%   its result for a few files with a known-good tool and make sure they are
+%   identical:
 %       Windows:  certutil -hashfile "Z:\data\G-0421\raw.dat" SHA256
 %       macOS:    shasum -a 256 /Volumes/data/G-0421/raw.dat
 %       Linux:    sha256sum /mnt/data/G-0421/raw.dat

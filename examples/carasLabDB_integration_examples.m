@@ -220,6 +220,30 @@ depthLog         = db.getVariables("session", sessionId, History=true);
 allDepths        = db.getVariableValues("probe depth", Kind="session");
 % db.unsetVariable("session", sessionId, "probe depth", Note="wrong probe");
 
+%% 3j. Recording work that may have to be sent later (recordEvent)
+% A pipeline that must keep working while the database is out of reach
+% mints the ids itself, keeps the record, and sends it when it can.
+% recordEvent writes the event, its input edges and its output files in one
+% transaction, and sending the same record again changes nothing. The
+% digest is the client's own hash of what it records: the same record must
+% always give the same digest. Every datetime must carry a time zone.
+% runId  = string(java.util.UUID.randomUUID());
+% fileId = string(java.util.UUID.randomUUID());
+% out = db.recordEvent("analysis", EventId=runId, Digest=recordSha256, ...
+%     OccurredAt=datetime("now", "TimeZone", "local"), SessionId=sessionId, ...
+%     Detail=struct("pipeline_name", "ephys_analysis/signals", ...
+%         "code_version", "c677202", ...
+%         "parameters", CarasLabDB.jsonText(optionsJsonText), ...   % stored as written
+%         "status", "succeeded"), ...
+%     Inputs=struct("artifact_id", rawArtifactId, "role", "raw"), ...
+%     Outputs=struct("artifact_id", fileId, "storage_root_id", 1, ...
+%         "relative_path", "G-0421/2026-07-03_pen1/pen1_extract.mat", ...
+%         "checksum", extractSha256, "size_bytes", 123456, "role", "lfp", "format", "mat"), ...
+%     MissingInputs="skip");     % an input not registered yet is added later:
+% db.addEventInput(EventId=runId, ArtifactId=rawArtifactId, IfExists="skip");
+% A connection that should not block for minutes when the server is down:
+% db = CarasLabDB(..., ConnectTimeout=5, StatementTimeout=60);
+
 %% 4. Correcting data (append-only: no UPDATE/DELETE on events/artifacts)
 % Events and artifacts are immutable — a database trigger blocks UPDATE and
 % DELETE outright. To fix a mistake, insert a new row whose `supersedes`

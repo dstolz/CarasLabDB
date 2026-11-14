@@ -49,6 +49,24 @@ classdef CarasLabDB < handle
 %   the error into a warning with the same identifier, for deliberately
 %   working with an older or newer database.
 %
+%   Time limits (seconds, Name=Value at construction; none by default):
+%       ConnectTimeout   - how long opening the connection may take before it
+%                          fails (PGCONNECT_TIMEOUT for the postgresql() call;
+%                          the variable is put back afterwards). Without it an
+%                          unreachable server can block for minutes.
+%       StatementTimeout - how long one statement may run (statement_timeout)
+%       LockTimeout      - how long a statement may wait for a lock (lock_timeout)
+%   The last two are session settings, so they also apply to an injected
+%   Connection. A connection that is lost is not reopened: construct a new
+%   CarasLabDB object.
+%
+%   Ids. EventId= on the addXEvent methods, ArtifactId= on addArtifact /
+%   addArtifactFromFile and SessionId= on addSession insert a row under an id
+%   the caller minted (a uuid) instead of one the database generates, so a
+%   client can refer to a row before it is written. recordEvent writes an
+%   event, its input edges and its output files as one transaction that is
+%   safe to send again (see RECORDEVENT).
+%
 %   Example:
 %       db  = CarasLabDB(Username="u", Password="p", PersonEmail="me@lab");
 %       pid = db.addProject(Name="Gerbil AC plasticity");
@@ -76,14 +94,15 @@ classdef CarasLabDB < handle
 %       supersedeArtifact, artifactLineage, runReadOnlyQuery, updateSubject,
 %       updateSession, addTagNamespace, registerTag, addTag, removeTag,
 %       setTag, getEntityTags, findByTags, setVariable, getVariables,
-%       defineVariable.
+%       defineVariable, recordEvent.
 %   Defined in this file: the add/get methods of the reference, project,
 %   subject and session tables; getEvents, getEventDetail, getArtifacts and
 %   the other readers; getTagNamespaces, getTags, updateTagNamespace,
 %   retireTag; unsetVariable, getVariableValues, getVariableDefinitions,
 %   updateVariableDefinition, retireVariable; retractEvent,
 %   retractArtifact, getRetractions; checkIntegrity; and the static helpers
-%   sqlLiteral, normalizeTag, parseTag, displayTag, normalizeVariableName.
+%   sqlLiteral, jsonText, normalizeTag, parseTag, displayTag,
+%   normalizeVariableName.
 %
 %   Tags. Events, artifacts, subjects, sessions and projects can carry
 %   namespace:value tags (stage:raw, cohort:a, qc:fail; a bare tag such as
@@ -195,6 +214,7 @@ classdef CarasLabDB < handle
         name        = defineVariable(obj, name, opts)
         eventIds    = addHusbandryBatch(obj, T, opts)
         [artifactId, info] = addArtifactFromFile(obj, filePath, opts)
+        out         = recordEvent(obj, eventType, opts)
     end
 
     methods (Static)
@@ -218,6 +238,9 @@ classdef CarasLabDB < handle
                 opts.PersonName (1,1) string = string(missing)
                 opts.UseActiveViews (1,1) logical = true
                 opts.AllowSchemaMismatch (1,1) logical = false  % warn, not error, on another schema version
+                opts.ConnectTimeout double {mustBeInteger, mustBePositive, mustBeScalarOrEmpty} = []
+                opts.StatementTimeout double {mustBeNonnegative, mustBeScalarOrEmpty} = []
+                opts.LockTimeout double {mustBeNonnegative, mustBeScalarOrEmpty} = []
                 opts.Connection = []    % inject an existing connection instead of opening one
                                         % (its session time zone is changed; see pInitSession)
             end
@@ -247,8 +270,16 @@ classdef CarasLabDB < handle
                     error("CarasLabDB:missingCredentials", ...
                         "Username and Password are required unless an existing Connection is supplied.");
                 end
+                % The native interface connects through libpq, which reads
+                % PGCONNECT_TIMEOUT; it is set for this call only.
+                restoreTimeout = []; %#ok<NASGU>
+                if ~isempty(opts.ConnectTimeout)
+                    restoreTimeout = CarasLabDB.pSetEnvFor("PGCONNECT_TIMEOUT", ...
+                        string(opts.ConnectTimeout)); %#ok<NASGU>
+                end
                 obj.Connection = postgresql(opts.Username, opts.Password, ...
                     Server=opts.Server, PortNumber=opts.Port, DatabaseName=opts.DatabaseName);
+                clear restoreTimeout
                 obj.OwnsConnection = true;
             end
 
@@ -263,6 +294,7 @@ classdef CarasLabDB < handle
 
             try
                 obj.pInitSession(opts.AllowSchemaMismatch);
+                obj.pSetTimeouts(opts.StatementTimeout, opts.LockTimeout);
                 obj.CurrentPersonId = obj.pResolvePerson(opts.PersonId, opts.PersonEmail, opts.PersonName);
             catch ME
                 % A refused construction (schema version, unknown person) must
@@ -559,9 +591,12 @@ classdef CarasLabDB < handle
         end
 
         function sessionId = addSession(obj, opts)
-            %ADDSESSION Insert a session; returns the generated session_id (uuid string).
+            %ADDSESSION Insert a session; returns its session_id (uuid string).
+            %   SessionId= inserts it under a uuid the caller minted; by
+            %   default the database generates one.
             arguments
                 obj (1,1) CarasLabDB
+                opts.SessionId (1,1) string = string(missing)
                 opts.SubjectId (1,1) string
                 opts.Label (1,1) string
                 opts.StorageRootId (1,1) double {mustBeInteger}
@@ -577,6 +612,7 @@ classdef CarasLabDB < handle
                 "label", opts.Label, ...
                 "storage_root_id", opts.StorageRootId, ...
                 "relative_path", opts.RelativePath);
+            s = obj.pSet(s, "session_id", CarasLabDB.pCheckUuid(opts.SessionId, "SessionId"));
             s = obj.pSet(s, "started_at", opts.StartedAt);
             s = obj.pSet(s, "ended_at", opts.EndedAt);
             s = obj.pSet(s, "rig", opts.Rig);
@@ -590,17 +626,30 @@ classdef CarasLabDB < handle
     % Artifact provenance edges & verification
     % ==================================================================
     methods
-        function addEventInput(obj, opts)
+        function inserted = addEventInput(obj, opts)
             %ADDEVENTINPUT Record that an event consumed an artifact (event_input edge).
+            %   An edge that is already recorded is an error, or with
+            %   IfExists="skip" is left as it is (INSERTED is then false).
+            %   Edges are immutable: a skipped edge keeps its own role.
             arguments
                 obj (1,1) CarasLabDB
                 opts.EventId (1,1) string
                 opts.ArtifactId (1,1) string
                 opts.Role (1,1) string = string(missing)
+                opts.IfExists (1,1) string {mustBeMember(opts.IfExists, ["error", "skip"])} = "error"
             end
             s = struct("event_id", opts.EventId, "artifact_id", opts.ArtifactId);
             s = obj.pSet(s, "role", opts.Role);
-            obj.pInsert(obj.pT("event_input"), s);
+            if opts.IfExists == "error"
+                obj.pInsert(obj.pT("event_input"), s);
+                inserted = true;
+                return
+            end
+            [cols, vals] = obj.pColsVals(s);
+            R = obj.pWrite("INSERT INTO " + obj.pT("event_input") + " (" + strjoin(cols, ", ") + ...
+                ") VALUES (" + strjoin(vals, ", ") + ") ON CONFLICT (event_id, artifact_id) " + ...
+                "DO NOTHING RETURNING event_id;");
+            inserted = height(R) > 0;
         end
 
         function verificationId = addArtifactVerification(obj, opts)
@@ -780,6 +829,7 @@ classdef CarasLabDB < handle
                 opts.SubjectId (1,1) string = string(missing)
                 opts.Label (1,1) string = string(missing)
                 opts.StorageRootId double {mustBeInteger, mustBeScalarOrEmpty} = []
+                opts.RelativePath (1,1) string = string(missing)   % exactly, '/' separated
                 opts.Tags string = strings(1, 0)       % must carry all of these
                 opts.AnyTags string = strings(1, 0)    % ... and at least one of these
                 opts.NotTags string = strings(1, 0)    % ... and none of these
@@ -789,6 +839,7 @@ classdef CarasLabDB < handle
             f = obj.pSet(f, "subject_id", opts.SubjectId);
             f = obj.pSet(f, "label", opts.Label);
             f = obj.pSet(f, "storage_root_id", opts.StorageRootId);
+            f = obj.pSet(f, "relative_path", opts.RelativePath);
             T = obj.pSelectFrom(obj.pT("session"), f, OrderBy="subject_id, label", ...
                 Where=obj.pTagWhere("session", opts.Tags, opts.AnyTags, opts.NotTags));
         end
@@ -888,6 +939,10 @@ classdef CarasLabDB < handle
             %   Checksum= is matched as the database stores it: surrounding
             %   whitespace is dropped and the hex lower-cased, so the
             %   upper-case digest some tools print finds the file.
+            %   StorageRootId= and RelativePath= find a file by where it is
+            %   (RelativePath exactly, with '/' separators, as stored);
+            %   PathPrefix= keeps the rows whose relative_path starts with
+            %   that text (a folder: end it with '/').
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
@@ -896,6 +951,9 @@ classdef CarasLabDB < handle
                 opts.SessionId (1,1) string = string(missing)
                 opts.Role (1,1) string = string(missing)
                 opts.Checksum (1,1) string = string(missing)
+                opts.StorageRootId double {mustBeInteger, mustBeScalarOrEmpty} = []
+                opts.RelativePath (1,1) string = string(missing)
+                opts.PathPrefix (1,1) string = string(missing)
                 opts.ActiveOnly (1,1) logical = obj.UseActiveViews
                 opts.Limit (1,1) double {mustBeInteger, mustBeNonnegative} = 0
                 opts.Tags string = strings(1, 0)       % must carry all of these
@@ -916,8 +974,14 @@ classdef CarasLabDB < handle
                 % The column holds lower(btrim(checksum)) (trg_artifact_normalize).
                 f.checksum = lower(strtrim(opts.Checksum));
             end
+            f = obj.pSet(f, "storage_root_id", opts.StorageRootId);
+            f = obj.pSet(f, "relative_path", opts.RelativePath);
+            where = obj.pTagWhere("artifact", opts.Tags, opts.AnyTags, opts.NotTags);
+            if obj.pIsProvided(opts.PathPrefix)
+                where(end+1) = "starts_with(relative_path, " + obj.sqlLiteral(opts.PathPrefix) + ")";
+            end
             T = obj.pSelectFrom(tbl, f, Limit=opts.Limit, OrderBy="created_at DESC, artifact_id", ...
-                Where=obj.pTagWhere("artifact", opts.Tags, opts.AnyTags, opts.NotTags));
+                Where=where);
         end
 
         function T = getEventInputs(obj, opts)
@@ -1592,6 +1656,128 @@ classdef CarasLabDB < handle
             end
         end
 
+        function out = pRecordEventRows(obj, eventType, base, detail, digest, attrs, ...
+                inputs, outputs, skipMissing)
+            %PRECORDEVENTROWS The writes of RECORDEVENT. Run only inside PTRANSACT.
+            %   BASE is the lab.event insert struct with event_id set; ATTRS
+            %   its attributes with client_digest added; INPUTS and OUTPUTS
+            %   cell arrays of checked event_input / artifact insert structs.
+            eventId = base.event_id;
+            litId = obj.sqlLiteral(eventId) + "::uuid";
+            nOut = numel(outputs);
+            out = struct("EventId", eventId, "Outcome", "inserted", ...
+                "OutputIds", strings(nOut, 1), "Unchanged", false(nOut, 1), ...
+                "SkippedInputs", strings(0, 1));
+
+            % 1. This record sent before, or another record under this id.
+            E = obj.pSelect("SELECT coalesce(attributes->>'client_digest', '') AS client_digest, " + ...
+                "coalesce(attributes->'unchanged_outputs', '[]'::jsonb)::text AS unchanged_outputs " + ...
+                "FROM " + obj.pT("event") + " WHERE event_id = " + litId + ";");
+            if height(E) > 0
+                stored = CarasLabDB.pColText(E.client_digest(1));
+                if stored ~= digest
+                    error("CarasLabDB:idConflict", ...
+                        "Event %s is in the database already as a different record " + ...
+                        "(digest '%s', not %s). Nothing was written.", eventId, stored, digest);
+                end
+                out.Outcome = "existing";
+                listed = string(jsondecode(char(CarasLabDB.pColText(E.unchanged_outputs(1)))));
+                for k = 1:nOut
+                    out.OutputIds(k) = obj.pCurrentFileRow(outputs{k});
+                    out.Unchanged(k) = ismember(out.OutputIds(k), listed);
+                end
+                return
+            end
+
+            % 2. Output files registered already with these bytes at this path.
+            for k = 1:nOut
+                id = obj.pCurrentFileRow(outputs{k});
+                if id ~= ""
+                    out.OutputIds(k) = id;
+                    out.Unchanged(k) = true;
+                end
+            end
+            if any(out.Unchanged)
+                attrs = CarasLabDB.pAddJsonMember(attrs, "unchanged_outputs", ...
+                    out.OutputIds(out.Unchanged), true);
+            end
+            base.attributes = attrs;
+
+            % 3. The event and its detail row.
+            obj.pInsertEventRows(base, obj.pT(obj.pDetailTable(eventType)), detail, {}, {});
+
+            % 4. Its input edges.
+            if skipMissing && ~isempty(inputs)
+                ids = strings(1, numel(inputs));
+                for k = 1:numel(inputs)
+                    ids(k) = obj.sqlLiteral(inputs{k}.artifact_id) + "::uuid";
+                end
+                R = obj.pSelect("SELECT artifact_id::text AS artifact_id FROM " + ...
+                    obj.pT("artifact") + " WHERE artifact_id IN (" + strjoin(ids, ", ") + ");");
+                present = strings(0, 1);
+                if height(R) > 0
+                    present = CarasLabDB.pColText(R.artifact_id);
+                end
+                keep = false(1, numel(inputs));
+                for k = 1:numel(inputs)
+                    keep(k) = ismember(inputs{k}.artifact_id, present);
+                    if ~keep(k)
+                        out.SkippedInputs(end+1, 1) = inputs{k}.artifact_id;
+                    end
+                end
+                inputs = inputs(keep);
+            end
+            for k = 1:numel(inputs)
+                edge = inputs{k};
+                edge.event_id = eventId;
+                obj.pInsert(obj.pT("event_input"), edge);
+            end
+
+            % 5. The new output files. One that names no subject or session
+            % takes the event's as stored (after trg_event_fill_subject); one
+            % that names others is left for trg_artifact_matches_event to
+            % refuse -- it is never re-filed here.
+            if all(out.Unchanged)
+                return
+            end
+            stored = obj.pRowsAsText(obj.pT("event"), "r.event_id = " + litId, "event_id");
+            recordedBy = string(missing);
+            if isfield(base, "recorded_by")
+                recordedBy = base.recorded_by;
+            end
+            for k = find(~out.Unchanged).'
+                a = outputs{k};
+                a.produced_by_event_id = eventId;
+                for col = ["subject_id", "session_id"]
+                    c = char(col);
+                    if ~isempty(stored) && ~isfield(a, c) && isfield(stored{1}, c) ...
+                            && CarasLabDB.pIsProvided(stored{1}.(c))
+                        a.(c) = stored{1}.(c);
+                    end
+                end
+                a = obj.pSet(a, "created_by", obj.pCreatedBy(recordedBy));
+                out.OutputIds(k) = obj.pInsertArtifact(a);
+            end
+        end
+
+        function id = pCurrentFileRow(obj, a)
+            %PCURRENTFILEROW The current row of the file A describes, or "" if none.
+            %   A is an artifact insert struct (storage_root_id, relative_path,
+            %   checksum as stored). uq_artifact_file_original allows one
+            %   original row per (root, path, checksum); its current version
+            %   (lab.fn_artifact_current) is the row that describes the file now.
+            R = obj.pSelect("SELECT " + obj.pT("fn_artifact_current") + ...
+                "(a.artifact_id)::text AS current_id FROM " + obj.pT("artifact") + " a " + ...
+                "WHERE a.supersedes IS NULL AND a.storage_root_id = " + ...
+                obj.sqlLiteral(a.storage_root_id) + " AND a.relative_path = " + ...
+                obj.sqlLiteral(a.relative_path) + " AND a.checksum = " + ...
+                obj.sqlLiteral(a.checksum) + ";");
+            id = "";
+            if height(R) > 0
+                id = CarasLabDB.pColText(R.current_id(1));
+            end
+        end
+
         function ids = pInsertEventBatch(obj, bases, detailTable, details)
             %PINSERTEVENTBATCH Insert several new events, base + detail each. Run only inside PTRANSACT.
             %   BASES and DETAILS are parallel cell arrays of insert structs
@@ -1829,8 +2015,12 @@ classdef CarasLabDB < handle
             %PEVENTBASE Assemble the lab.event insert struct shared by all event types.
             %   opts is the name-value struct of an addXEvent method; it must expose
             %   the common base fields (OccurredAt, SubjectId, SessionId, Notes,
-            %   Attributes, RecordedBy, RecordedAt, Supersedes).
+            %   Attributes, RecordedBy, RecordedAt, Supersedes) and may expose
+            %   EventId (a caller-minted uuid).
             base = struct("event_type", string(eventType));
+            if isfield(opts, "EventId")
+                base = obj.pSet(base, "event_id", CarasLabDB.pCheckUuid(opts.EventId, "EventId"));
+            end
             base.occurred_at = opts.OccurredAt;   % required, validated datetime
             base = obj.pSet(base, "subject_id", opts.SubjectId);
             base = obj.pSet(base, "session_id", opts.SessionId);
@@ -2044,6 +2234,20 @@ classdef CarasLabDB < handle
             end
         end
 
+        function pSetTimeouts(obj, statementSeconds, lockSeconds)
+            %PSETTIMEOUTS Apply StatementTimeout= / LockTimeout= to the session (seconds).
+            %   Empty leaves the server's setting; 0 means no limit. Sent in
+            %   whole milliseconds, PostgreSQL's unit for both settings.
+            if ~isempty(statementSeconds)
+                obj.pExec("SET statement_timeout = " + ...
+                    sprintf("%d", round(1000 * statementSeconds)) + ";");
+            end
+            if ~isempty(lockSeconds)
+                obj.pExec("SET lock_timeout = " + ...
+                    sprintf("%d", round(1000 * lockSeconds)) + ";");
+            end
+        end
+
         function rows = pRowsAsText(obj, tableRef, whereClause, idCol)
             %PROWSASTEXT Read rows as structs of exact text values (missing = NULL).
             %   Each column comes back as the text Postgres itself prints for
@@ -2094,6 +2298,75 @@ classdef CarasLabDB < handle
     end
 
     methods (Static, Access = private)
+        function id = pCheckUuid(id, name)
+            %PCHECKUUID A caller-minted id, checked to be a uuid and lower-cased.
+            %   A missing ID is returned as it is (the database then generates
+            %   one); anything else that is not 8-4-4-4-12 hex digits raises
+            %   CarasLabDB:invalidValue naming the argument NAME.
+            if ~CarasLabDB.pIsProvided(id)
+                return
+            end
+            if isempty(regexp(char(id), ['^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-' ...
+                    '[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'], 'once'))
+                error("CarasLabDB:invalidValue", ...
+                    "%s must be a uuid (8-4-4-4-12 hexadecimal digits), not '%s'.", name, id);
+            end
+            id = lower(id);
+        end
+
+        function attrs = pAddJsonMember(attrs, name, value, asArray)
+            %PADDJSONMEMBER A jsonb object value with member NAME = VALUE added.
+            %   ATTRS is [] (none yet), a scalar struct or a CarasLabDBJson
+            %   object. A struct gains a field (sent through jsonencode);
+            %   JSON text is edited, the rest kept as written
+            %   (CarasLabDBJson.withMember). VALUE is a string, or with
+            %   ASARRAY a string array sent as a JSON array. A member that is
+            %   there already is an error: only the caller of this sets it.
+            if isempty(attrs)
+                attrs = struct();
+            end
+            if isstruct(attrs)
+                if ~isscalar(attrs)
+                    error("CarasLabDB:invalidValue", "Attributes must be one JSON object.");
+                end
+                if isfield(attrs, name)
+                    error("CarasLabDB:invalidValue", ...
+                        "Attributes cannot set %s: recordEvent sets it.", name);
+                end
+                if asArray
+                    attrs.(char(name)) = cellstr(reshape(value, 1, []));
+                else
+                    attrs.(char(name)) = value;
+                end
+            elseif isa(attrs, "CarasLabDBJson")
+                attrs = attrs.withMember(name, value, Array=asArray);
+            else
+                error("CarasLabDB:invalidValue", ...
+                    "Attributes must be a struct or CarasLabDB.jsonText(...), not a %s.", ...
+                    class(attrs));
+            end
+        end
+
+        function restore = pSetEnvFor(name, value)
+            %PSETENVFOR Set environment variable NAME to VALUE until RESTORE is cleared.
+            %   A variable that was not set is removed again afterwards, not
+            %   set to "": libpq reads an empty PGCONNECT_TIMEOUT as an invalid
+            %   integer and refuses to connect.
+            wasSet = isenv(name);
+            old = string(getenv(name));
+            setenv(name, value);
+            restore = onCleanup(@() CarasLabDB.pRestoreEnv(name, wasSet, old));
+        end
+
+        function pRestoreEnv(name, wasSet, old)
+            %PRESTOREENV Put environment variable NAME back as PSETENVFOR found it.
+            if wasSet
+                setenv(name, old);
+            else
+                unsetenv(name);
+            end
+        end
+
         function s = pSet(s, name, value)
             %PSET Add field NAME=VALUE to struct S only if VALUE is "provided".
             %   Unprovided values (missing string, NaN, NaT, []) are omitted so the
@@ -2374,9 +2647,14 @@ classdef CarasLabDB < handle
             %   Handles NULLs (string(missing), the missing object, NaN, NaT,
             %   []), text (quotes doubled),
             %   numbers, logicals, datetime (timestamptz), and jsonb (struct /
-            %   containers.Map / dictionary via jsonencode).
+            %   containers.Map / dictionary via jsonencode, or JSON text as
+            %   written: CarasLabDB.jsonText).
             if isempty(v)
                 out = "NULL";
+                return
+            end
+            if isa(v, "CarasLabDBJson")
+                out = CarasLabDB.pQuoteText(v.Text) + "::jsonb";
                 return
             end
             if isstring(v) && isscalar(v) && ismissing(v)
@@ -2464,6 +2742,21 @@ classdef CarasLabDB < handle
                 error("CarasLabDB:scalarExpected", "Text SQL values must be scalar.");
             end
             out = CarasLabDB.pQuoteText(s);
+        end
+
+        function j = jsonText(text)
+            %JSONTEXT JSON text for a jsonb value, sent as written (not re-encoded).
+            %   j = CarasLabDB.jsonText('{"Th": [9, 3], "fs": 30000.0}')
+            %   Pass the result where a jsonb value is taken (Parameters=,
+            %   Attributes=, recordEvent's Detail and Outputs, ...). Unlike a
+            %   struct, which goes through jsonencode, the text reaches
+            %   PostgreSQL unchanged, so a value read from a JSON file keeps
+            %   its numbers' digits rather than passing through a MATLAB
+            %   double. (jsonb itself drops insignificant white space, orders
+            %   an object's keys and keeps the last of duplicate keys.) The
+            %   text must parse as JSON (CarasLabDB:invalidJson).
+            %   See also CARASLABDBJSON.
+            j = CarasLabDBJson(text);
         end
 
         function tags = normalizeTag(tags, opts)
