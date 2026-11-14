@@ -96,6 +96,17 @@ REVOKE UPDATE ON lab.subject, lab.person FROM lab_rw;
 GRANT UPDATE (project_id, species_code, sex, strain, genotype, source,
               date_of_birth, notes) ON lab.subject TO lab_rw;
 
+-- Forms (design_docs/forms.md). A template (lab.form) is described and
+-- retired in place; its name, which its versions refer to, is not among the
+-- columns. A subject form (lab.subject_form) moves to a newer template
+-- version, is described and retired in place; which subject, project and
+-- template it is never changes. trg_form_guard and trg_subject_form_guard
+-- hold the same lines whatever is granted. lab.form_version and
+-- lab.observation_event are append-only, like the event log.
+REVOKE UPDATE ON lab.form, lab.subject_form FROM lab_rw;
+GRANT UPDATE (label, description, retired_at) ON lab.form TO lab_rw;
+GRANT UPDATE (form_version, notes, retired_at) ON lab.subject_form TO lab_rw;
+
 -- Tables and sequences the owner creates later get the same read/append
 -- defaults. A new table that should be editable, or must not be written by
 -- clients, still needs its own line above.

@@ -10,7 +10,7 @@ def register(app):
 
         An empty result means healthy. Each row is (severity, check_name,
         subject, detail): severity is "error" or "warning", and subject is the
-        id (or storage_root:path) of the offending row. The 14 checks:
+        id (or storage_root:path) of the offending row. The 15 checks:
 
         - event_missing_detail (error): a typed event with no detail row.
         - artifact_verification_failed (error): the latest checksum check of
@@ -44,6 +44,9 @@ def register(app):
           path; usually a file overwritten without a "replaced" disposition.
         - disposed_file_found (warning): a file recorded as replaced, moved
           or deleted that a later checksum check found at its path, intact.
+        - observation_invalid (warning): an active form entry (an
+          observation event) whose current values break the rules of the
+          form version it was made on, e.g. a required value unset since.
 
         Errors are listed first, then by check_name and subject. Returns
         {"row_count", "limit", "truncated", "rows"}; `truncated` true means

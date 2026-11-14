@@ -241,6 +241,7 @@ function m = local_palette()
     m('endpoint')  = local_hex('937860');
     m('histology') = local_hex('DA8BC3');
     m('analysis')  = local_hex('3FA7B7');
+    m('observation') = local_hex('A39B2C');
 end
 
 function rgb = local_hex(h)

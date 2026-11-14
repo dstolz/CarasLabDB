@@ -800,6 +800,109 @@ CREATE TABLE lab.variable_value (
 );
 
 -- ---------------------------------------------------------------------------
+-- Forms: templates, subject forms and the entries made on them
+-- ---------------------------------------------------------------------------
+-- A data-entry form for one session of one subject (web/forms/, see
+-- design_docs/forms.md). Three layers, each in the shape the rest of the
+-- schema already uses:
+--
+--   * A *template* (lab.form) is a named, reusable form. Its identity is
+--     mutable reference data, like a variable definition; its content is a
+--     series of immutable versions (lab.form_version). Publishing an edited
+--     template appends a version, so an entry made on version 3 can always be
+--     read with the fields version 3 had.
+--   * A *subject form* (lab.subject_form) is a template put to use for one
+--     subject in one project -- by default the subject's own project, but a
+--     subject used in another project has its forms there too. It is pinned
+--     to the template version new entries use.
+--   * An *entry* is an event of type 'observation' (lab.observation_event):
+--     what was observed in one session, at event.occurred_at, under a free
+--     session label. Its field values are variables on the event, so they
+--     are typed, unit-checked, append-only and login-stamped like every other
+--     variable, a correction carries them forward, and lab.fn_retract
+--     withdraws the entry. The entry's note is the reserved text variable
+--     'entry note' on the same event, which can be changed later without a
+--     correction.
+--
+-- Clients write through lab.fn_publish_form, lab.fn_add_subject_form,
+-- lab.fn_record_observation and lab.fn_set_entry_note.
+
+-- One row per template. `name` follows the variable-name rule (lower case,
+-- words separated by single spaces) and never changes: the versions and the
+-- subject forms refer to it.
+CREATE TABLE lab.form (
+    name        text PRIMARY KEY,
+    label       text NOT NULL,
+    description text,
+    retired_at  timestamptz,                 -- hidden from the template picker once set
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    created_by  uuid REFERENCES lab.person(person_id),
+    CONSTRAINT form_name_ck CHECK (
+        name ~ '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$' AND length(name) <= 63),
+    CONSTRAINT form_label_ck CHECK (btrim(label) <> '')
+);
+
+-- The template's content, one row per published version, append-only.
+-- trg_form_version_policy numbers the versions 1, 2, 3 ... per template and
+-- refuses a definition that lab.fn_form_definition_problems finds fault with,
+-- however the row is written. created_login is stamped by
+-- trg_form_version_stamp_login.
+CREATE TABLE lab.form_version (
+    form_name     text NOT NULL REFERENCES lab.form(name),
+    version       integer NOT NULL CHECK (version > 0),
+    definition    jsonb NOT NULL,
+    note          text,                      -- what changed in this version
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    created_by    uuid REFERENCES lab.person(person_id),
+    created_login text,
+    PRIMARY KEY (form_name, version),
+    CONSTRAINT form_version_definition_ck CHECK (jsonb_typeof(definition) = 'object')
+);
+
+-- A template in use for one subject in one project. Mutable (form_version,
+-- notes and retired_at are edited in place and recorded in row_history), but
+-- what it *is* -- which subject, which project, which template -- never
+-- changes (trg_subject_form_guard): the entries made on it refer to it. A
+-- subject has a template at most once per project. form_version is the
+-- version new entries use; moving it to a newer version is an explicit step.
+CREATE TABLE lab.subject_form (
+    subject_form_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject_id      text NOT NULL REFERENCES lab.subject(subject_id) ON UPDATE CASCADE,
+    project_id      uuid NOT NULL REFERENCES lab.project(project_id),
+    form_name       text NOT NULL,
+    form_version    integer NOT NULL,
+    notes           text,
+    retired_at      timestamptz,             -- no longer offered for new entries
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    created_by      uuid REFERENCES lab.person(person_id),
+    UNIQUE (subject_id, project_id, form_name),
+    UNIQUE (subject_form_id, form_name),     -- FK target for lab.observation_event
+    FOREIGN KEY (form_name, form_version) REFERENCES lab.form_version(form_name, version)
+);
+
+-- Detail row of an 'observation' event: one entry on a subject form. The
+-- event row holds when (occurred_at), about whom (subject_id) and who
+-- recorded it; this holds which form and version it was made on and the
+-- session's label, which is free text (a session here need not be a
+-- lab.session folder; event.session_id links one when there is one).
+-- (subject_form_id, form_name) makes the entry's template the subject form's;
+-- trg_observation_event_policy makes its subject the subject form's.
+CREATE TABLE lab.observation_event (
+    event_id        uuid PRIMARY KEY,
+    event_type      text NOT NULL DEFAULT 'observation' CHECK (event_type = 'observation'),
+    subject_form_id uuid NOT NULL,
+    form_name       text NOT NULL,
+    form_version    integer NOT NULL,
+    session_label   text NOT NULL CHECK (session_label <> '' AND session_label = btrim(session_label)),
+    FOREIGN KEY (event_id, event_type)
+        REFERENCES lab.event(event_id, event_type),
+    FOREIGN KEY (subject_form_id, form_name)
+        REFERENCES lab.subject_form(subject_form_id, form_name),
+    FOREIGN KEY (form_name, form_version)
+        REFERENCES lab.form_version(form_name, version)
+);
+
+-- ---------------------------------------------------------------------------
 -- Audit logs
 -- ---------------------------------------------------------------------------
 -- Both are append-only (see the trigger loop below). Clients never write to
@@ -902,6 +1005,13 @@ CREATE INDEX ix_variable_value_subject  ON lab.variable_value (subject_id);
 CREATE INDEX ix_variable_value_session  ON lab.variable_value (session_id);
 CREATE INDEX ix_variable_value_project  ON lab.variable_value (project_id);
 
+-- A subject's forms ("this animal's forms in this project") and a form's
+-- entries ("every entry on this subject form").
+CREATE INDEX ix_subject_form_project          ON lab.subject_form (project_id);
+CREATE INDEX ix_subject_form_form             ON lab.subject_form (form_name, form_version);
+CREATE INDEX ix_observation_event_subject_form ON lab.observation_event (subject_form_id);
+CREATE INDEX ix_observation_event_form        ON lab.observation_event (form_name, form_version);
+
 -- ---------------------------------------------------------------------------
 -- Immutability + validation triggers
 -- ---------------------------------------------------------------------------
@@ -978,6 +1088,13 @@ BEGIN
           TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
 
+    IF TG_TABLE_NAME = 'form_version' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('%s on lab.form_version is not allowed: a published form version '
+                             'is never changed.', TG_OP),
+            HINT    = 'Publish a new version instead (lab.fn_publish_form).';
+    END IF;
+
     IF TG_TABLE_NAME = 'event_input' THEN
         -- event_input has no supersedes column, so the generic advice below
         -- would be impossible to follow. Correct a mis-recorded input by
@@ -1000,9 +1117,11 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'event','birth_event','surgery_event','recording_event','behavior_event',
         'husbandry_event','endpoint_event','histology_event','analysis_event',
+        'observation_event',
         'artifact','event_input',
         'artifact_verification','maintenance_log','row_history','schema_version',
-        'tag_assignment','variable_value','retraction','artifact_disposition'
+        'tag_assignment','variable_value','retraction','artifact_disposition',
+        'form_version'
     ] LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_immutable_%1$s ON lab.%1$s;', t);
@@ -1527,6 +1646,9 @@ BEGIN
         NEW.recorded_by := coalesce(NEW.recorded_by, lab.fn_current_person());
     ELSIF TG_TABLE_NAME = 'variable_value' THEN
         NEW.set_login := session_user;
+    ELSIF TG_TABLE_NAME = 'form_version' THEN
+        NEW.created_login := session_user;
+        NEW.created_by := coalesce(NEW.created_by, lab.fn_current_person());
     ELSE
         RAISE EXCEPTION 'lab.fn_stamp_login is not defined for table %', TG_TABLE_NAME;
     END IF;
@@ -1560,6 +1682,10 @@ CREATE TRIGGER trg_artifact_disposition_stamp_login
 
 CREATE TRIGGER trg_variable_value_stamp_login
     BEFORE INSERT ON lab.variable_value
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_form_version_stamp_login
+    BEFORE INSERT ON lab.form_version
     FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
 
 -- subject_id is the natural key every append-only table refers to, so only a
@@ -1740,6 +1866,184 @@ CREATE TRIGGER trg_artifact_carry_variables
     AFTER INSERT ON lab.artifact
     FOR EACH ROW EXECUTE FUNCTION lab.fn_carry_variables_on_supersede();
 
+-- Canonicalise a template on the way in: its name the way a variable name is
+-- (lab.fn_canonical_variable), and a label that defaults to the name.
+CREATE OR REPLACE FUNCTION lab.fn_normalize_form() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    NEW.name  := lab.fn_canonical_variable(NEW.name);
+    NEW.label := coalesce(nullif(btrim(NEW.label), ''), NEW.name);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_form_normalize
+    BEFORE INSERT ON lab.form
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_form();
+
+-- A template's name is what its versions, subject forms and entries refer
+-- to: it never changes. Label, description and retired_at stay editable.
+CREATE OR REPLACE FUNCTION lab.fn_form_guard() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    IF NEW.name IS DISTINCT FROM OLD.name THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('form %s cannot be renamed', OLD.name),
+            HINT    = 'Change its label, or retire it and publish a template under the new name.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_form_guard
+    BEFORE UPDATE ON lab.form
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_form_guard();
+
+-- Every version row, however it is written (lab.fn_publish_form or a raw
+-- INSERT): numbered max + 1 per template, under a per-template lock so two
+-- publishers cannot both take the same number; refused for a retired
+-- template; and refused when lab.fn_form_definition_problems reports
+-- anything about the definition, with every bound variable already defined
+-- for events (lab.fn_publish_form defines them first).
+CREATE OR REPLACE FUNCTION lab.fn_form_version_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_next     integer;
+    v_problems text;
+    v_detail   text;
+BEGIN
+    NEW.form_name := lab.fn_canonical_variable(NEW.form_name);
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.form_version', NEW.form_name), 0));
+    IF EXISTS (SELECT 1 FROM lab.form f
+               WHERE f.name = NEW.form_name AND f.retired_at IS NOT NULL) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('form %s is retired and takes no new versions', NEW.form_name),
+            HINT    = 'Clear its retired_at first.';
+    END IF;
+    SELECT coalesce(max(fv.version), 0) + 1 INTO v_next
+    FROM lab.form_version fv WHERE fv.form_name = NEW.form_name;
+    IF NEW.version IS NULL THEN
+        NEW.version := v_next;
+    ELSIF NEW.version <> v_next THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('the next version of form %s is %s, not %s',
+                             NEW.form_name, v_next, NEW.version),
+            HINT    = 'Leave version out: the database numbers the versions.';
+    END IF;
+
+    SELECT string_agg(p.path || ': ' || p.problem, '; ' ORDER BY p.ord),
+           jsonb_agg(jsonb_build_object('path', p.path, 'problem', p.problem) ORDER BY p.ord)::text
+      INTO v_problems, v_detail
+    FROM lab.fn_form_definition_problems(NEW.definition, true) p;
+    IF v_problems IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'CLB02',
+            MESSAGE = format('form %s: the definition is not valid: %s', NEW.form_name, v_problems),
+            DETAIL  = v_detail;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_form_version_policy
+    BEFORE INSERT ON lab.form_version
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_form_version_policy();
+
+-- Fill in a new subject form: the template name canonicalised, the project
+-- defaulting to the subject's own, and the version to the template's latest.
+CREATE OR REPLACE FUNCTION lab.fn_subject_form_defaults() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    NEW.form_name := lab.fn_canonical_variable(NEW.form_name);
+    IF NEW.project_id IS NULL THEN
+        SELECT s.project_id INTO NEW.project_id
+        FROM lab.subject s WHERE s.subject_id = NEW.subject_id;
+    END IF;
+    IF NEW.form_version IS NULL THEN
+        SELECT max(fv.version) INTO NEW.form_version
+        FROM lab.form_version fv WHERE fv.form_name = NEW.form_name;
+        IF NEW.form_version IS NULL THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('form %s has no published version', NEW.form_name),
+                HINT    = 'Publish it first (lab.fn_publish_form).';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_subject_form_defaults
+    BEFORE INSERT ON lab.subject_form
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_subject_form_defaults();
+
+-- A subject form's entries refer to it, so what it is never changes: only
+-- form_version (the version new entries use), notes and retired_at may be
+-- edited. The one exception is the relabelling a subject rename cascades
+-- into subject_id, admitted on the same terms as in lab.fn_forbid_mutation.
+CREATE OR REPLACE FUNCTION lab.fn_subject_form_guard() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_from text := coalesce(current_setting('lab.rename_from', true), '');
+    v_to   text := coalesce(current_setting('lab.rename_to', true), '');
+BEGIN
+    IF NEW.subject_form_id IS DISTINCT FROM OLD.subject_form_id
+       OR NEW.project_id IS DISTINCT FROM OLD.project_id
+       OR NEW.form_name IS DISTINCT FROM OLD.form_name
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.created_by IS DISTINCT FROM OLD.created_by THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('subject form %s: only form_version, notes and retired_at can change',
+                             OLD.subject_form_id),
+            HINT    = 'For another project or template, add a subject form for it '
+                      '(lab.fn_add_subject_form).';
+    END IF;
+    IF NEW.subject_id IS DISTINCT FROM OLD.subject_id
+       AND NOT (coalesce(current_setting('lab.maintenance', true), '') = 'subject_rename'
+                AND v_from <> '' AND v_to <> ''
+                AND OLD.subject_id = v_from AND NEW.subject_id = v_to
+                AND NOT EXISTS (SELECT 1 FROM lab.subject WHERE subject_id = v_from)
+                AND EXISTS (SELECT 1 FROM lab.subject WHERE subject_id = v_to)) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('subject form %s cannot be moved to another subject',
+                             OLD.subject_form_id),
+            HINT    = 'Add the template to the other subject instead.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_subject_form_guard
+    BEFORE UPDATE ON lab.subject_form
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_subject_form_guard();
+
+-- An entry is about the subject its subject form belongs to. The event row
+-- carries the subject, the detail row the subject form, so this cannot be a
+-- foreign key; the composite FK on (subject_form_id, form_name) already ties
+-- the entry's template to the subject form's.
+CREATE OR REPLACE FUNCTION lab.fn_observation_event_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_event_subject text;
+    v_form_subject  text;
+BEGIN
+    SELECT e.subject_id INTO v_event_subject FROM lab.event e WHERE e.event_id = NEW.event_id;
+    SELECT sf.subject_id INTO v_form_subject
+    FROM lab.subject_form sf WHERE sf.subject_form_id = NEW.subject_form_id;
+    IF v_form_subject IS NOT NULL AND v_event_subject IS DISTINCT FROM v_form_subject THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('observation event %s is about subject %s, but subject form %s '
+                             'belongs to subject %s', NEW.event_id,
+                             coalesce(v_event_subject, 'none'), NEW.subject_form_id, v_form_subject);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_observation_event_policy
+    BEFORE INSERT ON lab.observation_event
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_observation_event_policy();
+
 -- Only the current version of a row can be retracted, and only once: a
 -- superseded row is already inactive, and retracting it would say nothing
 -- about the correction that replaced it.
@@ -1889,7 +2193,9 @@ BEGIN
         ('session',            '''session_id'''),
         ('tag_namespace',      '''namespace'''),
         ('tag',                '''tag'''),
-        ('variable',           '''name''')
+        ('variable',           '''name'''),
+        ('form',               '''name'''),
+        ('subject_form',       '''subject_form_id''')
     ) AS v(tbl, pk_args) LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_history_%1$s ON lab.%1$s;', r.tbl);
@@ -2835,6 +3141,1095 @@ BEGIN
 END;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Forms: value rules, definitions, writes and reads
+-- ---------------------------------------------------------------------------
+-- Values reach these functions as the text the user typed and are stored as
+-- that text: a number is accepted only when it is already in the one form
+-- PostgreSQL's numeric gives back unchanged, so '1.50' is stored and shown as
+-- 1.50, and '1e3', '.5', '+1', '007' or '1,5' are refused with the reason
+-- rather than rewritten into something the user did not type.
+
+-- A plain decimal number, written the way numeric::text writes it.
+CREATE OR REPLACE FUNCTION lab.fn_form_number_ok(p_value text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+    SELECT CASE WHEN p_value ~ '^-?(0|[1-9][0-9]*)(\.[0-9]+)?$'
+                THEN p_value::numeric::text = p_value
+                ELSE false END;
+$$;
+
+-- A whole number, written the same way.
+CREATE OR REPLACE FUNCTION lab.fn_form_integer_ok(p_value text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+    SELECT p_value ~ '^-?(0|[1-9][0-9]*)$' AND p_value <> '-0';
+$$;
+
+-- What is wrong with one non-blank value of one form field, or NULL when it
+-- is acceptable. p_field is the field's object in the form definition.
+CREATE OR REPLACE FUNCTION lab.fn_form_value_problem(p_field jsonb, p_value text)
+RETURNS text
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_widget text := p_field->>'widget';
+    v_ok     boolean;
+BEGIN
+    IF v_widget IN ('number', 'integer') THEN
+        IF v_widget = 'number' AND NOT lab.fn_form_number_ok(p_value) THEN
+            RETURN format('"%s" is not a plain decimal number: write it like 12, -3 or 0.25 '
+                          '(no exponent, leading zeros, "+", spaces or thousands separators)',
+                          p_value);
+        END IF;
+        IF v_widget = 'integer' AND NOT lab.fn_form_integer_ok(p_value) THEN
+            RETURN format('"%s" is not a whole number: write it like 12 or -3', p_value);
+        END IF;
+        IF p_field ? 'min' AND p_value::numeric < (p_field->>'min')::numeric THEN
+            RETURN format('%s is below the minimum, %s', p_value, p_field->>'min');
+        END IF;
+        IF p_field ? 'max' AND p_value::numeric > (p_field->>'max')::numeric THEN
+            RETURN format('%s is above the maximum, %s', p_value, p_field->>'max');
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget IN ('text', 'longtext') THEN
+        IF v_widget = 'text' AND p_value ~ '[\r\n]' THEN
+            RETURN 'must be a single line';
+        END IF;
+        IF p_value ~ '^[=@]' THEN
+            RETURN 'starts with "=" or "@", which a spreadsheet opening the CSV would run '
+                   'as a formula: start it with another character';
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget = 'choice' THEN
+        IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(p_field->'options') o
+                       WHERE o.value->>'value' = p_value) THEN
+            RETURN format('"%s" is not one of the choices (%s)', p_value,
+                          (SELECT string_agg(o.value->>'value', ', ' ORDER BY o.n)
+                           FROM jsonb_array_elements(p_field->'options') WITH ORDINALITY o(value, n)));
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget = 'yesno' THEN
+        IF p_value NOT IN ('yes', 'no') THEN
+            RETURN format('"%s" is not yes or no', p_value);
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget = 'date' THEN
+        v_ok := p_value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$';
+        IF v_ok THEN
+            BEGIN
+                v_ok := to_char(p_value::date, 'YYYY-MM-DD') = p_value;
+            EXCEPTION WHEN OTHERS THEN
+                v_ok := false;
+            END;
+        END IF;
+        IF NOT v_ok THEN
+            RETURN format('"%s" is not a date written YYYY-MM-DD', p_value);
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget = 'time' THEN
+        IF p_value !~ '^([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$' THEN
+            RETURN format('"%s" is not a time written HH:MM or HH:MM:SS (24-hour)', p_value);
+        END IF;
+        RETURN NULL;
+    ELSIF v_widget = 'datetime' THEN
+        v_ok := p_value ~ ('^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]'
+                           '(:[0-5][0-9](\.[0-9]{1,6})?)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$');
+        IF v_ok THEN
+            BEGIN
+                v_ok := to_char(left(p_value, 10)::date, 'YYYY-MM-DD') = left(p_value, 10)
+                        AND p_value::timestamptz IS NOT NULL;
+            EXCEPTION WHEN OTHERS THEN
+                v_ok := false;
+            END;
+        END IF;
+        IF NOT v_ok THEN
+            RETURN format('"%s" is not a date and time with its UTC offset, written like '
+                          '2026-11-14T09:30-05:00', p_value);
+        END IF;
+        RETURN NULL;
+    END IF;
+    RETURN format('fields of widget %s take no value', coalesce(v_widget, 'NULL'));
+END;
+$$;
+
+-- What is wrong with a form definition, one row per problem in the order
+-- found; no rows means it can be published. The definition (format 1):
+--
+--   {"format": 1,
+--    "header":   [{"item": "species"}, {"item": "latest_weight"},
+--                 {"variable": "baseline weight", "source": "subject"}, ...],
+--    "sections": [{"title": "Recording",
+--                  "fields": [{"widget": "number", "variable": "probe depth",
+--                              "label": "Probe depth", "units": "um",
+--                              "required": true, "min": "0", "max": "6000",
+--                              "help": "...", "show_previous": true},
+--                             {"widget": "choice", "variable": "hemisphere",
+--                              "options": [{"value": "L"}, {"value": "R", "label": "Right"}]},
+--                             {"widget": "instruction", "text": "..."}]}]}
+--
+-- design_docs/forms.md describes every key. Each field that takes a value is
+-- bound to a variable (lab.variable), which holds a number for the number and
+-- integer widgets and text for the others. With p_strict every bound
+-- variable must already be defined for events, as it is once
+-- lab.fn_publish_form has run; without, a variable that does not exist yet is
+-- fine (lab.fn_publish_form defines it), which is how a client checks a draft.
+CREATE OR REPLACE FUNCTION lab.fn_form_definition_problems(p_def jsonb, p_strict boolean DEFAULT false)
+RETURNS TABLE (ord integer, path text, problem text)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    c_widgets    constant text[] := ARRAY['number','integer','text','longtext','choice','yesno',
+                                          'date','time','datetime','heading','instruction'];
+    c_items      constant text[] := ARRAY['project','members','species','sex','strain','genotype',
+                                          'date_of_birth','age','source','subject_notes','tags',
+                                          'latest_weight','endpoint','last_surgery','last_entry'];
+    c_field_keys constant text[] := ARRAY['widget','variable','label','units','required','min',
+                                          'max','options','help','show_previous','text'];
+    v_n      integer := 0;
+    v_sec    jsonb;
+    v_si     bigint;
+    v_fld    jsonb;
+    v_fi     bigint;
+    v_p      text;
+    v_widget text;
+    v_var    text;
+    v_type   text;
+    v_row    lab.variable%ROWTYPE;
+    v_fields text[] := '{}';
+    v_data   integer := 0;
+    v_key    text;
+    v_opt    jsonb;
+    v_vals   text[];
+    v_item   jsonb;
+    v_hi     bigint;
+    v_hseen  text[] := '{}';
+    v_hkey   text;
+    v_src    text;
+BEGIN
+    IF p_def IS NULL OR jsonb_typeof(p_def) <> 'object' THEN
+        v_n := v_n + 1; ord := v_n; path := 'definition';
+        problem := 'must be a JSON object'; RETURN NEXT;
+        RETURN;
+    END IF;
+    FOR v_key IN SELECT k FROM jsonb_object_keys(p_def) k ORDER BY k LOOP
+        IF v_key NOT IN ('format', 'header', 'sections') THEN
+            v_n := v_n + 1; ord := v_n; path := v_key;
+            problem := 'is not a key of a form definition'; RETURN NEXT;
+        END IF;
+    END LOOP;
+    IF p_def->'format' IS DISTINCT FROM '1'::jsonb THEN
+        v_n := v_n + 1; ord := v_n; path := 'format';
+        problem := 'must be 1'; RETURN NEXT;
+    END IF;
+    IF (CASE WHEN jsonb_typeof(p_def->'sections') = 'array'
+             THEN jsonb_array_length(p_def->'sections') = 0 ELSE true END) THEN
+        v_n := v_n + 1; ord := v_n; path := 'sections';
+        problem := 'must be a list of at least one section'; RETURN NEXT;
+        RETURN;
+    END IF;
+
+    FOR v_sec, v_si IN SELECT s.value, s.n
+                       FROM jsonb_array_elements(p_def->'sections') WITH ORDINALITY s(value, n) LOOP
+        v_p := format('section %s', v_si);
+        IF jsonb_typeof(v_sec) <> 'object' THEN
+            v_n := v_n + 1; ord := v_n; path := v_p;
+            problem := 'must be an object with a title and fields'; RETURN NEXT;
+            CONTINUE;
+        END IF;
+        FOR v_key IN SELECT k FROM jsonb_object_keys(v_sec) k ORDER BY k LOOP
+            IF v_key NOT IN ('title', 'fields') THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := format('%s is not a key of a section', v_key); RETURN NEXT;
+            END IF;
+        END LOOP;
+        IF v_sec ? 'title' AND jsonb_typeof(v_sec->'title') <> 'string' THEN
+            v_n := v_n + 1; ord := v_n; path := v_p;
+            problem := 'title must be text'; RETURN NEXT;
+        END IF;
+        IF jsonb_typeof(v_sec->'fields') IS DISTINCT FROM 'array' THEN
+            v_n := v_n + 1; ord := v_n; path := v_p;
+            problem := 'fields must be a list'; RETURN NEXT;
+            CONTINUE;
+        END IF;
+
+        FOR v_fld, v_fi IN SELECT f.value, f.n
+                           FROM jsonb_array_elements(v_sec->'fields') WITH ORDINALITY f(value, n) LOOP
+            v_p := format('section %s field %s', v_si, v_fi);
+            IF jsonb_typeof(v_fld) <> 'object' THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'must be an object'; RETURN NEXT;
+                CONTINUE;
+            END IF;
+            FOR v_key IN SELECT k FROM jsonb_object_keys(v_fld) k ORDER BY k LOOP
+                IF NOT (v_key = ANY (c_field_keys)) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('%s is not a key of a field', v_key); RETURN NEXT;
+                END IF;
+            END LOOP;
+            v_widget := CASE WHEN jsonb_typeof(v_fld->'widget') = 'string' THEN v_fld->>'widget' END;
+            IF v_widget IS NULL OR NOT (v_widget = ANY (c_widgets)) THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := format('widget must be one of %s', array_to_string(c_widgets, ', '));
+                RETURN NEXT;
+                CONTINUE;
+            END IF;
+            FOREACH v_key IN ARRAY ARRAY['label', 'units', 'help', 'text', 'min', 'max'] LOOP
+                IF v_fld ? v_key AND jsonb_typeof(v_fld->v_key) <> 'string' THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('%s must be text (a JSON string)', v_key); RETURN NEXT;
+                END IF;
+            END LOOP;
+            FOREACH v_key IN ARRAY ARRAY['required', 'show_previous'] LOOP
+                IF v_fld ? v_key AND jsonb_typeof(v_fld->v_key) <> 'boolean' THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('%s must be true or false', v_key); RETURN NEXT;
+                END IF;
+            END LOOP;
+
+            IF v_widget IN ('heading', 'instruction') THEN
+                IF jsonb_typeof(v_fld->'text') IS DISTINCT FROM 'string'
+                   OR btrim(v_fld->>'text') = '' THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('a %s needs its text', v_widget); RETURN NEXT;
+                END IF;
+                FOREACH v_key IN ARRAY ARRAY['variable', 'units', 'required', 'min', 'max',
+                                             'options', 'show_previous'] LOOP
+                    IF v_fld ? v_key THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('a %s takes no %s', v_widget, v_key); RETURN NEXT;
+                    END IF;
+                END LOOP;
+                CONTINUE;
+            END IF;
+
+            -- A field that takes a value.
+            v_data := v_data + 1;
+            IF v_fld ? 'text' THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'text is for headings and instructions; use label or help'; RETURN NEXT;
+            END IF;
+            v_var := CASE WHEN jsonb_typeof(v_fld->'variable') = 'string' THEN v_fld->>'variable' END;
+            IF v_var IS NULL THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'needs a variable, the name its values are stored under'; RETURN NEXT;
+            ELSE
+                v_p := format('section %s field %s (%s)', v_si, v_fi, v_var);
+                IF v_var <> lab.fn_canonical_variable(v_var) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('write the variable name as "%s"',
+                                      lab.fn_canonical_variable(v_var));
+                    RETURN NEXT;
+                ELSIF v_var !~ '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$' OR length(v_var) > 63 THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'a variable name is words of letters, digits, _ or -, separated '
+                               'by single spaces and starting with a letter, at most 63 characters';
+                    RETURN NEXT;
+                ELSIF v_var = 'entry note' THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'entry note is reserved for the note every entry has'; RETURN NEXT;
+                ELSIF v_var = ANY (v_fields) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'the variable is already a field of this form'; RETURN NEXT;
+                END IF;
+                v_fields := v_fields || v_var;
+            END IF;
+            IF v_fld ? 'label' AND btrim(v_fld->>'label') = '' THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'label must not be blank (leave it out to use the variable''s label)';
+                RETURN NEXT;
+            END IF;
+            v_type := CASE WHEN v_widget IN ('number', 'integer') THEN 'number' ELSE 'text' END;
+
+            IF v_fld ? 'units' THEN
+                IF v_type <> 'number' THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('a %s field takes no units', v_widget); RETURN NEXT;
+                ELSIF jsonb_typeof(v_fld->'units') = 'string'
+                      AND (v_fld->>'units' = '' OR v_fld->>'units' <> btrim(v_fld->>'units')) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'units must not be blank or have surrounding spaces'; RETURN NEXT;
+                END IF;
+            END IF;
+            FOREACH v_key IN ARRAY ARRAY['min', 'max'] LOOP
+                IF v_fld ? v_key AND jsonb_typeof(v_fld->v_key) = 'string' THEN
+                    IF v_type <> 'number' THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('a %s field takes no %s', v_widget, v_key); RETURN NEXT;
+                    ELSIF (v_widget = 'number' AND NOT lab.fn_form_number_ok(v_fld->>v_key))
+                          OR (v_widget = 'integer' AND NOT lab.fn_form_integer_ok(v_fld->>v_key)) THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('%s "%s" is not a %s', v_key, v_fld->>v_key,
+                                          CASE v_widget WHEN 'integer' THEN 'whole number'
+                                                        ELSE 'plain decimal number' END);
+                        RETURN NEXT;
+                    END IF;
+                END IF;
+            END LOOP;
+            IF v_type = 'number' AND jsonb_typeof(v_fld->'min') = 'string'
+               AND jsonb_typeof(v_fld->'max') = 'string'
+               AND lab.fn_form_number_ok(v_fld->>'min') AND lab.fn_form_number_ok(v_fld->>'max')
+               AND (v_fld->>'min')::numeric > (v_fld->>'max')::numeric THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'min is greater than max'; RETURN NEXT;
+            END IF;
+
+            IF v_widget = 'choice' THEN
+                IF (CASE WHEN jsonb_typeof(v_fld->'options') = 'array'
+                         THEN jsonb_array_length(v_fld->'options') = 0 ELSE true END) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'a choice needs a list of options'; RETURN NEXT;
+                ELSE
+                    v_vals := '{}';
+                    FOR v_opt IN SELECT o.value FROM jsonb_array_elements(v_fld->'options') o LOOP
+                        IF jsonb_typeof(v_opt) <> 'object'
+                           OR jsonb_typeof(v_opt->'value') IS DISTINCT FROM 'string'
+                           OR (v_opt ? 'label' AND jsonb_typeof(v_opt->'label') <> 'string')
+                           OR EXISTS (SELECT 1 FROM jsonb_object_keys(v_opt) k
+                                      WHERE k NOT IN ('value', 'label')) THEN
+                            v_n := v_n + 1; ord := v_n; path := v_p;
+                            problem := 'each option is {"value": text, "label": text (optional)}';
+                            RETURN NEXT;
+                        ELSIF v_opt->>'value' = '' OR v_opt->>'value' <> btrim(v_opt->>'value')
+                              OR v_opt->>'value' ~ '[\r\n]' THEN
+                            v_n := v_n + 1; ord := v_n; path := v_p;
+                            problem := format('option "%s" must be one line, not blank and without '
+                                              'surrounding spaces', v_opt->>'value');
+                            RETURN NEXT;
+                        ELSIF v_opt->>'value' ~ '^[=@]' THEN
+                            v_n := v_n + 1; ord := v_n; path := v_p;
+                            problem := format('option "%s" starts with "=" or "@", which a '
+                                              'spreadsheet would run as a formula', v_opt->>'value');
+                            RETURN NEXT;
+                        ELSIF v_opt->>'value' = ANY (v_vals) THEN
+                            v_n := v_n + 1; ord := v_n; path := v_p;
+                            problem := format('option "%s" is listed twice', v_opt->>'value');
+                            RETURN NEXT;
+                        ELSE
+                            v_vals := v_vals || (v_opt->>'value');
+                        END IF;
+                    END LOOP;
+                END IF;
+            ELSIF v_fld ? 'options' THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := format('a %s field takes no options', v_widget); RETURN NEXT;
+            END IF;
+
+            IF v_var IS NOT NULL AND v_var = lab.fn_canonical_variable(v_var) THEN
+                SELECT v.* INTO v_row FROM lab.variable v WHERE v.name = v_var;
+                IF FOUND THEN
+                    IF v_row.value_type <> v_type THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s holds %s, so it cannot be a %s field',
+                                          v_var, CASE v_row.value_type WHEN 'number' THEN 'numbers'
+                                                      ELSE 'text' END, v_widget);
+                        RETURN NEXT;
+                    END IF;
+                    IF v_fld ? 'units' AND (v_fld->>'units') IS DISTINCT FROM v_row.units THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s is recorded in %s, not in %s', v_var,
+                                          coalesce(v_row.units, 'no units'), v_fld->>'units');
+                        RETURN NEXT;
+                    END IF;
+                    IF v_row.retired_at IS NOT NULL THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s is retired', v_var); RETURN NEXT;
+                    END IF;
+                    IF p_strict AND NOT ('event' = ANY (v_row.applies_to)) THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s is not defined for events', v_var);
+                        RETURN NEXT;
+                    END IF;
+                ELSIF p_strict THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('variable %s is not defined', v_var); RETURN NEXT;
+                END IF;
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    IF v_data = 0 THEN
+        v_n := v_n + 1; ord := v_n; path := 'sections';
+        problem := 'the form has no field to fill in'; RETURN NEXT;
+    END IF;
+
+    -- What the designer puts at the top of the form.
+    IF p_def ? 'header' THEN
+        IF jsonb_typeof(p_def->'header') <> 'array' THEN
+            v_n := v_n + 1; ord := v_n; path := 'header';
+            problem := 'must be a list'; RETURN NEXT;
+            RETURN;
+        END IF;
+        FOR v_item, v_hi IN SELECT h.value, h.n
+                            FROM jsonb_array_elements(p_def->'header') WITH ORDINALITY h(value, n) LOOP
+            v_p := format('header %s', v_hi);
+            IF jsonb_typeof(v_item) <> 'object' THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'must be an object'; RETURN NEXT;
+                CONTINUE;
+            END IF;
+            IF v_item ? 'item' THEN
+                IF EXISTS (SELECT 1 FROM jsonb_object_keys(v_item) k WHERE k <> 'item')
+                   OR jsonb_typeof(v_item->'item') <> 'string'
+                   OR NOT ((v_item->>'item') = ANY (c_items)) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := format('an info item is {"item": one of %s}',
+                                      array_to_string(c_items, ', '));
+                    RETURN NEXT;
+                    CONTINUE;
+                END IF;
+                v_hkey := 'item:' || (v_item->>'item');
+            ELSE
+                IF EXISTS (SELECT 1 FROM jsonb_object_keys(v_item) k
+                           WHERE k NOT IN ('variable', 'source', 'label'))
+                   OR jsonb_typeof(v_item->'variable') IS DISTINCT FROM 'string'
+                   OR jsonb_typeof(v_item->'source') IS DISTINCT FROM 'string'
+                   OR (v_item ? 'label' AND (jsonb_typeof(v_item->'label') <> 'string'
+                                             OR btrim(v_item->>'label') = '')) THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'a variable item is {"variable": name, "source": subject, project '
+                               'or previous_entry, "label": text (optional)}';
+                    RETURN NEXT;
+                    CONTINUE;
+                END IF;
+                v_var := v_item->>'variable';
+                v_src := v_item->>'source';
+                v_p := format('header %s (%s)', v_hi, v_var);
+                v_hkey := 'variable:' || v_src || ':' || v_var;
+                IF v_src NOT IN ('subject', 'project', 'previous_entry') THEN
+                    v_n := v_n + 1; ord := v_n; path := v_p;
+                    problem := 'source must be subject, project or previous_entry'; RETURN NEXT;
+                ELSIF v_src = 'previous_entry' THEN
+                    IF NOT (v_var = ANY (v_fields)) AND v_var <> 'entry note' THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := 'a value from the previous entry must be a field of this form '
+                                   '(or entry note)';
+                        RETURN NEXT;
+                    END IF;
+                ELSE
+                    SELECT v.* INTO v_row FROM lab.variable v WHERE v.name = v_var;
+                    IF NOT FOUND THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s is not defined', v_var); RETURN NEXT;
+                    ELSIF NOT (v_src = ANY (v_row.applies_to)) THEN
+                        v_n := v_n + 1; ord := v_n; path := v_p;
+                        problem := format('variable %s applies to %s only, not to a %s', v_var,
+                                          array_to_string(v_row.applies_to, ', '), v_src);
+                        RETURN NEXT;
+                    END IF;
+                END IF;
+            END IF;
+            IF v_hkey = ANY (v_hseen) THEN
+                v_n := v_n + 1; ord := v_n; path := v_p;
+                problem := 'is already in the header'; RETURN NEXT;
+            END IF;
+            v_hseen := v_hseen || v_hkey;
+        END LOOP;
+    END IF;
+END;
+$$;
+
+-- What is wrong with the values of one entry on version p_form_version of
+-- form p_form_name, one row per problem; no rows means they can be stored.
+-- p_values is {variable: value}, each value the text as typed (a JSON
+-- string); a blank or missing value is no value. Every key must be a field
+-- of that version. With p_stored the values are ones already in the
+-- database (lab.fn_check_integrity): keys that are not fields, which another
+-- client may have set on the event, are ignored, and so is a variable
+-- retired since.
+CREATE OR REPLACE FUNCTION lab.fn_observation_problems(
+    p_form_name    text,
+    p_form_version integer,
+    p_values       jsonb,
+    p_stored       boolean DEFAULT false
+) RETURNS TABLE (field text, problem text)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_def    jsonb;
+    v_fld    jsonb;
+    v_fields text[];
+    v_key    text;
+    v_val    jsonb;
+    v_txt    text;
+    v_msg    text;
+BEGIN
+    SELECT fv.definition INTO v_def FROM lab.form_version fv
+    WHERE fv.form_name = p_form_name AND fv.version = p_form_version;
+    IF NOT FOUND THEN
+        field := ''; problem := format('form %s has no version %s', p_form_name, p_form_version);
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    p_values := coalesce(p_values, '{}'::jsonb);
+    IF jsonb_typeof(p_values) <> 'object' THEN
+        field := ''; problem := 'the values must be a JSON object {variable: value}';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    SELECT coalesce(array_agg(f.value->>'variable'), '{}') INTO v_fields
+    FROM jsonb_array_elements(v_def->'sections') s,
+         jsonb_array_elements(s.value->'fields') f
+    WHERE f.value->>'widget' NOT IN ('heading', 'instruction');
+
+    FOR v_key, v_val IN SELECT e.key, e.value FROM jsonb_each(p_values) e ORDER BY e.key LOOP
+        IF NOT (v_key = ANY (v_fields)) THEN
+            IF NOT p_stored THEN
+                field := v_key;
+                problem := format('is not a field of form %s version %s', p_form_name, p_form_version);
+                RETURN NEXT;
+            END IF;
+        ELSIF jsonb_typeof(v_val) NOT IN ('string', 'null') THEN
+            field := v_key;
+            problem := format('must be sent as text (a JSON string), not as a JSON %s, so that '
+                              'it is stored exactly as typed', jsonb_typeof(v_val));
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+
+    FOR v_fld IN SELECT f.value
+                 FROM jsonb_array_elements(v_def->'sections') WITH ORDINALITY s(value, sn),
+                      jsonb_array_elements(s.value->'fields') WITH ORDINALITY f(value, fn)
+                 WHERE f.value->>'widget' NOT IN ('heading', 'instruction')
+                 ORDER BY s.sn, f.fn LOOP
+        v_key := v_fld->>'variable';
+        v_txt := CASE WHEN jsonb_typeof(p_values->v_key) = 'string' THEN p_values->>v_key END;
+        IF v_txt IS NULL OR btrim(v_txt) = '' THEN
+            IF coalesce((v_fld->>'required')::boolean, false) THEN
+                field := v_key; problem := 'is required'; RETURN NEXT;
+            END IF;
+            CONTINUE;
+        END IF;
+        v_msg := lab.fn_form_value_problem(v_fld, v_txt);
+        IF v_msg IS NOT NULL THEN
+            field := v_key; problem := v_msg; RETURN NEXT;
+        ELSIF NOT p_stored
+              AND EXISTS (SELECT 1 FROM lab.variable v
+                          WHERE v.name = v_key AND v.retired_at IS NOT NULL) THEN
+            field := v_key; problem := 'its variable has been retired and takes no new values';
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- Publish a template: define the variables its fields are bound to (a new
+-- variable holds numbers for the number and integer widgets and text for the
+-- others, in the field's units, and applies to events; an existing one has
+-- 'event' added to its applies_to if it lacks it), create the lab.form row on
+-- first publication, and append the definition as the next version.
+-- Publishing a definition identical to the latest version appends nothing
+-- and returns that version with is_new false. p_label and p_description, when
+-- given, also update the template's label and description.
+--
+--     SELECT * FROM lab.fn_publish_form('daily check', '{"format": 1, "sections": [...]}',
+--                                       p_label => 'Daily check');
+CREATE OR REPLACE FUNCTION lab.fn_publish_form(
+    p_name        text,
+    p_definition  jsonb,
+    p_label       text DEFAULT NULL,
+    p_description text DEFAULT NULL,
+    p_note        text DEFAULT NULL,
+    p_by          uuid DEFAULT NULL
+) RETURNS TABLE (version_number integer, is_new boolean)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_name     text := lab.fn_canonical_variable(p_name);
+    v_form     lab.form%ROWTYPE;
+    v_problems text;
+    v_detail   text;
+    v_fld      jsonb;
+    v_var      text;
+    v_row      lab.variable%ROWTYPE;
+    v_latest   lab.form_version%ROWTYPE;
+BEGIN
+    IF v_name IS NULL OR v_name !~ '^[a-z][a-z0-9_-]*( [a-z0-9_-]+)*$' OR length(v_name) > 63 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('"%s" is not a valid form name', coalesce(v_name, '')),
+            HINT    = 'Use words of letters, digits, _ or -, separated by single spaces and '
+                      'starting with a letter, at most 63 characters: daily check';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.form_version', v_name), 0));
+
+    SELECT string_agg(p.path || ': ' || p.problem, '; ' ORDER BY p.ord),
+           jsonb_agg(jsonb_build_object('path', p.path, 'problem', p.problem) ORDER BY p.ord)::text
+      INTO v_problems, v_detail
+    FROM lab.fn_form_definition_problems(p_definition, false) p;
+    IF v_problems IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'CLB02',
+            MESSAGE = format('form %s: the definition is not valid: %s', v_name, v_problems),
+            DETAIL  = v_detail;
+    END IF;
+
+    SELECT f.* INTO v_form FROM lab.form f WHERE f.name = v_name;
+    IF NOT FOUND THEN
+        INSERT INTO lab.form (name, label, description, created_by)
+        VALUES (v_name, p_label, p_description, coalesce(p_by, lab.fn_current_person()));
+    ELSE
+        IF v_form.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('form %s is retired and takes no new versions', v_name),
+                HINT    = 'Clear its retired_at first.';
+        END IF;
+        IF nullif(btrim(p_label), '') IS NOT NULL AND p_label IS DISTINCT FROM v_form.label THEN
+            UPDATE lab.form SET label = p_label WHERE name = v_name;
+        END IF;
+        IF p_description IS NOT NULL AND p_description IS DISTINCT FROM v_form.description THEN
+            UPDATE lab.form SET description = nullif(p_description, '') WHERE name = v_name;
+        END IF;
+    END IF;
+
+    FOR v_fld IN SELECT f.value
+                 FROM jsonb_array_elements(p_definition->'sections') s,
+                      jsonb_array_elements(s.value->'fields') f
+                 WHERE f.value->>'widget' NOT IN ('heading', 'instruction') LOOP
+        v_var := v_fld->>'variable';
+        SELECT v.* INTO v_row FROM lab.variable v WHERE v.name = v_var;
+        IF NOT FOUND THEN
+            PERFORM lab.fn_define_variable(
+                v_var,
+                CASE WHEN v_fld->>'widget' IN ('number', 'integer') THEN 'number' ELSE 'text' END,
+                v_fld->>'units', coalesce(v_fld->>'label', v_var), NULL, ARRAY['event'], p_by);
+        ELSIF NOT ('event' = ANY (v_row.applies_to)) THEN
+            UPDATE lab.variable SET applies_to = applies_to || 'event'::text WHERE name = v_var;
+        END IF;
+    END LOOP;
+
+    SELECT fv.* INTO v_latest FROM lab.form_version fv
+    WHERE fv.form_name = v_name ORDER BY fv.version DESC LIMIT 1;
+    IF FOUND AND v_latest.definition = p_definition THEN
+        version_number := v_latest.version;
+        is_new := false;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    INSERT INTO lab.form_version (form_name, definition, note, created_by)
+    VALUES (v_name, p_definition, nullif(btrim(p_note), ''), p_by)
+    RETURNING version INTO version_number;
+    is_new := true;
+    RETURN NEXT;
+END;
+$$;
+
+-- Put a template to use for a subject: returns the subject form for
+-- (subject, project, template), creating it if there is none. The project
+-- defaults to the subject's own and the version to the template's latest.
+-- An existing subject form is returned as it is (whatever p_form_version
+-- says), and brought back into use if it had been retired.
+CREATE OR REPLACE FUNCTION lab.fn_add_subject_form(
+    p_subject_id   text,
+    p_form_name    text,
+    p_project_id   uuid DEFAULT NULL,
+    p_form_version integer DEFAULT NULL,
+    p_notes        text DEFAULT NULL,
+    p_by           uuid DEFAULT NULL
+) RETURNS uuid
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_name    text := lab.fn_canonical_variable(p_form_name);
+    v_project uuid := p_project_id;
+    v_form    lab.form%ROWTYPE;
+    v_id      uuid;
+    v_retired timestamptz;
+BEGIN
+    IF v_project IS NULL THEN
+        SELECT s.project_id INTO v_project FROM lab.subject s WHERE s.subject_id = p_subject_id;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM lab.subject s WHERE s.subject_id = p_subject_id) THEN
+        RAISE EXCEPTION 'subject % does not exist', coalesce(p_subject_id, 'NULL');
+    END IF;
+    SELECT f.* INTO v_form FROM lab.form f WHERE f.name = v_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'form % does not exist', coalesce(v_name, 'NULL');
+    END IF;
+    IF v_form.retired_at IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('form %s is retired', v_name),
+            HINT    = 'Clear its retired_at to use it again.';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.subject_form', p_subject_id, v_project, v_name), 0));
+    SELECT sf.subject_form_id, sf.retired_at INTO v_id, v_retired
+    FROM lab.subject_form sf
+    WHERE sf.subject_id = p_subject_id AND sf.project_id = v_project AND sf.form_name = v_name;
+    IF FOUND THEN
+        IF v_retired IS NOT NULL THEN
+            UPDATE lab.subject_form SET retired_at = NULL WHERE subject_form_id = v_id;
+        END IF;
+        RETURN v_id;
+    END IF;
+    INSERT INTO lab.subject_form (subject_id, project_id, form_name, form_version, notes, created_by)
+    VALUES (p_subject_id, v_project, v_name, p_form_version, nullif(btrim(p_notes), ''),
+            coalesce(p_by, lab.fn_current_person()))
+    RETURNING subject_form_id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+-- Record one entry on a subject form, or a correction of one, in one
+-- transaction. Made for a client that may send the same entry more than once
+-- (the browser keeps an entry until the server confirms it, and sends it
+-- again after a dropped connection): the client mints p_event_id, and the
+-- database stores a digest of the entry in event.attributes.client_digest.
+--   * An event p_event_id that is this same entry (same digest) is
+--     'existing' and nothing is written. That is decided before anything is
+--     checked, so an entry already stored is never refused on replay.
+--   * An event p_event_id that is anything else raises SQLSTATE CLB01.
+--   * Values that break the rules of the form version (lab.fn_observation_problems),
+--     or a blank session label, raise SQLSTATE CLB02 with the problems as a
+--     JSON list [{field, problem}] in DETAIL.
+--   * Otherwise the event, its detail row and its values are written and the
+--     result is 'inserted'.
+-- p_values is {variable: text as typed}; p_note is the entry's note, stored
+-- in the 'entry note' variable. occurred_at is when the session happened.
+--
+-- A correction (p_supersedes) stays on the same subject form and keeps the
+-- form version of the entry it corrects. trg_event_carry_variables copies the
+-- predecessor's values onto it; then values that changed are set, values
+-- that were cleared are unset, and unchanged values keep their history. The
+-- predecessor's current tags are carried forward (retired tags are not: a
+-- retired tag cannot be assigned, and lab.fn_check_integrity reports it).
+-- Correcting an entry that has already been corrected raises SQLSTATE CLB03
+-- naming the current version.
+CREATE OR REPLACE FUNCTION lab.fn_record_observation(
+    p_event_id        uuid,
+    p_subject_form_id uuid,
+    p_occurred_at     timestamptz,
+    p_session_label   text,
+    p_values          jsonb,
+    p_note            text DEFAULT NULL,
+    p_supersedes      uuid DEFAULT NULL,
+    p_session_id      uuid DEFAULT NULL,
+    p_attributes      jsonb DEFAULT NULL,
+    p_recorded_by     uuid DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_values   jsonb := coalesce(p_values, '{}'::jsonb);
+    v_note     text := CASE WHEN btrim(coalesce(p_note, '')) = '' THEN NULL ELSE p_note END;
+    v_digest   text;
+    v_type     text;
+    v_stored   text;
+    v_sf       lab.subject_form%ROWTYPE;
+    v_version  integer;
+    v_old_sf   uuid;
+    v_next     uuid;
+    v_problems text;
+    v_detail   text;
+    v_fld      jsonb;
+    v_var      text;
+    v_new      text;
+    v_cur      text;
+BEGIN
+    IF p_event_id IS NULL OR p_subject_form_id IS NULL OR p_occurred_at IS NULL THEN
+        RAISE EXCEPTION 'an entry needs its event id, its subject form and when it occurred';
+    END IF;
+    IF jsonb_typeof(v_values) <> 'object' THEN
+        RAISE EXCEPTION 'the values must be a JSON object {variable: value}';
+    END IF;
+    IF p_attributes IS NOT NULL AND jsonb_typeof(p_attributes) <> 'object' THEN
+        RAISE EXCEPTION 'the attributes must be a JSON object';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.observation', p_event_id), 0));
+
+    -- The digest covers what the entry says, not how it was sent: blank
+    -- values are left out (blank is no value), and the time is written in
+    -- UTC so that the same instant sent with another offset is the same entry.
+    v_digest := encode(sha256(convert_to(jsonb_build_object(
+        'subject_form_id', p_subject_form_id,
+        'occurred_at', to_char(p_occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+        'session_label', p_session_label,
+        'session_id', p_session_id,
+        'supersedes', p_supersedes,
+        'note', v_note,
+        'values', (SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb)
+                   FROM jsonb_each(v_values) e
+                   WHERE NOT (jsonb_typeof(e.value) = 'null'
+                              OR (jsonb_typeof(e.value) = 'string'
+                                  AND btrim(e.value #>> '{}') = ''))))::text, 'UTF8')), 'hex');
+
+    SELECT e.event_type, e.attributes->>'client_digest' INTO v_type, v_stored
+    FROM lab.event e WHERE e.event_id = p_event_id;
+    IF FOUND THEN
+        IF v_type = 'observation' AND v_stored = v_digest THEN
+            RETURN 'existing';
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = 'CLB01',
+            MESSAGE = format('event %s already exists and is not this entry', p_event_id),
+            HINT    = 'An entry that was changed after it was saved is a correction: '
+                      'send it with a new event id and p_supersedes.';
+    END IF;
+
+    SELECT sf.* INTO v_sf FROM lab.subject_form sf WHERE sf.subject_form_id = p_subject_form_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subject form % does not exist', p_subject_form_id;
+    END IF;
+
+    IF p_supersedes IS NULL THEN
+        v_version := v_sf.form_version;
+    ELSE
+        SELECT o.subject_form_id, o.form_version INTO v_old_sf, v_version
+        FROM lab.observation_event o WHERE o.event_id = p_supersedes;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'event % is not an entry on a form, so this cannot correct it',
+                p_supersedes;
+        END IF;
+        IF v_old_sf <> p_subject_form_id THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('entry %s was made on subject form %s; its correction must be too',
+                                 p_supersedes, v_old_sf);
+        END IF;
+        SELECT e.event_id INTO v_next FROM lab.event e WHERE e.supersedes = p_supersedes;
+        IF v_next IS NOT NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'CLB03',
+                MESSAGE = format('entry %s has already been corrected; its current version is %s',
+                                 p_supersedes, lab.fn_event_current(p_supersedes)),
+                HINT    = 'Correct the current version instead.';
+        END IF;
+    END IF;
+
+    SELECT string_agg(x.field || ': ' || x.problem, '; '),
+           jsonb_agg(jsonb_build_object('field', x.field, 'problem', x.problem))::text
+      INTO v_problems, v_detail
+    FROM (SELECT p.field, p.problem
+          FROM lab.fn_observation_problems(v_sf.form_name, v_version, v_values) p
+          UNION ALL
+          SELECT 'session label', 'must not be blank or have surrounding spaces'
+          WHERE p_session_label IS NULL OR p_session_label = ''
+             OR p_session_label <> btrim(p_session_label)
+          UNION ALL
+          SELECT 'entry note', 'starts with "=" or "@", which a spreadsheet opening the CSV '
+                               'would run as a formula: start it with another character'
+          WHERE v_note ~ '^[=@]') x;
+    IF v_problems IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'CLB02',
+            MESSAGE = format('the entry cannot be stored: %s', v_problems),
+            DETAIL  = v_detail;
+    END IF;
+
+    INSERT INTO lab.event (event_id, event_type, subject_id, session_id, occurred_at,
+                           recorded_by, supersedes, attributes)
+    VALUES (p_event_id, 'observation', v_sf.subject_id, p_session_id, p_occurred_at,
+            p_recorded_by, p_supersedes,
+            coalesce(p_attributes, '{}'::jsonb) || jsonb_build_object('client_digest', v_digest));
+    INSERT INTO lab.observation_event (event_id, subject_form_id, form_name, form_version,
+                                       session_label)
+    VALUES (p_event_id, p_subject_form_id, v_sf.form_name, v_version, p_session_label);
+
+    -- Values: compared as text with what the event already holds (nothing for
+    -- a new entry, the carried values for a correction).
+    FOR v_fld IN
+        SELECT f.value
+        FROM lab.form_version fv,
+             jsonb_array_elements(fv.definition->'sections') s,
+             jsonb_array_elements(s.value->'fields') f
+        WHERE fv.form_name = v_sf.form_name AND fv.version = v_version
+          AND f.value->>'widget' NOT IN ('heading', 'instruction')
+        UNION ALL
+        SELECT jsonb_build_object('variable', 'entry note', 'widget', 'longtext')
+    LOOP
+        v_var := v_fld->>'variable';
+        IF v_var = 'entry note' THEN
+            v_new := v_note;
+        ELSE
+            v_new := CASE WHEN jsonb_typeof(v_values->v_var) = 'string'
+                               AND btrim(v_values->>v_var) <> ''
+                          THEN v_values->>v_var END;
+        END IF;
+        SELECT CASE WHEN vv.op = 'set' THEN coalesce(vv.value_text, vv.value_num::text) END
+          INTO v_cur
+        FROM lab.variable_value vv
+        WHERE vv.event_id = p_event_id AND vv.variable = v_var
+        ORDER BY vv.value_id DESC LIMIT 1;
+        IF NOT FOUND THEN
+            v_cur := NULL;
+        END IF;
+        IF v_new IS NULL THEN
+            IF v_cur IS NOT NULL THEN
+                PERFORM lab.fn_unset_variable('event', p_event_id::text, v_var,
+                                              'cleared in the correction', p_recorded_by);
+            END IF;
+        ELSIF v_new IS DISTINCT FROM v_cur THEN
+            IF v_fld->>'widget' IN ('number', 'integer') THEN
+                PERFORM lab.fn_set_variable('event', p_event_id::text, v_var,
+                                            p_number => v_new::numeric, p_by => p_recorded_by);
+            ELSE
+                PERFORM lab.fn_set_variable('event', p_event_id::text, v_var,
+                                            p_text => v_new, p_by => p_recorded_by);
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF p_supersedes IS NOT NULL THEN
+        INSERT INTO lab.tag_assignment (entity_kind, event_id, tag, op, note, applied_by)
+        SELECT 'event', p_event_id, c.tag, 'add',
+               format('carried forward from %s', p_supersedes), p_recorded_by
+        FROM lab.tag_current c
+        JOIN lab.tag t ON t.tag = c.tag
+        WHERE c.entity_kind = 'event' AND c.event_id = p_supersedes AND t.retired_at IS NULL
+        ORDER BY c.tag;
+    END IF;
+    RETURN 'inserted';
+END;
+$$;
+
+-- Change the note of an entry without correcting it: the note is the entry's
+-- 'entry note' variable, so this appends a value row (the earlier text stays
+-- in the log with who wrote it). A blank note clears it. Text equal to the
+-- current note writes nothing, so sending the same change twice is harmless.
+-- Only the current version of an entry takes a new note. Returns 'set',
+-- 'unset' or 'unchanged'.
+CREATE OR REPLACE FUNCTION lab.fn_set_entry_note(
+    p_event_id uuid,
+    p_note     text,
+    p_by       uuid DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_new text := CASE WHEN btrim(coalesce(p_note, '')) = '' THEN NULL ELSE p_note END;
+    v_cur text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM lab.observation_event o WHERE o.event_id = p_event_id) THEN
+        RAISE EXCEPTION 'event % is not an entry on a form', coalesce(p_event_id::text, 'NULL');
+    END IF;
+    IF EXISTS (SELECT 1 FROM lab.event e WHERE e.supersedes = p_event_id) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('entry %s has been corrected; its current version is %s',
+                             p_event_id, lab.fn_event_current(p_event_id)),
+            HINT    = 'Change the note of the current version.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM lab.retraction r WHERE r.event_id = p_event_id) THEN
+        RAISE EXCEPTION 'entry % has been withdrawn', p_event_id;
+    END IF;
+    IF v_new ~ '^[=@]' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'CLB02',
+            MESSAGE = 'the note starts with "=" or "@", which a spreadsheet opening the CSV '
+                      'would run as a formula: start it with another character',
+            DETAIL  = jsonb_build_array(jsonb_build_object(
+                          'field', 'entry note',
+                          'problem', 'starts with "=" or "@"'))::text;
+    END IF;
+    -- The same lock trg_variable_value_policy takes, so that the comparison
+    -- and the write are one step.
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.variable', 'event', p_event_id::text, 'entry note'), 0));
+    SELECT CASE WHEN vv.op = 'set' THEN vv.value_text END INTO v_cur
+    FROM lab.variable_value vv
+    WHERE vv.event_id = p_event_id AND vv.variable = 'entry note'
+    ORDER BY vv.value_id DESC LIMIT 1;
+    IF v_new IS NULL THEN
+        IF v_cur IS NULL THEN
+            RETURN 'unchanged';
+        END IF;
+        PERFORM lab.fn_unset_variable('event', p_event_id::text, 'entry note', NULL, p_by);
+        RETURN 'unset';
+    END IF;
+    IF v_new = v_cur THEN
+        RETURN 'unchanged';
+    END IF;
+    PERFORM lab.fn_set_variable('event', p_event_id::text, 'entry note', p_text => v_new,
+                                p_by => p_by);
+    RETURN 'set';
+END;
+$$;
+
+-- The first version of the correction chain an event belongs to: the id an
+-- entry keeps through its corrections.
+CREATE OR REPLACE FUNCTION lab.fn_event_original(p_event_id uuid) RETURNS uuid
+LANGUAGE plpgsql STABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_id   uuid := p_event_id;
+    v_prev uuid;
+BEGIN
+    LOOP
+        SELECT e.supersedes INTO v_prev FROM lab.event e WHERE e.event_id = v_id;
+        EXIT WHEN v_prev IS NULL;
+        v_id := v_prev;
+    END LOOP;
+    RETURN v_id;
+END;
+$$;
+
+-- Every active entry on a form (neither corrected nor withdrawn), with its
+-- values. field_values is {variable: value} over the entry's current values,
+-- each as the text the database stored (a JSON string, never a JSON number:
+-- 1.50 stays 1.50), the note left out; note is the entry's note. entry_id is
+-- the id of the entry's first version, which its corrections keep. Read per
+-- event through ix_variable_value_event, not through lab.variable_current.
+CREATE VIEW lab.observation_active AS
+    SELECT e.event_id,
+           lab.fn_event_original(e.event_id) AS entry_id,
+           e.supersedes,
+           o.subject_form_id, e.subject_id, sf.project_id,
+           o.form_name, o.form_version, o.session_label,
+           e.occurred_at, e.recorded_at, e.recorded_by, e.recorded_login, e.session_id,
+           e.attributes,
+           coalesce(v.field_values, '{}'::jsonb) AS field_values,
+           v.note
+    FROM lab.event_active e
+    JOIN lab.observation_event o ON o.event_id = e.event_id
+    JOIN lab.subject_form sf ON sf.subject_form_id = o.subject_form_id
+    LEFT JOIN LATERAL (
+        SELECT jsonb_object_agg(c.variable, c.value)
+                   FILTER (WHERE c.variable <> 'entry note') AS field_values,
+               max(c.value) FILTER (WHERE c.variable = 'entry note') AS note
+        FROM (SELECT DISTINCT ON (vv.variable) vv.variable, vv.op,
+                     coalesce(vv.value_text, vv.value_num::text) AS value
+              FROM lab.variable_value vv
+              WHERE vv.event_id = e.event_id
+              ORDER BY vv.variable, vv.value_id DESC) c
+        WHERE c.op = 'set'
+    ) v ON true;
+
+-- The fields of all of a subject's forms in one project, in the order the
+-- per-subject, per-project CSV (web/forms/) lists them: form by form in the
+-- order the forms were added to the subject (by name when two were added in
+-- one transaction, which gives them the same created_at), and within a form in the order
+-- the fields first appear across its versions (a field added in version 2
+-- comes after version 1's). A variable on two forms is one column, listed
+-- where it first appears. The versions counted are those up to the one each
+-- subject form uses, and any its entries were made on.
+CREATE OR REPLACE FUNCTION lab.fn_subject_project_columns(p_subject_id text, p_project_id uuid)
+RETURNS TABLE (column_no integer, variable text, label text, units text, value_type text,
+               widget text, form_name text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+    WITH sf AS (
+        SELECT s.subject_form_id, s.form_name, s.form_version,
+               row_number() OVER (ORDER BY s.created_at, s.form_name) AS form_no
+        FROM lab.subject_form s
+        WHERE s.subject_id = p_subject_id AND s.project_id = p_project_id
+    ), f AS (
+        SELECT sf.form_no, sf.form_name, fv.version, sec.n AS section_no, fld.n AS field_no,
+               fld.value AS field
+        FROM sf
+        JOIN lab.form_version fv
+          ON fv.form_name = sf.form_name
+         AND (fv.version <= sf.form_version
+              OR EXISTS (SELECT 1 FROM lab.observation_event o
+                         WHERE o.subject_form_id = sf.subject_form_id
+                           AND o.form_version = fv.version))
+        CROSS JOIN LATERAL jsonb_array_elements(fv.definition->'sections')
+                               WITH ORDINALITY AS sec(value, n)
+        CROSS JOIN LATERAL jsonb_array_elements(sec.value->'fields')
+                               WITH ORDINALITY AS fld(value, n)
+        WHERE fld.value->>'widget' NOT IN ('heading', 'instruction')
+    ), firsts AS (
+        SELECT DISTINCT ON (f.field->>'variable')
+               f.field->>'variable' AS variable, f.form_no, f.version, f.section_no,
+               f.field_no, f.form_name, f.field
+        FROM f
+        ORDER BY f.field->>'variable', f.form_no, f.version, f.section_no, f.field_no
+    )
+    SELECT (row_number() OVER (ORDER BY x.form_no, x.version, x.section_no, x.field_no))::integer,
+           x.variable, coalesce(x.field->>'label', v.label), v.units, v.value_type,
+           x.field->>'widget', x.form_name
+    FROM firsts x
+    JOIN lab.variable v ON v.name = x.variable
+    ORDER BY 1;
+$$;
+
 -- What is wrong with a tag filter, one row per faulty token; no rows means the
 -- filter is sound. lab.fn_tag_match deliberately treats an unknown token as
 -- "no entity has it", which is right for matching but makes a typo silent:
@@ -2904,7 +4299,8 @@ LANGUAGE sql STABLE AS $$
         UNION ALL SELECT event_id FROM lab.husbandry_event
         UNION ALL SELECT event_id FROM lab.endpoint_event
         UNION ALL SELECT event_id FROM lab.histology_event
-        UNION ALL SELECT event_id FROM lab.analysis_event)
+        UNION ALL SELECT event_id FROM lab.analysis_event
+        UNION ALL SELECT event_id FROM lab.observation_event)
 
     UNION ALL
     -- Non-analysis events with no subject. event_subject_required_ck rejects
@@ -3064,7 +4460,22 @@ LANGUAGE sql STABLE AS $$
     JOIN lab.artifact_disposition_latest d
       ON d.artifact_id = a.artifact_id AND d.disposition <> 'restored'
     JOIN lab.artifact_verification_latest v
-      ON v.artifact_id = a.artifact_id AND v.status = 'ok' AND v.verified_at > d.occurred_at;
+      ON v.artifact_id = a.artifact_id AND v.status = 'ok' AND v.verified_at > d.occurred_at
+
+    UNION ALL
+    -- Active form entries whose current values break the rules of the form
+    -- version they were made on: a required value unset, a number outside its
+    -- range, a choice that is not an option. lab.fn_record_observation refuses
+    -- such entries; this catches values changed afterwards by another client
+    -- (lab.fn_set_variable / fn_unset_variable on the event). Variables on the
+    -- event that are not fields of its form are not judged.
+    SELECT 'warning', 'observation_invalid', oa.event_id::text,
+           format('entry on form %s version %s: %s', oa.form_name, oa.form_version,
+                  string_agg(p.field || ': ' || p.problem, '; ' ORDER BY p.field))
+    FROM lab.observation_active oa
+    CROSS JOIN LATERAL lab.fn_observation_problems(oa.form_name, oa.form_version,
+                                                   oa.field_values, true) p
+    GROUP BY oa.event_id, oa.form_name, oa.form_version;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -3076,8 +4487,18 @@ INSERT INTO lab.event_type (code, label) VALUES
     ('birth','Birth'), ('surgery','Surgery'), ('recording','Recording'),
     ('behavior','Behavior / training'), ('husbandry','Husbandry / health'),
     ('endpoint','Endpoint / euthanasia'), ('histology','Histology'),
-    ('analysis','Analysis run')
+    ('analysis','Analysis run'), ('observation','Observation (form entry)')
 ON CONFLICT (code) DO NOTHING;
+
+-- The note every form entry has (lab.fn_record_observation,
+-- lab.fn_set_entry_note). Reserved: lab.fn_form_definition_problems refuses a
+-- form field bound to it.
+INSERT INTO lab.variable (name, label, description, value_type, applies_to) VALUES
+    ('entry note', 'Note',
+     'The note on a form entry (an observation event). It can be changed after the entry is '
+     'made, with lab.fn_set_entry_note; every earlier text stays in the value log.',
+     'text', ARRAY['event'])
+ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO lab.artifact_role (code, label) VALUES
     ('raw','Raw acquisition'), ('spikes','Spike times'), ('lfp','LFP'),

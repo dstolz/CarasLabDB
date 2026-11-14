@@ -91,6 +91,11 @@ INSERT INTO lab.husbandry_event (event_id, measure, weight_g) VALUES
 -- The administrator maps the member's login to their person row.
 UPDATE lab.person SET db_login = 'rt_member'
 WHERE person_id = '00000000-0000-0000-0000-0000000000a1';
+-- A template in use for R2, so that the rename cascade below also runs
+-- through lab.subject_form and its guard trigger.
+SELECT version_number FROM lab.fn_publish_form('roles fixture',
+    '{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "roles fixture value"}]}]}');
+SELECT lab.fn_add_subject_form('R2', 'roles fixture') AS rt_fixture_sf \gset
 
 -- ---------------------------------------------------------------------------
 -- A lab member (lab_rw)
@@ -266,8 +271,10 @@ SELECT pg_temp.assert(
     'trigger functions fired by the rename cascade did not run the caller''s code');
 SELECT pg_temp.assert(
     (SELECT subject_id FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e2')
+        = 'R2-renamed'
+    AND (SELECT subject_id FROM lab.subject_form WHERE subject_form_id = :'rt_fixture_sf')
         = 'R2-renamed',
-    'the cascade itself ran');
+    'the cascade itself ran, into the subject forms too');
 -- The supported route, for a role that holds EXECUTE on the function.
 SELECT lab.fn_rename_subject('R3', 'R3-renamed');
 RESET SESSION AUTHORIZATION;
@@ -320,6 +327,100 @@ SELECT pg_temp.expect_error(
     $q$INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
        VALUES ('00000000-0000-0000-0000-0000000000f1', 'restored', now())$q$,
     'permission denied');
+RESET SESSION AUTHORIZATION;
+
+-- ---------------------------------------------------------------------------
+-- Forms (design_docs/forms.md)
+-- ---------------------------------------------------------------------------
+-- A member publishes a template, puts it to use for a subject, records and
+-- corrects entries and changes an entry's note; each row carries the
+-- member's login. What a template or subject form is cannot be edited, and
+-- versions and entries are append-only.
+SET SESSION AUTHORIZATION rt_member;
+SELECT pg_temp.assert(
+    (SELECT version_number || '|' || is_new FROM lab.fn_publish_form('roles check',
+        '{"format": 1, "header": [{"item": "sex"}],
+          "sections": [{"fields": [{"widget": "number", "variable": "roles depth", "units": "um",
+                                    "required": true},
+                                   {"widget": "text", "variable": "roles side"}]}]}',
+        p_label => 'Roles check')) = '1|true',
+    'a member may publish a template');
+SELECT lab.fn_add_subject_form('R2-renamed', 'roles check') AS rt_sf \gset
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-0000000000d1', :'rt_sf', now(), 'day 1',
+    '{"roles depth": "1350.50", "roles side": "left"}', 'first',
+    p_attributes => '{"client": "roles_test"}') = 'inserted',
+    'a member may record an entry');
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-0000000000d2', :'rt_sf', now(), 'day 1',
+    '{"roles depth": "1400", "roles side": "left"}', 'first',
+    p_supersedes => '00000000-0000-0000-0000-0000000000d1') = 'inserted'
+    AND lab.fn_set_entry_note('00000000-0000-0000-0000-0000000000d2', 'second') = 'set',
+    'a member may correct an entry and change its note');
+UPDATE lab.form SET description = 'described by a member', retired_at = NULL WHERE name = 'roles check';
+UPDATE lab.subject_form SET notes = 'a member''s note' WHERE subject_form_id = :'rt_sf';
+SELECT pg_temp.assert(
+    (SELECT created_login || '|' || created_by FROM lab.form_version WHERE form_name = 'roles check')
+        = 'rt_member|00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT created_by FROM lab.form WHERE name = 'roles check') = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT created_by FROM lab.subject_form WHERE subject_form_id = :'rt_sf')
+        = '00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT string_agg(DISTINCT e.recorded_login || '|' || e.recorded_by, ',')
+           FROM lab.event e JOIN lab.observation_event o USING (event_id))
+        = 'rt_member|00000000-0000-0000-0000-0000000000a1'
+    AND (SELECT bool_and(set_login = 'rt_member') FROM lab.variable_value
+          WHERE event_id IN ('00000000-0000-0000-0000-0000000000d1', '00000000-0000-0000-0000-0000000000d2'))
+    AND (SELECT changed_by FROM lab.row_history WHERE table_name = 'form') = 'rt_member'
+    AND (SELECT changed_by FROM lab.row_history WHERE table_name = 'subject_form'
+          AND row_key = jsonb_build_object('subject_form_id', :'rt_sf')) = 'rt_member',
+    'templates, versions, subject forms, entries and their values carry the member''s login and person');
+SELECT pg_temp.expect_error($q$UPDATE lab.form SET name = 'renamed' WHERE name = 'roles check'$q$,
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.subject_form SET project_id = project_id WHERE subject_form_id = %L$q$, :'rt_sf'),
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.subject_form SET subject_id = 'R3' WHERE subject_form_id = %L$q$, :'rt_sf'),
+    'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.form_version SET note = 'x'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.form_version$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.form$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.subject_form$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.observation_event SET session_label = 'x'$q$,
+    'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.observation_event$q$, 'permission denied');
+-- A raw INSERT of a version goes through the same checks as fn_publish_form.
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.form_version (form_name, definition) VALUES ('roles check', '{"format": 1}')$q$,
+    'definition is not valid');
+RESET SESSION AUTHORIZATION;
+
+-- The read-only login reads the forms and entries but writes none of them.
+SET SESSION AUTHORIZATION rt_reader;
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.observation_active) = 1
+    AND (SELECT field_values->>'roles depth' || '|' || note FROM lab.observation_active) = '1400|second'
+    AND (SELECT count(*) FROM lab.fn_subject_project_columns('R2-renamed',
+                                                             '00000000-0000-0000-0000-0000000000b1')) = 3
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_form_definition_problems(
+        (SELECT definition FROM lab.form_version WHERE form_name = 'roles check'), true))
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_observation_problems('roles check', 1,
+        '{"roles depth": "1"}')),
+    'the read-only login reads entries and runs the read-only form functions');
+SELECT pg_temp.expect_error($q$
+    SELECT * FROM lab.fn_publish_form('reader form',
+        '{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "roles side"}]}]}')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_add_subject_form('R1', 'roles check')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    SELECT lab.fn_record_observation(gen_random_uuid(), %L, now(), 'x', '{"roles depth": "1"}')$q$,
+    :'rt_sf'), 'permission denied');
+SELECT pg_temp.expect_error(
+    $q$SELECT lab.fn_set_entry_note('00000000-0000-0000-0000-0000000000d2', 'reader')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.form SET description = 'x'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.subject_form SET notes = 'x'$q$, 'permission denied');
 RESET SESSION AUTHORIZATION;
 
 ROLLBACK;

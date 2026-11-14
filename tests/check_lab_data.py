@@ -260,6 +260,8 @@ FX_SUBJECT = "CHECK-LAB-DATA-FIXTURE"
 FX_PATH = "check_lab_data/s1/raw.dat"
 FX_OCCURRED = "2020-01-02T03:04:05.123456Z"
 FX_SIZE = 12345
+FX_OBS1 = "0bbe0000-0000-4000-8000-000000000001"
+FX_OBS2 = "0bbe0000-0000-4000-8000-000000000002"
 FIXTURE = r"""
 DO $fx$
 DECLARE
@@ -314,9 +316,24 @@ BEGIN
                                 12345678901234567890.123456789);
     -- the analysis withdrawn
     PERFORM lab.fn_retract('event', an, 'check_lab_data retraction');
+    -- a form entry (an observation event), then its correction
+    PERFORM lab.fn_publish_form('check_lab_data form',
+        '{"format": 1, "sections": [{"fields": [
+            {"widget": "number", "variable": "cld obs depth", "units": "um"},
+            {"widget": "text", "variable": "cld obs side"}]}]}');
+    PERFORM lab.fn_record_observation(
+        '%(obs1)s', lab.fn_add_subject_form('%(subject)s', 'check_lab_data form'),
+        '2020-01-05T10:00:00Z', 'day 5',
+        '{"cld obs depth": "0.000100", "cld obs side": "left"}', 'a note');
+    PERFORM lab.fn_record_observation(
+        '%(obs2)s', lab.fn_add_subject_form('%(subject)s', 'check_lab_data form'),
+        '2020-01-05T10:00:00Z', 'day 5',
+        '{"cld obs depth": "1350.50", "cld obs side": "left"}', 'a note',
+        p_supersedes => '%(obs1)s');
 END
 $fx$;
-""" % {"subject": FX_SUBJECT, "path": FX_PATH, "occurred": FX_OCCURRED, "size": FX_SIZE}
+""" % {"subject": FX_SUBJECT, "path": FX_PATH, "occurred": FX_OCCURRED, "size": FX_SIZE,
+       "obs1": FX_OBS1, "obs2": FX_OBS2}
 
 
 def export_with_fixture():
@@ -353,7 +370,8 @@ def check_fixture(data, integrity_counts):
     if len(sessions) != 1:
         bad("expected 1 fixture session, found %d" % len(sessions))
 
-    recs = [e for e in data["events"] if e["subject_id"] == FX_SUBJECT]
+    recs = [e for e in data["events"]
+            if e["subject_id"] == FX_SUBJECT and e["event_type"] != "observation"]
     if len(recs) != 2 or any(e["event_type"] != "recording" for e in recs):
         bad("expected the 2 fixture recording events, found %d" % len(recs))
     new = [e for e in recs if e["supersedes"] is not None]
@@ -435,6 +453,31 @@ def check_fixture(data, integrity_counts):
             for d in data["dispositions"] if d["artifact_id"] == out[0]["artifact_id"]]
     if disp != [("deleted", None, "2020-01-04T00:00:00Z", "check_lab_data deletion")]:
         bad("the fixture's disposition came back as %r" % disp)
+
+    # the form entry and its correction: the detail row, and the values as
+    # the exact text stored, the unchanged one carried forward
+    obs = {e["event_id"]: e for e in data["events"] if e["event_type"] == "observation"
+           and e["subject_id"] == FX_SUBJECT}
+    if set(obs) != {FX_OBS1, FX_OBS2} or obs[FX_OBS2]["supersedes"] != FX_OBS1:
+        bad("the fixture's form entries came back as %r" % sorted(obs))
+    for e in obs.values():
+        d = e["detail"]
+        if set(d) != {"subject_form_id", "form_name", "form_version", "session_label"} \
+                or (d["form_name"], d["form_version"], d["session_label"]) \
+                != ("check_lab_data form", 1, "day 5"):
+            bad("form entry %s detail came back as %r" % (e["event_id"], d))
+    got_obs = [(r["entity_id"], r["variable"], r["op"], r["value"])
+               for r in data["variableValues"]
+               if r["entity_kind"] == "event" and r["entity_id"] in obs]
+    want_obs = [(FX_OBS1, "cld obs depth", "set", "0.000100"),
+                (FX_OBS1, "cld obs side", "set", "left"),
+                (FX_OBS1, "entry note", "set", "a note"),
+                (FX_OBS2, "cld obs depth", "set", "0.000100"),
+                (FX_OBS2, "cld obs side", "set", "left"),
+                (FX_OBS2, "entry note", "set", "a note"),
+                (FX_OBS2, "cld obs depth", "set", "1350.50")]
+    if got_obs != want_obs:
+        bad("the form entries' values came back as %r" % got_obs)
 
     # the integrity summary agrees with lab.fn_check_integrity() itself
     got = {"%s/%s" % (c["severity"], c["check_name"]): c["count"]

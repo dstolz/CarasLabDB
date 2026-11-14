@@ -2519,12 +2519,14 @@ classdef CarasLabDB < handle
             %   runtime -- a code inserted there comes back out of the database
             %   and would otherwise be concatenated straight into SQL as an
             %   *identifier*, which sqlLiteral does not and cannot protect
-            %   (it escapes values). Validating against the eight types that
+            %   (it escapes values). Validating against the nine types that
             %   actually have detail tables closes that stored-injection path
             %   and turns an unknown code into a clear error instead of a
-            %   confusing "relation does not exist".
+            %   confusing "relation does not exist". 'observation' is an entry
+            %   made on a form (web/forms/, lab.fn_record_observation); it is
+            %   here so that supersedeEvent and the readers can handle one.
             known = ["birth", "surgery", "recording", "behavior", ...
-                     "husbandry", "endpoint", "histology", "analysis"];
+                     "husbandry", "endpoint", "histology", "analysis", "observation"];
             eventType = string(eventType);
             if ~isscalar(eventType) || ismissing(eventType) || ~ismember(eventType, known)
                 error("CarasLabDB:unknownEventType", ...

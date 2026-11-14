@@ -169,6 +169,7 @@ events AS (
             WHEN 'endpoint'  THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.endpoint_event  x WHERE x.event_id = e.event_id)
             WHEN 'histology' THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.histology_event x WHERE x.event_id = e.event_id)
             WHEN 'analysis'  THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.analysis_event  x WHERE x.event_id = e.event_id)
+            WHEN 'observation' THEN (SELECT to_jsonb(x) - 'event_id' - 'event_type' FROM lab.observation_event x WHERE x.event_id = e.event_id)
             ELSE '{}'::jsonb
         END, '{}'::jsonb)
     ) ORDER BY e.occurred_at, e.event_id), '[]'::json) AS j
