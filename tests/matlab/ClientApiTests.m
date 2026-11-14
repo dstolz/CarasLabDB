@@ -507,25 +507,20 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             % A server that accepts the TCP connection and never answers:
             % without a limit libpq waits for minutes.
             tc.requireDb();
-            tc.assumeTrue(exist("tcpserver", "file") > 0 || exist("tcpserver", "class") > 0, ...
-                "tcpserver is not available");
-            server = [];
-            for port = 55432:55532
-                try
-                    server = tcpserver("127.0.0.1", port);
-                    break
-                catch
-                end
-            end
-            tc.assumeNotEmpty(server, "no free local port for the silent server");
-            tc.addTeardown(@() delete(server));
+            % A listening socket that never accepts: the kernel completes the
+            % TCP handshake into its backlog, so the client connects and
+            % then waits for a reply that never comes.
+            tc.assumeTrue(usejava("jvm"), "a Java listening socket needs the JVM");
+            server = java.net.ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"));
+            tc.addTeardown(@() server.close());
+            port = double(server.getLocalPort());
             had = isenv("PGCONNECT_TIMEOUT");
             old = string(getenv("PGCONNECT_TIMEOUT"));
             t0 = tic;
             failed = false;
             try
                 CarasLabDB(Username="nobody", Password="x", Server="127.0.0.1", ...
-                    Port=server.ServerPort, DatabaseName="lab", ConnectTimeout=2);
+                    Port=port, DatabaseName="lab", ConnectTimeout=2);
             catch
                 failed = true;
             end
