@@ -124,7 +124,7 @@ From the repo root (`/srv/CarasLabDB`):
 ```bash
 psql -X -v ON_ERROR_STOP=1 -h localhost -U lab_admin -d lab -f design_docs/schema.sql
 psql -X -v ON_ERROR_STOP=1 -h localhost -U lab_admin -d lab -f design_docs/grants.sql
-psql -X -h localhost -U lab_admin -d lab -c "SELECT max(version) FROM lab.schema_version;"   # 5
+psql -X -h localhost -U lab_admin -d lab -c "SELECT max(version) FROM lab.schema_version;"   # 1
 ```
 
 `schema.sql` prints `NOTICE: trigger ... does not exist, skipping` lines;
@@ -415,7 +415,7 @@ Open 443 (not 8778) to the lab subnets in the firewall, as in §1.5.
 
 - [ ] `systemctl status postgresql` shows the service **active (running)**.
 - [ ] `psql -h localhost -U lab_admin -d lab -c "\dt lab.*"` lists the schema
-      tables, and `SELECT max(version) FROM lab.schema_version` returns 5.
+      tables, and `SELECT max(version) FROM lab.schema_version` returns 1.
 - [ ] A member's own login (in `lab_rw`) can `SELECT`/`INSERT`, cannot
       `UPDATE lab.person` or an event, and `SELECT lab.fn_current_person()`
       returns their person.
@@ -494,7 +494,7 @@ lab_dashboard -d lab -c "SELECT * FROM lab.fn_check_integrity()"`: an empty
 result is healthy. Schedule the verifier weekly and the integrity report
 daily from cron, with the password in that OS user's `~/.pgpass`.
 
-**Schema upgrades** follow [deployment-windows.md](deployment-windows.md) §6:
+**Schema upgrades** (from launch on) follow [deployment-windows.md](deployment-windows.md) §6:
 back up, stop the clients, apply the migration as `lab_admin` with
 `psql -X -v ON_ERROR_STOP=1 -1 -h localhost -U lab_admin -d lab -f
 design_docs/migrations/<script>.sql`, re-run `grants.sql`, check, and update

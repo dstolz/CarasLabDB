@@ -322,10 +322,14 @@ directly. `changed_by` is `session_user`, the login that connected, which
 **`maintenance_log`** — one row per identity-maintenance operation (§4.1).
 
 **`schema_version`** — one row per applied schema version; the current
-version is `max(version)`. `schema.sql` installs the latest version directly;
-an existing database is upgraded by the scripts in
-[`migrations/`](migrations/), each of which records its own row. A fresh
-install and an upgraded database end with identical schemas. Both clients read
+version is `max(version)`. `schema.sql` installs the current version
+directly. The database has not been launched, so the current schema is
+version 1 and changes are made in `schema.sql`. From launch on, an existing
+database is upgraded by the scripts in [`migrations/`](migrations/), each of
+which records its own row, and a fresh install and an upgraded database end
+with identical schemas. The upgrade scripts of the pre-launch numbering are
+archived, untested, in [`migrations/pre-launch/`](migrations/pre-launch/).
+Both clients read
 the version at connect time: the MATLAB class, which writes, refuses to
 connect to a version it was not written for (unless told
 `AllowSchemaMismatch=true`), and the read-only MCP server attaches a warning
@@ -521,8 +525,8 @@ records the *login* that was connected, in `event.recorded_login`,
 `variable_value.set_login`: `trg_*_stamp_login` sets each to `session_user`
 whatever the client sends, the same guarantee `row_history` gives for the
 mutable tables. With one login per lab member that identifies the writer
-without client cooperation; with a shared login it identifies nobody. Rows
-written before schema version 4 have `NULL`.
+without client cooperation; with a shared login it identifies nobody. Only
+rows written before pre-launch schema version 4 have `NULL`.
 
 The two are tied by `person.db_login`: `lab.fn_current_person()` returns the
 person whose `db_login` is the connected login (NULL for a login mapped to
@@ -600,7 +604,7 @@ SELECT * FROM lab.fn_check_integrity();
 | Check | Severity | Meaning |
 |---|---|---|
 | `event_missing_detail` | error | Typed event whose detail row was never written |
-| `event_missing_subject` | warning | Non-analysis event with no subject; only possible for rows that predate `event_subject_required_ck` in a migrated database |
+| `event_missing_subject` | warning | Non-analysis event with no subject; only possible for rows that predate `event_subject_required_ck` in a database migrated from a pre-launch schema |
 | `artifact_verification_failed` | error | Latest integrity check of the artifact's file was `missing` or `mismatch` (by file, so it survives a correction of the artifact row) |
 | `event_recorded_before_occurred` | warning | `occurred_at` more than a day after `recorded_at` — usually a client timezone bug |
 | `artifact_never_verified` | warning | Active artifact whose file has no verification on record |
@@ -608,7 +612,7 @@ SELECT * FROM lab.fn_check_integrity();
 | `tag_not_carried_forward` | warning | Active event or artifact whose superseded predecessor has current tags that the successor lacks; the correction drops out of the tag filters the original matched. Reported against the successor, listing the missing tags |
 | `artifact_event_mismatch` | warning | Active artifact filed under a different subject or session than the event that produced it; only possible for rows that predate `trg_artifact_matches_event` |
 | `input_not_carried_forward` | warning | Active event whose superseded predecessor consumed artifacts while it declares none, so lineage through it stops. A correction that re-declares a different, non-empty set of inputs is deliberate and not reported |
-| `tag_cardinality_violation` | error | An entity with more than one current tag in a single-valued namespace; only possible for assignments that raced before schema version 4 |
+| `tag_cardinality_violation` | error | An entity with more than one current tag in a single-valued namespace; only possible for assignments that raced before pre-launch schema version 4 |
 | `artifact_producer_retracted` | warning | Active artifact whose producing event (in its current version) has been retracted; retract the file too, or supersede it with the event it belongs to |
 | `input_retracted` | warning | Active event that consumed an artifact whose current version has been retracted: the analysis rests on a file the lab has withdrawn |
 | `duplicate_active_path` | warning | Two active artifacts at one path; the NAS file can only be one of them |
@@ -779,8 +783,8 @@ targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
 The seed `INSERT`s use `ON CONFLICT DO NOTHING`, so re-applying the file to a
 database that already has the vocabulary is not a hard failure. The `CREATE
 TABLE` statements are not idempotent, however — this is still a
-fresh-database script. To upgrade an existing database, apply the scripts in
-[`migrations/`](migrations/) in order (§3.6). Roles and privileges are in
+fresh-database script. After launch, an existing database is upgraded by
+applying the scripts in [`migrations/`](migrations/) in order (§3.6). Roles and privileges are in
 [`grants.sql`](grants.sql), applied after either.
 
 ---
@@ -822,7 +826,8 @@ type/idiom substitutions apply.
   on a scratch database.
 - [grants.sql](grants.sql) — the roles and privileges every deployment guide
   applies.
-- [migrations/](migrations/) — upgrade scripts for existing databases.
+- [migrations/](migrations/) — upgrade scripts for existing databases, from
+  launch on; `pre-launch/` archives the pre-launch ones.
 - `examples/carasLabDB_integration_examples.m` — how to use the MATLAB
   `CarasLabDB` class from your own code: connecting, filtering, adding events
   and artifacts, corrections and error handling. It connects through the

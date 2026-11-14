@@ -153,7 +153,7 @@ classdef CarasLabDB < handle
     end
 
     properties (Constant)
-        SchemaVersionExpected = 5               % schema version this class is written for
+        SchemaVersionExpected = 1               % schema version this class is written for
     end
 
     properties
@@ -1908,11 +1908,12 @@ classdef CarasLabDB < handle
             %   SELECT lab.fn_current_person(): the lab.person row whose
             %   db_login is this session's login (an administrator sets
             %   db_login when a member is onboarded). Missing when the login
-            %   is mapped to nobody, and on a schema older than version 5,
-            %   which has no such function -- asking would raise, and on an
+            %   is mapped to nobody, and on a database of unknown version (a
+            %   pre-launch prototype with no lab.schema_version), which may
+            %   have no such function -- asking would raise, and on an
             %   injected connection could abort the caller's transaction.
             pid = string(missing);
-            if ~(obj.SchemaVersion >= 5)
+            if ~(obj.SchemaVersion >= 1)
                 return
             end
             T = obj.pSelect("SELECT " + obj.pT("fn_current_person") + "()::text AS person_id;");
@@ -2009,8 +2010,8 @@ classdef CarasLabDB < handle
                     tz, ME.message);
             end
 
-            % Version 1 of the schema had no schema_version table. Probe for
-            % it rather than letting the SELECT fail, which would abort the
+            % The first pre-launch schema had no schema_version table. Probe
+            % for it rather than letting the SELECT fail, which would abort the
             % caller's transaction on an injected connection.
             obj.SchemaVersion = NaN;
             R = obj.pSelect("SELECT to_regclass(" + ...
@@ -2022,7 +2023,7 @@ classdef CarasLabDB < handle
             end
             if ~isequal(obj.SchemaVersion, CarasLabDB.SchemaVersionExpected)
                 if isnan(obj.SchemaVersion)
-                    found = "unknown (no schema_version table, i.e. version 1)";
+                    found = "unknown (no schema_version table: a pre-launch prototype)";
                 else
                     found = string(obj.SchemaVersion);
                 end

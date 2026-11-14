@@ -66,7 +66,7 @@ MAX_LIMIT = 1000
 # (schema_map.py, the per-tool filters) were written against. A database at
 # another version may return incomplete rows rather than an error, so a
 # mismatch is logged and repeated in every result as `schema_warning`.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 1
 
 # Inclusive lower / exclusive upper bound operators for `time_ranges`.
 _RANGE_OPS = (">=", "<")
@@ -405,7 +405,8 @@ def _check_schema_version(conn):
     global schema_warning
     cur = conn.cursor()
     try:
-        # Version 1 had no schema_version table; probe rather than fail.
+        # The first pre-launch schema had no schema_version table; probe
+        # rather than fail.
         cur.execute("SELECT to_regclass('lab.schema_version') IS NOT NULL")
         version = None
         if cur.fetchone()[0]:
@@ -416,7 +417,7 @@ def _check_schema_version(conn):
     if version == SCHEMA_VERSION:
         schema_warning = None
         return
-    found = ("unknown (no lab.schema_version table, i.e. version 1)"
+    found = ("unknown (no lab.schema_version table: a pre-launch prototype)"
              if version is None else str(version))
     schema_warning = (
         f"Database schema version is {found}; this MCP server is written for "

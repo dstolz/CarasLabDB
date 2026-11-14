@@ -1,8 +1,8 @@
 -- ============================================================================
 -- Schema assertions for design_docs/schema.sql
 -- ============================================================================
--- Run against a database that has just had schema.sql (or the v1 schema plus
--- every script in design_docs/migrations/) applied and holds no other data:
+-- Run against a database that has just had schema.sql applied and holds no
+-- other data:
 --
 --     psql -X -v ON_ERROR_STOP=1 -d lab_test -f tests/schema_test.sql
 --
@@ -87,8 +87,8 @@ VALUES ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-0000000
 -- ---------------------------------------------------------------------------
 -- Version and baseline behaviour
 -- ---------------------------------------------------------------------------
-SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 5,
-                      'schema_version is 5');
+SELECT pg_temp.assert((SELECT max(version) FROM lab.schema_version) = 1,
+                      'schema_version is 1');
 
 SELECT pg_temp.assert(
     (SELECT subject_id FROM lab.event WHERE event_id = '00000000-0000-0000-0000-0000000000e1') = 'G1',
@@ -591,7 +591,7 @@ SELECT pg_temp.assert(
     'no structural integrity errors in the fixture');
 
 -- ===========================================================================
--- Schema version 4
+-- Pre-launch schema version 4
 -- ===========================================================================
 -- Fixture at this point: recording e1 is superseded by e7; its raw file f1 by
 -- f7 and then by an active row with role 'derived'; analysis e2 consumed f1
@@ -824,7 +824,7 @@ SELECT pg_temp.assert(
     'once the inputs are re-declared, lineage reaches e2''s files through current event e8');
 
 -- ===========================================================================
--- Schema version 5: user-defined variables, retraction, logins
+-- Pre-launch schema version 5: user-defined variables, retraction, logins
 -- ===========================================================================
 -- Fixture at this point: subjects G1-renamed and G2; sessions c1 and c3
 -- (G1-renamed) and c2 (G2); recording e7 is current (e1 superseded); analysis

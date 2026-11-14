@@ -155,15 +155,16 @@ createdb lab && psql -X -v ON_ERROR_STOP=1 -d lab -f design_docs/schema.sql
 psql -X -v ON_ERROR_STOP=1 -d lab -f design_docs/grants.sql
 ```
 
-The schema is at version 5. To upgrade an existing database instead, apply
-the scripts in `design_docs/migrations/` in order, as the owner, after a
-backup (`tools/backup_lab.py`).
+The schema is at version 1: the database has not been launched yet, and
+changes are made in `schema.sql` directly. From launch on, an existing
+database is upgraded by applying the scripts in `design_docs/migrations/` in
+order, as the owner, after a backup (`tools/backup_lab.py`). The pre-launch
+upgrade scripts are kept, untested, in `design_docs/migrations/pre-launch/`.
 
 **Run the tests:** `tests/schema_test.sql` checks the schema's constraints and
 triggers against a freshly loaded database, `tests/roles_test.sql` what
 members of `lab_rw` and `lab_ro` may do (run as a superuser after
-`grants.sql`), `tests/seed_v1.sql` + `tests/migrated_data_test.sql` the
-migrations on a database holding data, `tests/check_verify_artifacts.py` the
+`grants.sql`), `tests/check_verify_artifacts.py` the
 file verifier, `tests/check_lab_data.py` the live dashboard's export, and
 `mcp-server/tests/` the MCP server. CI runs them on PostgreSQL 14, 15, 16
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
@@ -249,7 +250,8 @@ the Linux and Synology alternatives.
 design_docs/         Schema DDL and design documentation
   schema.sql           Canonical PostgreSQL DDL (schema `lab`), latest version
   grants.sql           Roles and privileges (lab_rw, lab_ro)
-  migrations/          Upgrade scripts for existing databases
+  migrations/          Upgrade scripts for existing databases (from launch;
+                       pre-launch/ holds the archived pre-launch ones)
   overview.md          Conceptual model — read this first
   database-design.md   Table-by-table rationale
   tagging.md           Tags: syntax, policy flags, filters, corrections
@@ -267,7 +269,7 @@ web/                 Standalone dashboard (synthetic data)
 mcp-server/          Read-only MCP server (Python): typed query tools for LLM agents
 tools/               Backup, restore and file verification (Python)
 examples/            End-to-end demo scripts
-tests/               Schema, role and migration assertions (psql), tool checks (Python)
+tests/               Schema and role assertions (psql), tool checks (Python)
   matlab/              MATLAB unit and GUI tests (CI and local)
 CLAUDE.md            Repo conventions for Claude Code / coding agents
 ```

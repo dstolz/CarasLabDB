@@ -9,10 +9,13 @@ data. It has six parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
-  redefine it. It installs the latest schema version; `design_docs/migrations/`
-  upgrades existing databases, and `design_docs/grants.sql` holds the roles
-  and privileges every deployment guide applies. Current schema version: 5
-  (`design_docs/migrations/005_variables_retraction_logins.sql`). It includes
+  redefine it. It installs the current schema version, and
+  `design_docs/grants.sql` holds the roles and privileges every deployment
+  guide applies. Current schema version: **1**. The database has not been
+  launched, so changes are made in `schema.sql` directly, at version 1, with no
+  migration. `design_docs/migrations/pre-launch/` archives the upgrade scripts
+  of the pre-launch numbering (they took a first prototype to what was then
+  version 5, the schema now called 1); nothing applies or tests them. It includes
   the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
   tables (`variable`, `variable_value`) and `retraction`;
   `design_docs/tagging.md` and `design_docs/variables.md` are the user-facing
@@ -63,7 +66,8 @@ data. It has six parts:
   The schema's table and column names are hard-coded — the event-detail
   tables/columns in `src/caraslabdb_mcp/schema_map.py`, the rest in the
   per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
-  change must be mirrored there, and `db.SCHEMA_VERSION` bumped. See
+  change must be mirrored there (and, after launch, `db.SCHEMA_VERSION`
+  bumped). See
   `design_docs/mcp-server.md`.
 - **`tools/`** — Python scripts, cross-platform, standard library only except
   that the verifier needs psycopg: `backup_lab.py` (database + roles +
@@ -127,7 +131,7 @@ records:
   `artifact_verification.verified_login`, `tag_assignment.applied_login`,
   `retraction.retracted_login`, `variable_value.set_login` are set to
   `session_user` by the `trg_*_stamp_login` triggers whatever the client
-  sends (NULL on rows older than schema version 4). Clients never send them
+  sends (NULL only on rows older than pre-launch schema version 4). Clients never send them
   and do not carry them forward in a correction. `lab.person.db_login` maps a
   login to a person (`lab.fn_current_person()`); the database fills the
   person column from it when the client names nobody, and the MATLAB class
@@ -196,18 +200,22 @@ records:
 
 Any schema change must preserve this pattern: never add a mutable column
 where append + supersede would do, and never let a new detail table skip the
-`(event_id, event_type)` composite-FK trick. A schema change also needs: a new
-numbered script in `design_docs/migrations/` that inserts its
-`lab.schema_version` row; the same change in `schema.sql` with its seeded
-version bumped (a fresh install and an upgraded database must give identical
-`pg_dump --schema-only` output — so a column added to an existing table goes
-last in its `CREATE TABLE`, where `ALTER TABLE ADD COLUMN` puts it, and a
-`SELECT *` view over that table is re-created in the migration);
-`CarasLabDB.SchemaVersionExpected` and the MCP server's `db.SCHEMA_VERSION`
-bumped; `grants.sql` updated if the new table needs anything beyond
-read/insert; assertions in `tests/schema_test.sql`; and, for anything a role
-may or may not do, in `tests/roles_test.sql`. Function and view bodies in a
-migration must be byte-identical to `schema.sql`.
+`(event_id, event_type)` composite-FK trick. A schema change also needs:
+`grants.sql` updated if the new table needs anything beyond read/insert;
+assertions in `tests/schema_test.sql`; and, for anything a role may or may not
+do, in `tests/roles_test.sql`.
+
+Until launch, the change is made in `schema.sql` only and the version stays 1.
+From launch on, it also needs: a new numbered script in
+`design_docs/migrations/` (from `002`) that inserts its `lab.schema_version`
+row; the seeded version in `schema.sql` bumped (a fresh install and an
+upgraded database must give identical `pg_dump --schema-only` output — so a
+column added to an existing table goes last in its `CREATE TABLE`, where
+`ALTER TABLE ADD COLUMN` puts it, and a `SELECT *` view over that table is
+re-created in the migration); `CarasLabDB.SchemaVersionExpected` and the MCP
+server's `db.SCHEMA_VERSION` bumped; and a CI check that the migrations
+reproduce a fresh install. Function and view bodies in a migration must be
+byte-identical to `schema.sql`.
 
 ## The MATLAB interface (`@CarasLabDB`)
 
@@ -328,10 +336,8 @@ walkthrough script, not an automated test, and assumes a reachable database.
 
 CI (`.github/workflows/tests.yml`) runs on PostgreSQL 14, 15, 16 and 17. It
 applies the schema, runs `tests/schema_test.sql`, applies `grants.sql` twice
-and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), checks
-that a v1 database plus the migrations matches a fresh install, upgrades a v1
-database that holds rows (`tests/seed_v1.sql`,
-`tests/migrated_data_test.sql`), runs the artifact verifier end to end
+and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), runs the
+artifact verifier end to end
 (`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
 and runs the MCP server's pytest suite. The `matlab` job runs

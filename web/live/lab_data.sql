@@ -43,7 +43,7 @@
 --     session zone's offset; server.py pins that zone to UTC, and PGTZ=UTC
 --     does the same for psql.
 --   * recorded_login / created_login are the database logins that inserted
---     the row (NULL on rows older than schema version 4).
+--     the row (NULL only on rows older than pre-launch schema version 4).
 --   * Variables: `variables` are the definitions (lab.variable, applies_to as
 --     a JSON array); `variableValues` is the whole append-only log
 --     (lab.variable_value) in value_id order, each row naming its entity as

@@ -1,5 +1,5 @@
 classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.TestCase
-%VARIABLETESTS Tests of the schema version 5 features of the CarasLabDB class.
+%VARIABLETESTS Tests of the pre-launch schema version 5 features of the CarasLabDB class.
 %
 %   results = runtests("tests/matlab/VariableTests.m")
 %   results = runtests("tests/matlab", Tag="NoDatabase")  % no server needed
@@ -259,9 +259,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
             db2 = tc.verifyWarning(@() CarasLabDB(Connection=unmapped), "CarasLabDB:noCurrentPerson");
             tc.verifyTrue(ismissing(db2.CurrentPersonId));
 
-            % An older schema has no lab.fn_current_person: it is not called.
+            % A database of unknown version (a pre-launch prototype) may have
+            % no lab.fn_current_person: it is not called.
             old = RecordingConnection();
-            old.SchemaVersion = 4;
+            old.SchemaVersion = NaN;
             old.LoginPersonId = pid;
             db3 = tc.verifyWarning(@() CarasLabDB(Connection=old, AllowSchemaMismatch=true), ...
                 "CarasLabDB:noCurrentPerson");

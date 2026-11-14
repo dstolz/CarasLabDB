@@ -648,7 +648,7 @@ def test_fn_tag_is_refused_through_the_read_only_path(seed):
 
 
 # ---------------------------------------------------------------------------
-# Schema version 5: variables, retraction, counts, paging, file lookup
+# Pre-launch schema version 5: variables, retraction, counts, paging, file lookup
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")

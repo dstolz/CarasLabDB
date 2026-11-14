@@ -15,7 +15,7 @@ summarised in [§9](#9-using-variables-from-each-client). Variables follow the
 same pattern as [tags](tagging.md): mutable definitions, an append-only log
 of values, and current values derived by a view.
 
-Every SQL example below was run against a scratch database (schema version 5,
+Every SQL example below was run against a scratch database (schema version 1,
 PostgreSQL 16) as a login in `lab_rw`; outputs are shown where they help
 (with the test login renamed `jdoe` and long ids shortened).
 

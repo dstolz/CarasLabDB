@@ -251,8 +251,9 @@ known; items marked *IT decision* need input before go-live.
    The database records its schema version (`lab.schema_version`), and an
    existing database is upgraded by the numbered scripts in
    `design_docs/migrations/`, each applied once by the owner role in a
-   maintenance window, after a backup, and refusing to run twice (the
-   current version is 5). The lab admin login applies them; the runbook is
+   maintenance window, after a backup, and refusing to run twice. The
+   database has not been launched: the current version is 1 and there are
+   no migrations yet. The lab admin login applies them; the runbook is
    `deployment-windows.md` §6.
 
 6. **Single instance, no offline mode.** *(IT decision)* Clients write

@@ -284,7 +284,7 @@ def test_tag_tables_are_allowed_and_tag_orderings_listed():
     assert db.ORDER_BY_TAG_ASSIGNMENT == "assignment_id DESC"
     assert db.ORDER_BY_TAG_ASSIGNMENT in db.ALLOWED_ORDER_BY
     assert db.ORDER_BY_TAG_CURRENT in db.ALLOWED_ORDER_BY
-    assert db.SCHEMA_VERSION == 5
+    assert db.SCHEMA_VERSION == 1
 
 
 def test_tag_pk_rejects_unknown_kind():

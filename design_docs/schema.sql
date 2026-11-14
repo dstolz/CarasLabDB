@@ -7,10 +7,12 @@
 --
 --     createdb lab && psql -d lab -f design_docs/schema.sql
 --
--- This file installs the latest schema version (see lab.schema_version below).
--- To upgrade an existing database instead, apply the scripts in
--- design_docs/migrations/ in order; a fresh install from this file and an
--- upgraded database end up with identical schemas.
+-- This file installs the current schema version (see lab.schema_version
+-- below). The database has not been launched, so the current schema is
+-- version 1 and changes are made here directly. From launch on, every change
+-- also gets a numbered upgrade script in design_docs/migrations/, and a fresh
+-- install from this file and an upgraded database must end up with identical
+-- schemas.
 --
 -- Requires privileges to create a schema. gen_random_uuid() is in core since
 -- PG 13; the pgcrypto line is a fallback for older servers.
@@ -23,9 +25,9 @@ CREATE SCHEMA IF NOT EXISTS lab;
 -- Schema version
 -- ---------------------------------------------------------------------------
 -- One row per applied schema version; the current version is max(version).
--- This file installs the latest version directly; an existing database is
--- brought up to date by the scripts in design_docs/migrations/, each of which
--- inserts its own row. Clients (the CarasLabDB MATLAB class, the MCP server)
+-- This file installs the current version directly; after launch, an existing
+-- database is brought up to date by the scripts in design_docs/migrations/,
+-- each of which inserts its own row. Clients (the CarasLabDB MATLAB class, the MCP server)
 -- read max(version) at connect time and warn when it is not the version they
 -- were written for -- a client with hard-coded column lists can otherwise
 -- return wrong data against a changed schema rather than failing.
@@ -254,7 +256,7 @@ CREATE TABLE lab.event (
     -- The database login that inserted the row, set by trg_event_stamp_login
     -- whatever the client sends. recorded_by is the person the client says
     -- made the entry; this is who was actually connected. NULL only for rows
-    -- that predate schema version 4.
+    -- that predate pre-launch schema version 4.
     recorded_login text,
     CHECK (supersedes <> event_id),
     -- attributes is an open extension point, but it must stay an *object*:
@@ -2747,7 +2749,8 @@ LANGUAGE sql STABLE AS $$
     UNION ALL
     -- Non-analysis events with no subject. event_subject_required_ck rejects
     -- these on insert; this reports rows that predate the constraint in a
-    -- database migrated from schema version 1 (where it may be NOT VALID).
+    -- database migrated from the first pre-launch schema (where it may be
+    -- NOT VALID).
     SELECT 'warning', 'event_missing_subject', e.event_id::text,
            format('%s event has no subject_id', e.event_type)
     FROM lab.event e
@@ -2823,7 +2826,7 @@ LANGUAGE sql STABLE AS $$
     UNION ALL
     -- Active artifacts filed under a different animal or session than the
     -- event that produced them. trg_artifact_matches_event rejects these on
-    -- insert; this reports rows that predate it (schema version 4).
+    -- insert; this reports rows that predate it (pre-launch schema version 4).
     SELECT 'warning', 'artifact_event_mismatch', a.artifact_id::text,
            format('filed under subject %s / session %s, but producing event %s is about '
                   'subject %s / session %s',
@@ -2852,7 +2855,7 @@ LANGUAGE sql STABLE AS $$
     UNION ALL
     -- More than one current tag in a single-valued namespace on one entity.
     -- trg_tag_assignment_policy prevents it; this reports assignments that
-    -- raced before schema version 4 made the check race-free.
+    -- raced before pre-launch schema version 4 made the check race-free.
     SELECT 'error', 'tag_cardinality_violation', c.entity_id,
            format('%s has %s current tags in single-valued namespace %s: %s',
                   c.entity_kind, count(*), c.namespace, string_agg(c.tag, ', ' ORDER BY c.tag))
@@ -2954,10 +2957,11 @@ INSERT INTO lab.tag (tag, description) VALUES
 ON CONFLICT (tag) DO NOTHING;
 
 -- The version this file installs. Keep in step with the newest script in
--- design_docs/migrations/ and with the client constants that check it
--- (CarasLabDB.SchemaVersionExpected, caraslabdb_mcp.db.SCHEMA_VERSION).
+-- design_docs/migrations/ (none before launch) and with the client constants
+-- that check it (CarasLabDB.SchemaVersionExpected,
+-- caraslabdb_mcp.db.SCHEMA_VERSION).
 INSERT INTO lab.schema_version (version, description) VALUES
-    (5, 'Fresh install from schema.sql')
+    (1, 'Fresh install from schema.sql')
 ON CONFLICT (version) DO NOTHING;
 
 -- ---------------------------------------------------------------------------

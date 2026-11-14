@@ -180,7 +180,7 @@ connection, and a connection found dead at the start of a call is replaced
 once, so a server restart costs the caller nothing. `get_event_detail` makes
 its queries through one cursor, so they see the same snapshot. On each new
 connection `db.py` reads `lab.schema_version`; if it is not the version the
-server was written for (`db.SCHEMA_VERSION`, currently 5), it logs a warning
+server was written for (`db.SCHEMA_VERSION`, currently 1), it logs a warning
 and every result carries a `schema_warning` string — list envelopes before
 their rows, and `get_event_detail`'s row as its first key.
 
@@ -335,7 +335,7 @@ reason; with `active_only=False` it returns the row as recorded, marked
 `is_current: false`, with `retraction_reason` / `retracted_at` /
 `retracted_by` filled in for a retracted event.
 
-**Retraction** (`lab.retraction`, schema version 5) withdraws an event or
+**Retraction** (`lab.retraction`) withdraws an event or
 artifact that should never have been written, with a reason; nothing
 replaces it. The `*_active` views leave retracted rows out, so every default
 read does too (`get_events`, `get_artifacts`, `find_by_tags`, the
@@ -429,7 +429,7 @@ every file). `format` is matched exactly.
 
 ### User-defined variables
 
-Schema version 5 adds variables: named values on events, artifacts,
+The schema has variables: named values on events, artifacts,
 subjects, sessions and projects (`lab.variable` the definitions,
 `lab.variable_value` the append-only log of `set` / `unset`,
 `lab.variable_current` the latest `set` per entity and variable).
@@ -450,8 +450,8 @@ always read as named.
 
 ### Persons and logins
 
-`get_persons` returns `lab.person` with `SELECT *`, which since schema
-version 5 includes `db_login`, the PostgreSQL login a person connects with —
+`get_persons` returns `lab.person` with `SELECT *`, which includes
+`db_login`, the PostgreSQL login a person connects with —
 what the `*_login` audit columns record. It is a role name, not a
 credential; the docstring says so.
 

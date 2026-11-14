@@ -58,7 +58,7 @@ $$;
 -- ---------------------------------------------------------------------------
 -- rt_member   a lab member: inherits lab_rw, nothing else.
 -- rt_reader   the dashboard / MCP login: inherits lab_ro.
--- rt_legacy   a member on a deployment whose grants predate schema version 4:
+-- rt_legacy   a member whose grants predate pre-launch schema version 4:
 --             table-level UPDATE on lab.subject, key column included.
 -- rt_renamer  a delegated administrator: may run lab.fn_rename_subject, but
 --             is neither the owner nor a superuser.
@@ -202,7 +202,7 @@ SELECT pg_temp.expect_error(
 RESET SESSION AUTHORIZATION;
 
 -- ---------------------------------------------------------------------------
--- A member whose grants predate version 4: UPDATE on the whole of lab.subject
+-- A member whose grants predate pre-launch version 4: UPDATE on all of lab.subject
 -- ---------------------------------------------------------------------------
 -- The column-level grant is not the only barrier: trg_subject_id_guard
 -- refuses the change for a role that may not run lab.fn_rename_subject.

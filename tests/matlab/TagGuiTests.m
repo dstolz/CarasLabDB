@@ -688,7 +688,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
         function eventsTabShowsRecordedLoginNextToRecordedBy(tc)
             % The database login that inserted an event (recorded_login,
-            % schema version 4) is shown right after recorded_by.
+            % pre-launch schema version 4) is shown right after recorded_by.
             tc.Fx.makeWorld("gui-login", 0);
             m = tc.mainParts();
             tc.chooseTab("events");
