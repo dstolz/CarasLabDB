@@ -263,6 +263,50 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             tc.verifyFalse(any(contains(conn.Log, "INSERT INTO lab.event_input")));
             tc.verifyTrue(any(contains(conn.Log, "INSERT INTO lab.artifact ")));
         end
+
+        function recordEventRecordsTheFileItReplaced(tc)
+            [db, conn] = ClientApiTests.recordingDb();
+            conn.Results("RETURNING event_id") = table(ClientApiTests.EventId, 'VariableNames', {'event_id'});
+            conn.Results("RETURNING artifact_id") = table(ClientApiTests.OutputId, 'VariableNames', {'artifact_id'});
+            t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            a = ClientApiTests.goodArgs(t);
+            old = "0f8a2a5e-6c1b-4c1e-9d0e-3a1b2c3d4e10";
+            a.Outputs.replaces = old;
+            args = namedargs2cell(a);
+            db.recordEvent("analysis", args{:});
+            at = find(contains(conn.Log, "INSERT INTO lab.artifact_disposition"));
+            tc.assertNumElements(at, 1);
+            tc.verifyGreaterThan(at, find(contains(conn.Log, "INSERT INTO lab.artifact "), 1));
+            d = conn.Log(at);
+            tc.verifySubstring(d, "'replaced'");
+            tc.verifySubstring(d, "'" + old + "'");
+            tc.verifySubstring(d, "'" + ClientApiTests.OutputId + "'");
+            tc.verifySubstring(d, "2026-11-14 09:01:00", "when the run finished");
+            tc.verifyFalse(contains(conn.Log(find(contains(conn.Log, "INSERT INTO lab.artifact "), 1)), ...
+                "replaces"), "replaces is not an artifact column");
+
+            % A replaced row the database does not have: skipped with MissingInputs="skip".
+            conn.clearLog();
+            out = db.recordEvent("analysis", args{:}, MissingInputs="skip");
+            tc.verifyEqual(out.SkippedReplaces, old);
+            tc.verifyFalse(any(contains(conn.Log, "INSERT INTO lab.artifact_disposition")));
+        end
+
+        function presentOnlyReadsArtifactPresent(tc)
+            [db, conn] = ClientApiTests.recordingDb();
+            db.getArtifacts(PresentOnly=true);
+            tc.verifySubstring(conn.Log(1), "FROM lab.artifact_present");
+            tc.verifyError(@() db.getArtifacts(PresentOnly=true, ActiveOnly=false), ...
+                "CarasLabDB:invalidValue");
+            conn.clearLog();
+            db.getArtifactDispositions(ArtifactId=ClientApiTests.OutputId, LatestPerFile=true);
+            db.getArtifactDispositions(Disposition="moved");
+            tc.verifySubstring(conn.Log(1), "FROM lab.artifact_disposition_latest");
+            tc.verifySubstring(conn.Log(2), "disposition = 'moved'");
+            tc.verifyError(@() db.getArtifactDispositions(Disposition="lost"), "CarasLabDB:invalidValue");
+            tc.verifyError(@() db.addArtifactDisposition(ArtifactId="x", Disposition="deleted", ...
+                OccurredAt=datetime("now", "TimeZone", "UTC")), "CarasLabDB:invalidValue");
+        end
     end
 
     % =====================================================================
@@ -390,6 +434,60 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             tc.verifyEmpty(db.getEvents(EventId=ids.EventId, ActiveOnly=false));
         end
 
+        function dispositionsSayWhereAFileIs(tc)
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("disp", 1);
+            aid = w.ArtifactIds(1);
+            t = datetime(2026, 11, 2, 9, 0, 0, "TimeZone", "UTC");
+            tc.verifyNumElements(LabScratchDb.column(db.getArtifacts(ArtifactId=aid, PresentOnly=true), ...
+                "artifact_id"), 1);
+            id = db.addArtifactDisposition(ArtifactId=aid, Disposition="deleted", OccurredAt=t, ...
+                Note="cleaned up");
+            tc.verifyGreaterThan(id, 0);
+            tc.verifyEmpty(db.getArtifacts(ArtifactId=aid, PresentOnly=true), "a deleted file is not present");
+            tc.verifyNumElements(LabScratchDb.column(db.getArtifacts(ArtifactId=aid), "artifact_id"), 1, ...
+                "its row is still active");
+            L = db.getArtifactDispositions(ArtifactId=aid, LatestPerFile=true);
+            tc.verifyEqual(LabScratchDb.column(L, "disposition"), "deleted");
+            tc.verifyError(@() db.addArtifactDisposition(ArtifactId=aid, Disposition="deleted", ...
+                OccurredAt=t), ?MException, "a file already gone cannot be deleted again");
+            db.addArtifactDisposition(ArtifactId=aid, Disposition="restored", OccurredAt=t + days(1));
+            tc.verifyNumElements(LabScratchDb.column(db.getArtifacts(ArtifactId=aid, PresentOnly=true), ...
+                "artifact_id"), 1, "restored: present again");
+            T = db.getArtifactDispositions(ArtifactId=aid);
+            tc.verifyEqual(LabScratchDb.column(T, "disposition"), ["restored"; "deleted"], "newest first");
+        end
+
+        function recordEventRecordsReplacedAndRestoredFiles(tc)
+            % v1 at a path; v2 overwrites it (replaces v1); v3 writes v1's
+            % bytes again (replaces v2): v1's row is reused and restored.
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("rr", 1);
+            [a1, v1] = ClientApiTests.analysisRecord(fx, w);
+            db.recordEvent("analysis", a1{:});
+            [a2, v2] = ClientApiTests.analysisRecord(fx, w, Path=v1.Path, Replaces=v1.OutputId);
+            db.recordEvent("analysis", a2{:});
+            present = @() LabScratchDb.column(db.getArtifacts(RelativePath=v1.Path, ...
+                StorageRootId=fx.RootId, PresentOnly=true), "artifact_id");
+            tc.verifyEqual(present(), v2.OutputId, "v2 is at the path; v1 was replaced");
+            tc.verifyEqual(LabScratchDb.column(db.getArtifactDispositions(ArtifactId=v1.OutputId), ...
+                "successor_artifact_id"), v2.OutputId);
+            [a3, ~] = ClientApiTests.analysisRecord(fx, w, Path=v1.Path, Checksum=v1.Checksum, ...
+                Replaces=v2.OutputId);
+            out = db.recordEvent("analysis", a3{:});
+            tc.verifyEqual(out.OutputIds, v1.OutputId, "the same bytes: v1's row");
+            tc.verifyTrue(out.Unchanged);
+            tc.verifyEqual(present(), v1.OutputId, "v1 restored, v2 replaced");
+            tc.verifyEqual(LabScratchDb.column(db.getArtifactDispositions(ArtifactId=v1.OutputId), ...
+                "disposition"), ["restored"; "replaced"]);
+            dup = fx.Db.runQuery("SELECT * FROM lab.fn_check_integrity() WHERE check_name = " + ...
+                "'duplicate_active_path' AND subject = " + ...
+                LabScratchDb.quote(string(fx.RootId) + ":" + v1.Path));
+            tc.verifyEqual(height(dup), 0, "one present file at the path");
+        end
+
         function statementTimeoutStopsALongStatement(tc)
             tc.requireDb();
             s = tc.Fx.connectionSettings();
@@ -483,6 +581,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                 opts.Checksum (1,1) string = string(missing)
                 opts.InputId (1,1) string = string(missing)
                 opts.RootId double = []
+                opts.Replaces (1,1) string = string(missing)
             end
             ids.EventId = ClientApiTests.newId(fx);
             ids.OutputId = ClientApiTests.newId(fx);
@@ -504,6 +603,12 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                 root = fx.RootId;
             end
             t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            output = struct("artifact_id", ids.OutputId, "storage_root_id", root, ...
+                "relative_path", ids.Path, "checksum", ids.Checksum, ...
+                "size_bytes", 10, "role", "derived", "format", "mat");
+            if ~ismissing(opts.Replaces)
+                output.replaces = opts.Replaces;
+            end
             args = {"EventId", ids.EventId, "Digest", ids.Digest, "OccurredAt", t, ...
                 "SessionId", w.SessionId, ...
                 "Detail", struct("pipeline_name", "mtest/run", "code_version", "abc", ...
@@ -511,9 +616,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                         '{"fs": 30000.0, "big": 12345678901234567890}'), ...
                     "started_at", t, "finished_at", t + minutes(2), "status", "succeeded"), ...
                 "Inputs", struct("artifact_id", input, "role", "raw"), ...
-                "Outputs", struct("artifact_id", ids.OutputId, "storage_root_id", root, ...
-                    "relative_path", ids.Path, "checksum", ids.Checksum, ...
-                    "size_bytes", 10, "role", "derived", "format", "mat")};
+                "Outputs", output};
         end
     end
 end

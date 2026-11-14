@@ -76,6 +76,8 @@ ROW_KEYS = {
                        "value_type", "note", "set_at", "set_by", "set_login"},
     "retractions": {"retraction_id", "entity_kind", "entity_id", "reason", "retracted_at",
                     "retracted_by", "retracted_login"},
+    "dispositions": {"disposition_id", "artifact_id", "disposition", "successor_artifact_id",
+                     "occurred_at", "recorded_at", "recorded_by", "recorded_login", "note"},
 }
 ARRAYS = tuple(ROW_KEYS) + ("roleMeta",)
 VERIFICATION_KEYS = {"status", "verified_at", "verified_artifact_id"}
@@ -96,6 +98,7 @@ TIMESTAMPS = {
     "variables": {"retired_at": True, "created_at": False},
     "variableValues": {"set_at": False},
     "retractions": {"retracted_at": False},
+    "dispositions": {"occurred_at": False, "recorded_at": False},
 }
 # UTC ISO-8601 with a literal Z, the one form the page compares as text.
 TS = re.compile(r"^\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{6})?Z$")
@@ -206,6 +209,18 @@ def check_shape(data, source):
             bad("retraction %r has a bad entity" % r["retraction_id"])
         if not isinstance(r["reason"], str) or not r["reason"].strip():
             bad("retraction %r has no reason" % r["retraction_id"])
+    artifact_ids = {a["artifact_id"] for a in data["artifacts"]}
+    for r in data["dispositions"]:
+        did = r["disposition_id"]
+        if r["disposition"] not in ("replaced", "moved", "deleted", "restored"):
+            bad("disposition %r is %r" % (did, r["disposition"]))
+        if r["artifact_id"] not in artifact_ids:
+            bad("disposition %r names an artifact not in the export" % did)
+        succ = r["successor_artifact_id"]
+        if succ is not None and succ not in artifact_ids:
+            bad("disposition %r names a successor not in the export" % did)
+        if (r["disposition"] == "moved") != (succ is not None) and r["disposition"] != "replaced":
+            bad("disposition %r: a move names its successor, a deletion or restore none" % did)
 
     integ = data["integrity"]
     if not isinstance(integ, dict):
@@ -249,7 +264,7 @@ FIXTURE = r"""
 DO $fx$
 DECLARE
     proj uuid; root smallint; sess uuid;
-    e1 uuid; e2 uuid; a1 uuid; a2 uuid; an uuid;
+    e1 uuid; e2 uuid; a1 uuid; a2 uuid; a3 uuid; an uuid;
 BEGIN
     INSERT INTO lab.project (name) VALUES ('check_lab_data ' || gen_random_uuid())
         RETURNING project_id INTO proj;
@@ -281,6 +296,12 @@ BEGIN
     INSERT INTO lab.analysis_event (event_id, status) VALUES (an, 'succeeded');
     INSERT INTO lab.event_input (event_id, artifact_id, role) VALUES (an, a2, 'raw');
     PERFORM lab.fn_tag('artifact', a2::text, 'stage:raw');
+    -- the analysis's output, later removed by a clean-up
+    INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, checksum)
+        VALUES (an, root, 'check_lab_data/s1/spikes.npy', repeat('cd', 32))
+        RETURNING artifact_id INTO a3;
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at, note)
+        VALUES (a3, 'deleted', '2020-01-04T00:00:00Z', 'check_lab_data deletion');
     -- variables: a number whose text matters, updated; a text value, unset;
     -- a number too long for a double
     PERFORM lab.fn_set_variable('session', sess::text, 'check_lab_data depth', 1200,
@@ -405,6 +426,15 @@ def check_fixture(data, integrity_counts):
     rets = [r for r in data["retractions"] if r["entity_id"] == consumer[0]["event_id"]]
     if [(r["entity_kind"], r["reason"]) for r in rets] != [("event", "check_lab_data retraction")]:
         bad("the fixture's retraction came back as %r" % rets)
+
+    # the disposition, on the analysis's output
+    out = [a for a in data["artifacts"] if a["relative_path"] == "check_lab_data/s1/spikes.npy"]
+    if len(out) != 1 or out[0]["produced_by_event_id"] != consumer[0]["event_id"]:
+        bad("the analysis's output is not exported: %r" % out)
+    disp = [(d["disposition"], d["successor_artifact_id"], d["occurred_at"], d["note"])
+            for d in data["dispositions"] if d["artifact_id"] == out[0]["artifact_id"]]
+    if disp != [("deleted", None, "2020-01-04T00:00:00Z", "check_lab_data deletion")]:
+        bad("the fixture's disposition came back as %r" % disp)
 
     # the integrity summary agrees with lab.fn_check_integrity() itself
     got = {"%s/%s" % (c["severity"], c["check_name"]): c["count"]

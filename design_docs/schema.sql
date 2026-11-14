@@ -552,6 +552,56 @@ CREATE UNIQUE INDEX uq_retraction_artifact
     ON lab.retraction (artifact_id) WHERE artifact_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- File disposition: what became of a registered file
+-- ---------------------------------------------------------------------------
+-- An artifact row states that a file with these bytes was produced at this
+-- path. When the file is later overwritten (a step run again), moved (copied
+-- elsewhere and the original removed) or deleted (a clean-up), that statement
+-- is still true, and the analyses that read the old bytes must go on pointing
+-- at the row. So the row is neither superseded -- a correction, which lineage
+-- follows to the successor (fn_artifact_lineage, follow_corrections) -- nor
+-- retracted, which says it was entered in error. A disposition records what
+-- happened to the file instead, and lab.artifact_present leaves the row out.
+--
+-- Like a verification (lab.artifact_verification_latest), a disposition
+-- belongs to the *file* -- (storage root, relative path, checksum) -- not to
+-- one row: a correction of the artifact row describes the same file and
+-- shares its dispositions. The latest disposition of a file, in insertion
+-- order (disposition_id), is its state:
+--   replaced  other bytes are at the path now (successor: the row for them,
+--             at the same path, if it is registered)
+--   moved     the bytes are elsewhere now (successor: the row there, required,
+--             with the same checksum at another path)
+--   deleted   the file is gone
+--   restored  the same bytes are back at the path (after any of the above)
+-- trg_artifact_disposition_policy keeps the sequence meaningful: a file is
+-- disposed of only while present, restored only while disposed of.
+CREATE TABLE lab.artifact_disposition (
+    disposition_id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    artifact_id           uuid NOT NULL REFERENCES lab.artifact(artifact_id),
+    disposition           text NOT NULL,
+    successor_artifact_id uuid REFERENCES lab.artifact(artifact_id),
+    occurred_at           timestamptz NOT NULL,      -- when it happened to the file
+    recorded_at           timestamptz NOT NULL DEFAULT now(),
+    recorded_by           uuid REFERENCES lab.person(person_id),
+    note                  text,
+    attributes            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Login that inserted the row (trg_artifact_disposition_stamp_login).
+    recorded_login        text,
+    CONSTRAINT disposition_kind_ck CHECK (
+        disposition IN ('replaced', 'moved', 'deleted', 'restored')),
+    CONSTRAINT disposition_successor_ck CHECK (
+        CASE disposition
+            WHEN 'moved'    THEN successor_artifact_id IS NOT NULL
+            WHEN 'deleted'  THEN successor_artifact_id IS NULL
+            WHEN 'restored' THEN successor_artifact_id IS NULL
+            ELSE true
+        END),
+    CONSTRAINT disposition_not_self_ck CHECK (successor_artifact_id <> artifact_id),
+    CONSTRAINT disposition_attributes_object_ck CHECK (jsonb_typeof(attributes) = 'object')
+);
+
+-- ---------------------------------------------------------------------------
 -- Tags
 -- ---------------------------------------------------------------------------
 -- Hashtag-style labels on events, artifacts, subjects, sessions and projects,
@@ -817,6 +867,9 @@ CREATE INDEX ix_analysis_params_gin  ON lab.analysis_event USING gin (parameters
 -- whole verification log per artifact, i.e. quadratic in database size.
 CREATE INDEX ix_artifact_verification_artifact
     ON lab.artifact_verification (artifact_id, verified_at DESC);
+-- Read the same way as the verifications: latest disposition per file.
+CREATE INDEX ix_artifact_disposition_artifact
+    ON lab.artifact_disposition (artifact_id, disposition_id DESC);
 
 CREATE INDEX ix_subject_project          ON lab.subject (project_id);
 CREATE INDEX ix_project_member_person    ON lab.project_member (person_id);
@@ -919,7 +972,7 @@ BEGIN
 
     IF TG_TABLE_NAME IN ('artifact_verification', 'maintenance_log',
                          'row_history', 'schema_version', 'tag_assignment',
-                         'variable_value', 'retraction') THEN
+                         'variable_value', 'retraction', 'artifact_disposition') THEN
         RAISE EXCEPTION
           '% on %.% is not allowed: this table is an append-only log.',
           TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
@@ -949,7 +1002,7 @@ BEGIN
         'husbandry_event','endpoint_event','histology_event','analysis_event',
         'artifact','event_input',
         'artifact_verification','maintenance_log','row_history','schema_version',
-        'tag_assignment','variable_value','retraction'
+        'tag_assignment','variable_value','retraction','artifact_disposition'
     ] LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_immutable_%1$s ON lab.%1$s;', t);
@@ -1469,6 +1522,9 @@ BEGIN
     ELSIF TG_TABLE_NAME = 'retraction' THEN
         NEW.retracted_login := session_user;
         NEW.retracted_by := coalesce(NEW.retracted_by, lab.fn_current_person());
+    ELSIF TG_TABLE_NAME = 'artifact_disposition' THEN
+        NEW.recorded_login := session_user;
+        NEW.recorded_by := coalesce(NEW.recorded_by, lab.fn_current_person());
     ELSIF TG_TABLE_NAME = 'variable_value' THEN
         NEW.set_login := session_user;
     ELSE
@@ -1496,6 +1552,10 @@ CREATE TRIGGER trg_tag_assignment_stamp_login
 
 CREATE TRIGGER trg_retraction_stamp_login
     BEFORE INSERT ON lab.retraction
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_artifact_disposition_stamp_login
+    BEFORE INSERT ON lab.artifact_disposition
     FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
 
 CREATE TRIGGER trg_variable_value_stamp_login
@@ -1716,6 +1776,77 @@ CREATE TRIGGER trg_retraction_policy
     BEFORE INSERT ON lab.retraction
     FOR EACH ROW EXECUTE FUNCTION lab.fn_retraction_policy();
 
+-- What may be recorded about a file (see lab.artifact_disposition): it is
+-- replaced, moved or deleted only while present, and restored only while it
+-- is not. A move names the row for the same bytes at another path; a
+-- replacement, when it names one, the row for other bytes at the same path.
+-- One writer at a time per file, so two clients cannot both dispose of it.
+CREATE OR REPLACE FUNCTION lab.fn_artifact_disposition_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_file   lab.artifact%ROWTYPE;
+    v_next   lab.artifact%ROWTYPE;
+    v_latest text;
+BEGIN
+    SELECT * INTO v_file FROM lab.artifact a WHERE a.artifact_id = NEW.artifact_id;
+    IF NOT FOUND THEN
+        RETURN NEW;     -- the foreign key reports it
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        concat_ws(':', 'lab.artifact_disposition', v_file.storage_root_id,
+                  v_file.relative_path, v_file.checksum), 0));
+
+    SELECT d.disposition INTO v_latest
+    FROM lab.artifact f
+    JOIN lab.artifact_disposition d ON d.artifact_id = f.artifact_id
+    WHERE f.storage_root_id = v_file.storage_root_id
+      AND f.relative_path   = v_file.relative_path
+      AND f.checksum        = v_file.checksum
+    ORDER BY d.disposition_id DESC
+    LIMIT 1;
+
+    IF NEW.disposition = 'restored' THEN
+        IF v_latest IS NULL OR v_latest = 'restored' THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('the file of artifact %s is present: there is nothing to restore',
+                                 NEW.artifact_id);
+        END IF;
+    ELSIF v_latest IS NOT NULL AND v_latest <> 'restored' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = format('the file of artifact %s is already recorded as %s',
+                             NEW.artifact_id, v_latest),
+            HINT    = 'Record ''restored'' first if the same bytes came back.';
+    END IF;
+
+    IF NEW.successor_artifact_id IS NOT NULL THEN
+        SELECT * INTO v_next FROM lab.artifact a WHERE a.artifact_id = NEW.successor_artifact_id;
+        IF FOUND AND NEW.disposition = 'moved'
+           AND (v_next.checksum <> v_file.checksum
+                OR (v_next.storage_root_id = v_file.storage_root_id
+                    AND v_next.relative_path = v_file.relative_path)) THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('artifact %s cannot be where artifact %s moved: a move keeps '
+                                 'the bytes (the same checksum) at another path',
+                                 NEW.successor_artifact_id, NEW.artifact_id);
+        END IF;
+        IF FOUND AND NEW.disposition = 'replaced'
+           AND (v_next.storage_root_id <> v_file.storage_root_id
+                OR v_next.relative_path <> v_file.relative_path
+                OR v_next.checksum = v_file.checksum) THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('artifact %s cannot have replaced artifact %s: a replacement '
+                                 'is other bytes (another checksum) at the same path',
+                                 NEW.successor_artifact_id, NEW.artifact_id);
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_artifact_disposition_policy
+    BEFORE INSERT ON lab.artifact_disposition
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_artifact_disposition_policy();
+
 -- Edit history for the mutable tables (see lab.row_history). SECURITY DEFINER
 -- so that clients need no INSERT privilege on row_history and cannot write
 -- forged history rows; the trigger arguments name the table's primary-key
@@ -1886,6 +2017,35 @@ CREATE VIEW lab.artifact_verification_latest AS
         ORDER BY av.verified_at DESC, av.verification_id DESC
         LIMIT 1
     ) v ON true;
+
+-- The latest disposition of each artifact row's file, by file like the
+-- verifications above: every row describing (root, path, checksum) shares it.
+-- disposed_artifact_id is the row the disposition was recorded against.
+CREATE VIEW lab.artifact_disposition_latest AS
+    SELECT a.artifact_id, d.disposition_id, d.disposed_artifact_id, d.disposition,
+           d.successor_artifact_id, d.occurred_at, d.recorded_at, d.recorded_by
+    FROM lab.artifact a
+    JOIN LATERAL (
+        SELECT ad.disposition_id, ad.artifact_id AS disposed_artifact_id,
+               ad.disposition, ad.successor_artifact_id, ad.occurred_at,
+               ad.recorded_at, ad.recorded_by
+        FROM lab.artifact f
+        JOIN lab.artifact_disposition ad ON ad.artifact_id = f.artifact_id
+        WHERE f.storage_root_id = a.storage_root_id
+          AND f.relative_path   = a.relative_path
+          AND f.checksum        = a.checksum
+        ORDER BY ad.disposition_id DESC
+        LIMIT 1
+    ) d ON true;
+
+-- Active artifacts whose file is where the row says it is: not replaced,
+-- moved or deleted since (or restored since). Where to find a file; the
+-- integrity checks of files read this, not artifact_active.
+CREATE VIEW lab.artifact_present AS
+    SELECT a.* FROM lab.artifact_active a
+    WHERE NOT EXISTS (
+        SELECT 1 FROM lab.artifact_disposition_latest d
+        WHERE d.artifact_id = a.artifact_id AND d.disposition <> 'restored');
 
 -- Uniform edge list for graph tooling.
 CREATE VIEW lab.provenance_edge AS
@@ -2762,7 +2922,7 @@ LANGUAGE sql STABLE AS $$
     -- new artifact row for the same file, and the failure must follow it.
     SELECT 'error', 'artifact_verification_failed', a.artifact_id::text,
            format('latest verification is %s (%s)', v.status, v.verified_at)
-    FROM lab.artifact_active a
+    FROM lab.artifact_present a
     JOIN lab.artifact_verification_latest v ON v.artifact_id = a.artifact_id
     WHERE v.status <> 'ok'
 
@@ -2778,7 +2938,7 @@ LANGUAGE sql STABLE AS $$
     -- file, so a correction does not make a verified file look unchecked).
     SELECT 'warning', 'artifact_never_verified', a.artifact_id::text,
            format('registered %s, no verification recorded', a.created_at)
-    FROM lab.artifact_active a
+    FROM lab.artifact_present a
     WHERE NOT EXISTS (SELECT 1 FROM lab.artifact_verification_latest v
                       WHERE v.artifact_id = a.artifact_id)
 
@@ -2885,13 +3045,26 @@ LANGUAGE sql STABLE AS $$
     JOIN lab.retraction r ON r.artifact_id = lab.fn_artifact_current(ei.artifact_id)
 
     UNION ALL
-    -- Two active artifacts at one path: the NAS file can only be one of them.
+    -- Two present artifacts at one path: the file can only be one of them. A
+    -- file overwritten without a 'replaced' disposition shows up here.
     SELECT 'warning', 'duplicate_active_path',
            a.storage_root_id || ':' || a.relative_path,
-           format('%s active artifacts share this path', count(*))
-    FROM lab.artifact_active a
+           format('%s present artifacts share this path', count(*))
+    FROM lab.artifact_present a
     GROUP BY a.storage_root_id, a.relative_path
-    HAVING count(*) > 1;
+    HAVING count(*) > 1
+
+    UNION ALL
+    -- A file recorded as replaced, moved or deleted that a later check found
+    -- at its path with its bytes: one of the two records is wrong.
+    SELECT 'warning', 'disposed_file_found', a.artifact_id::text,
+           format('recorded as %s at %s, but verified ok at %s', d.disposition,
+                  d.occurred_at, v.verified_at)
+    FROM lab.artifact_active a
+    JOIN lab.artifact_disposition_latest d
+      ON d.artifact_id = a.artifact_id AND d.disposition <> 'restored'
+    JOIN lab.artifact_verification_latest v
+      ON v.artifact_id = a.artifact_id AND v.status = 'ok' AND v.verified_at > d.occurred_at;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -2914,7 +3087,7 @@ INSERT INTO lab.artifact_role (code, label) VALUES
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO lab.acquisition_system (code, label) VALUES
-    ('intan_rhx','Intan RHX'), ('open_ephys','Open Ephys')
+    ('intan_rhx','Intan RHX'), ('open_ephys','Open Ephys'), ('tdt_synapse','TDT Synapse')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO lab.species (code, common_name) VALUES

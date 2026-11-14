@@ -669,6 +669,79 @@ classdef CarasLabDB < handle
             s = obj.pSet(s, "verified_at", opts.VerifiedAt);
             verificationId = double(obj.pInsertReturning(obj.pT("artifact_verification"), s, "verification_id"));
         end
+
+        function dispositionId = addArtifactDisposition(obj, opts)
+            %ADDARTIFACTDISPOSITION Record what became of a registered file; returns disposition_id.
+            %   addArtifactDisposition(ArtifactId=aid, Disposition="deleted", OccurredAt=t)
+            %   addArtifactDisposition(ArtifactId=aid, Disposition="moved", ...
+            %       SuccessorArtifactId=newAid, OccurredAt=t, Note="to the NAS")
+            %
+            %   Disposition is "replaced" (other bytes are at the path now;
+            %   SuccessorArtifactId, when given, is their row), "moved" (the
+            %   bytes are elsewhere; SuccessorArtifactId is required: the row
+            %   for the same checksum at the new path), "deleted", or
+            %   "restored" (the same bytes are back at the path).
+            %
+            %   The artifact row stays active: a disposition is not a
+            %   correction (lineage through the row is unchanged, so analyses
+            %   that read the old bytes still point at them) and not a
+            %   retraction (the row was not entered in error). The file
+            %   leaves lab.artifact_present, i.e. getArtifacts(PresentOnly=true),
+            %   and the integrity checks of files skip it. A disposition
+            %   belongs to the file (storage root, path, checksum), so it may
+            %   name any row describing that file, and every such row shares
+            %   it. The database refuses one that does not fit the file's
+            %   state: disposing of a file already recorded as gone, or
+            %   restoring one that is present.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.ArtifactId (1,1) string
+                opts.Disposition (1,1) string {mustBeMember(opts.Disposition, ...
+                    ["replaced", "moved", "deleted", "restored"])}
+                opts.OccurredAt (1,1) datetime
+                opts.SuccessorArtifactId (1,1) string = string(missing)
+                opts.Note (1,1) string = string(missing)
+                opts.Attributes = []
+                opts.RecordedBy (1,1) string = string(missing)
+            end
+            s = struct("artifact_id", obj.pCheckUuid(opts.ArtifactId, "ArtifactId"), ...
+                "disposition", opts.Disposition, "occurred_at", opts.OccurredAt);
+            s = obj.pSet(s, "successor_artifact_id", ...
+                obj.pCheckUuid(opts.SuccessorArtifactId, "SuccessorArtifactId"));
+            s = obj.pSet(s, "note", opts.Note);
+            s = obj.pSet(s, "attributes", opts.Attributes);
+            s = obj.pSet(s, "recorded_by", obj.pCreatedBy(opts.RecordedBy));
+            dispositionId = double(obj.pInsertReturning(obj.pT("artifact_disposition"), ...
+                s, "disposition_id"));
+        end
+
+        function T = getArtifactDispositions(obj, opts)
+            %GETARTIFACTDISPOSITIONS The file-disposition log, or each file's latest disposition.
+            %   T = getArtifactDispositions(ArtifactId=aid)
+            %       the rows recorded against this artifact row, newest first
+            %   T = getArtifactDispositions(ArtifactId=aid, LatestPerFile=true)
+            %       the latest disposition of its file, whichever row of the
+            %       file it was recorded against (disposed_artifact_id), from
+            %       lab.artifact_disposition_latest; no row: never disposed of
+            %   Disposition= filters on "replaced", "moved", "deleted" or
+            %   "restored". See ADDARTIFACTDISPOSITION.
+            arguments
+                obj (1,1) CarasLabDB
+                opts.ArtifactId (1,1) string = string(missing)
+                opts.Disposition (1,1) string = string(missing)
+                opts.LatestPerFile (1,1) logical = false
+            end
+            obj.pCheckMember(opts.Disposition, ["replaced", "moved", "deleted", "restored"], ...
+                "Disposition");
+            f = struct();
+            f = obj.pSet(f, "artifact_id", opts.ArtifactId);
+            f = obj.pSet(f, "disposition", opts.Disposition);
+            if opts.LatestPerFile
+                T = obj.pSelectFrom(obj.pT("artifact_disposition_latest"), f, OrderBy="artifact_id");
+            else
+                T = obj.pSelectFrom(obj.pT("artifact_disposition"), f, OrderBy="disposition_id DESC");
+            end
+        end
     end
 
     % ==================================================================
@@ -943,6 +1016,10 @@ classdef CarasLabDB < handle
             %   (RelativePath exactly, with '/' separators, as stored);
             %   PathPrefix= keeps the rows whose relative_path starts with
             %   that text (a folder: end it with '/').
+            %   PresentOnly=true reads lab.artifact_present instead: active
+            %   rows whose file has not been recorded as replaced, moved or
+            %   deleted since (see ADDARTIFACTDISPOSITION) -- where a file is
+            %   now. It needs ActiveOnly=true.
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
@@ -954,6 +1031,7 @@ classdef CarasLabDB < handle
                 opts.StorageRootId double {mustBeInteger, mustBeScalarOrEmpty} = []
                 opts.RelativePath (1,1) string = string(missing)
                 opts.PathPrefix (1,1) string = string(missing)
+                opts.PresentOnly (1,1) logical = false
                 opts.ActiveOnly (1,1) logical = obj.UseActiveViews
                 opts.Limit (1,1) double {mustBeInteger, mustBeNonnegative} = 0
                 opts.Tags string = strings(1, 0)       % must carry all of these
@@ -963,6 +1041,13 @@ classdef CarasLabDB < handle
             tbl = obj.pT("artifact_version");
             if opts.ActiveOnly
                 tbl = obj.pT("artifact_active");
+            end
+            if opts.PresentOnly
+                if ~opts.ActiveOnly
+                    error("CarasLabDB:invalidValue", ...
+                        "PresentOnly=true needs ActiveOnly=true: only a current row's file can be present.");
+                end
+                tbl = obj.pT("artifact_present");
             end
             f = struct();
             f = obj.pSet(f, "artifact_id", opts.ArtifactId);
@@ -1657,17 +1742,18 @@ classdef CarasLabDB < handle
         end
 
         function out = pRecordEventRows(obj, eventType, base, detail, digest, attrs, ...
-                inputs, outputs, skipMissing)
+                inputs, outputs, replaces, skipMissing)
             %PRECORDEVENTROWS The writes of RECORDEVENT. Run only inside PTRANSACT.
             %   BASE is the lab.event insert struct with event_id set; ATTRS
             %   its attributes with client_digest added; INPUTS and OUTPUTS
-            %   cell arrays of checked event_input / artifact insert structs.
+            %   cell arrays of checked event_input / artifact insert structs;
+            %   REPLACES the artifact_id each output overwrote ("" for none).
             eventId = base.event_id;
             litId = obj.sqlLiteral(eventId) + "::uuid";
             nOut = numel(outputs);
             out = struct("EventId", eventId, "Outcome", "inserted", ...
                 "OutputIds", strings(nOut, 1), "Unchanged", false(nOut, 1), ...
-                "SkippedInputs", strings(0, 1));
+                "SkippedInputs", strings(0, 1), "SkippedReplaces", strings(0, 1));
 
             % 1. This record sent before, or another record under this id.
             E = obj.pSelect("SELECT coalesce(attributes->>'client_digest', '') AS client_digest, " + ...
@@ -1737,13 +1823,12 @@ classdef CarasLabDB < handle
             % takes the event's as stored (after trg_event_fill_subject); one
             % that names others is left for trg_artifact_matches_event to
             % refuse -- it is never re-filed here.
-            if all(out.Unchanged)
-                return
-            end
-            stored = obj.pRowsAsText(obj.pT("event"), "r.event_id = " + litId, "event_id");
             recordedBy = string(missing);
             if isfield(base, "recorded_by")
                 recordedBy = base.recorded_by;
+            end
+            if any(~out.Unchanged)
+                stored = obj.pRowsAsText(obj.pT("event"), "r.event_id = " + litId, "event_id");
             end
             for k = find(~out.Unchanged).'
                 a = outputs{k};
@@ -1757,6 +1842,42 @@ classdef CarasLabDB < handle
                 end
                 a = obj.pSet(a, "created_by", obj.pCreatedBy(recordedBy));
                 out.OutputIds(k) = obj.pInsertArtifact(a);
+            end
+
+            % 6. What became of the files the outputs took the place of, as
+            % of when the run finished.
+            doneAt = base.occurred_at;
+            if isfield(detail, "finished_at") && isdatetime(detail.finished_at)
+                doneAt = detail.finished_at;
+            end
+            by = obj.pCreatedBy(recordedBy);
+            for k = find(out.Unchanged).'
+                % The same bytes written again: if the file had been recorded
+                % as gone, it is back.
+                L = obj.pSelect("SELECT disposition FROM " + obj.pT("artifact_disposition_latest") + ...
+                    " WHERE artifact_id = " + obj.sqlLiteral(out.OutputIds(k)) + "::uuid;");
+                if height(L) > 0 && CarasLabDB.pColText(L.disposition(1)) ~= "restored"
+                    d = struct("artifact_id", out.OutputIds(k), "disposition", "restored", ...
+                        "occurred_at", doneAt);
+                    obj.pInsert(obj.pT("artifact_disposition"), obj.pSet(d, "recorded_by", by));
+                end
+            end
+            for k = 1:nOut
+                r = replaces(k);
+                if ismissing(r) || r == "" || r == out.OutputIds(k)
+                    continue
+                end
+                if skipMissing
+                    R = obj.pSelect("SELECT artifact_id::text AS artifact_id FROM " + ...
+                        obj.pT("artifact") + " WHERE artifact_id = " + obj.sqlLiteral(r) + "::uuid;");
+                    if height(R) == 0
+                        out.SkippedReplaces(end+1, 1) = r;
+                        continue
+                    end
+                end
+                d = struct("artifact_id", r, "disposition", "replaced", ...
+                    "successor_artifact_id", out.OutputIds(k), "occurred_at", doneAt);
+                obj.pInsert(obj.pT("artifact_disposition"), obj.pSet(d, "recorded_by", by));
             end
         end
 

@@ -39,6 +39,14 @@ function out = recordEvent(obj, eventType, opts)
 %     5. Inserts the new output files, produced by this event. An output
 %        that names no subject or session is filed under the event's; one
 %        that names others is refused by the database, never re-filed.
+%     6. Records what became of the files the outputs took the place of
+%        (lab.artifact_disposition, see ADDARTIFACTDISPOSITION): an output
+%        whose "replaces" names the row of the bytes it overwrote at the
+%        same path records that row as 'replaced' by it; a file already
+%        registered (step 2) that had been recorded as gone is 'restored'.
+%        Both happen when the run finished (Detail.finished_at, else
+%        OccurredAt). A "replaces" row the database does not have is an
+%        error, or with MissingInputs="skip" is listed in out.SkippedReplaces.
 %   Any failure rolls the whole transaction back: nothing is half written.
 %
 %   EventType is "analysis", "recording" or "behavior". Detail holds that
@@ -59,7 +67,8 @@ function out = recordEvent(obj, eventType, opts)
 %   Inputs is a struct array with fields artifact_id and, optionally, role.
 %   Outputs is a struct array with fields storage_root_id, relative_path
 %   and checksum, and optionally artifact_id, checksum_algo, size_bytes,
-%   role, format, subject_id, session_id and attributes. A field outside
+%   role, format, subject_id, session_id, attributes and replaces (the
+%   artifact_id of the earlier bytes at the same path; see step 6). A field outside
 %   these lists is an error (CarasLabDB:invalidValue): field names become
 %   column names, so they are checked against fixed lists here.
 %
@@ -82,6 +91,7 @@ function out = recordEvent(obj, eventType, opts)
 %                      describes that file (its own new row, or the existing one)
 %       Unchanged      logical column: the file was registered already
 %       SkippedInputs  string column: input artifact ids left out (MissingInputs="skip")
+%       SkippedReplaces string column: "replaces" rows left out (MissingInputs="skip")
 %
 %   See also CARASLABDB, ADDANALYSISEVENT, ADDARTIFACT, ADDEVENTINPUT,
 %   CARASLABDB.JSONTEXT.
@@ -152,8 +162,9 @@ function out = recordEvent(obj, eventType, opts)
 
     outputColumns = ["artifact_id", "storage_root_id", "relative_path", "checksum", ...
         "checksum_algo", "size_bytes", "role", "format", "subject_id", "session_id", "attributes"];
-    local_onlyFields(opts.Outputs, outputColumns, "Outputs");
+    local_onlyFields(opts.Outputs, [outputColumns, "replaces"], "Outputs");
     outputs = cell(1, numel(opts.Outputs));
+    replaces = strings(1, numel(opts.Outputs));
     where = strings(1, numel(opts.Outputs));
     for k = 1:numel(opts.Outputs)
         o = opts.Outputs(k);
@@ -172,6 +183,10 @@ function out = recordEvent(obj, eventType, opts)
         end
         if isfield(a, "artifact_id")
             a.artifact_id = obj.pCheckUuid(a.artifact_id, "Outputs.artifact_id");
+        end
+        if isfield(a, "replaces")
+            replaces(k) = obj.pCheckUuid(a.replaces, "Outputs.replaces");
+            a = rmfield(a, "replaces");
         end
         if isfield(a, "checksum_algo")
             obj.pCheckMember(a.checksum_algo, ["sha256", "md5", "blake3"], "Outputs.checksum_algo");
@@ -195,7 +210,7 @@ function out = recordEvent(obj, eventType, opts)
     base = obj.pEventBase(eventType, fake);
 
     out = obj.pTransact(@() obj.pRecordEventRows(eventType, base, detail, digest, attrs, ...
-        inputs, outputs, opts.MissingInputs == "skip"));
+        inputs, outputs, replaces, opts.MissingInputs == "skip"));
 end
 
 % -------------------------------------------------------------------------

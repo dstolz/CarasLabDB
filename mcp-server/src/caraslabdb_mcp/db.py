@@ -88,6 +88,8 @@ ORDER_BY_VARIABLE_VALUE = "value_id"
 # Unique: one current value per (entity, variable).
 ORDER_BY_VARIABLE_CURRENT = "entity_kind, entity_id, variable"
 ORDER_BY_RETRACTION = "retracted_at DESC, retraction_id DESC"
+ORDER_BY_DISPOSITION = "disposition_id DESC"
+ORDER_BY_DISPOSITION_LATEST = "artifact_id"
 ORDER_BY_SUBJECT = "subject_id"
 ORDER_BY_SESSION = "subject_id, label"
 ORDER_BY_VERIFICATION_LATEST = "artifact_id"
@@ -119,6 +121,7 @@ DEFAULT_ORDER_BY = {
     "lab.artifact": ORDER_BY_ARTIFACT,
     "lab.artifact_active": ORDER_BY_ARTIFACT,
     "lab.artifact_version": ORDER_BY_ARTIFACT,
+    "lab.artifact_present": ORDER_BY_ARTIFACT,
     "lab.event_input": "event_id, artifact_id",
     "lab.artifact_verification": ORDER_BY_VERIFICATION,
     "lab.artifact_verification_latest": ORDER_BY_VERIFICATION_LATEST,
@@ -132,6 +135,8 @@ DEFAULT_ORDER_BY = {
     "lab.variable_value": ORDER_BY_VARIABLE_VALUE,
     "lab.variable_current": ORDER_BY_VARIABLE_CURRENT,
     "lab.retraction": ORDER_BY_RETRACTION,
+    "lab.artifact_disposition": ORDER_BY_DISPOSITION,
+    "lab.artifact_disposition_latest": ORDER_BY_DISPOSITION_LATEST,
 }
 DEFAULT_ORDER_BY.update({t: "event_id" for t in schema_map.EVENT_DETAIL_TABLE.values()})
 
@@ -153,6 +158,7 @@ PAGE_KEYS = {
                             ("verification_id", True, "bigint")),
     ORDER_BY_VERIFICATION_LATEST: (("artifact_id", False, "uuid"),),
     ORDER_BY_TAG_ASSIGNMENT: (("assignment_id", True, "bigint"),),
+    ORDER_BY_DISPOSITION: (("disposition_id", True, "bigint"),),
     ORDER_BY_TAG_CURRENT: (("tag", False, "text"), ("assignment_id", False, "bigint")),
     ORDER_BY_SUBJECT: (("subject_id", False, "text"),),
     ORDER_BY_SESSION: (("subject_id", False, "text"), ("label", False, "text")),

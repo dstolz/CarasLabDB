@@ -17,7 +17,8 @@ data. It has six parts:
   of the pre-launch numbering (they took a first prototype to what was then
   version 5, the schema now called 1); nothing applies or tests them. It includes
   the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
-  tables (`variable`, `variable_value`) and `retraction`;
+  tables (`variable`, `variable_value`), `retraction` and
+  `artifact_disposition`;
   `design_docs/tagging.md` and `design_docs/variables.md` are the user-facing
   guides.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
@@ -40,7 +41,8 @@ data. It has six parts:
   artifact with its file's latest `verification`, the tag vocabulary as
   `tagNamespaces`/`tags` and the whole tag log as `tagAssignments`, the
   variable definitions as `variables` and the whole value log as
-  `variableValues` (values as text, exactly as stored), and `retractions`.
+  `variableValues` (values as text, exactly as stored), `retractions` and
+  `dispositions`.
   Current tags, current variable values and "active" are derived in the
   browser, in the same way as `tag_current`, `variable_current` and the
   `*_active` views. The `integrity` summary is not in `lab_data.sql`: it comes
@@ -108,7 +110,7 @@ records:
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
   `maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
-  `variable_value` and `retraction`.
+  `variable_value`, `retraction` and `artifact_disposition`.
   Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
   replaces. `event_active` / `artifact_active` views filter to current rows
@@ -120,7 +122,19 @@ records:
   `lab.fn_retract('event'|'artifact', id, reason)` appends a `retraction`
   row; the row stays, leaves the `*_active` views, and superseding it later
   restores it (the successor is active). Not a substitute for a correction.
-- The mutable tables (reference, project, `subject`, `session`) are edited in
+- **File disposition** records what became of a registered file:
+  `lab.artifact_disposition` (`replaced` / `moved` / `deleted` / `restored`,
+  with a successor row for a move, and for a replacement when it is
+  registered) is an append-only log that belongs to the *file* (root, path,
+  checksum), like verifications; `artifact_disposition_latest` is each file's
+  state and `artifact_present` the active rows whose file is still where the
+  row says. The row stays active -- a disposition is neither a correction
+  (lineage would follow it to the new bytes) nor a retraction -- and
+  `trg_artifact_disposition_policy` (advisory lock per file) allows a
+  disposition only while the file is present and `restored` only while it is
+  not. The integrity checks of files (`artifact_verification_failed`,
+  `artifact_never_verified`, `duplicate_active_path`) read `artifact_present`,
+  and `tools/verify_artifacts.py` checks only present files.- The mutable tables (reference, project, `subject`, `session`) are edited in
   place, and the `fn_log_row_change` triggers record every UPDATE/DELETE in
   `row_history`.
 - Two timestamps per event: `occurred_at` (when it happened) vs. `recorded_at`
@@ -195,7 +209,7 @@ records:
   for the tag reason above. A correction's variables are carried forward **by
   trigger** (`trg_event_carry_variables` / `trg_artifact_carry_variables`),
   not by the client — do not also copy them in MATLAB.
-- `lab.fn_check_integrity()` has 13 checks (see `database-design.md` §4.2);
+- `lab.fn_check_integrity()` has 14 checks (see `database-design.md` §4.2);
   a new invariant that a constraint cannot enforce gets a check there.
 
 Any schema change must preserve this pattern: never add a mutable column
@@ -321,11 +335,15 @@ Key behaviors baked into the class:
   `jsonencode`. The constructor takes `ConnectTimeout=` (sets
   `PGCONNECT_TIMEOUT` for the `postgresql()` call only), `StatementTimeout=`
   and `LockTimeout=` (session settings). `getArtifacts` takes
-  `StorageRootId=`, `RelativePath=`, `PathPrefix=`; `getSessions`
-  `RelativePath=`.
+  `StorageRootId=`, `RelativePath=`, `PathPrefix=`, `PresentOnly=`;
+  `getSessions` `RelativePath=`. `addArtifactDisposition` /
+  `getArtifactDispositions(LatestPerFile=)` (inline) write and read the
+  disposition log; `recordEvent` records an output's `replaces` row as
+  `replaced` and a reused file that was gone as `restored`.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
-  retract action (Ctrl+Delete), a daily husbandry entry grid (Ctrl+H) and an
+  retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
+  daily husbandry entry grid (Ctrl+H) and an
   integrity view (Ctrl+I); Ctrl+? lists the shortcuts. Its settings persist
   through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
 

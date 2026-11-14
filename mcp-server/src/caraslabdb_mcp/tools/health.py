@@ -10,19 +10,21 @@ def register(app):
 
         An empty result means healthy. Each row is (severity, check_name,
         subject, detail): severity is "error" or "warning", and subject is the
-        id (or storage_root:path) of the offending row. The 13 checks:
+        id (or storage_root:path) of the offending row. The 14 checks:
 
         - event_missing_detail (error): a typed event with no detail row.
         - artifact_verification_failed (error): the latest checksum check of
-          an active artifact's file was "missing" or "mismatch". By file,
-          not by row: the check follows the file across corrections.
+          a present artifact's file was "missing" or "mismatch". By file,
+          not by row: the check follows the file across corrections. A
+          file recorded as replaced, moved or deleted (see
+          get_artifact_dispositions) is not present and is not reported.
         - tag_cardinality_violation (error): an entity has more than one
           current tag in a single-valued namespace.
         - event_missing_subject (warning): a non-analysis event with no
           subject (rows predating that rule).
         - event_recorded_before_occurred (warning): occurred_at is more than a
           day after recorded_at, usually a client clock or time-zone bug.
-        - artifact_never_verified (warning): the file of an active artifact
+        - artifact_never_verified (warning): the file of a present artifact
           has never been checked (again by file).
         - artifact_producer_superseded (warning): an active artifact still
           attached to an event that has been corrected.
@@ -38,7 +40,10 @@ def register(app):
           lineage through it stops.
         - input_retracted (warning): an active event that consumed an
           artifact (in its current version) since retracted.
-        - duplicate_active_path (warning): two active artifacts at one path.
+        - duplicate_active_path (warning): two present artifacts at one
+          path; usually a file overwritten without a "replaced" disposition.
+        - disposed_file_found (warning): a file recorded as replaced, moved
+          or deleted that a later checksum check found at its path, intact.
 
         Errors are listed first, then by check_name and subject. Returns
         {"row_count", "limit", "truncated", "rows"}; `truncated` true means

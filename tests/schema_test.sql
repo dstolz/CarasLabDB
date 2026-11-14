@@ -1090,6 +1090,149 @@ SELECT pg_temp.assert(
         = '00000000-0000-0000-0000-0000000000a1',
     'a row that names no person is attributed to the login''s person; a named person is kept');
 
+-- ===========================================================================
+-- File disposition (lab.artifact_disposition, lab.artifact_present)
+-- ===========================================================================
+INSERT INTO lab.subject (subject_id, project_id) VALUES ('G3', '00000000-0000-0000-0000-0000000000b1');
+INSERT INTO lab.session (session_id, subject_id, label, storage_root_id, relative_path) VALUES
+    ('00000000-0000-0000-0000-0000000009c1', 'G3', 's1',
+     (SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'), 'G3/s1');
+INSERT INTO lab.event (event_id, event_type, session_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-0000000009e1', 'recording',
+        '00000000-0000-0000-0000-0000000009c1', '2026-10-01 09:00+00');
+INSERT INTO lab.recording_event (event_id) VALUES ('00000000-0000-0000-0000-0000000009e1');
+-- a1 raw file; a2 an output; a3 other bytes later written to a2's path;
+-- a4 a1's bytes at another path; a5 other bytes at another path.
+INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, relative_path, checksum)
+SELECT v.id::uuid, '00000000-0000-0000-0000-0000000009e1',
+       (SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'), v.path, repeat(v.hex, 32)
+FROM (VALUES ('00000000-0000-0000-0000-0000000009a1', 'G3/s1/raw.dat',      '11'),
+             ('00000000-0000-0000-0000-0000000009a2', 'G3/s1/out.mat',      '22'),
+             ('00000000-0000-0000-0000-0000000009a3', 'G3/s1/out.mat',      '33'),
+             ('00000000-0000-0000-0000-0000000009a4', 'G3/s1/copy/raw.dat', '11'),
+             ('00000000-0000-0000-0000-0000000009a5', 'G3/s1/other.dat',    '55')) AS v(id, path, hex);
+
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.artifact_present
+      WHERE artifact_id::text LIKE '00000000-0000-0000-0000-0000000009a_') = 5,
+    'every new file is present');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+            WHERE check_name = 'duplicate_active_path' AND subject LIKE '%:G3/s1/out.mat'),
+    'two present rows at one path: the overwrite was not recorded');
+
+-- replaced: other bytes at the same path, and only while present.
+INSERT INTO lab.artifact_disposition (artifact_id, disposition, successor_artifact_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-0000000009a2', 'replaced',
+        '00000000-0000-0000-0000-0000000009a3', '2026-10-02 09:00+00');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.artifact_present
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009a2')
+    AND EXISTS (SELECT 1 FROM lab.artifact_present
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009a3')
+    AND EXISTS (SELECT 1 FROM lab.artifact_active
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009a2'),
+    'a replaced file leaves artifact_present, its row stays active, its successor is present');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name = 'duplicate_active_path' AND subject LIKE '%:G3/s1/out.mat'),
+    'with the replacement recorded the path holds one present file');
+SELECT pg_temp.assert(
+    (SELECT recorded_login FROM lab.artifact_disposition
+      WHERE artifact_id = '00000000-0000-0000-0000-0000000009a2') = session_user,
+    'the disposition carries the login that recorded it');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a2', 'deleted', now())$q$,
+    'already recorded as replaced');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, successor_artifact_id, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a3', 'replaced',
+            '00000000-0000-0000-0000-0000000009a5', now())$q$,
+    'a replacement');
+
+-- A correction of a disposed row describes the same file: it is not present either.
+INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, relative_path,
+                          checksum, role, supersedes)
+SELECT '00000000-0000-0000-0000-0000000009b2', produced_by_event_id, storage_root_id,
+       relative_path, checksum, 'derived', artifact_id
+FROM lab.artifact WHERE artifact_id = '00000000-0000-0000-0000-0000000009a2';
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.artifact_present
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009b2')
+    AND (SELECT disposition FROM lab.artifact_disposition_latest
+          WHERE artifact_id = '00000000-0000-0000-0000-0000000009b2') = 'replaced',
+    'a disposition belongs to the file, so a correction of its row shares it');
+
+-- moved: the same bytes at another path, the successor required.
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a1', 'moved', now())$q$,
+    'disposition_successor_ck');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, successor_artifact_id, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a1', 'moved',
+            '00000000-0000-0000-0000-0000000009a5', now())$q$,
+    'a move keeps');
+INSERT INTO lab.artifact_disposition (artifact_id, disposition, successor_artifact_id, occurred_at, note)
+VALUES ('00000000-0000-0000-0000-0000000009a1', 'moved',
+        '00000000-0000-0000-0000-0000000009a4', '2026-10-03 09:00+00', 'to the copy folder');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.artifact_present
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009a1')
+    AND EXISTS (SELECT 1 FROM lab.artifact_present
+                WHERE artifact_id = '00000000-0000-0000-0000-0000000009a4'),
+    'a moved file leaves artifact_present; the row at its new path is present');
+
+-- A failed check of a file that is no longer there is not an integrity error;
+-- an ok check after it was recorded gone is a contradiction worth a warning.
+INSERT INTO lab.artifact_verification (artifact_id, status)
+VALUES ('00000000-0000-0000-0000-0000000009a1', 'missing');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                WHERE check_name IN ('artifact_verification_failed', 'artifact_never_verified')
+                  AND subject = '00000000-0000-0000-0000-0000000009a1'),
+    'the checks of files skip a file recorded as moved');
+INSERT INTO lab.artifact_verification (artifact_id, status, observed_checksum)
+VALUES ('00000000-0000-0000-0000-0000000009a1', 'ok', repeat('11', 32));
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+            WHERE check_name = 'disposed_file_found'
+              AND subject = '00000000-0000-0000-0000-0000000009a1'),
+    'a file verified ok after it was recorded moved is reported');
+
+-- deleted, then restored; restoring what is present is refused.
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, successor_artifact_id, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a5', 'deleted',
+            '00000000-0000-0000-0000-0000000009a4', now())$q$,
+    'disposition_successor_ck');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a5', 'restored', now())$q$,
+    'nothing to restore');
+INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+VALUES ('00000000-0000-0000-0000-0000000009a5', 'deleted', '2026-10-04 09:00+00');
+INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+VALUES ('00000000-0000-0000-0000-0000000009a5', 'restored', '2026-10-05 09:00+00');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.artifact_present
+            WHERE artifact_id = '00000000-0000-0000-0000-0000000009a5'),
+    'a restored file is present again');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+    VALUES ('00000000-0000-0000-0000-0000000009a5', 'restored', now())$q$,
+    'nothing to restore');
+
+-- The log is append-only.
+SELECT pg_temp.expect_error('UPDATE lab.artifact_disposition SET note = ''x''', 'append-only log');
+SELECT pg_temp.expect_error('DELETE FROM lab.artifact_disposition', 'append-only log');
+SELECT pg_temp.expect_error('TRUNCATE lab.artifact_disposition CASCADE', 'not allowed');
+
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.acquisition_system WHERE code = 'tdt_synapse'),
+    'TDT Synapse is a seeded acquisition system');
+
 -- ---------------------------------------------------------------------------
 -- Client metadata probes
 -- ---------------------------------------------------------------------------

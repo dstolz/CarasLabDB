@@ -61,6 +61,7 @@ classdef CarasLabDBApp < handle
         showTagEditor(obj, kind, entityId)
         showVariableEditor(obj, kind, entityId)
         showRetractDialog(obj, kind, entityId)
+        showFileDispositionDialog(obj, artifactId)
         showHusbandryEntry(obj)
         showIntegrityReport(obj)
         runCustomSQL(obj)
@@ -243,6 +244,7 @@ classdef CarasLabDBApp < handle
             %   Ctrl+Shift+S Add Subject · Ctrl+Shift+N Add Session ·
             %   Ctrl+D Edit/Supersede · Ctrl+T Tags, Ctrl+L Variables and
             %   Ctrl+Delete Retract for the selected row ·
+            %   Ctrl+Shift+F File disposition of the selected artifact ·
             %   Ctrl+H Daily husbandry · Ctrl+I Integrity report ·
             %   Enter Apply filters (browse tabs) ·
             %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters ·
@@ -273,6 +275,8 @@ classdef CarasLabDBApp < handle
                 obj.onAddMenu("subject");
             elseif key == "n" && ctrl && shift
                 obj.onAddMenu("session");
+            elseif key == "f" && ctrl && shift
+                obj.onFileDisposition();
             elseif key == "e" && ctrl
                 obj.onExport();
             elseif key == "d" && ctrl
@@ -356,6 +360,23 @@ classdef CarasLabDBApp < handle
                 return
             end
             obj.showRetractDialog(d.Entity, id);
+        end
+
+        function onFileDisposition(obj, ~, ~)
+            %ONFILEDISPOSITION Record what became of the selected artifact's file (Ctrl+Shift+F).
+            %   Replaced, moved, deleted or restored: the artifact row stays
+            %   active, and the file leaves lab.artifact_present.
+            d = obj.pCurrentTabDef();
+            if isempty(d) || d.Entity ~= "artifact"
+                uialert(obj.Fig, "Select a file on the Artifacts tab: what became of a " + ...
+                    "file is recorded for an artifact.", "File disposition");
+                return
+            end
+            [~, id] = obj.pRequireSelection("File disposition", "Select a row first.");
+            if ismissing(id)
+                return
+            end
+            obj.showFileDispositionDialog(id);
         end
 
         function onHusbandry(obj, ~, ~)

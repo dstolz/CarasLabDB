@@ -155,6 +155,19 @@ SELECT pg_temp.expect_error($q$DELETE FROM lab.variable_value$q$, 'permission de
 SELECT pg_temp.expect_error($q$DELETE FROM lab.retraction$q$, 'permission denied');
 SELECT pg_temp.expect_error($q$DELETE FROM lab.variable$q$, 'permission denied');
 
+-- May record what became of a file; the record is permanent and carries the
+-- member's login and person, whatever the member sends.
+INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at, recorded_login)
+VALUES ('00000000-0000-0000-0000-0000000000f1', 'deleted', now(), 'someone_else');
+SELECT pg_temp.assert(
+    (SELECT recorded_login || '|' || recorded_by FROM lab.artifact_disposition)
+        = 'rt_member|00000000-0000-0000-0000-0000000000a1'
+    AND NOT EXISTS (SELECT 1 FROM lab.artifact_present
+                    WHERE artifact_id = '00000000-0000-0000-0000-0000000000f1'),
+    'a member may record a file''s disposition; it records the login and the person');
+SELECT pg_temp.expect_error($q$UPDATE lab.artifact_disposition SET note = 'x'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.artifact_disposition$q$, 'permission denied');
+
 -- May add a person, but not map a login to one.
 INSERT INTO lab.person (full_name, email) VALUES ('Added By Member', 'added@example.edu');
 SELECT pg_temp.expect_error(
@@ -285,6 +298,8 @@ SELECT pg_temp.assert(
     AND lab.fn_variable_number('subject', 'R1', 'probe depth') = 1300
     AND (SELECT count(*) FROM lab.fn_artifact_lineage('00000000-0000-0000-0000-0000000000f1', 'up')) = 1
     AND (SELECT count(*) FROM lab.fn_check_integrity()) >= 0
+    AND (SELECT count(*) FROM lab.artifact_disposition_latest) = 1
+    AND NOT EXISTS (SELECT 1 FROM lab.artifact_present)
     AND lab.fn_tag_match('subject', 'R1', ARRAY['topic:roles_test'])
     AND NOT EXISTS (SELECT 1 FROM lab.fn_tag_filter_problems('subject', ARRAY['topic:roles_test'])),
     'the read-only login reads tables, views and the read-only functions');
@@ -300,6 +315,10 @@ SELECT pg_temp.expect_error(
     $q$SELECT lab.fn_set_variable('subject', 'R1', 'probe depth', 1)$q$, 'permission denied');
 SELECT pg_temp.expect_error(
     $q$SELECT lab.fn_retract('event', '00000000-0000-0000-0000-0000000000e1', 'x')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error(
+    $q$INSERT INTO lab.artifact_disposition (artifact_id, disposition, occurred_at)
+       VALUES ('00000000-0000-0000-0000-0000000000f1', 'restored', now())$q$,
     'permission denied');
 RESET SESSION AUTHORIZATION;
 

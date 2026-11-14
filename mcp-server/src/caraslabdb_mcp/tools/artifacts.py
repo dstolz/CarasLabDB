@@ -40,6 +40,7 @@ def register(app):
         any_tags: Optional[list[str]] = None,
         none_tags: Optional[list[str]] = None,
         active_only: bool = True,
+        present_only: bool = False,
         limit: int = db.DEFAULT_LIMIT,
         cursor: OptText = None,
     ) -> dict:
@@ -57,6 +58,13 @@ def register(app):
         replaced; to find the correction of artifact X use supersedes=X with
         active_only=False. Ordered newest-first by created_at, then
         artifact_id.
+
+        present_only=True keeps only files that are where their row says
+        (lab.artifact_present): active rows whose file has not been recorded
+        as replaced, moved or deleted since (see get_artifact_dispositions).
+        Use it to answer "where is this file now"; an active row that is not
+        present is still a true record of what was produced, and analyses
+        that read it still point at it. present_only needs active_only=True.
 
         "Which artifact is this file?": a file is identified by
         storage_root_id (see get_storage_roots) plus relative_path, the path
@@ -108,7 +116,12 @@ def register(app):
             checksum = checksum.strip().lower()
         relative_path = _path(relative_path, "relative_path")
         relative_path_prefix = _path(relative_path_prefix, "relative_path_prefix")
+        if present_only and not active_only:
+            raise ValueError("present_only=True needs active_only=True: only a current "
+                             "row's file can be present.")
         table = "lab.artifact_active" if active_only else "lab.artifact_version"
+        if present_only:
+            table = "lab.artifact_present"
         return db.select_from(table, {
             "artifact_id": artifact_id, "produced_by_event_id": produced_by_event_id,
             "subject_id": subject_id, "session_id": session_id,
@@ -187,3 +200,56 @@ def register(app):
         return db.select_from("lab.artifact_verification", {
             "artifact_id": artifact_id,
         }, limit=limit, order_by=db.ORDER_BY_VERIFICATION, paged=True, cursor=cursor)
+
+    @app.tool()
+    def get_artifact_dispositions(
+        artifact_id: OptText = None,
+        disposition: OptText = None,
+        latest_per_file: bool = False,
+        limit: int = db.DEFAULT_LIMIT,
+        cursor: OptText = None,
+    ) -> dict:
+        """List what became of registered files: replaced, moved, deleted, restored.
+
+        An artifact row is a permanent record that a file with these bytes
+        was produced at this path. When the file is later overwritten (a
+        step run again: "replaced"), moved elsewhere ("moved") or removed
+        ("deleted"), a disposition records it (lab.artifact_disposition);
+        "restored" says the same bytes are back. The artifact row stays
+        active -- it is neither a correction nor a retraction, and lineage
+        through it is unchanged -- but it leaves get_artifacts(
+        present_only=True). successor_artifact_id names the row for the new
+        bytes at the same path (replaced) or for the same bytes at the new
+        path (moved). Rows carry disposition_id, artifact_id, disposition,
+        successor_artifact_id, occurred_at (when it happened to the file),
+        recorded_at, recorded_by (person_id), note, attributes and
+        recorded_login.
+
+        A disposition belongs to the file (storage root, path, checksum),
+        and a correction gives the same file a new artifact row, so the log
+        for the current row's id can be empty although its file was moved.
+        latest_per_file=True answers "what is the state of this file now"
+        instead (lab.artifact_disposition_latest): one row per artifact whose
+        file has a disposition, taken across every row describing the file,
+        with disposed_artifact_id naming the row it was recorded against.
+        An artifact with no row there has never been disposed of.
+
+        disposition is one of "replaced", "moved", "deleted", "restored"
+        (anything else is an error). A filter left out (or null) is not
+        applied. The log is ordered newest first by disposition_id;
+        latest_per_file by artifact_id. Returns {"row_count", "limit",
+        "truncated", "next_cursor", "rows"}; for the next page call again
+        with cursor=<next_cursor> (`limit`, max 1000, caps each page).
+        """
+        if disposition is not None and disposition not in (
+                "replaced", "moved", "deleted", "restored"):
+            raise ValueError(
+                f"disposition must be 'replaced', 'moved', 'deleted' or 'restored', "
+                f"got {disposition!r}.")
+        if latest_per_file:
+            return db.select_from("lab.artifact_disposition_latest", {
+                "artifact_id": artifact_id, "disposition": disposition,
+            }, limit=limit, paged=True, cursor=cursor)
+        return db.select_from("lab.artifact_disposition", {
+            "artifact_id": artifact_id, "disposition": disposition,
+        }, limit=limit, order_by=db.ORDER_BY_DISPOSITION, paged=True, cursor=cursor)

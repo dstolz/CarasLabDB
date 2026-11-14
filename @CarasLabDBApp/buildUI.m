@@ -62,9 +62,9 @@ function buildUI(obj)
         "ValueChangedFcn", @(s,e) obj.onRefresh(s,e));
 
     % ---- toolbar, row 2: the selected row -----------------------------------
-    rb = uigridlayout(root, [1 6]);
+    rb = uigridlayout(root, [1 7]);
     rb.Layout.Row = 2; rb.Layout.Column = 1;
-    rb.ColumnWidth = {90, 130, 80, 100, 90, '1x'};
+    rb.ColumnWidth = {90, 130, 80, 100, 90, 70, '1x'};
     rb.Padding = [0 0 0 0];
 
     uilabel(rb, "Text", "Selected row:", "HorizontalAlignment", "right");
@@ -78,6 +78,10 @@ function buildUI(obj)
     uibutton(rb, "Text", "Retract…", ...
         "Tooltip", "Retract the selected event or artifact (Ctrl+Delete)", ...
         "ButtonPushedFcn", @(s,e) obj.onRetract(s,e));
+    uibutton(rb, "Text", "File…", ...
+        "Tooltip", "Record that the selected artifact's file was replaced, moved, " + ...
+        "deleted or restored (Ctrl+Shift+F)", ...
+        "ButtonPushedFcn", @(s,e) obj.onFileDisposition(s,e));
     uilabel(rb, "Text", "");   % spacer
 
     % ---- body: filter panel | tab group ------------------------------------

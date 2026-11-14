@@ -626,13 +626,15 @@ set PGUSER=lab_verifier
 The service account needs read access to the share; a mapped drive letter
 such as `Z:\` belongs to a signed-in user's session, so use the UNC path. A
 root whose directory is missing or empty is refused, so an unmounted share
-does not record every file as missing. `--older-than-days 7` checks only
+does not record every file as missing. Only present files are checked: one
+recorded as replaced, moved or deleted (`lab.artifact_disposition`) is not
+where its row says, by design. `--older-than-days 7` checks only
 files not verified in the last week and `--limit N` caps one run. Exit code
 1 means at least one file is missing or mismatched.
 
 ### 4.3 Integrity report
 
-`lab.fn_check_integrity()` returns one row per problem (13 checks; see
+`lab.fn_check_integrity()` returns one row per problem (14 checks; see
 [database-design.md](database-design.md) §4.2); an empty result is healthy.
 Any login can run it; use `lab_dashboard`. Save this as
 `C:\src\CarasLabDB\deploy\integrity.sql` (a file of your own). It prints every
