@@ -15,7 +15,9 @@ function run_matlab_tests()
 %   CI, where a PostgreSQL service is running -- a database test that did
 %   not run means the scratch database could not be set up, and that is
 %   reported as a failure too: otherwise a broken fixture would look like a
-%   passing run.
+%   passing run. So is a test file that runtests could not load (it only
+%   warns and leaves the file out): every *Tests.m file must contribute
+%   results.
 
     here = fileparts(mfilename("fullpath"));
     repoRoot = fileparts(here);
@@ -24,6 +26,18 @@ function run_matlab_tests()
     results = runtests(fullfile(here, "matlab"), "OutputDetail", "Detailed");
     if isempty(results)
         error("run_matlab_tests:noTests", "No tests were found under %s.", fullfile(here, "matlab"));
+    end
+    % runtests leaves out a test file it cannot load (a syntax error, two
+    % methods with one name) with only a warning, and the run then passes
+    % without its tests. Every *Tests.m file must have contributed results.
+    files = dir(fullfile(here, "matlab", "*Tests.m"));
+    names = string({results.Name});
+    excluded = strings(1, 0);
+    for k = 1:numel(files)
+        [~, cls] = fileparts(files(k).name);
+        if ~any(startsWith(names, cls + "/"))
+            excluded(end+1) = string(cls); %#ok<AGROW>
+        end
     end
 
     nPassed = nnz([results.Passed]);
@@ -42,6 +56,10 @@ function run_matlab_tests()
         version("-release"), nPassed, nFailed, nnz(incomplete), numel(results));
 
     problems = strings(1, 0);
+    if ~isempty(excluded)
+        problems(end+1) = sprintf("%d test file(s) could not be loaded and did not run: %s " + ...
+            "(see the warnings at the start of the log).", numel(excluded), strjoin(excluded, ", "));
+    end
     if nFailed > 0
         problems(end+1) = sprintf("%d test(s) failed.", nFailed);
     end

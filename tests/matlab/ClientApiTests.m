@@ -336,7 +336,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             tc.verifyEqual(fx.counts(), after);
         end
 
-        function recordEventKeepsAFileRegisteredAlready(tc)
+        function recordEventReusesARegisteredFile(tc)
             db = tc.requireDb();
             fx = tc.Fx;
             w = fx.makeWorld("same", 1);
