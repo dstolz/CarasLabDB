@@ -12,6 +12,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["web/live/server.py", "--port", "8778"],
       "port": 8778
+    },
+    {
+      "name": "lab-forms",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["web/forms/server.py", "--port", "8779", "--csv-root", "forms-csv", "--insecure-cookie"],
+      "port": 8779
     }
   ]
 }

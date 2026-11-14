@@ -43,6 +43,7 @@ only where noted.
 |-----------|----------|---------------|
 | Database  | PostgreSQL 14 or newer | The lab server |
 | Live dashboard | Python 3; `psql` on the PATH, or the `psycopg` package | The lab server, bound to 127.0.0.1 |
+| Forms server | Python 3 with the `psycopg` package | The lab server, bound to 127.0.0.1 |
 | Reverse proxy | IIS with URL Rewrite and Application Request Routing (ARR) | The lab server |
 | Scheduled jobs | Python 3; the PostgreSQL client programs; `psycopg` for the verifier | The lab server (the verifier on any machine that mounts the NAS) |
 | MATLAB interface + GUI | MATLAB **R2024b+** with **Database Toolbox** | Each researcher workstation |
@@ -62,6 +63,7 @@ whatever you choose consistent.
 | `jdoe`, ... | one login per lab member, `IN ROLE lab_rw` | that person's MATLAB client and GUI | those of `lab_rw` |
 | `lab_dashboard` | login, `IN ROLE lab_ro` | the live dashboard | those of `lab_ro` |
 | `lab_mcp` | login, `IN ROLE lab_ro` | the MCP server ([mcp-server.md](mcp-server.md)) | those of `lab_ro` |
+| `lab_forms` | login, `IN ROLE lab_ro` | the forms server's CSV rewrites (§3.6); members enter data under their own logins | those of `lab_ro` |
 | `lab_verifier` | login, `IN ROLE lab_rw` | `tools\verify_artifacts.py` | those of `lab_rw` |
 
 Why a separate owner: the owner of the schema can drop the immutability
@@ -212,6 +214,7 @@ could sign entries as someone else.
 ```sql
 CREATE ROLE lab_dashboard LOGIN PASSWORD 'CHANGE_ME_DASH' IN ROLE lab_ro;
 CREATE ROLE lab_mcp       LOGIN PASSWORD 'CHANGE_ME_MCP'  IN ROLE lab_ro;
+CREATE ROLE lab_forms     LOGIN PASSWORD 'CHANGE_ME_FORMS' IN ROLE lab_ro;
 CREATE ROLE lab_verifier  LOGIN PASSWORD 'CHANGE_ME_VER'  IN ROLE lab_rw;
 ```
 
@@ -430,6 +433,7 @@ command line. One line per login, `host:port:database:user:password`. For
 
 ```
 localhost:5432:lab:lab_dashboard:CHANGE_ME_DASH
+localhost:5432:lab:lab_forms:CHANGE_ME_FORMS
 localhost:5432:lab:lab_verifier:CHANGE_ME_VER
 localhost:5432:*:postgres:POSTGRES_PASSWORD
 ```
@@ -547,6 +551,90 @@ python -m http.server 8777 --directory web
 # http://localhost:8777/lab-dashboard.html
 ```
 
+### 3.6 The forms server
+
+*(Not verified in this repository's testing on Windows; the server and its
+end-to-end check run on Linux in CI.)*
+
+`web/forms/server.py` is the browser page for entering one session of one
+subject on a form, and for building the form templates
+([forms.md](forms.md)). Unlike the dashboard it **writes**: each lab member
+signs in on the page with their own database login, and the server connects
+as that login, so every entry carries the member's login exactly as it would
+from MATLAB. The server keeps the connection in memory for the browser
+session and never stores the password. It needs the `psycopg` package
+(`python -m pip install "psycopg[binary]"`).
+
+After every change it rewrites the subject's CSV file for the project under
+its CSV root: one file per subject per project (`<project>/<subject>.csv`).
+Choose the CSV root and give the service account **write** access to it
+(it otherwise has read access only to the NAS share, §9):
+
+- a folder on the NAS, given as a UNC path (`\\nas\data\forms`; a mapped
+  drive letter belongs to a signed-in user's session and does not exist for
+  the task), or
+- a local folder (`D:\LabForms`) that people reach through a share.
+
+A launcher, `C:\src\CarasLabDB\deploy\run-forms.cmd` (a file of your own):
+
+```bat
+@echo off
+set PGHOST=localhost
+set PGPORT=5432
+set PGDATABASE=lab
+rem The login the CSV retries and the nightly rebuild read with (lab_ro):
+set PGUSER=lab_forms
+"C:\Program Files\Python312\python.exe" C:\src\CarasLabDB\web\forms\server.py --host 127.0.0.1 --port 8779 --csv-root \\nas\data\forms --csv-time-zone America/New_York --public-origin https://labserver.example.edu >> C:\ProgramData\CarasLabDB\forms.log 2>&1
+```
+
+`--public-origin` is the address people open the page at (scheme and host,
+no path), which the server checks every change request against.
+`--csv-time-zone` is the zone the CSV files give times in, with their UTC
+offset; without it, the database's default zone. Register it as a task
+exactly like the dashboard (§3.3), named "CarasLabDB forms", with the
+launcher above.
+
+Put it behind IIS on the same site as the dashboard, under `/forms/`. The
+forms rule goes **before** the dashboard's catch-all rule:
+
+```xml
+<rule name="CarasLabDB forms" stopProcessing="true">
+  <match url="^forms/(.*)" />
+  <action type="Rewrite" url="http://127.0.0.1:8779/{R:1}" />
+</rule>
+<rule name="CarasLabDB forms, no slash" stopProcessing="true">
+  <match url="^forms$" />
+  <action type="Redirect" url="forms/" />
+</rule>
+```
+
+People then open `https://<server>/forms/`. The page and its API use only
+relative addresses, so the prefix is all it needs. Keep 8779 closed (the
+server listens on 127.0.0.1 anyway).
+
+- **Passwords cross the network only inside HTTPS.** IIS terminates TLS and
+  passes the sign-in to 127.0.0.1; `pg_hba.conf` already accepts `+lab_rw`
+  from 127.0.0.1 with `scram-sha-256` (§1.5). Never use `trust` there: the
+  sign-in would then accept any password.
+- **The session cookie** is `Secure`, `HttpOnly` and `SameSite=Strict`. A
+  member is signed out after 30 minutes without a request (`--idle-minutes`)
+  and 12 hours after sign-in (`--max-hours`). What was not yet saved stays in
+  the browser.
+- **Browsers keep unsent entries** (when the server cannot be reached) in the
+  page's storage until they are sent. Ask IT not to clear site data for this
+  address when the browser closes (§9).
+- **A CSV file open in Excel is locked** on Windows. The entry is still saved
+  in the database; the server rewrites the file once it is closed (it tries
+  every minute, as `lab_forms`). A file someone edited by hand is renamed
+  `<subject>.edited-<UTC time>.csv` before the new one is written, never
+  overwritten. The database is the record; the CSV files can always be
+  rebuilt from it:
+
+  ```powershell
+  $env:PGUSER = "lab_forms"
+  python web\forms\server.py --csv-root \\nas\data\forms --csv-time-zone America/New_York --rebuild-csv
+  ```
+
 ---
 
 ## 4. Scheduled jobs
@@ -567,6 +655,7 @@ redirected to one, and each exits non-zero on failure: have Task Scheduler
 | Backup check | daily 08:00 | `tools\backup_lab.py --check 26` (§4.1) |
 | File verification | weekly | `tools\verify_artifacts.py` (§4.2) |
 | Integrity report | daily | `lab.fn_check_integrity()` (§4.3) |
+| Forms CSV rebuild | daily 03:30 | `web\forms\server.py --rebuild-csv` as `lab_forms` (§3.6): picks up corrections and withdrawals of form entries made from MATLAB |
 
 ### 4.1 Backups
 
@@ -634,7 +723,7 @@ files not verified in the last week and `--limit N` caps one run. Exit code
 
 ### 4.3 Integrity report
 
-`lab.fn_check_integrity()` returns one row per problem (14 checks; see
+`lab.fn_check_integrity()` returns one row per problem (15 checks; see
 [database-design.md](database-design.md) §4.2); an empty result is healthy.
 Any login can run it; use `lab_dashboard`. Save this as
 `C:\src\CarasLabDB\deploy\integrity.sql` (a file of your own). It prints every
@@ -825,6 +914,10 @@ text)` to that person's login only, never to `lab_rw`.
 - [ ] After a reboot with nobody signed in, the dashboard answers through
       IIS over HTTPS with campus login, and `http://<server>:8778/` is not
       reachable from another machine.
+- [ ] Through IIS, `https://<server>/forms/` signs a member in with their own
+      login; an entry saved there appears in `lab.observation_active` with
+      `recorded_login` = that login, and in the subject's CSV under the CSV
+      root. `http://<server>:8779/` is not reachable from another machine.
 - [ ] The backup task has produced a set in the backup directory and in the
       `--copy-to` directory, and the check task succeeds.
 - [ ] A restore drill (§5) ended with `restore_lab: OK`.
@@ -843,8 +936,8 @@ can be sure of it; where it says **confirm with IT**, the answer is yours.
   needs PostgreSQL (one major version, 14 or later, pinned: a major-version
   change needs the dump-and-restore in §6.1 and must not happen as an
   automatic update; minor updates within the version are routine), Python 3
-  with the `psycopg` package for the verifier, and, for the dashboard proxy,
-  IIS with URL Rewrite and ARR. Whether these are packaged by IT, available
+  with the `psycopg` package for the verifier and the forms server, and, for
+  the dashboard and forms proxy, IIS with URL Rewrite and ARR. Whether these are packaged by IT, available
   in Software Center, or installed by the lab with approval: **confirm with
   IT**.
 - **Firewall rules** may be owned by Group Policy or MECM, in which case a
@@ -853,7 +946,7 @@ can be sure of it; where it says **confirm with IT**, the answer is yours.
   IT** how such rules are requested.
 - **Reboots happen in maintenance windows**, so every component must start
   unattended: the PostgreSQL service (automatic start, installed that way),
-  the dashboard (an At-startup task, §3.3) and the scheduled jobs (which run
+  the dashboard and the forms server (At-startup tasks, §3.3 and §3.6) and the scheduled jobs (which run
   whether or not anyone is signed in). The lab should be told when windows
   are, because clients cannot record metadata while the server is down.
 - **The machine must not sleep or hibernate**; it is a server. Whether the
@@ -869,7 +962,7 @@ can be sure of it; where it says **confirm with IT**, the answer is yours.
   without a signed-in user; the PostgreSQL service account (and any account
   run as a Windows service) needs **"Log on as a service"**. It needs read
   access to the repo and the NAS share and write access to the backup
-  directories. Whether a domain account, a group-managed service account or
+  directories and to the forms CSV folder (§3.6). Whether a domain account, a group-managed service account or
   a local account fits your policy, and whether these rights are granted by
   Group Policy: **confirm with IT**.
 - **The clock is synchronised by the domain** (domain-joined machines take
@@ -886,6 +979,13 @@ can be sure of it; where it says **confirm with IT**, the answer is yours.
   expects such credentials to be kept: **confirm with IT**.
 - **Certificates** for PostgreSQL TLS (§1.6) and for the dashboard's HTTPS
   binding (§3.4), for the server's DNS names, from the campus CA.
+- **Browser storage for the forms page.** The forms page (§3.6) keeps an
+  entry in the browser until the server confirms it. A browser policy that
+  clears site data when the browser closes would delete an entry not yet
+  sent; exempt the forms address from it. The page is served over HTTPS
+  with Windows Authentication, so the site should be in the browsers'
+  intranet zone (or `AuthServerAllowlist`) for sign-on without a prompt.
+  **Confirm with IT.**
 
 See [deployment-requirements.md](deployment-requirements.md) for the
 plain-language summary of what the system needs.

@@ -34,6 +34,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | `@CarasLabDBApp/` | MATLAB GUI (programmatic `uifigure` app) for interactive metadata entry and browsing |
 | `web/lab-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
 | `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
+| `web/forms/` | Browser data entry: build named, reusable form templates and fill them in for one session of one subject, under each member's own login; a CSV file per subject per project is kept up to date |
 | `mcp-server/` | **Read-only** Model Context Protocol server exposing typed `get*` query tools over the `lab` schema to an LLM agent |
 | `tools/` | Python scripts: `backup_lab.py` / `restore_lab.py` (backup and restore of the database and its roles) and `verify_artifacts.py` (checks the files on the NAS against their checksums) |
 
@@ -41,8 +42,9 @@ reading an analysis event rather than reverse-engineering a folder.
 
 The schema is built around an **append-only event log**:
 
-- **`event`** is a base table. Each of the 8 event types — `birth`, `surgery`,
-  `recording`, `behavior`, `husbandry`, `endpoint`, `histology`, `analysis` —
+- **`event`** is a base table. Each of the 9 event types — `birth`, `surgery`,
+  `recording`, `behavior`, `husbandry`, `endpoint`, `histology`, `analysis`,
+  `observation` (an entry made on a form) —
   has its own detail table (class-table inheritance). Type correctness is
   enforced declaratively with `UNIQUE(event_id, event_type)` plus a composite
   foreign key on each detail table.
@@ -76,6 +78,11 @@ The schema is built around an **append-only event log**:
   written through `lab.fn_set_variable`; `lab.variable_current` holds the
   latest values, and a correction carries them forward automatically. See
   `design_docs/variables.md`.
+- **Forms** — named, reusable data-entry templates (`form`, immutable
+  versions in `form_version`) put to use for a subject in a project
+  (`subject_form`). Each entry is an `observation` event whose values are
+  variables on the event, stored exactly as typed. See
+  `design_docs/forms.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale.
@@ -166,7 +173,8 @@ upgrade scripts are kept, untested, in `design_docs/migrations/pre-launch/`.
 triggers against a freshly loaded database, `tests/roles_test.sql` what
 members of `lab_rw` and `lab_ro` may do (run as a superuser after
 `grants.sql`), `tests/check_verify_artifacts.py` the
-file verifier, `tests/check_lab_data.py` the live dashboard's export, and
+file verifier, `tests/check_lab_data.py` the live dashboard's export,
+`tests/check_forms_server.py` the forms server and its CSV files, and
 `mcp-server/tests/` the MCP server. CI runs them on PostgreSQL 14, 15, 16
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
 run in CI too, in MATLAB R2024b, R2025a and the latest release on Linux
@@ -215,6 +223,18 @@ PGDATABASE=lab PGUSER=lab_dashboard python web/live/server.py --port 8778
 # then open http://127.0.0.1:8778/
 ```
 
+**Enter session data in the browser:** `web/forms/server.py` serves a page
+for building form templates and filling them in for one session of one
+subject. Members sign in with their own database login; every entry goes to
+the database, and the server keeps one CSV file per subject per project under
+`--csv-root`. In production it stays bound to 127.0.0.1 behind the HTTPS
+proxy. See `design_docs/forms.md`.
+
+```sh
+PGDATABASE=lab python web/forms/server.py --csv-root /srv/lab-forms
+# then open http://127.0.0.1:8779/ (add --insecure-cookie to test over plain http)
+```
+
 **Back up and check:** `tools/backup_lab.py` backs up the database and its
 roles (run as a PostgreSQL superuser; `--check HOURS` for monitoring),
 `tools/restore_lab.py` restores a backup into a new database and checks it
@@ -257,6 +277,7 @@ design_docs/         Schema DDL and design documentation
   database-design.md   Table-by-table rationale
   tagging.md           Tags: syntax, policy flags, filters, corrections
   variables.md         User-defined variables: names, units, history, queries
+  forms.md             Browser forms: templates, entries, CSV files, outbox
   testing-locally.md   Local testing guide
   mcp-server.md        Read-only MCP server: design and setup
   deployment-requirements.md   Server-side requirements summary for IT
@@ -267,6 +288,7 @@ design_docs/         Schema DDL and design documentation
 @CarasLabDBApp/      MATLAB GUI (uifigure)
 web/                 Standalone dashboard (synthetic data)
   live/                Live dashboard: /api/data server + query
+  forms/               Forms: server, page and per-subject CSV export
 mcp-server/          Read-only MCP server (Python): typed query tools for LLM agents
 tools/               Backup, restore and file verification (Python)
 examples/            End-to-end demo scripts

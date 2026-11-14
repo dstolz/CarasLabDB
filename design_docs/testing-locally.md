@@ -403,6 +403,22 @@ dropdb -U postgres lab_verify
 **Pass:** `check_verify_artifacts: OK` and `check_lab_data: OK (...)`.
 `check_lab_data.py` rolls its fixture back, so `lab_test` is left as it was.
 
+The forms server ([forms.md](forms.md)) has its own end-to-end check. It
+creates two throw-away logins, so run it as a superuser, on a database of
+its own with the schema and the grants:
+
+```powershell
+createdb -U postgres lab_forms
+psql -U postgres -d lab_forms -X -q -f design_docs/schema.sql -f design_docs/grants.sql
+$env:PGUSER = "postgres"; $env:PGDATABASE = "lab_forms"; python tests\check_forms_server.py
+dropdb -U postgres lab_forms
+```
+
+**Pass:** `check_forms_server: OK (...)`. It signs in through the API,
+publishes templates, records, corrects and withdraws entries, and compares
+each subject's CSV with the database byte for byte, including a file locked
+as Excel locks it and a file edited by hand.
+
 ---
 
 ## 2. Test the MATLAB interface (`@CarasLabDB`)
@@ -618,6 +634,43 @@ console shows no errors, and controls/filters respond. Because data is generated
 in-page by a fixed-seed mulberry32 PRNG, the charts are deterministic across
 reloads.
 
+### 4.1 The forms page
+
+The forms page needs its server and a database (`lab_test` after §1.4, with a
+member login mapped to a person):
+
+```powershell
+psql -U postgres -d lab_test -c "CREATE ROLE dev_member LOGIN PASSWORD 'devpass' IN ROLE lab_rw"
+psql -U postgres -d lab_test -c "INSERT INTO lab.person (full_name, db_login) VALUES ('Dev Member', 'dev_member')"
+# PGUSER is only the login the server rewrites waiting CSV files with;
+# members sign in on the page with their own.
+$env:PGUSER = "postgres"; $env:PGDATABASE = "lab_test"
+python web\forms\server.py --csv-root C:\temp\forms-csv --insecure-cookie
+# open http://127.0.0.1:8779/ and sign in as dev_member
+```
+
+Work through it by hand. Nothing in CI drives the page in a browser.
+
+- [ ] Templates → New template: add a number field with units and a
+      minimum, a choice and a required yes/no; add a subject variable to *Top
+      of the form*. *Checks* says there are no problems; Ctrl+S publishes
+      version 1.
+- [ ] Enter data: Ctrl+K, find a subject, add the template for it, fill it
+      in, Ctrl+S. The entry is listed, and
+      `C:\temp\forms-csv\<project>\<subject>.csv` has the row, with the
+      number exactly as typed (`1350.50`).
+- [ ] Type `1e3` in the number field: it is refused with the reason.
+- [ ] Stop the server, then save an entry. The page says the server cannot
+      be reached and the *Unsent* tab counts 1. Start the server again, and
+      within two minutes, or at once with *Send now*, the count drops to 0
+      and the entry is in the CSV, once.
+- [ ] Correct an entry and change a note (Ctrl+E on the row): the CSV shows
+      the current values, and *history* lists both notes.
+- [ ] Open the CSV in Excel and save an entry: the page says the file is
+      waiting; close Excel and within a minute the file is rewritten.
+- [ ] `checkIntegrity()` in MATLAB (or `SELECT * FROM lab.fn_check_integrity()`)
+      reports no `observation_invalid`.
+
 ---
 
 ## 5. Full local acceptance checklist
@@ -647,6 +700,8 @@ Run top to bottom against `lab_test` before you deploy to a server:
 - [ ] `CarasLabDBApp` browses, filters, exports, adds, and supersedes.
 - [ ] `lab-dashboard.html` renders with no console errors; the Tags filter
       (`#`) narrows the tables.
+- [ ] `check_forms_server.py` prints OK (§1.5), and the forms page passes
+      its checklist (§4.1).
 
 ---
 

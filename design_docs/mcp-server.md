@@ -103,7 +103,7 @@ mcp-server/
   check, not a convention — a call site can't skip it. Both allowlists are
   derived from one map, `DEFAULT_ORDER_BY` (table → its default ordering), so
   a table cannot be made readable without being given a deterministic order.
-- **`schema_map.py`** hardcodes the 8 event types to their detail
+- **`schema_map.py`** hardcodes the 9 event types to their detail
   table/columns (built by hand from `schema.sql`, not introspected at
   runtime). This is the one place `get_event_detail` needs a table name that
   depends on data read from the database (the event's `event_type` string);
@@ -314,7 +314,7 @@ through these tools. Every list tool also takes `limit: int = 200`.
 | `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current` ordered by tag, or with `include_history` the full assignment log, latest first by `assignment_id`; pageable), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
 | `variables.py` | `get_variable_definitions(entity_kind, include_retired)` (`lab.variable`), `get_variables(entity_kind, entity_id, name, current_only, active_only)` (current values from `lab.variable_current`, or with `current_only=False` the `lab.variable_value` log oldest first; pageable), `find_by_variable(entity_kind, name, equals, at_least, at_most, text_equals, active_only)` (entities by current value; pageable) |
 | `summary.py` | `get_counts(question, subject_id, project_id, entity_kind, active_only)` — exact counts: `events_by_type`, `artifacts_by_role` (with `total_size_bytes`), `subjects_by_project_species`, `sessions_per_subject`, `current_tags_by_tag`, `current_variables_by_variable` |
-| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 14 checks described in the docstring — an integration test compares the list with the function; errors first; empty means healthy) |
+| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 15 checks described in the docstring — an integration test compares the list with the function; errors first; empty means healthy) |
 
 ### Corrections: current rows, history, and lineage
 

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this repo is
 
 A metadata/provenance system for the Caras Lab's extracellular electrophysiology
-data. It has six parts:
+data. It has seven parts:
 
 - **`design_docs/schema.sql`** — the canonical PostgreSQL 14+ DDL (schema `lab`).
   This is the single source of truth for the data model; nothing else should
@@ -17,10 +17,11 @@ data. It has six parts:
   of the pre-launch numbering (they took a first prototype to what was then
   version 5, the schema now called 1); nothing applies or tests them. It includes
   the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
-  tables (`variable`, `variable_value`), `retraction` and
+  tables (`variable`, `variable_value`), the form tables (`form`,
+  `form_version`, `subject_form`, `observation_event`), `retraction` and
   `artifact_disposition`;
-  `design_docs/tagging.md` and `design_docs/variables.md` are the user-facing
-  guides.
+  `design_docs/tagging.md`, `design_docs/variables.md` and
+  `design_docs/forms.md` are the user-facing guides.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
@@ -55,6 +56,26 @@ data. It has six parts:
   script writes CRLF line endings; the repository stores the file with LF.
   `server.py` serves only the page and `/api/data`, caches the export for 5 s
   and gzips it.
+- **`web/forms/`** — the browser data-entry tool (`design_docs/forms.md`).
+  `server.py` (standard library plus psycopg 3) serves `forms.html` /
+  `forms.js` / `forms.css` and a JSON API over the SQL write paths
+  (`lab.fn_publish_form`, `fn_add_subject_form`, `fn_record_observation`,
+  `fn_set_entry_note`, `fn_retract`). It **writes, as each member's own
+  login**: the page's sign-in opens a psycopg connection with the member's
+  login and password, kept in memory per browser session (HttpOnly,
+  SameSite=Strict cookie; the password is dropped after connecting). Never
+  replace that with a shared login. POSTs need `X-CarasLab-Forms: 1` and a
+  same-origin `Origin`; JSON bodies refuse fractional numbers, since every
+  value travels as the text typed. After each change `csv_export.py`
+  regenerates the subject's CSV for the project (`<root>/<project>/<subject>.csv`)
+  from the database: atomic replace, `_manifest.json` of the hashes it wrote,
+  hand-edited files renamed aside, locked files retried every minute as the
+  `PG*` login (`lab_forms`, `lab_ro`), `--rebuild-csv` for all. The page uses
+  no external resources and no inline script (strict CSP), puts all
+  user-typed text in with `textContent`, uses relative URLs (it is served
+  under `/forms/` by the proxy), and keeps every entry in an IndexedDB outbox
+  until the server confirms it; replays are idempotent by the client-minted
+  event id. Shortcuts: Ctrl+S, Ctrl+K, Ctrl+E, Alt+1..3, Ctrl+?.
 - **`mcp-server/`** — a Python **read-only** Model Context Protocol server
   (`src/caraslabdb_mcp/`) that gives an LLM agent typed `get*` tools mirroring
   `@CarasLabDB`'s read surface (reference tables, subjects/sessions, events and
@@ -97,9 +118,9 @@ login inheriting `lab_ro`. Never document or code a shared `lab_rw` login.
 The schema is organized around an **append-only event log**, not mutable
 records:
 
-- **`event`** is a base table; each of the 8 event types (`birth`, `surgery`,
-  `recording`, `behavior`, `husbandry`, `endpoint`, `histology`, `analysis`)
-  has its own detail table (class-table inheritance). Type correctness is
+- **`event`** is a base table; each of the 9 event types (`birth`, `surgery`,
+  `recording`, `behavior`, `husbandry`, `endpoint`, `histology`, `analysis`,
+  `observation`) has its own detail table (class-table inheritance). Type correctness is
   enforced declaratively via `UNIQUE(event_id, event_type)` + a composite FK
   on each detail table — not by trigger.
 - **`artifact`** rows are files on the NAS (path + checksum), each pointing at
@@ -110,7 +131,7 @@ records:
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
   `maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
-  `variable_value`, `retraction` and `artifact_disposition`.
+  `variable_value`, `retraction`, `artifact_disposition` and `form_version`.
   Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
   replaces. `event_active` / `artifact_active` views filter to current rows
@@ -209,7 +230,28 @@ records:
   for the tag reason above. A correction's variables are carried forward **by
   trigger** (`trg_event_carry_variables` / `trg_artifact_carry_variables`),
   not by the client — do not also copy them in MATLAB.
-- `lab.fn_check_integrity()` has 14 checks (see `database-design.md` §4.2);
+- **Forms** (`database-design.md` §3.9, `forms.md`). A template is `form`
+  (mutable, in `row_history`; name never changes) with append-only versions
+  in `form_version` (`trg_form_version_policy` numbers them and refuses a
+  definition `fn_form_definition_problems` faults, so a raw INSERT is held to
+  the same rules). `subject_form` is a template put to use for one subject in
+  one project (mutable `form_version` / `notes` / `retired_at`; subject,
+  project and template fixed by `trg_subject_form_guard`, a rename cascade
+  excepted). An entry is an `observation` event (`observation_event`: subject
+  form, template, version, free `session_label`) whose field values are
+  **variables on the event** and whose note is the reserved variable
+  `entry note` (changed later by `fn_set_entry_note`, no correction).
+  **`lab.fn_record_observation` is the write path**: idempotent by
+  client-minted id plus `attributes.client_digest` (same id and digest is
+  `existing`, checked before validation; otherwise SQLSTATE `CLB01`), value
+  problems are `CLB02` with JSON in DETAIL, correcting a corrected entry
+  `CLB03`; a correction keeps the subject form and version, sets changed
+  values, unsets cleared ones and carries tags. Values are the text typed: a
+  JSON number is refused, and a number only in the form `numeric::text` gives
+  back (`fn_form_number_ok`; `1.50` stays `1.50`, `1e3` is refused, never
+  rewritten). `observation_active` and `fn_subject_project_columns` are the
+  reads (never `entity_variables`, which turns numbers into JSON numbers).
+- `lab.fn_check_integrity()` has 15 checks (see `database-design.md` §4.2);
   a new invariant that a constraint cannot enforce gets a check there.
 
 Any schema change must preserve this pattern: never add a mutable column
@@ -379,7 +421,9 @@ and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), runs the
 artifact verifier end to end
 (`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
-and runs the MCP server's pytest suite. The `matlab` job runs
+runs the forms server end to end against its own database
+(`tests/check_forms_server.py`, as the superuser: it creates throw-away
+logins), and runs the MCP server's pytest suite. The `matlab` job runs
 `tests/matlab/` in MATLAB R2024b, R2025a and the latest release on Linux
 (`matlab-actions`, free for a public repository) against a PostgreSQL
 service, under Xvfb for the GUI tests; `tests/run_matlab_tests.m` is its
@@ -402,6 +446,13 @@ to exercise the code:
   `--copy-to <dir>` for a second copy), then `python tools/restore_lab.py
   <dir>/lab_<stamp>.dump lab_restored` (never overwrites; exit 0 when the row
   counts match the manifest).
+- **Forms server**: `PGDATABASE=<db> python web/forms/server.py --csv-root
+  <dir> --insecure-cookie` (the `lab-forms` launch config), then sign in on
+  `http://127.0.0.1:8779/` with a login in `lab_rw`. End to end:
+  `PGDATABASE=lab_forms python tests/check_forms_server.py` on a database
+  with `schema.sql` and `grants.sql`, as a superuser. Nothing in CI drives
+  the page in a browser; `design_docs/testing-locally.md` §4.1 is the manual
+  checklist.
 - **MCP server**: `cd mcp-server && pip install -e .[test] && python -m pytest
   tests` (set `CARASLABDB_TEST_DB` to a scratch database to include the
   integration tests)
