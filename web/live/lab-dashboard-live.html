@@ -38,6 +38,7 @@ try{
     --ev-endpoint:#937860;
     --ev-histology:#DA8BC3;
     --ev-analysis:#3FA7B7;
+    --ev-observation:#A39B2C;
 
     --positive:#1f9d55;
     --negative:#dc3545;
@@ -85,6 +86,7 @@ try{
   html[data-theme="dark"] .ev-endpoint{background:rgba(147,120,96,.28);color:#dcc0a3;}
   html[data-theme="dark"] .ev-histology{background:rgba(218,139,195,.24);color:#f2c0e2;}
   html[data-theme="dark"] .ev-analysis{background:rgba(63,167,183,.24);color:#8fdcea;}
+  html[data-theme="dark"] .ev-observation{background:rgba(163,155,44,.26);color:#e2db8c;}
   html[data-theme="dark"] .pill{background:var(--surface-3);color:var(--text-secondary);}
   html[data-theme="dark"] .pill.ok,html[data-theme="dark"] .pill.active,html[data-theme="dark"] .pill.succeeded{background:rgba(31,157,85,.22);color:#8fe6ac;}
   html[data-theme="dark"] .pill.missing,html[data-theme="dark"] .pill.failed{background:rgba(220,53,69,.22);color:#f4a3a8;}
@@ -237,10 +239,12 @@ try{
   .ev-endpoint{background:rgba(147,120,96,.16);color:#6e5842;}
   .ev-histology{background:rgba(218,139,195,.16);color:#a6539a;}
   .ev-analysis{background:rgba(63,167,183,.15);color:#2b7d8b;}
+  .ev-observation{background:rgba(163,155,44,.16);color:#6d6716;}
   .dot-birth{background:var(--ev-birth)}.dot-surgery{background:var(--ev-surgery)}
   .dot-recording{background:var(--ev-recording)}.dot-behavior{background:var(--ev-behavior)}
   .dot-husbandry{background:var(--ev-husbandry)}.dot-endpoint{background:var(--ev-endpoint)}
   .dot-histology{background:var(--ev-histology)}.dot-analysis{background:var(--ev-analysis)}
+  .dot-observation{background:var(--ev-observation)}
 
   .pill{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11.5px;font-weight:600;background:var(--surface-3);color:#54617a;}
   .pill.ok{background:rgba(31,157,85,.13);color:#187a41;}
@@ -340,6 +344,7 @@ try{
   .tl-item.t-recording::before{background:var(--ev-recording)}.tl-item.t-behavior::before{background:var(--ev-behavior)}
   .tl-item.t-husbandry::before{background:var(--ev-husbandry)}.tl-item.t-endpoint::before{background:var(--ev-endpoint)}
   .tl-item.t-histology::before{background:var(--ev-histology)}.tl-item.t-analysis::before{background:var(--ev-analysis)}
+  .tl-item.t-observation::before{background:var(--ev-observation)}
   .tl-item.superseded{opacity:.5;}
   .tl-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
   .tl-date{font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums;min-width:96px;}
@@ -968,7 +973,7 @@ window.__initDashboard = function(){
   // fallback for a payload that omits the lookup.
   const ETYPES = D.eventTypeMeta.length
     ? D.eventTypeMeta.map(e=>e.code)
-    : ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis'];
+    : ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis','observation'];
   const CSSVAR = getComputedStyle(document.documentElement);
   // --ev-<code> only exists for the types the stylesheet knows; anything newer
   // gets a neutral grey rather than an empty (invisible) colour.
@@ -1135,6 +1140,7 @@ window.__initDashboard = function(){
       case 'endpoint': return `${esc(d.method||'')}${d.perfusion_fixative?` · ${esc(d.perfusion_fixative)}`:''}`;
       case 'histology': return `${esc(d.technique||'')} · ${esc(d.stain||'')} · ${esc(d.target_region||'')}`;
       case 'analysis': return `${esc(d.pipeline_name||'pipeline')} · <span class="pill ${cssTok(d.status)}">${esc(d.status||'—')}</span>`;
+      case 'observation': return `${esc(d.form_name||'form')} v${esc(d.form_version==null?'?':d.form_version)} · ${esc(d.session_label||'')}`;
       default: return '';
     }
   }
@@ -2240,7 +2246,8 @@ window.__initDashboard = function(){
     artifact_producer_retracted:'Active files whose producing event was retracted',
     input_retracted:'Active events that consumed a retracted file',
     duplicate_active_path:'Two present files at one path',
-    disposed_file_found:'Files recorded as gone that a later check found intact'
+    disposed_file_found:'Files recorded as gone that a later check found intact',
+    observation_invalid:'Form entries whose values break their form version’s rules'
   };
   function integrityExample(x){
     const sub=String(x.subject==null?'':x.subject);
@@ -2519,7 +2526,9 @@ window.__initDashboard = function(){
       analysis:[['Pipeline',d.pipeline_name],['Code version',d.code_version?`<span class="mono">${esc(d.code_version)}</span>`:null,true],['Status',d.status?`<span class="pill ${cssTok(d.status)}">${esc(d.status)}</span>`:null,true],
         ['Started',fmtDateTime(d.started_at)],['Finished',fmtDateTime(d.finished_at)],
         ['Parameters',d.parameters?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.parameters))}</span>`:null,true],
-        ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]]
+        ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]],
+      observation:[['Form',d.form_name],['Form version',d.form_version],['Session label',d.session_label],
+        ['Subject form',d.subject_form_id?`<span class="mono">${esc(d.subject_form_id)}</span>`:null,true]]
     };
     let body = kv(base.concat(detailMap[e.event_type]||[]));
     if(e.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-4px 0 8px">“${esc(e.notes)}”</div>`;

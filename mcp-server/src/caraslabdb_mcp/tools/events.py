@@ -84,7 +84,7 @@ def register(app):
 
         E.g. a 'recording' event's row includes sample_rate_hz, n_channels,
         probe_id, etc. from lab.recording_event. The detail table is looked
-        up from a fixed internal map of the 8 known event types -- never
+        up from a fixed internal map of the 9 known event types -- never
         built from the event_type string directly.
 
         The row always carries `is_current`, `superseded_by`,

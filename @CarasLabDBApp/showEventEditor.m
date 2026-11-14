@@ -39,6 +39,9 @@ function showEventEditor(obj, mode, eventType, eventId)
         eventId (1,1) string = ""
     end
 
+    % "observation" is not offered for a new event: an entry is made on a
+    % form (web/forms/), which supplies its subject form and values. An
+    % existing one can be corrected here like any other event.
     types = ["birth","surgery","recording","behavior", ...
              "husbandry","endpoint","histology","analysis"];
 

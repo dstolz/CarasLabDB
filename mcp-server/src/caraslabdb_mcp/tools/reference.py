@@ -61,7 +61,7 @@ def register(app):
 
     @app.tool()
     def get_event_types(limit: int = db.DEFAULT_LIMIT) -> dict:
-        """List the 8 known event type codes/labels (birth, surgery, recording, ...).
+        """List the 9 known event type codes/labels (birth, surgery, recording, ...).
 
         Ordered by code. Returns {"row_count", "limit", "truncated", "rows"};
         `truncated` true means more rows exist than were returned (raise

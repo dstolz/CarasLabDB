@@ -4,12 +4,12 @@ This is the one place `get_event_detail` needs a table name that depends on
 data read from the database (the event's `event_type`). Rather than trust
 that value directly, it is looked up in this hardcoded dict -- built by hand
 from design_docs/schema.sql, not introspected at runtime -- so a caller can
-never influence which table gets joined beyond the 8 known event types.
+never influence which table gets joined beyond the 9 known event types.
 """
 
 EVENT_TYPES = (
     "birth", "surgery", "recording", "behavior",
-    "husbandry", "endpoint", "histology", "analysis",
+    "husbandry", "endpoint", "histology", "analysis", "observation",
 )
 
 EVENT_DETAIL_TABLE = {t: f"lab.{t}_event" for t in EVENT_TYPES}
@@ -32,4 +32,6 @@ EVENT_DETAIL_COLUMNS = {
         "pipeline_id", "pipeline_name", "code_version", "parameters",
         "environment", "started_at", "finished_at", "status",
     ),
+    # An entry on a form (web/forms/); its values are variables on the event.
+    "observation": ("subject_form_id", "form_name", "form_version", "session_label"),
 }

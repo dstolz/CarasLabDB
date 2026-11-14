@@ -942,12 +942,12 @@ def test_integrity_docstring_lists_every_check(seed):
         source = conn.execute(
             "SELECT pg_get_functiondef('lab.fn_check_integrity()'::regprocedure)").fetchone()[0]
     checks = set(re.findall(r"SELECT '(error|warning)', '([a-z_]+)'", source))
-    assert len(checks) == 14
+    assert len(checks) == 15
     doc = {t.name: t.description for t in asyncio.run(app.list_tools())}["get_integrity_report"]
-    assert "The 14 checks" in doc
+    assert "The 15 checks" in doc
     for severity, name in checks:
         assert f"- {name} ({severity})" in doc, name
-    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 14
+    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 15
 
 
 def test_artifact_file_lookup(seed5):

@@ -50,7 +50,7 @@ jobs:
           python -m pip install -e "mcp-server[test]" "ruff==0.15.20"
 
       - name: Lint Python
-        run: ruff check mcp-server web/live tests tools
+        run: ruff check mcp-server web/live web/forms tests tools
 
       - name: Apply schema.sql to a fresh database
         run: |
@@ -75,6 +75,14 @@ jobs:
           createdb lab_verify
           psql -X -q -v ON_ERROR_STOP=1 -d lab_verify -f design_docs/schema.sql
           PGDATABASE=lab_verify python tests/check_verify_artifacts.py
+
+      # Creates two throw-away logins, so it runs as the superuser, on a
+      # database of its own with the schema and the grants.
+      - name: Forms server, end to end
+        run: |
+          createdb lab_forms
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_forms -f design_docs/schema.sql -f design_docs/grants.sql
+          PGDATABASE=lab_forms python tests/check_forms_server.py
 
       - name: MCP server tests (unit and integration)
         env:

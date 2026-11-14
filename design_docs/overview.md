@@ -46,6 +46,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, file dispositions (Ctrl+Shift+F), a daily husbandry grid and the integrity report |
 | Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
+| Forms (`web/forms/`) | A browser page for building data-entry templates and entering one session of one subject on them, under each member's own login, with a CSV file per subject per project kept up to date ([forms.md](forms.md)) |
 | MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag and variable lookups |
 | Tools (`tools/`) | Backup and restore of the database and its roles (`backup_lab.py`, `restore_lab.py`), and the scheduled check of the NAS files against their checksums (`verify_artifacts.py`) |
 
@@ -106,6 +107,11 @@ flowchart LR
   settings no fixed column anticipates. One number (with units) or one piece
   of text; setting it again is an update and the history is kept; a
   correction carries it forward. See [Variables](variables.md).
+- **Form.** A named, reusable data-entry template, built in the browser and
+  put to use for a subject in a project. Each entry made on it is an
+  `observation` event whose field values are variables on the event, plus a
+  note that can be changed later; for each subject in each project the
+  entries are also kept as one CSV file. See [Forms](forms.md).
 - **Login and person.** Every lab member connects with their own database
   login. The database stamps that login on each row it stores and maps it to
   the member's `person` row (`lab.person.db_login`), so who entered what does

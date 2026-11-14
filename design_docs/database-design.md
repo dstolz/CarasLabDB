@@ -14,7 +14,7 @@ complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
 ## 1. Overview & ER diagram
 
-The schema has seven layers:
+The schema has eight layers:
 
 1. **Reference tables** — mostly-static vocabulary and registries (`person`,
    `probe`, `pipeline`, `storage_root`, `species`, and the categorical lookups
@@ -37,6 +37,10 @@ The schema has seven layers:
    session): definitions (`variable`) and an append-only log of values set
    and unset (`variable_value`), with current values derived by a view
    (§3.8). Same shape as tags.
+8. **Forms** — named, reusable data-entry templates (`form`, with immutable
+   versions in `form_version`), put to use for a subject in a project
+   (`subject_form`); each entry made on one is an `observation` event whose
+   values are variables on the event (§3.9).
 
 Alongside the event log, `retraction` records events and artifacts withdrawn
 as entered in error (§4.3).
@@ -69,6 +73,7 @@ erDiagram
     event        ||--|| endpoint_event   : detail
     event        ||--|| histology_event  : detail
     event        ||--|| analysis_event   : detail
+    event        ||--|| observation_event : detail
     event        |o--o{ event            : supersedes
 
     event        ||--o{ artifact         : produces
@@ -95,6 +100,13 @@ erDiagram
     project      |o--o{ variable_value   : carries
     event        |o--o| retraction       : withdrawn_by
     artifact     |o--o| retraction       : withdrawn_by
+
+    form         ||--o{ form_version     : published_as
+    form_version ||--o{ subject_form     : pinned_by
+    subject      ||--o{ subject_form     : uses
+    project      ||--o{ subject_form     : in
+    subject_form ||--o{ observation_event : entries
+    form_version ||--o{ observation_event : made_on
 ```
 
 ---
@@ -140,7 +152,7 @@ erDiagram
 | `species` | Species vocabulary for `subject`. |
 | `probe` | Electrode/probe device registry, including channel geometry as JSONB. Referenced by surgeries (implant) and recordings (acquisition device). |
 | `pipeline` | Analysis pipeline registry (name + repo). Each *run* pins its own `code_version`/`parameters` on the `analysis_event`, so this table stays stable while runs vary. |
-| `event_type` | The eight event-type codes; the discriminator that selects a detail table. |
+| `event_type` | The nine event-type codes; the discriminator that selects a detail table. |
 | `artifact_role` | Role a file plays (`raw`, `spikes`, `lfp`, `video`, `figure`, …). |
 | `acquisition_system` | Acquisition software (`intan_rhx`, `open_ephys`). |
 
@@ -194,6 +206,7 @@ Detail tables and their type-specific columns:
 | `endpoint_event` | `method`, `perfusion_fixative`, `tissue_collected`, `disposition` |
 | `histology_event` | `technique`, `target_region`, `stain`, `microscope` |
 | `analysis_event` | `pipeline_id`, `pipeline_name`, `code_version`, `parameters`, `environment`, `started_at`, `finished_at`, `status` |
+| `observation_event` | `subject_form_id`, `form_name`, `form_version`, `session_label` — an entry made on a form; its values are variables on the event (§3.9) |
 
 Every event except an `analysis` run names a subject
 (`event_subject_required_ck`). An analysis may span several animals; any other
@@ -482,6 +495,59 @@ like the other `*_login` columns (§4). `set_by` is filled with
 `fn_current_person()` by the write functions, not by the trigger, so a
 carried-forward value keeps the `set_by` it had.
 
+### 3.9 Forms
+
+A form is a data-entry page for one session of one subject, built in the
+browser (`web/forms/`). The user guide, the definition format and the server
+are in [forms.md](forms.md); this is the data model.
+
+| Table | Purpose |
+|---|---|
+| `form` | A **template**: `name` (primary key, the variable-name rule, never changes: `trg_form_guard`), `label`, `description`, `retired_at`. Mutable, recorded in `row_history`; `lab_rw` may update `label`, `description` and `retired_at` only. |
+| `form_version` | The template's content, **append-only**: `(form_name, version)`, `definition` (`jsonb`), `note`, `created_by`, `created_login` (stamped). `trg_form_version_policy` numbers versions 1, 2, … under a per-template advisory lock and refuses a definition `lab.fn_form_definition_problems` faults, so a raw `INSERT` is held to the same rules as `lab.fn_publish_form`. |
+| `subject_form` | A template **put to use for one subject in one project** (by default the subject's own; a subject used in another project has its forms there). `UNIQUE (subject_id, project_id, form_name)`. `form_version` is the version new entries use, moved to a newer one explicitly. Mutable (`form_version`, `notes`, `retired_at`) and recorded in `row_history`; `trg_subject_form_guard` keeps the subject, project and template fixed (a subject rename's cascade excepted). |
+| `observation_event` | Detail row of an **entry**: which subject form, template and version it was made on, and the session's free-text `session_label`. The `(subject_form_id, form_name)` FK ties the entry's template to the subject form's; `trg_observation_event_policy` ties its subject (on `event`) to the subject form's. |
+
+**An entry is an event.** When the session happened is `event.occurred_at`,
+who entered it `recorded_by` / `recorded_login`; a correction supersedes it
+and `lab.fn_retract` withdraws it, exactly like any other event. A session
+here is a label and a time, not necessarily a `lab.session` folder;
+`event.session_id` links one when there is one.
+
+**Its values are variables on the event.** Each field of a template is bound
+to a `lab.variable` (numbers for the number and integer widgets, text for the
+others), so values are typed, unit-checked, append-only and login-stamped,
+and a correction carries them forward by `trg_event_carry_variables`. The
+note every entry has is the reserved text variable `entry note`; it can be
+changed later (`lab.fn_set_entry_note`) without a correction, and every
+earlier text stays in the log.
+
+**Values are kept as typed.** `lab.fn_record_observation` takes each value as
+the text the user typed (a JSON string; a JSON number is refused) and
+accepts a number only in the form `numeric` gives back unchanged, so `1.50`
+is stored and shown as `1.50` and `1e3`, `.5` or `007` are refused with the
+reason rather than rewritten (`lab.fn_form_number_ok`,
+`lab.fn_observation_problems`).
+
+**Written once, sent many times.** The browser mints the entry's event id and
+keeps the entry until the server confirms it. `lab.fn_record_observation`
+stores a digest of the entry in `event.attributes.client_digest`: the same
+id with the same digest is `existing` and writes nothing (checked before
+anything else, so an entry already stored is never refused on replay);
+another digest is SQLSTATE `CLB01`. Value problems are `CLB02` with the
+problems as JSON in `DETAIL`; correcting an entry that has already been
+corrected is `CLB03`.
+
+**Write and read functions.** `lab.fn_publish_form` (defines the fields'
+variables, appends a version unless the definition is unchanged),
+`lab.fn_add_subject_form`, `lab.fn_record_observation` (an entry or its
+correction, in one transaction: the correction keeps the subject form and
+version, sets changed values, unsets cleared ones, carries tags),
+`lab.fn_set_entry_note`; `lab.observation_active` (active entries with their
+values as stored text, and `entry_id`, the id of the first version, which
+corrections keep) and `lab.fn_subject_project_columns` (the column order of
+a subject's CSV for a project). All run with the caller's privileges.
+
 ---
 
 ## 4. Immutability & corrections
@@ -595,7 +661,7 @@ real event everywhere and renders as a blank row.
 
 `lab.fn_check_integrity()` is the scheduled check for that and related
 conditions — run it on a schedule (the deployment guides' scheduled jobs);
-it has 14 checks, and an empty result means healthy:
+it has 15 checks, and an empty result means healthy:
 
 ```sql
 SELECT * FROM lab.fn_check_integrity();
@@ -617,6 +683,7 @@ SELECT * FROM lab.fn_check_integrity();
 | `input_retracted` | warning | Active event that consumed an artifact whose current version has been retracted: the analysis rests on a file the lab has withdrawn |
 | `duplicate_active_path` | warning | Two present artifacts at one path; the file can only be one of them, so one was overwritten without a `replaced` disposition (§4.4) |
 | `disposed_file_found` | warning | A file recorded as replaced, moved or deleted that a later checksum check found at its path with its bytes: one of the two records is wrong |
+| `observation_invalid` | warning | Active form entry whose current values break the rules of the form version it was made on (a required value unset since, a number out of range); `lab.fn_record_observation` refuses such entries, so this catches values changed afterwards by another client (§3.9) |
 
 **Worked example — a recording logged with the wrong sample rate:**
 
@@ -794,24 +861,29 @@ createdb lab && psql -d lab -f design_docs/schema.sql
 
 `schema.sql` creates everything described above, in dependency order: the `lab`
 schema; the reference/lookup tables; the `project` tables; the `subject` /
-`session` dimensions; the base `event` and its eight detail tables; `artifact` /
+`session` dimensions; the base `event` and its nine detail tables; `artifact` /
 `event_input` / `artifact_verification` / `retraction`; the tag tables
 (`tag_namespace`, `tag`, `tag_assignment`); the variable tables (`variable`,
-`variable_value`); all indexes; the immutability
+`variable_value`); the form tables (`form`, `form_version`, `subject_form`,
+`observation_event`); all indexes; the immutability
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
 maintenance function, `maintenance_log`, `row_history` and `schema_version`;
 the `event_active` /
 `artifact_active` / `event_version` / `artifact_version` /
 `artifact_verification_latest` / `provenance_edge` / `subject_current` /
-`tag_current` / `entity_tags` / `variable_current` / `entity_variables` views; `fn_artifact_lineage()` and the
+`tag_current` / `entity_tags` / `variable_current` / `entity_variables` /
+`observation_active` views; `fn_artifact_lineage()` and the
 correction-chain helpers (`fn_event_current()`, `fn_artifact_current()`,
 `fn_event_versions()`, `fn_artifact_versions()`), the tag functions (`fn_tag()`,
 `fn_register_tag()`, `fn_tag_match()`, `fn_find_by_tags()`,
 `fn_canonical_tag()`, `fn_tag_filter_problems()`), the variable functions
 (`fn_set_variable()`, `fn_unset_variable()`, `fn_define_variable()`,
 `fn_variable_number()`, `fn_variable_text()`, `fn_canonical_variable()`,
-`fn_carry_variables()`), `fn_current_person()`, `fn_retract()` and
-`fn_check_integrity()`;
+`fn_carry_variables()`), the form functions (`fn_publish_form()`,
+`fn_add_subject_form()`, `fn_record_observation()`, `fn_set_entry_note()`,
+`fn_form_definition_problems()`, `fn_observation_problems()`,
+`fn_subject_project_columns()`, `fn_event_original()`), `fn_current_person()`,
+`fn_retract()` and `fn_check_integrity()`;
 and the seed vocabulary
 (including the starting tag namespaces). It
 targets PostgreSQL 14+ (`gen_random_uuid()` is in core since PG 13; a
@@ -858,6 +930,8 @@ type/idiom substitutions apply.
   grammar, corrections, and per-client usage.
 - [variables.md](variables.md) — user-defined variables: naming, units,
   history, queries, corrections, and per-client usage.
+- [forms.md](forms.md) — data-entry forms: templates, subject forms,
+  entries, the CSV files, the server and the browser outbox.
 - [mcp-server.md](mcp-server.md) — the read-only MCP interface over this schema.
 - [testing-locally.md](testing-locally.md) — how to load and verify the schema
   on a scratch database.

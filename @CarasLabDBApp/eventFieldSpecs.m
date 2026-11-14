@@ -2,9 +2,14 @@ function specs = eventFieldSpecs(eventType)
 %EVENTFIELDSPECS Field descriptors for a given event type's detail table.
 %
 %   specs = CarasLabDBApp.eventFieldSpecs(eventType) returns a struct array
-%   describing the type-specific detail fields for one of the eight event
+%   describing the type-specific detail fields for one of the nine event
 %   types. It is the single source that drives the dynamic add/supersede form
 %   and mirrors the detail tables in design_docs/schema.sql.
+%
+%   For "observation" (an entry made on a form in web/forms/) only the
+%   session label is editable here: the subject form, template and version
+%   are what the entry was made on, and its values are variables on the
+%   event (Ctrl+L), carried forward by the database on a correction.
 %
 %   Each element has:
 %       Key    - form field key (matches Arg, used internally)
@@ -97,6 +102,9 @@ function specs = eventFieldSpecs(eventType)
                 local_dt("StartedAt","started_at","Started at"), ...
                 local_dt("FinishedAt","finished_at","Finished at"), ...
                 local_e("Status","status","Status",["running","succeeded","failed"])];
+
+        case "observation"
+            specs = local_f("SessionLabel","session_label","Session label","text");
 
         otherwise
             error("CarasLabDBApp:unknownEventType", ...

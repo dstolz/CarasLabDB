@@ -38,6 +38,7 @@ try{
     --ev-endpoint:#937860;
     --ev-histology:#DA8BC3;
     --ev-analysis:#3FA7B7;
+    --ev-observation:#A39B2C;
 
     --positive:#1f9d55;
     --negative:#dc3545;
@@ -85,6 +86,7 @@ try{
   html[data-theme="dark"] .ev-endpoint{background:rgba(147,120,96,.28);color:#dcc0a3;}
   html[data-theme="dark"] .ev-histology{background:rgba(218,139,195,.24);color:#f2c0e2;}
   html[data-theme="dark"] .ev-analysis{background:rgba(63,167,183,.24);color:#8fdcea;}
+  html[data-theme="dark"] .ev-observation{background:rgba(163,155,44,.26);color:#e2db8c;}
   html[data-theme="dark"] .pill{background:var(--surface-3);color:var(--text-secondary);}
   html[data-theme="dark"] .pill.ok,html[data-theme="dark"] .pill.active,html[data-theme="dark"] .pill.succeeded{background:rgba(31,157,85,.22);color:#8fe6ac;}
   html[data-theme="dark"] .pill.missing,html[data-theme="dark"] .pill.failed{background:rgba(220,53,69,.22);color:#f4a3a8;}
@@ -237,10 +239,12 @@ try{
   .ev-endpoint{background:rgba(147,120,96,.16);color:#6e5842;}
   .ev-histology{background:rgba(218,139,195,.16);color:#a6539a;}
   .ev-analysis{background:rgba(63,167,183,.15);color:#2b7d8b;}
+  .ev-observation{background:rgba(163,155,44,.16);color:#6d6716;}
   .dot-birth{background:var(--ev-birth)}.dot-surgery{background:var(--ev-surgery)}
   .dot-recording{background:var(--ev-recording)}.dot-behavior{background:var(--ev-behavior)}
   .dot-husbandry{background:var(--ev-husbandry)}.dot-endpoint{background:var(--ev-endpoint)}
   .dot-histology{background:var(--ev-histology)}.dot-analysis{background:var(--ev-analysis)}
+  .dot-observation{background:var(--ev-observation)}
 
   .pill{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11.5px;font-weight:600;background:var(--surface-3);color:#54617a;}
   .pill.ok{background:rgba(31,157,85,.13);color:#187a41;}
@@ -340,6 +344,7 @@ try{
   .tl-item.t-recording::before{background:var(--ev-recording)}.tl-item.t-behavior::before{background:var(--ev-behavior)}
   .tl-item.t-husbandry::before{background:var(--ev-husbandry)}.tl-item.t-endpoint::before{background:var(--ev-endpoint)}
   .tl-item.t-histology::before{background:var(--ev-histology)}.tl-item.t-analysis::before{background:var(--ev-analysis)}
+  .tl-item.t-observation::before{background:var(--ev-observation)}
   .tl-item.superseded{opacity:.5;}
   .tl-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
   .tl-date{font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums;min-width:96px;}
@@ -773,7 +778,8 @@ try{
     {code:'husbandry', label:'Husbandry / health'},
     {code:'endpoint',  label:'Endpoint / euthanasia'},
     {code:'histology', label:'Histology'},
-    {code:'analysis',  label:'Analysis run'}
+    {code:'analysis',  label:'Analysis run'},
+    {code:'observation', label:'Observation (form entry)'}
   ];
   const roleMeta = ['raw','spikes','lfp','waveforms','video','figure','report','derived','other'];
 
@@ -1337,6 +1343,46 @@ try{
     }
   }
 
+  // -- form entries --------------------------------------------------------------
+  // Entries on subject forms (lab.observation_event, made in web/forms/): a
+  // 'daily check' before each recent session, its values variables on the
+  // event, the note the reserved 'entry note' variable. Drawn after every
+  // other stream so that none of them changes; the value log is then put back
+  // in insertion order and renumbered, as lab.variable_value would number it.
+  {
+    const obsDefs = [
+      {name:'headcap condition', label:'Headcap condition', units:null, value_type:'text', applies_to:['event'],
+       description:'State of the implant and the headcap before the session'},
+      {name:'body condition score', label:'Body condition score', units:null, value_type:'number', applies_to:['event'],
+       description:'1 (emaciated) to 5 (obese), in half points'},
+      {name:'entry note', label:'Note', units:null, value_type:'text', applies_to:['event'],
+       description:'The note on a form entry (an observation event); it can be changed after the entry is made'}
+    ];
+    obsDefs.forEach(v=>variables.push(Object.assign(v,{retired_at:null, created_at:iso(VAR_AT), created_by:PI.person_id})));
+    variables.sort((a,b)=> a.name<b.name?-1:1);
+    const subjectForm = new Map();
+    const added = [];
+    const addValue = (eid, name, value, at, by, note) => added.push({value_id:0, entity_kind:'event', entity_id:eid,
+      variable:name, op:'set', value:String(value), value_type:obsDefs.find(v=>v.name===name).value_type,
+      note:note||null, set_at:iso(at), set_by:by.person_id, set_login:null});
+    sessions.filter(x=>T(x.started_at) > NOW - 150*DAY && T(x.started_at) < NOW).slice(0, 60).forEach(x=>{
+      if(!subjectForm.has(x.subject_id)) subjectForm.set(x.subject_id, uuid());
+      const at = T(x.started_at) - 90*60000;
+      const by = pick([people[1], people[2], people[4]]);
+      const eid = addEvent('observation', {subject_id:x.subject_id, occurred_at:at, recorded_by:by,
+        detail:{subject_form_id:subjectForm.get(x.subject_id), form_name:'daily check', form_version:1,
+                session_label:iso(at).slice(0,16).replace('T',' ')}});
+      const rec = T(events[events.length-1].recorded_at);
+      addValue(eid, 'headcap condition', pickW([['intact',0.82],['loose',0.12],['cracked',0.06]]), rec, by);
+      addValue(eid, 'body condition score', pick(['3','3','3','3.5','2.5']), rec, by);
+      if(chance(0.35)) addValue(eid, 'entry note', pick(['Bright and alert.', 'Slight redness at the headcap margin.',
+        'Ate the reward pellets before the session.', 'Quiet; weighed twice to confirm.']), rec, by);
+    });
+    const merged = variableValues.concat(added).map((r,i)=>[r,i])
+      .sort((a,b)=> T(a[0].set_at)-T(b[0].set_at) || a[1]-b[1]).map(([r],i)=>Object.assign(r,{value_id:i+1}));
+    variableValues.splice(0, variableValues.length, ...merged);
+  }
+
   // -- integrity summary -------------------------------------------------------
   // What web/live/lab_integrity.sql would report for this data: the checks of
   // lab.fn_check_integrity() that this dataset can trip, counted over the
@@ -1614,7 +1660,7 @@ try{
   // fallback for a payload that omits the lookup.
   const ETYPES = D.eventTypeMeta.length
     ? D.eventTypeMeta.map(e=>e.code)
-    : ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis'];
+    : ['birth','surgery','recording','behavior','husbandry','endpoint','histology','analysis','observation'];
   const CSSVAR = getComputedStyle(document.documentElement);
   // --ev-<code> only exists for the types the stylesheet knows; anything newer
   // gets a neutral grey rather than an empty (invisible) colour.
@@ -1781,6 +1827,7 @@ try{
       case 'endpoint': return `${esc(d.method||'')}${d.perfusion_fixative?` · ${esc(d.perfusion_fixative)}`:''}`;
       case 'histology': return `${esc(d.technique||'')} · ${esc(d.stain||'')} · ${esc(d.target_region||'')}`;
       case 'analysis': return `${esc(d.pipeline_name||'pipeline')} · <span class="pill ${cssTok(d.status)}">${esc(d.status||'—')}</span>`;
+      case 'observation': return `${esc(d.form_name||'form')} v${esc(d.form_version==null?'?':d.form_version)} · ${esc(d.session_label||'')}`;
       default: return '';
     }
   }
@@ -2886,7 +2933,8 @@ try{
     artifact_producer_retracted:'Active files whose producing event was retracted',
     input_retracted:'Active events that consumed a retracted file',
     duplicate_active_path:'Two present files at one path',
-    disposed_file_found:'Files recorded as gone that a later check found intact'
+    disposed_file_found:'Files recorded as gone that a later check found intact',
+    observation_invalid:'Form entries whose values break their form version’s rules'
   };
   function integrityExample(x){
     const sub=String(x.subject==null?'':x.subject);
@@ -3163,7 +3211,9 @@ try{
       analysis:[['Pipeline',d.pipeline_name],['Code version',d.code_version?`<span class="mono">${esc(d.code_version)}</span>`:null,true],['Status',d.status?`<span class="pill ${cssTok(d.status)}">${esc(d.status)}</span>`:null,true],
         ['Started',fmtDateTime(d.started_at)],['Finished',fmtDateTime(d.finished_at)],
         ['Parameters',d.parameters?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.parameters))}</span>`:null,true],
-        ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]]
+        ['Environment',d.environment?`<span class="mono" style="font-size:12px">${esc(JSON.stringify(d.environment))}</span>`:null,true]],
+      observation:[['Form',d.form_name],['Form version',d.form_version],['Session label',d.session_label],
+        ['Subject form',d.subject_form_id?`<span class="mono">${esc(d.subject_form_id)}</span>`:null,true]]
     };
     let body = kv(base.concat(detailMap[e.event_type]||[]));
     if(e.notes) body+=`<div style="font-size:13px;color:var(--text-secondary);margin:-4px 0 8px">“${esc(e.notes)}”</div>`;

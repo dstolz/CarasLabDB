@@ -331,6 +331,15 @@ selected row: its current values, set and clear them, and the history.
 **Dashboards.** The dashboards show each entity's current variables (label,
 value, units) and have a Variables view of the definitions.
 
+**Forms (`web/forms/`).** Each field of a form template is bound to a
+variable; an entry's values are variables on its `observation` event, and
+its note is the reserved variable `entry note`. Publishing a template
+defines the variables its fields name (for events) and adds `event` to an
+existing variable's `applies_to`; the builder shows an existing variable's
+type and units, which the field must match. A value is sent and stored as
+the text typed, and a number only in the form `numeric` gives back
+unchanged. See [forms.md](forms.md).
+
 **MCP server (read-only).** Tools to read the definitions, an entity's
 variables and the entities with a given value (`get_variable_definitions`,
 `get_variables`, `find_by_variable`); there is no write tool. See

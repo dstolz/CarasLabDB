@@ -1234,6 +1234,449 @@ SELECT pg_temp.assert(
     'TDT Synapse is a seeded acquisition system');
 
 -- ---------------------------------------------------------------------------
+-- Forms: templates, subject forms, entries (observation events)
+-- ---------------------------------------------------------------------------
+INSERT INTO lab.project (project_id, name)
+VALUES ('00000000-0000-0000-0000-0000000000b2', 'second-project');
+INSERT INTO lab.subject (subject_id, project_id, sex) VALUES
+    ('F1', '00000000-0000-0000-0000-0000000000b1', 'F');
+
+SELECT pg_temp.assert(EXISTS (SELECT 1 FROM lab.event_type WHERE code = 'observation'),
+                      'observation is a seeded event type');
+SELECT pg_temp.assert(
+    (SELECT value_type || '|' || array_to_string(applies_to, ',') FROM lab.variable
+      WHERE name = 'entry note') = 'text|event',
+    'entry note is a seeded text variable for events');
+
+-- Number text is accepted only in the one form numeric gives back unchanged.
+SELECT pg_temp.assert(
+    lab.fn_form_number_ok('1.50') AND lab.fn_form_number_ok('-0.25') AND lab.fn_form_number_ok('0')
+    AND lab.fn_form_number_ok('0.000100') AND lab.fn_form_number_ok('1234567890123456789012345')
+    AND NOT lab.fn_form_number_ok('1e3') AND NOT lab.fn_form_number_ok('.5')
+    AND NOT lab.fn_form_number_ok('+1') AND NOT lab.fn_form_number_ok('007')
+    AND NOT lab.fn_form_number_ok('-0') AND NOT lab.fn_form_number_ok('1,5')
+    AND NOT lab.fn_form_number_ok(' 1') AND NOT lab.fn_form_number_ok('1.')
+    AND NOT lab.fn_form_number_ok('NaN') AND NOT lab.fn_form_number_ok('Infinity'),
+    'fn_form_number_ok accepts plain decimals and nothing it would rewrite');
+SELECT pg_temp.assert(
+    lab.fn_form_integer_ok('12') AND lab.fn_form_integer_ok('-3')
+    AND NOT lab.fn_form_integer_ok('1.0') AND NOT lab.fn_form_integer_ok('-0')
+    AND NOT lab.fn_form_integer_ok('01'),
+    'fn_form_integer_ok accepts whole numbers only');
+
+-- Definition problems: each kind of fault is reported, with its place.
+CREATE TEMP TABLE form_bad (def jsonb, pattern text);
+INSERT INTO form_bad VALUES
+    ('[]', 'must be a JSON object'),
+    ('{"format": 2, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}]}', 'must be 1'),
+    ('{"format": 1, "sections": []}', 'at least one section'),
+    ('{"format": 1, "sections": [{"fields": []}], "colour": "red"}', 'not a key of a form definition'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "heading", "text": "x"}]}]}', 'no field to fill in'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "slider", "variable": "a"}]}]}', 'widget must be one of'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text"}]}]}', 'needs a variable'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "Probe Depth"}]}]}', 'write the variable name as "probe depth"'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "entry note"}]}]}', 'reserved'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}, {"widget": "longtext", "variable": "a"}]}]}', 'already a field'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a", "units": "g"}]}]}', 'takes no units'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "a", "min": 0}]}]}', 'min must be text'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "a", "min": "1e3"}]}]}', 'not a plain decimal number'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "integer", "variable": "a", "max": "1.5"}]}]}', 'not a whole number'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "a", "min": "5", "max": "1"}]}]}', 'min is greater than max'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "choice", "variable": "a"}]}]}', 'needs a list of options'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "choice", "variable": "a", "options": [{"value": "x"}, {"value": "x"}]}]}]}', 'listed twice'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "choice", "variable": "a", "options": [{"value": "=1"}]}]}]}', 'formula'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "yesno", "variable": "a", "options": [{"value": "x"}]}]}]}', 'takes no options'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a", "required": "yes"}]}]}', 'true or false'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "instruction", "variable": "a", "text": "x"}]}]}', 'takes no variable'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "session only"}]}]}', 'not defined for events'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "probe depth"}]}]}', 'holds numbers'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "baseline weight", "units": "kg"}]}]}', 'recorded in g, not in kg'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}], "header": [{"item": "weather"}]}', 'an info item is'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}], "header": [{"variable": "nope", "source": "subject"}]}', 'variable nope is not defined'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}], "header": [{"variable": "session only", "source": "subject"}]}', 'applies to session only'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}], "header": [{"variable": "b", "source": "previous_entry"}]}', 'must be a field of this form'),
+    ('{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "a"}]}], "header": [{"item": "sex"}, {"item": "sex"}]}', 'already in the header');
+-- 'session only' is a number for sessions alone: strict mode wants it
+-- defined for events, non-strict lets publish add that.
+SELECT lab.fn_define_variable('session only', 'number', p_applies_to => ARRAY['session']);
+SELECT pg_temp.assert(NOT EXISTS (
+    SELECT 1 FROM form_bad b
+    WHERE NOT EXISTS (SELECT 1 FROM lab.fn_form_definition_problems(b.def, true) p
+                      WHERE p.problem ~ b.pattern)),
+    'fn_form_definition_problems reports every kind of fault: ' ||
+    coalesce((SELECT string_agg(b.pattern, '; ') FROM form_bad b
+              WHERE NOT EXISTS (SELECT 1 FROM lab.fn_form_definition_problems(b.def, true) p
+                                WHERE p.problem ~ b.pattern)), ''));
+SELECT pg_temp.assert(NOT EXISTS (SELECT 1 FROM lab.fn_form_definition_problems(
+    '{"format": 1, "sections": [{"fields": [{"widget": "number", "variable": "session only"}]}]}', false)),
+    'without p_strict an existing variable not yet defined for events is no problem');
+
+-- Publish: variables defined, versions numbered, an identical definition is
+-- not a new version, applies_to grows.
+CREATE TEMP TABLE form_def (v integer, def jsonb);
+INSERT INTO form_def VALUES (1, $j${"format": 1,
+  "header": [{"item": "species"}, {"item": "latest_weight"},
+             {"variable": "baseline weight", "source": "subject", "label": "Baseline"},
+             {"variable": "probe depth", "source": "previous_entry"}],
+  "sections": [{"title": "Recording", "fields": [
+      {"widget": "number", "variable": "probe depth", "units": "um", "required": true,
+       "min": "0", "max": "6000", "show_previous": true},
+      {"widget": "integer", "variable": "trial count"},
+      {"widget": "choice", "variable": "hemisphere",
+       "options": [{"value": "L", "label": "Left"}, {"value": "R", "label": "Right"}]},
+      {"widget": "yesno", "variable": "implant ok", "required": true},
+      {"widget": "instruction", "text": "Check the headcap before connecting."}]},
+   {"title": "Times", "fields": [
+      {"widget": "date", "variable": "surgery date"},
+      {"widget": "time", "variable": "start time"},
+      {"widget": "datetime", "variable": "fed at"},
+      {"widget": "text", "variable": "booth"},
+      {"widget": "longtext", "variable": "remarks"}]}]}$j$);
+INSERT INTO form_def SELECT 2, jsonb_set(def, '{sections,1,fields}',
+    (def #> '{sections,1,fields}') || '[{"widget": "number", "variable": "sound level"}]')
+FROM form_def WHERE v = 1;
+
+SELECT pg_temp.assert(
+    (SELECT version_number || '|' || is_new FROM lab.fn_publish_form(
+        ' Daily  Check ', (SELECT def FROM form_def WHERE v = 1), p_label => 'Daily check',
+        p_note => 'first')) = '1|true',
+    'the first publication is version 1');
+SELECT pg_temp.assert(
+    (SELECT label FROM lab.form WHERE name = 'daily check') = 'Daily check'
+    AND (SELECT created_login = session_user AND note = 'first' FROM lab.form_version
+          WHERE form_name = 'daily check' AND version = 1)
+    AND (SELECT value_type || '|' || coalesce(units, '') || '|' || array_to_string(applies_to, ',')
+           FROM lab.variable WHERE name = 'trial count') = 'number||event'
+    AND (SELECT value_type FROM lab.variable WHERE name = 'hemisphere') = 'text'
+    AND (SELECT 'event' = ANY (applies_to) AND 'session' = ANY (applies_to)
+           FROM lab.variable WHERE name = 'probe depth'),
+    'publishing defines the fields'' variables for events and grows an existing one''s applies_to');
+SELECT pg_temp.assert(
+    (SELECT version_number || '|' || is_new FROM lab.fn_publish_form(
+        'daily check', (SELECT def FROM form_def WHERE v = 1))) = '1|false'
+    AND (SELECT count(*) FROM lab.form_version WHERE form_name = 'daily check') = 1,
+    'publishing an identical definition appends nothing');
+SELECT pg_temp.assert(
+    (SELECT version_number || '|' || is_new FROM lab.fn_publish_form(
+        'daily check', (SELECT def FROM form_def WHERE v = 2), p_note => 'adds sound level')) = '2|true',
+    'a changed definition is the next version');
+SELECT pg_temp.expect_error($q$
+    SELECT * FROM lab.fn_publish_form('daily check', '{"format": 1, "sections": []}')$q$,
+    'definition is not valid');
+SELECT pg_temp.expect_error($q$SELECT * FROM lab.fn_publish_form('2 bad', '{}')$q$,
+    'not a valid form name');
+-- The version policy holds for a raw INSERT too.
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.form_version (form_name, definition) VALUES ('daily check', '{"format": 1}')$q$,
+    'definition is not valid');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.form_version (form_name, version, definition)
+    SELECT 'daily check', 7, def FROM form_def WHERE v = 1$q$,
+    'next version of form daily check is 3');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.form_version (form_name, definition) VALUES ('daily check',
+      '{"format": 1, "sections": [{"fields": [{"widget": "text", "variable": "brand new"}]}]}')$q$,
+    'variable brand new is not defined');
+-- Versions are immutable, the template's name too; its label is not.
+SELECT pg_temp.expect_error('UPDATE lab.form_version SET note = ''x''', 'never changed');
+SELECT pg_temp.expect_error('DELETE FROM lab.form_version', 'never changed');
+SELECT pg_temp.expect_error('TRUNCATE lab.form_version CASCADE', 'not allowed');
+SELECT pg_temp.expect_error('UPDATE lab.form SET name = ''other''', 'cannot be renamed');
+UPDATE lab.form SET description = 'Before each session' WHERE name = 'daily check';
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.row_history WHERE table_name = 'form' AND row_key = '{"name": "daily check"}') = 1,
+    'edits to a template are recorded in row_history');
+
+-- Subject forms: project and version default, one per (subject, project,
+-- template), what they are never changes.
+SELECT lab.fn_add_subject_form('F1', 'Daily Check', p_form_version => 1) AS sf1 \gset
+SELECT lab.fn_add_subject_form('F1', 'daily check', '00000000-0000-0000-0000-0000000000b2') AS sf2 \gset
+SELECT pg_temp.assert(
+    (SELECT project_id || '|' || form_version FROM lab.subject_form WHERE subject_form_id = :'sf1')
+        = '00000000-0000-0000-0000-0000000000b1|1'
+    AND (SELECT project_id || '|' || form_version FROM lab.subject_form WHERE subject_form_id = :'sf2')
+        = '00000000-0000-0000-0000-0000000000b2|2'
+    AND lab.fn_add_subject_form('F1', 'daily check') = :'sf1',
+    'a subject form defaults to the subject''s project and the latest version, and is not added twice');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_add_subject_form('nobody', 'daily check')$q$, 'does not exist');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_add_subject_form('F1', 'no such form')$q$, 'does not exist');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.subject_form (subject_id, form_name) VALUES ('F1', 'daily check')$q$,
+    'duplicate key');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.subject_form SET project_id = '00000000-0000-0000-0000-0000000000b2'
+    WHERE subject_form_id = %L$q$, :'sf1'), 'only form_version, notes and retired_at');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.subject_form SET subject_id = 'G1-renamed' WHERE subject_form_id = %L$q$, :'sf1'),
+    'cannot be moved to another subject');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.subject_form SET form_version = 9 WHERE subject_form_id = %L$q$, :'sf1'),
+    'foreign key');
+
+-- Entries: inserted, then the same entry again is 'existing' (also with the
+-- time sent with another offset and blank values left out); another entry
+-- under that id is refused.
+CREATE TEMP TABLE obs_vals (k text, v jsonb);
+INSERT INTO obs_vals VALUES
+    ('first', '{"probe depth": "1350.50", "trial count": "12", "hemisphere": "L", "implant ok": "yes",
+                "surgery date": "2026-08-30", "start time": "09:30", "fed at": "2026-11-13T18:00-05:00",
+                "booth": "B2", "remarks": "Line one\nline two"}');
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f001', :'sf1', '2026-11-14 09:30-05', '2026-11-14 09:30',
+    (SELECT v FROM obs_vals WHERE k = 'first'), 'Bright and alert.',
+    p_attributes => '{"client": "schema_test"}') = 'inserted',
+    'an entry is inserted');
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f001', :'sf1', '2026-11-14 14:30Z', '2026-11-14 09:30',
+    (SELECT v || '{"sound level": "  "}' FROM obs_vals WHERE k = 'first'), 'Bright and alert.') = 'existing',
+    'the same entry sent again is existing, and writes nothing');
+SELECT pg_temp.expect_error(format($q$
+    SELECT lab.fn_record_observation('00000000-0000-0000-0000-00000000f001', %L,
+        '2026-11-14 09:30-05', '2026-11-14 09:30', '{"probe depth": "1351", "implant ok": "yes"}')$q$, :'sf1'),
+    'already exists and is not this entry');
+SELECT pg_temp.expect_error($q$
+    SELECT lab.fn_record_observation('00000000-0000-0000-0000-0000000000e1',
+        (SELECT subject_form_id FROM lab.subject_form LIMIT 1), now(), 'x', '{}')$q$,
+    'already exists and is not this entry');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.event WHERE event_id = '00000000-0000-0000-0000-00000000f001') = 1
+    AND (SELECT count(*) FROM lab.variable_value WHERE event_id = '00000000-0000-0000-0000-00000000f001') = 10,
+    'the replay wrote nothing');
+SELECT pg_temp.assert(
+    (SELECT e.subject_id || '|' || o.form_name || '|' || o.form_version || '|' || o.session_label
+            || '|' || e.recorded_login || '|' || (e.attributes->>'client')
+            || '|' || length(e.attributes->>'client_digest')
+       FROM lab.event e JOIN lab.observation_event o USING (event_id)
+      WHERE e.event_id = '00000000-0000-0000-0000-00000000f001')
+        = 'F1|daily check|1|2026-11-14 09:30|' || session_user || '|schema_test|64',
+    'the entry''s event and detail row record its subject, form, version, label, login and digest');
+-- Values are stored as the text typed: numbers exactly, text with its newline.
+SELECT pg_temp.assert(
+    (SELECT field_values::text || '|' || note FROM lab.observation_active
+      WHERE event_id = '00000000-0000-0000-0000-00000000f001')
+        = (SELECT v::text FROM obs_vals WHERE k = 'first') || '|Bright and alert.'
+    AND (SELECT value_num::text FROM lab.variable_value
+          WHERE event_id = '00000000-0000-0000-0000-00000000f001' AND variable = 'probe depth') = '1350.50'
+    AND (SELECT entry_id = event_id FROM lab.observation_active
+          WHERE event_id = '00000000-0000-0000-0000-00000000f001'),
+    'observation_active returns every value as the text stored, and the note');
+-- (A read in the statement that calls a write function does not see what the
+-- function wrote: the statement's snapshot is older. Hence separate steps.)
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f002', :'sf1', '2026-11-15 09:30-05', '2026-11-15',
+    '{"probe depth": "5999.000000000000000000000001", "implant ok": "no"}') = 'inserted',
+    'a second entry is inserted');
+SELECT pg_temp.assert(
+    (SELECT field_values->>'probe depth' FROM lab.observation_active
+          WHERE event_id = '00000000-0000-0000-0000-00000000f002') = '5999.000000000000000000000001',
+    'a number with more digits than a double holds is stored exactly');
+
+-- Every value rule refuses what it should, with SQLSTATE CLB02.
+CREATE TEMP TABLE obs_bad (vals jsonb, note text, label text, pattern text);
+INSERT INTO obs_bad VALUES
+    ('{"implant ok": "yes"}', NULL, 'x', 'probe depth: is required'),
+    ('{"probe depth": "1350", "implant ok": "  "}', NULL, 'x', 'implant ok: is required'),
+    ('{"probe depth": 1350, "implant ok": "yes"}', NULL, 'x', 'must be sent as text'),
+    ('{"probe depth": "1.35e3", "implant ok": "yes"}', NULL, 'x', 'not a plain decimal number'),
+    ('{"probe depth": "-1", "implant ok": "yes"}', NULL, 'x', 'below the minimum, 0'),
+    ('{"probe depth": "6000.5", "implant ok": "yes"}', NULL, 'x', 'above the maximum, 6000'),
+    ('{"probe depth": "1", "trial count": "1.5", "implant ok": "yes"}', NULL, 'x', 'not a whole number'),
+    ('{"probe depth": "1", "hemisphere": "left", "implant ok": "yes"}', NULL, 'x', 'not one of the choices \(L, R\)'),
+    ('{"probe depth": "1", "implant ok": "true"}', NULL, 'x', 'not yes or no'),
+    ('{"probe depth": "1", "implant ok": "yes", "surgery date": "2026-02-30"}', NULL, 'x', 'not a date'),
+    ('{"probe depth": "1", "implant ok": "yes", "start time": "9:30"}', NULL, 'x', 'not a time'),
+    ('{"probe depth": "1", "implant ok": "yes", "fed at": "2026-11-13T18:00"}', NULL, 'x', 'UTC offset'),
+    ('{"probe depth": "1", "implant ok": "yes", "booth": "two\nlines"}', NULL, 'x', 'single line'),
+    ('{"probe depth": "1", "implant ok": "yes", "booth": "=HYPERLINK(1)"}', NULL, 'x', 'formula'),
+    ('{"probe depth": "1", "implant ok": "yes", "remarks": "@cmd"}', NULL, 'x', 'formula'),
+    ('{"probe depth": "1", "implant ok": "yes", "sound level": "60"}', NULL, 'x', 'not a field of form daily check version 1'),
+    ('{"probe depth": "1", "implant ok": "yes"}', '=1+1', 'x', 'entry note: starts with'),
+    ('{"probe depth": "1", "implant ok": "yes"}', NULL, ' x', 'session label'),
+    ('{"probe depth": "1", "implant ok": "yes"}', NULL, '', 'session label'),
+    ('[1]', NULL, 'x', 'must be a JSON object');
+CREATE FUNCTION pg_temp.obs_error(p_vals jsonb, p_note text, p_label text, p_sf uuid)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM lab.fn_record_observation(gen_random_uuid(), p_sf, now(), p_label, p_vals, p_note);
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE || ' ' || SQLERRM;
+END;
+$$;
+SELECT pg_temp.assert(NOT EXISTS (
+    SELECT 1 FROM obs_bad b
+    WHERE pg_temp.obs_error(b.vals, b.note, b.label, :'sf1') !~ b.pattern),
+    'every value rule refuses what it should: ' ||
+    coalesce((SELECT string_agg(b.pattern || ' -> ' || pg_temp.obs_error(b.vals, b.note, b.label, :'sf1'), '; ')
+              FROM obs_bad b
+              WHERE pg_temp.obs_error(b.vals, b.note, b.label, :'sf1') !~ b.pattern), ''));
+SELECT pg_temp.assert(
+    pg_temp.obs_error('{"probe depth": "1.35e3", "implant ok": "yes"}', NULL, 'x', :'sf1') LIKE 'CLB02 %',
+    'a value problem is SQLSTATE CLB02');
+-- An entry on a subject form names that form's subject: a raw detail row
+-- under another subject's event is refused.
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-00000000f0ff', 'observation', 'G1-renamed', now());
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.observation_event (event_id, subject_form_id, form_name, form_version, session_label)
+    VALUES ('00000000-0000-0000-0000-00000000f0ff', %L, 'daily check', 1, 'x')$q$, :'sf1'),
+    'belongs to subject F1');
+INSERT INTO lab.event (event_id, event_type, subject_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-00000000f0fe', 'observation', 'F1', now());
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.observation_event (event_id, subject_form_id, form_name, form_version, session_label)
+    VALUES ('00000000-0000-0000-0000-00000000f0fe', %L, 'second form', 1, 'x')$q$, :'sf1'),
+    'foreign key');
+
+-- The note is changed without a correction; the history is kept.
+SELECT pg_temp.assert(
+    lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f001', 'Bright; ate well.') = 'set'
+    AND lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f001', 'Bright; ate well.') = 'unchanged',
+    'fn_set_entry_note sets a changed note and writes nothing for the same text');
+SELECT pg_temp.assert(
+    (SELECT note FROM lab.observation_active
+          WHERE event_id = '00000000-0000-0000-0000-00000000f001') = 'Bright; ate well.'
+    AND (SELECT string_agg(value_text, ' > ' ORDER BY value_id) FROM lab.variable_value
+          WHERE event_id = '00000000-0000-0000-0000-00000000f001' AND variable = 'entry note')
+        = 'Bright and alert. > Bright; ate well.'
+    AND (SELECT bool_and(set_login = session_user) FROM lab.variable_value
+          WHERE event_id = '00000000-0000-0000-0000-00000000f001' AND variable = 'entry note'),
+    'fn_set_entry_note appends the new note and keeps the old one, under the login');
+SELECT pg_temp.assert(
+    lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f002', '   ') = 'unchanged'
+    AND lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f002', 'tmp') = 'set'
+    AND lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f002', '') = 'unset',
+    'a blank note clears a note, and is nothing to clear on an entry without one');
+SELECT pg_temp.assert(
+    (SELECT note IS NULL FROM lab.observation_active
+      WHERE event_id = '00000000-0000-0000-0000-00000000f002'),
+    'a cleared note is gone');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f001', '@x')$q$,
+    'formula');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_set_entry_note('00000000-0000-0000-0000-0000000000e1', 'x')$q$,
+    'not an entry on a form');
+
+-- A correction: same subject form and version; changed values set, cleared
+-- values unset, unchanged ones carried with their set_at; tags carried.
+SELECT lab.fn_tag('event', '00000000-0000-0000-0000-00000000f001', 'qc:pass');
+CREATE TEMP TABLE obs_before AS
+SELECT set_at FROM lab.variable_value
+WHERE event_id = '00000000-0000-0000-0000-00000000f001' AND variable = 'booth';
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f003', :'sf1', '2026-11-14 09:30-05', '2026-11-14 09:30',
+    (SELECT (v - 'hemisphere') || '{"probe depth": "1400", "trial count": ""}' FROM obs_vals WHERE k = 'first'),
+    'Bright; ate well.', p_supersedes => '00000000-0000-0000-0000-00000000f001') = 'inserted',
+    'a correction is inserted');
+SELECT pg_temp.assert(
+    (SELECT field_values->>'probe depth' || '|' || coalesce(field_values->>'trial count', 'none')
+            || '|' || coalesce(field_values->>'hemisphere', 'none') || '|' || (field_values->>'booth')
+            || '|' || note || '|' || form_version || '|' || entry_id
+       FROM lab.observation_active WHERE event_id = '00000000-0000-0000-0000-00000000f003')
+        = '1400|none|none|B2|Bright; ate well.|1|00000000-0000-0000-0000-00000000f001'
+    AND NOT EXISTS (SELECT 1 FROM lab.observation_active
+                    WHERE event_id = '00000000-0000-0000-0000-00000000f001'),
+    'the correction replaces the entry: changed, cleared and kept values, the note, the version, the entry id');
+SELECT pg_temp.assert(
+    (SELECT vv.set_at FROM lab.variable_value vv
+      WHERE vv.event_id = '00000000-0000-0000-0000-00000000f003' AND vv.variable = 'booth')
+        = (SELECT set_at FROM obs_before)
+    AND (SELECT count(*) FROM lab.variable_value
+          WHERE event_id = '00000000-0000-0000-0000-00000000f003' AND variable = 'booth') = 1
+    AND (SELECT string_agg(op, ',' ORDER BY value_id) FROM lab.variable_value
+          WHERE event_id = '00000000-0000-0000-0000-00000000f003' AND variable = 'hemisphere') = 'set,unset',
+    'an unchanged value keeps its set_at and is not written again; a cleared one is unset');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.tag_current WHERE entity_kind = 'event'
+            AND event_id = '00000000-0000-0000-0000-00000000f003' AND tag = 'qc:pass'),
+    'the correction carries the entry''s tags');
+SELECT pg_temp.expect_error(format($q$
+    SELECT lab.fn_record_observation(gen_random_uuid(), %L, now(), 'x',
+        '{"probe depth": "1", "implant ok": "yes"}',
+        p_supersedes => '00000000-0000-0000-0000-00000000f001')$q$, :'sf1'),
+    'already been corrected; its current version is 00000000-0000-0000-0000-00000000f003');
+SELECT pg_temp.expect_error(format($q$
+    SELECT lab.fn_record_observation(gen_random_uuid(), %L, now(), 'x',
+        '{"probe depth": "1", "implant ok": "yes"}',
+        p_supersedes => '00000000-0000-0000-0000-00000000f003')$q$, :'sf2'),
+    'its correction must be too');
+SELECT pg_temp.expect_error(format($q$
+    SELECT lab.fn_record_observation(gen_random_uuid(), %L, now(), 'x', '{}',
+        p_supersedes => '00000000-0000-0000-0000-0000000000e1')$q$, :'sf1'),
+    'not an entry on a form');
+SELECT pg_temp.expect_error($q$SELECT lab.fn_set_entry_note('00000000-0000-0000-0000-00000000f001', 'x')$q$,
+    'has been corrected');
+-- A correction under the subject form's newer version keeps the entry's own.
+UPDATE lab.subject_form SET form_version = 2 WHERE subject_form_id = :'sf1';
+SELECT pg_temp.assert(
+    (SELECT string_agg(form_version::text, ',') FROM lab.observation_active
+      WHERE subject_form_id = :'sf1') = '1,1'
+    AND (SELECT count(*) FROM lab.row_history WHERE table_name = 'subject_form') = 1,
+    'moving a subject form to a newer version changes no entry and is recorded in row_history');
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f004', :'sf1', '2026-11-16 09:30-05', '2026-11-16',
+    '{"probe depth": "1500", "implant ok": "yes", "sound level": "65"}') = 'inserted',
+    'an entry is inserted under the newer version');
+SELECT pg_temp.assert(
+    (SELECT form_version FROM lab.observation_active
+          WHERE event_id = '00000000-0000-0000-0000-00000000f004') = 2,
+    'a new entry uses the subject form''s version');
+
+-- The CSV column order: by form, then by first appearance across versions.
+SELECT version_number FROM lab.fn_publish_form('second form', $j${"format": 1, "sections": [{"fields": [
+    {"widget": "text", "variable": "booth"}, {"widget": "number", "variable": "pellets"}]}]}$j$);
+SELECT lab.fn_add_subject_form('F1', 'second form') AS sf3 \gset
+SELECT pg_temp.assert(
+    (SELECT string_agg(variable || coalesce('(' || units || ')', ''), ',' ORDER BY column_no)
+       FROM lab.fn_subject_project_columns('F1', '00000000-0000-0000-0000-0000000000b1'))
+        = 'probe depth(um),trial count,hemisphere,implant ok,surgery date,start time,fed at,booth,'
+          'remarks,sound level,pellets',
+    'fn_subject_project_columns lists each variable once, form by form, version by version');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.fn_subject_project_columns('F1', '00000000-0000-0000-0000-0000000000b2')) = 10
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_subject_project_columns('F1', '00000000-0000-0000-0000-0000000000b1') c
+                    WHERE c.variable = 'entry note'),
+    'the other project''s subject form, on version 2, has every field; the note is no column');
+
+-- Integrity: a required value unset afterwards is reported; withdrawal hides
+-- the entry; an observation event without its detail row is an error.
+SELECT pg_temp.assert(NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity()
+                                  WHERE check_name = 'observation_invalid'),
+    'valid entries are not reported');
+SELECT lab.fn_unset_variable('event', '00000000-0000-0000-0000-00000000f004', 'implant ok');
+SELECT lab.fn_set_variable('event', '00000000-0000-0000-0000-00000000f004', 'housing', p_text => 'pair');
+SELECT pg_temp.assert(
+    (SELECT detail FROM lab.fn_check_integrity()
+      WHERE check_name = 'observation_invalid' AND subject = '00000000-0000-0000-0000-00000000f004')
+        = 'entry on form daily check version 2: implant ok: is required',
+    'observation_invalid reports a required value unset since; other variables are not judged');
+SELECT lab.fn_retract('event', '00000000-0000-0000-0000-00000000f004', 'test');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.observation_active WHERE event_id = '00000000-0000-0000-0000-00000000f004')
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'observation_invalid'),
+    'a withdrawn entry is not active and not judged');
+SELECT pg_temp.assert(
+    EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'event_missing_detail'
+            AND subject = '00000000-0000-0000-0000-00000000f0ff'),
+    'an observation event without its detail row is event_missing_detail');
+
+-- Detail rows are append-only like every other.
+SELECT pg_temp.expect_error('UPDATE lab.observation_event SET session_label = ''y''', 'append-only');
+SELECT pg_temp.expect_error('DELETE FROM lab.observation_event', 'append-only');
+
+-- A subject rename carries the subject forms and entries along.
+SELECT lab.fn_rename_subject('F1', 'F1-renamed');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.subject_form WHERE subject_id = 'F1-renamed') = 3
+    AND (SELECT count(*) FROM lab.observation_active WHERE subject_id = 'F1-renamed') = 2
+    AND (SELECT count(*) FROM lab.fn_subject_project_columns('F1-renamed',
+                                  '00000000-0000-0000-0000-0000000000b1')) = 11,
+    'a subject rename relabels its subject forms and entries');
+SELECT pg_temp.assert(lab.fn_record_observation(
+    '00000000-0000-0000-0000-00000000f001', :'sf1', '2026-11-14 14:30Z', '2026-11-14 09:30',
+    (SELECT v FROM obs_vals WHERE k = 'first'), 'Bright and alert.') = 'existing',
+    'an entry stored before a rename is still recognised when it is sent again');
+
+-- ---------------------------------------------------------------------------
 -- Client metadata probes
 -- ---------------------------------------------------------------------------
 -- MATLAB's Database Toolbox learns a result's column types by first sending a

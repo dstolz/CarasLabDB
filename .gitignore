@@ -19,3 +19,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 .ruff_cache/
+
+# Forms server CSV output when run from the lab-forms launch configuration
+forms-csv/
