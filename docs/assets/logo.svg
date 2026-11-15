@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 256" width="840" height="256" role="img" aria-labelledby="t">
+  <title id="t">CarasLabDB</title>
+  <style>
+    .word { fill: #1b2432; }
+    .sub  { fill: #6b7688; }
+    .db   { fill: #3FA7B7; }
+    @media (prefers-color-scheme: dark) {
+      .word { fill: #eaf0fb; }
+      .sub  { fill: #9aa6ba; }
+    }
+    text { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e2a44"/>
+      <stop offset="1" stop-color="#141b2d"/>
+    </linearGradient>
+    <linearGradient id="trace" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4C72B0"/>
+      <stop offset="0.5" stop-color="#eaf0fb"/>
+      <stop offset="1" stop-color="#3FA7B7"/>
+    </linearGradient>
+    <clipPath id="tile"><rect width="256" height="256" rx="56"/></clipPath>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <g clip-path="url(#tile)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#6b7fa6" stroke-width="7">
+      <ellipse cx="128" cy="64" rx="72" ry="22"/>
+      <path d="M56 64 V192 A72 22 0 0 0 200 192 V64"/>
+      <path d="M56 107 A72 22 0 0 0 200 107" opacity="0.55"/>
+      <path d="M56 150 A72 22 0 0 0 200 150" opacity="0.55"/>
+    </g>
+    <path d="M22 132 H92 C99 132 101 125 106 125 C112 125 114 196 124 196 C134 196 136 96 148 96 C160 96 160 132 172 132 H234"
+          stroke="#141b2d" stroke-width="18"/>
+    <path d="M22 132 H92 C99 132 101 125 106 125 C112 125 114 196 124 196 C134 196 136 96 148 96 C160 96 160 132 172 132 H234"
+          stroke="url(#trace)" stroke-width="9"/>
+  </g>
+  <circle cx="34" cy="132" r="13" fill="#4C72B0" stroke="#141b2d" stroke-width="5"/>
+  <circle cx="222" cy="132" r="13" fill="#3FA7B7" stroke="#141b2d" stroke-width="5"/>
+  <text x="296" y="140" font-size="88" font-weight="700" letter-spacing="-2" textLength="512" lengthAdjust="spacingAndGlyphs"><tspan class="word">CarasLab</tspan><tspan class="db">DB</tspan></text>
+  <text x="300" y="190" font-size="26" font-weight="500" class="sub" textLength="420" lengthAdjust="spacing">events · artifacts · provenance</text>
+</svg>

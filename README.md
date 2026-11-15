@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="CarasLabDB" width="560">
+</p>
+
 # CarasLabDB
 
 A metadata and provenance system for the Caras Lab's extracellular
