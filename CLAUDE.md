@@ -410,13 +410,18 @@ Rules a change must keep:
   client folder is `%LOCALAPPDATA%\caraslabdb\client` (env
   `CARASLABDB_CLIENT_DIR`; `DB.useTemporary` in tests). Never reintroduce a
   toolbox-specific store. Read prefs with `ispref` before `getpref`.
-- **No dependency on a toolbox.** The package may not name `EphysDataset`,
-  `AppPrefs`, `LabCapture`, `EPsych`... — a toolbox is reached only through
-  **tool hooks**: `Sync.registerTool(name, struct(readSession=,
-  copyOfSession=, assignSubject=))` for records about a dataset *folder*
-  (`dataset.tool`; a folder with no tool is `ephys_analysis`, the only tool
-  before the package). Private JSON helpers live in `+labclient/private`.
-- **The shared-outbox rule.** Two MATLAB processes (an ephys app, EPsych) may
+- **No dependency on a toolbox.** The package may not name a toolbox, its
+  classes or its files (`EphysDataset`, `AppPrefs`, `LabCapture`, `EPsych`,
+  `ephys_analysis`...), in code or in comments — a toolbox is reached only
+  through **tool hooks**: `Sync.registerTool(name, struct(readSession=,
+  copyOfSession=, assignSubject=), TakesUntagged=)` for records about a
+  dataset *folder* (`dataset.tool`). A dataset record that names no tool
+  (written before records named their tool) is `Bundles.Untagged`: no tool is
+  assumed for it, and it is sent only through the one tool per MATLAB that
+  registered with `TakesUntagged=true` (the toolbox that wrote such records
+  says so itself); with none it waits untouched. Private JSON helpers live in
+  `+labclient/private`.
+- **The shared-outbox rule.** Two MATLAB processes (of different toolboxes) may
   run over one outbox. A process never claims a record it cannot fully send:
   `Sync.nextIds` skips an event whose tool is not registered here (untouched:
   not claimed, not failed); a record of no dataset needs no hooks. The claim is

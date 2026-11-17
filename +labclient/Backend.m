@@ -1,5 +1,5 @@
 classdef (Abstract) Backend < handle
-    % labclient.Backend  What the toolbox asks of the lab database: the one seam to CarasLabDB.
+    % labclient.Backend  What the client asks of the lab database: the one seam to CarasLabDB.
     %   labclient.DB talks to the database only through these methods. The real
     %   backend is labclient.CarasBackend (the CarasLabDB class, Database
     %   Toolbox); the tests use labclient.FakeBackend, which keeps the same

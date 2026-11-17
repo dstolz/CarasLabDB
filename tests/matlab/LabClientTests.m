@@ -20,7 +20,8 @@ classdef LabClientTests < matlab.unittest.TestCase
 %   events, a replacement file registered beside the one it replaces, a record
 %   recorded as a copy of a file already in the database whichever of two
 %   toolboxes sent it first, a record whose tool is not running here never
-%   claimed; labclient.SubjectCache.
+%   claimed, a dataset record that names no tool sent only through the tool
+%   registered to take such records; labclient.SubjectCache.
 %
 %   See also LABSCRATCHDB, CLIENTAPITESTS.
 
@@ -77,13 +78,19 @@ classdef LabClientTests < matlab.unittest.TestCase
             fclose(fid);
         end
 
-        function registerTool(tc, name)
+        function registerTool(tc, name, opts)
             %registerTool  A fake toolbox: its session files are entries of a map, every hook call counted.
+            arguments
+                tc
+                name (1,1) string
+                opts.TakesUntagged (1,1) logical = false
+            end
             S = tc.Sessions; C = tc.Calls;
             labclient.Sync.registerTool(name, struct( ...
                 "readSession", @(folder, nm) LabClientTests.readFake(S, C, folder, nm), ...
                 "copyOfSession", @(folder, nm, sid, kind, ev) LabClientTests.copyFake(S, C, folder, nm, sid, kind, ev), ...
-                "assignSubject", @(folder, nm, subj) LabClientTests.assignFake(S, C, folder, nm, subj)));
+                "assignSubject", @(folder, nm, subj) LabClientTests.assignFake(S, C, folder, nm, subj)), ...
+                TakesUntagged=opts.TakesUntagged);
         end
 
         function n = called(tc, hook)
@@ -111,7 +118,7 @@ classdef LabClientTests < matlab.unittest.TestCase
             end %#ok<INUSL>
             id = opts.Id;
             if id == ""; id = labclient.Bundles.newId(); end
-            it = labclient.Bundles.item(f, Role="raw", Kind="epsych", ArtifactId=labclient.Bundles.newId(), ...
+            it = labclient.Bundles.item(f, Role="raw", Kind="session", ArtifactId=labclient.Bundles.newId(), ...
                 Sha256=labclient.fileSha256(f), Root="nas", Rel=string(strrep(extractAfter(f, strlength(tc.Top) + 1), "\", "/")));
             b = labclient.Bundles.event(EventId=id, EventType=opts.Type, OccurredAt=labclient.Bundles.now(), ...
                 Detail=struct("task", "detect", "trials_completed", 12), Attributes=struct("rig", "r1"), ...
@@ -419,7 +426,8 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEqual(d.record.outputs(1).bytes, 1234);
             tc.verifyEqual(d.record.inputs(1).bytes, 5000000000);
             tc.verifyEqual(d.record.subject_id, "", "a record from before records named their subject");
-            tc.verifyEqual(labclient.Bundles.toolOf(d), "ephys_analysis", "a folder and no tool: the toolbox that had no other");
+            tc.verifyEqual(labclient.Bundles.toolOf(d), labclient.Bundles.Untagged, ...
+                "a folder and no tool: no toolbox is assumed for it");
             tc.verifySubstring(txt, '"outputs":[{', "a list of one is still a list");
             u = tc.golden();
             u.record.outputs(1).sha256 = "";
@@ -607,7 +615,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         % ---- sending: records of no dataset ---------------------------------------------------------
 
         function aRecordOfNoDatasetIsSentForItsSubject(tc)
-            f = tc.file("epsych/s1.mat", 1:64);
+            f = tc.file("rig/s1.mat", 1:64);
             b = tc.record(f, Subject="SUBJ-1");
             labclient.Outbox.put(b);
             r = labclient.Sync.flush(Budget=10);
@@ -618,12 +626,12 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEmpty(tc.Fake.Sessions, "a behavior record needs no lab.session");
             A = tc.Fake.Artifacts;
             tc.verifyEqual([A.produced_by_event_id, A.relative_path, A.checksum], ...
-                [b.bundle_id, "epsych/s1.mat", labclient.fileSha256(f)]);
+                [b.bundle_id, "rig/s1.mat", labclient.fileSha256(f)]);
             tc.verifyEqual(e.recorded_by, tc.Fake.PersonId);
         end
 
         function aSubjectTheDatabaseDoesNotHaveHoldsTheRecord(tc)
-            f = tc.file("epsych/s9.mat", 1:64);
+            f = tc.file("rig/s9.mat", 1:64);
             b = tc.record(f, Subject="SUBJ-9");
             labclient.Outbox.put(b);
             labclient.Sync.flush(Budget=10);
@@ -650,7 +658,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function theDialogAssignsARecordOfNoDataset(tc)
-            f = tc.file("epsych/s7.mat", 1:64);
+            f = tc.file("rig/s7.mat", 1:64);
             b = tc.record(f, Subject="SUBJ-10");   % a typo for SUBJ-1
             labclient.Outbox.put(b);
             labclient.Sync.flush(Budget=10);
@@ -707,7 +715,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         % ---- sending: a file replaced by new bytes at the same path -----------------------------------
 
         function aReplacementFileOfAnEventAlreadySent(tc)
-            f = tc.file("epsych/session.mat", 1:50);
+            f = tc.file("rig/session.mat", 1:50);
             ev = tc.record(f, Subject="SUBJ-1");
             labclient.Outbox.put(ev);
             labclient.Sync.flush(Budget=10);
@@ -715,9 +723,9 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEqual(labclient.Outbox.stateOf(ev.bundle_id), "done");
 
             pause(1.1);
-            tc.file("epsych/session.mat", 1:80);   % the same path, new bytes
-            it = labclient.Bundles.item(f, Role="raw", Kind="epsych", ArtifactId=labclient.Bundles.newId(), ...
-                Root="nas", Rel="epsych/session.mat", Replaces=old.artifact_id);
+            tc.file("rig/session.mat", 1:80);   % the same path, new bytes
+            it = labclient.Bundles.item(f, Role="raw", Kind="session", ArtifactId=labclient.Bundles.newId(), ...
+                Root="nas", Rel="rig/session.mat", Replaces=old.artifact_id);
             fb = labclient.Bundles.files(EventId=ev.bundle_id, Outputs=it, After=strings(1, 0));
             tc.verifyFalse(labclient.Bundles.isSealed(fb), "the hash is not known yet");
             labclient.Outbox.put(fb);
@@ -742,8 +750,8 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEqual(height(tc.Fake.Dispositions), 1);
 
             % an earlier file the database does not have: noted, not an error
-            it2 = labclient.Bundles.item(f, Role="raw", Kind="epsych", ArtifactId=labclient.Bundles.newId(), ...
-                Root="nas", Rel="epsych/other.mat", Replaces=labclient.Bundles.newId(), Sha256=repmat('b', 1, 64));
+            it2 = labclient.Bundles.item(f, Role="raw", Kind="session", ArtifactId=labclient.Bundles.newId(), ...
+                Root="nas", Rel="rig/other.mat", Replaces=labclient.Bundles.newId(), Sha256=repmat('b', 1, 64));
             fb2 = labclient.Bundles.files(EventId=ev.bundle_id, Outputs=it2);
             labclient.Outbox.put(fb2);
             labclient.Sync.flush(Budget=10);
@@ -752,10 +760,10 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function aFilesRecordWaitsForItsEventAndHoldsAWrongCopy(tc)
-            f = tc.file("epsych/w.mat", 1:50);
-            ev = tc.record(tc.file("epsych/w0.mat", 1:20), Subject="SUBJ-1");
+            f = tc.file("rig/w.mat", 1:50);
+            ev = tc.record(tc.file("rig/w0.mat", 1:20), Subject="SUBJ-1");
             it = labclient.Bundles.item(f, Role="derived", Kind="x", ArtifactId=labclient.Bundles.newId(), ...
-                Root="nas", Rel="epsych/w.mat", Sha256=labclient.fileSha256(f), ...
+                Root="nas", Rel="rig/w.mat", Sha256=labclient.fileSha256(f), ...
                 Attributes=struct("copied_from_sha256", repmat('c', 1, 64)));
             fb = labclient.Bundles.files(EventId=ev.bundle_id, Artifacts=it);
             labclient.Outbox.put(fb);
@@ -773,7 +781,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         % ---- sending: copies of a file already in the database, from either toolbox --------------------
 
         function aNoDatasetRecordOfAFileAlreadyThereIsACopyOfItsEvent(tc)
-            % an ephys-style dataset record first, then an EPsych-style record of the same bytes
+            % a dataset record of one toolbox first, then another toolbox's record of no dataset, of the same bytes
             tc.registerTool("tool-x");
             f1 = tc.file("sessions/a/beh.mat", 1:90);
             ds = tc.datasetBlock("a", "SUBJ-1", "tool-x");
@@ -784,7 +792,7 @@ classdef LabClientTests < matlab.unittest.TestCase
             S = tc.Fake.Sessions.session_id;
             tc.verifyEqual(height(tc.Fake.Sessions), 1, "the dataset record made its session");
 
-            f2 = tc.file("epsych/beh_copy.mat", 1:90);   % byte for byte the same file
+            f2 = tc.file("rig/beh_copy.mat", 1:90);   % byte for byte the same file
             b2 = tc.record(f2, Subject="SUBJ-1");
             labclient.Outbox.put(b2);
             labclient.Sync.flush(Budget=10);
@@ -800,7 +808,7 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEqual(string(a.copy_recorded_as), b2.bundle_id);
 
             % a record of the same bytes naming another subject is not filed under this one's event
-            f3 = tc.file("epsych/beh_copy2.mat", 1:90);
+            f3 = tc.file("rig/beh_copy2.mat", 1:90);
             b3 = tc.record(f3, Subject="SUBJ-2");
             labclient.Outbox.put(b3);
             labclient.Sync.flush(Budget=10);
@@ -809,9 +817,9 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function aDatasetRecordOfAFileAlreadyThereIsACopyOfAnEventWithNoSession(tc)
-            % an EPsych-style record first, then an ephys copySessions-style dataset record of the same bytes
+            % a record of no dataset first, then another toolbox's dataset record of the same bytes
             tc.registerTool("tool-x");
-            f1 = tc.file("epsych/e1.mat", 1:90);
+            f1 = tc.file("rig/e1.mat", 1:90);
             b1 = tc.record(f1, Subject="SUBJ-1");
             labclient.Outbox.put(b1);
             labclient.Sync.flush(Budget=10);
@@ -837,7 +845,7 @@ classdef LabClientTests < matlab.unittest.TestCase
             f = tc.file("sessions/c/beh.mat", 1:40);
             ds = tc.datasetBlock("c", "SUBJ-1", "ghost-tool");
             bd = tc.record(f, Dataset=ds);
-            bn = tc.record(tc.file("epsych/n.mat", 1:41), Subject="SUBJ-2");
+            bn = tc.record(tc.file("rig/n.mat", 1:41), Subject="SUBJ-2");
             labclient.Outbox.put(bd);
             labclient.Outbox.put(bn);
             tc.verifyFalse(labclient.Sync.hasTool("ghost-tool"));
@@ -875,6 +883,67 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyError(@() labclient.Sync.release("SUBJ-7", "SUBJ-1", T2), "labclient:Sync:NoTool");
         end
 
+        function anUntaggedDatasetRecordWaitsForTheToolThatTakesThem(tc)
+            % a dataset record that names no tool (written before records named their tool)
+            f = tc.file("sessions/u/beh.mat", 1:44);
+            ds = tc.datasetBlock("u", "SUBJ-1", "");
+            b = tc.record(f, Dataset=ds);
+            tc.verifyEqual(labclient.Bundles.toolOf(b), labclient.Bundles.Untagged);
+            tc.verifyFalse(contains(labclient.Bundles.encode(b), '"tool"'), "no tool: the member is left out");
+            labclient.Outbox.put(b);
+            tc.registerTool("tool-x");                 % a tool runs here, but not one that takes them
+            tc.verifyFalse(labclient.Sync.hasTool(labclient.Bundles.Untagged));
+            tc.verifyEqual(labclient.Sync.untaggedTool(), "");
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 0);
+            tc.verifyEqual(labclient.Outbox.stateOf(b.bundle_id), "pending", "untouched: not claimed, not failed");
+            tc.verifyEqual(labclient.Outbox.note(b.bundle_id, "pending").reason, "", "not even a note");
+            tc.verifyEqual(tc.called("readSession"), 0, "no tool's hooks were tried on it");
+            tc.verifyError(@() labclient.Sync.hooks(labclient.Bundles.Untagged), "labclient:Sync:NoTool");
+
+            labclient.Sync.unregisterTool("tool-x");
+            tc.registerTool("tool-old", TakesUntagged=true);   % the toolbox that wrote such records
+            tc.verifyEqual(labclient.Sync.untaggedTool(), "tool-old");
+            tc.verifyTrue(labclient.Sync.hasTool(labclient.Bundles.Untagged));
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 1);
+            tc.verifyEqual(labclient.Outbox.stateOf(b.bundle_id), "done");
+            tc.verifyGreaterThan(tc.called("readSession"), 0, "sent through that tool's hooks");
+            tc.verifyEqual(tc.Fake.Sessions.subject_id, "SUBJ-1");
+        end
+
+        function anUntaggedDatasetRecordIsAssignedThroughTheToolThatTakesThem(tc)
+            tc.registerTool("tool-old", TakesUntagged=true);
+            f = tc.file("sessions/v/beh.mat", 1:35);
+            ds = tc.datasetBlock("v", "SUBJ-7", "");
+            b = tc.record(f, Dataset=ds);
+            labclient.Outbox.put(b);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(b.bundle_id), "held");
+            T = labclient.Sync.subjectHolds();
+            tc.verifyEqual([T.folder_id, T.name, T.tool], ["SUBJ-7", "v", labclient.Bundles.Untagged]);
+            labclient.Sync.release("SUBJ-7", "SUBJ-1", T(:, ["name" "folder"]));   % no tool column: names no tool either
+            tc.verifyEqual(tc.called("assignSubject"), 1);
+            tc.verifyEqual(labclient.Outbox.stateOf(b.bundle_id), "pending");
+            labclient.Sync.unregisterTool("tool-old");
+            tc.verifyError(@() labclient.Sync.release("SUBJ-7", "SUBJ-1", T), "labclient:Sync:NoTool");
+        end
+
+        function onlyOneToolTakesTheUntaggedRecords(tc)
+            tc.registerTool("tool-old", TakesUntagged=true);
+            tc.verifyError(@() tc.registerTool("tool-new", TakesUntagged=true), "labclient:Sync:UntaggedTaken");
+            tc.verifyFalse(labclient.Sync.hasTool("tool-new"), "refused: not registered at all");
+            tc.registerTool("tool-new");               % without them it may run beside the other
+            tc.verifyEqual(labclient.Sync.untaggedTool(), "tool-old");
+            tc.registerTool("tool-old", TakesUntagged=true);   % the same tool again: its registration replaced
+            tc.verifyEqual(labclient.Sync.untaggedTool(), "tool-old");
+            tc.registerTool("tool-old");               % registered again without it: it takes them no more
+            tc.verifyEqual(labclient.Sync.untaggedTool(), "");
+            tc.verifyFalse(labclient.Sync.hasTool(labclient.Bundles.Untagged));
+            hooks = labclient.Sync.hooks("tool-old");
+            tc.verifyError(@() labclient.Sync.registerTool(labclient.Bundles.Untagged, hooks), "labclient:Sync:BadName");
+        end
+
         function toolHooksAreChecked(tc)
             tc.verifyError(@() labclient.Sync.registerTool("t", struct("readSession", 1)), "labclient:Sync:BadHooks");
             tc.verifyEqual(labclient.Sync.tools(), strings(1, 0));
@@ -888,7 +957,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function sendingTwiceWritesOnce(tc)
-            b = tc.record(tc.file("epsych/t.mat", 1:12), Subject="SUBJ-1");
+            b = tc.record(tc.file("rig/t.mat", 1:12), Subject="SUBJ-1");
             labclient.Outbox.put(b);
             labclient.Sync.flush(Budget=10);
             labclient.Outbox.move(b.bundle_id, "pending");
@@ -898,7 +967,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function anUnreachableServerLeavesTheOutboxAsItWas(tc)
-            b = tc.record(tc.file("epsych/u.mat", 1:12), Subject="SUBJ-1");
+            b = tc.record(tc.file("rig/u.mat", 1:12), Subject="SUBJ-1");
             labclient.Outbox.put(b);
             tc.Fake.Reachable = false;
             t0 = tic;
@@ -909,7 +978,7 @@ classdef LabClientTests < matlab.unittest.TestCase
         end
 
         function noSendingWhileSuspended(tc)
-            b = tc.record(tc.file("epsych/s.mat", 1:12), Subject="SUBJ-1");
+            b = tc.record(tc.file("rig/s.mat", 1:12), Subject="SUBJ-1");
             labclient.Outbox.put(b);
             quiet = labclient.Sync.suspend();
             labclient.Sync.tick();

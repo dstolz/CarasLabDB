@@ -2,8 +2,8 @@ classdef Hasher
     % labclient.Hasher  The SHA-256 of the files a record names, taken without making anyone wait.
     %   The lab database keeps every file with its SHA-256. A file up to
     %   labclient.Settings.HashInProcessMB is hashed in MATLAB (labclient.fileSha256) as
-    %   soon as it is captured; a larger one by a separate process, so a
-    %   pipeline step never waits minutes for its .bin to be hashed:
+    %   soon as it is captured; a larger one by a separate process, so the
+    %   step that wrote it never waits minutes for it to be hashed:
     %   PowerShell (.NET's SHA-256) on Windows, shasum -a 256 on macOS,
     %   sha256sum on Linux. The job writes its result to a temporary name and
     %   renames it into place, in the outbox's "hashing" folder, so a job

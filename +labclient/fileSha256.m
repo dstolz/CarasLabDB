@@ -13,7 +13,7 @@ function h = fileSha256(file, opts)
 %   Large files are better hashed out of process (labclient.Hasher), so the
 %   caller does not wait.
 %
-%   See also labclient.Hasher, copySessions.
+%   See also labclient.Hasher.
 
 arguments
     file (1,1) string

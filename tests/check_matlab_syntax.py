@@ -8,16 +8,19 @@ datetime, table, Database Toolbox, uifigure components or matlab.unittest.
 What Octave can do is parse, so this is a syntax check and nothing more: it
 catches an unbalanced parenthesis, a malformed statement or a stray token in
 any file at the repository root or under @CarasLabDB/, @CarasLabDBApp/,
-tests/matlab/ and examples/.
++labclient/, tests/matlab/ and examples/.
 It does not check that the code works. design_docs/matlab-first-run-checklist.md
 is the list of things that must be checked in MATLAB itself.
 
-Octave's parser rejects four things that are valid MATLAB, so the files are
+Octave's parser rejects five things that are valid MATLAB, so the files are
 copied to a temporary folder and rewritten there, line for line, before they
 are parsed (the repository is not touched, and line numbers are kept):
 
   * `arguments` blocks are blanked out. Their contents are therefore NOT
     checked.
+  * The declarations of a `methods (Abstract)` block are blanked out: outside
+    an @-folder Octave takes a method declared without a body for a method
+    kept in another file. They are therefore NOT checked either.
   * A typed property declaration (`Name (1,1) string = "x"`) is reduced to
     `Name = "x"`.
   * Backslashes inside double-quoted literals are doubled, because Octave
@@ -28,7 +31,7 @@ are parsed (the repository is not touched, and line numbers are kept):
 
 Known blind spots: a missing `end` inside a classdef file is not reliably
 reported (Octave reads the keywords that follow as ordinary calls), and
-anything inside an `arguments` block.
+anything inside an `arguments` block or a `methods (Abstract)` block.
 
 Exit status: 0 when every file parses, 1 on a syntax error, 2 when Octave is
 not installed.
@@ -43,10 +46,11 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-PATTERNS = ("*.m", "@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "tests/*.m", "tests/matlab/*.m",
-            "tests/matlab/*/*.m", "examples/*.m")
+PATTERNS = ("*.m", "@CarasLabDB/*.m", "@CarasLabDBApp/*.m", "+labclient/*.m", "+labclient/private/*.m",
+            "tests/*.m", "tests/matlab/*.m", "tests/matlab/*/*.m", "examples/*.m")
 
 ARGUMENTS = re.compile(r"^\s*arguments\s*(\([A-Za-z, ]*\))?\s*(%.*)?$")
+ABSTRACT_METHODS = re.compile(r"^\s*methods\s*\([^)]*\bAbstract\b[^)]*\)\s*(%.*)?$")
 BLOCK_END = re.compile(r"^\s*end\s*(%.*)?$")
 PROPERTIES = re.compile(r"^\s*properties\b")
 TYPED_PROPERTY = re.compile(
@@ -134,6 +138,14 @@ def rewrite_file(text):
                 j += 1
             out.extend([""] * (j - i + 1))            # keep line numbers
             i = j + 1
+            continue
+        if ABSTRACT_METHODS.match(line):
+            j = i + 1
+            while j < len(lines) and not BLOCK_END.match(lines[j]):
+                j += 1
+            out.append(line)                          # the block stays, its declarations go
+            out.extend([""] * (j - i - 1))
+            i = j
             continue
         if PROPERTIES.match(line):
             in_properties = True

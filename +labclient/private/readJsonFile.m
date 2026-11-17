@@ -3,8 +3,7 @@ function s = readJsonFile(file, opts)
 %   ErrorOnFail=false returns [] for a missing or unparsable file instead of
 %   raising. Error identifiers: labclient:readJsonFile:NotFound, :BadJson.
 %
-%   A private copy of the helper of the same name in the ephys_analysis
-%   toolbox, so the package needs nothing outside itself.
+%   Private to the package, so it needs nothing outside itself.
 
 arguments
     file (1,1) string

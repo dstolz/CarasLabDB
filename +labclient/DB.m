@@ -1,8 +1,8 @@
 classdef DB < handle
     % labclient.DB  The lab database (CarasLabDB) as the toolboxes use it: optional, and never in the way.
-    %   A toolbox (ephys_analysis, EPsych, ...) records its work in the lab's database when it is set up
+    %   A toolbox of the lab records its work in the lab's database when it is set up
     %   (labclient.Settings) and reachable, and works exactly as before when it
-    %   is not: nothing the apps or the pipeline do waits for the server or
+    %   is not: nothing a toolbox or its apps do waits for the server or
     %   fails because of it. One labclient.DB object per MATLAB keeps the
     %   connection and what is known about the server:
     %
