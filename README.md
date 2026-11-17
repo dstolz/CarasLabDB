@@ -186,7 +186,10 @@ water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know
   that made it for reading and writing the folder's session file. A toolbox
   registers three function handles once (`labclient.Sync.registerTool(name,
   struct(readSession=, copyOfSession=, assignSubject=))`); its records say
-  `dataset.tool`. **The shared-outbox rule:** several MATLABs may run over one
+  `dataset.tool`. The package knows no toolbox by name: a dataset record that
+  names no tool (written before records named their tool) is sent only through
+  the tool that registered with `TakesUntagged=true`, and waits untouched
+  while none has. **The shared-outbox rule:** several MATLABs may run over one
   outbox; a process never claims a record it cannot fully send, so a record
   whose tool is not registered in this MATLAB is left untouched for one that
   has it. Records of no dataset need no hooks: any process sends them.

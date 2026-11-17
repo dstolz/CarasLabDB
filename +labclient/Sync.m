@@ -4,10 +4,9 @@ classdef Sync
     %   finishes the hashes still needed (labclient.Hasher), gives back the claims
     %   of a MATLAB that stopped, and, when the database answers within 2 s,
     %   sends one record (labclient.Outbox, oldest first, a record after those it
-    %   names in "after"). While a pipeline run or an analysis run is going
-    %   (suspend), it waits. flush sends as many as a time budget allows: a
-    %   script calls it, and so do the end of EphysPipeline.run and the
-    %   scheduled copy.
+    %   names in "after"). While a toolbox has a run going that must not be
+    %   disturbed (suspend), it waits. flush sends as many as a time budget
+    %   allows: a script calls it, and so can a toolbox at the end of a run.
     %
     %   Sending a record (sendBundle):
     %     - the dataset's session is found by the id its session file holds,
@@ -40,7 +39,7 @@ classdef Sync
     %     T = labclient.Sync.subjectHolds()    % the records waiting for a subject
     %     labclient.Sync.release(folderId, subjectId, datasets)
     %     tf = labclient.Sync.enabled()        % the settings say Enabled and CarasLabDB can be used
-    %     labclient.Sync.registerTool(name, hooks)   % see "Tools and their hooks"
+    %     labclient.Sync.registerTool(name, hooks, TakesUntagged=false)   % see "Tools and their hooks"
     %
     %   Sending a "files" record (labclient.Bundles.files) registers copies of
     %   files an event produced, once each, after the event; an item that
@@ -52,23 +51,28 @@ classdef Sync
     %   behavior event already in the database is recorded as a copy of that
     %   event's files, whichever toolbox sent it first.
     %
-    %   Tools and their hooks. A record about a dataset FOLDER (an ephys
-    %   recording, say) needs the toolbox that made it for three things only
-    %   that toolbox knows: reading the dataset's session file, noting a
-    %   copy of another session in it, and noting the subject a person
-    %   assigned. A toolbox registers them once per MATLAB:
+    %   Tools and their hooks. A record about a dataset FOLDER (the folder
+    %   of one recording, say) needs the toolbox that made it for three
+    %   things only that toolbox knows: reading the dataset's session file,
+    %   noting a copy of another session in it, and noting the subject a
+    %   person assigned. A toolbox registers them once per MATLAB, under a
+    %   name of its own choosing:
     %
-    %     labclient.Sync.registerTool("ephys_analysis", struct( ...
+    %     labclient.Sync.registerTool("my_toolbox", struct( ...
     %         "readSession",   @(folder, name) ..., ...   % struct: session_id, subject_id, recording_event_id
     %         "copyOfSession", @(folder, name, sessionId, kind, eventId) ..., ...
     %         "assignSubject", @(folder, name, subjectId) ...))
     %
-    %   A record carries its tool in dataset.tool (a record from before the
-    %   package, with a folder and no tool, is "ephys_analysis"). THE SHARED
-    %   OUTBOX RULE: several MATLABs (an ephys app, EPsych) may run over one
-    %   outbox; a process never claims a record it cannot fully send, so a
-    %   record whose tool is not registered here is left untouched (not
-    %   claimed, not failed) for a process that has it. A record with no
+    %   A record carries its tool in dataset.tool. This package knows no
+    %   toolbox by name: a dataset record that names no tool (written before
+    %   records named their tool; labclient.Bundles.Untagged) belongs to the
+    %   toolbox that says so when it registers (TakesUntagged=true), and
+    %   waits untouched while none has.
+    %
+    %   THE SHARED OUTBOX RULE: several MATLABs (of different toolboxes) may
+    %   run over one outbox; a process never claims a record it cannot fully
+    %   send, so a record whose tool is not registered here is left untouched
+    %   (not claimed, not failed) for a process that has it. A record with no
     %   dataset folder needs no hooks and any process sends it. The claim
     %   itself is a rename that one process wins; a claim keeps a heartbeat
     %   (kept fresh while the record is worked on) and is given back when
@@ -135,18 +139,31 @@ classdef Sync
             tf = s.Enabled && (labclient.DB.hasFactory() || labclient.CarasBackend.hasClass());
         end
 
-        function registerTool(name, hooks)
+        function registerTool(name, hooks, opts)
             %registerTool  Say how this MATLAB's toolbox NAME reads and writes its datasets' session files.
             %   HOOKS is a struct of function handles: readSession(folder,
             %   name) returning a struct with session_id, subject_id and
             %   recording_event_id (strings, "" for none);
             %   copyOfSession(folder, name, sessionId, kind, eventId) and
             %   assignSubject(folder, name, subjectId). Registering again
-            %   replaces the hooks. Records of datasets of NAME are sent only
-            %   by a MATLAB that registered it (see the class help).
+            %   replaces the registration (hooks and TakesUntagged). Records
+            %   of datasets of NAME are sent only by a MATLAB that registered
+            %   it (see the class help).
+            %
+            %   TakesUntagged=true: NAME also sends, with these hooks, the
+            %   dataset records that name no tool (labclient.Bundles.Untagged:
+            %   written before records named their tool). Only the toolbox
+            %   that wrote such records says so. One tool per MATLAB can:
+            %   another is refused (labclient:Sync:UntaggedTaken), since no
+            %   record may be sent through hooks that are not its own.
             arguments
                 name (1,1) string {mustBeNonzeroLengthText}
                 hooks (1,1) struct
+                opts.TakesUntagged (1,1) logical = false
+            end
+            if name == labclient.Bundles.Untagged
+                error("labclient:Sync:BadName", ...
+                    "%s is not a tool's name: it stands for the records that name no tool.", name);
             end
             need = ["readSession" "copyOfSession" "assignSubject"];
             for f = need
@@ -154,9 +171,17 @@ classdef Sync
                     error("labclient:Sync:BadHooks", "The hooks of tool %s must have a function handle %s.", name, f);
                 end
             end
+            if opts.TakesUntagged
+                other = labclient.Sync.untaggedTool();
+                if other ~= "" && other ~= name
+                    error("labclient:Sync:UntaggedTaken", ...
+                        "The dataset records that name no tool are tool %s's in this MATLAB already: %s cannot take them too.", ...
+                        other, name);
+                end
+            end
             R = labclient.Sync.registry();
-            R.(matlab.lang.makeValidName(name)) = struct("name", name, "hooks", struct( ...
-                "readSession", hooks.readSession, "copyOfSession", hooks.copyOfSession, ...
+            R.(matlab.lang.makeValidName(name)) = struct("name", name, "untagged", opts.TakesUntagged, ...
+                "hooks", struct("readSession", hooks.readSession, "copyOfSession", hooks.copyOfSession, ...
                 "assignSubject", hooks.assignSubject));
             labclient.Sync.registry(R);
         end
@@ -176,8 +201,26 @@ classdef Sync
 
         function tf = hasTool(name)
             %hasTool  True when tool NAME is registered in this MATLAB ("" needs none: always true).
+            %   labclient.Bundles.Untagged: true when a tool registered here
+            %   takes the dataset records that name no tool.
             name = string(name);
+            if name == labclient.Bundles.Untagged
+                tf = labclient.Sync.untaggedTool() ~= "";
+                return
+            end
             tf = name == "" || isfield(labclient.Sync.registry(), matlab.lang.makeValidName(name));
+        end
+
+        function name = untaggedTool()
+            %untaggedTool  The tool registered here that takes the dataset records naming no tool ("" when none).
+            name = "";
+            R = labclient.Sync.registry();
+            for f = reshape(string(fieldnames(R)), 1, [])
+                if R.(f).untagged
+                    name = string(R.(f).name);
+                    return
+                end
+            end
         end
 
         function names = tools()
@@ -191,7 +234,16 @@ classdef Sync
 
         function h = hooks(name)
             %hooks  The hooks of tool NAME (labclient:Sync:NoTool when it is not registered here).
+            %   labclient.Bundles.Untagged gives the hooks of the tool that
+            %   takes the dataset records naming no tool.
             name = string(name);
+            if name == labclient.Bundles.Untagged
+                name = labclient.Sync.untaggedTool();
+                if name == ""
+                    error("labclient:Sync:NoTool", ...
+                        "No tool running in this MATLAB takes the dataset records that name no tool: they wait for one that does.");
+                end
+            end
             R = labclient.Sync.registry();
             key = matlab.lang.makeValidName(name);
             if name == "" || ~isfield(R, key)
@@ -213,7 +265,7 @@ classdef Sync
         end
 
         function r = suspend()
-            %suspend  No sending until R is cleared (a pipeline or analysis run is going).
+            %suspend  No sending until R is cleared (a run that must not be disturbed is going).
             st = labclient.Sync.state();
             st.Suspended = st.Suspended + 1;
             labclient.Sync.state(st);
@@ -297,7 +349,8 @@ classdef Sync
         function T = subjectHolds()
             %subjectHolds  The records held for a subject: folder_id, name, folder, bundle_id, tool (a row each).
             %   A dataset's record: folder_id is the subject its folder's
-            %   name gives, name and folder the dataset's, tool its tool. A
+            %   name gives, name and folder the dataset's, tool its tool
+            %   (labclient.Bundles.Untagged when it names none). A
             %   record of no dataset that names its subject
             %   (labclient.Bundles.event, SubjectId=): folder_id is that
             %   subject id, folder and tool "", name says what the record is
@@ -324,11 +377,14 @@ classdef Sync
         end
 
         function [t, c] = datasetText(P)
-            %datasetText  Where the records of processing block P stand: "4 sent, 1 to send, 1 needs you".
-            %   C counts sent, waiting, need (held or failed), discarded and
-            %   elsewhere (no record in this computer's outbox: captured
-            %   while the database was off, or on another computer). "" when
-            %   no record has an event id.
+            %datasetText  Where a dataset's records stand: "4 sent, 1 to send, 1 needs you".
+            %   P is what a toolbox keeps of the records it captured for one
+            %   dataset: a scalar struct with one member per record, each a
+            %   struct with the record's event_id (a member without one is
+            %   skipped). C counts sent, waiting, need (held or failed),
+            %   discarded and elsewhere (no record in this computer's outbox:
+            %   captured while the database was off, or on another computer).
+            %   "" when no record has an event id.
             c = struct("sent", 0, "waiting", 0, "need", 0, "discarded", 0, "elsewhere", 0);
             t = "";
             if ~isstruct(P) || ~isscalar(P); return; end
@@ -363,7 +419,8 @@ classdef Sync
             %     - a dataset's record (folder ~= ""): SUBJECTID is noted in
             %       its session file through its tool's assignSubject hook
             %       (labclient:Sync:NoTool when this MATLAB does not run that
-            %       tool); the folder is not renamed;
+            %       tool; a row that names no tool is the tool's that takes
+            %       the records naming none); the folder is not renamed;
             %     - a record of no dataset (folder == "", matched by its
             %       bundle_id): its subject id is rewritten to SUBJECTID
             %       (the old one is kept in the event's attributes as
@@ -377,7 +434,7 @@ classdef Sync
             hasBundle = ismember("bundle_id", vars);
             for k = 1:height(datasets)
                 if string(datasets.folder(k)) == ""; continue; end
-                tool = "ephys_analysis";
+                tool = labclient.Bundles.Untagged;
                 if hasTool && string(datasets.tool(k)) ~= ""; tool = string(datasets.tool(k)); end
                 h = labclient.Sync.hooks(tool);
                 h.assignSubject(datasets.folder(k), datasets.name(k), subjectId);
@@ -567,7 +624,7 @@ classdef Sync
             roots = be.storageRoots();
             also = strings(1, 0);
             if any(ev.event_type == ["recording" "behavior"])
-                % A second copy of a recording (or ePsych session) already in
+                % A second copy of a recording (or behavior session) already in
                 % the database: its files are copies of that event's, not a
                 % new recording.
                 [cs, S, E, why, from, also] = labclient.Sync.copyOf(be, b.record.outputs);

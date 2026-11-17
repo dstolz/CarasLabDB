@@ -6,9 +6,8 @@ function writeJsonFile(file, s, opts)
 %   file never share a temporary name. Text=true: S is JSON text already
 %   (a string or char row), written as it is with the same atomic rename.
 %
-%   A private copy of the helper of the same name in the ephys_analysis
-%   toolbox, so the package needs nothing outside itself. Error identifier
-%   labclient:writeJsonFile:CannotWrite.
+%   Private to the package, so it needs nothing outside itself. Error
+%   identifier labclient:writeJsonFile:CannotWrite.
 
 arguments
     file (1,1) string

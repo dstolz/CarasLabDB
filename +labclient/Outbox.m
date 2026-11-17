@@ -34,7 +34,7 @@ classdef Outbox
     %     labclient.Outbox.move(id, state, Reason=, Flags=)  % hold, release, retry, discard
     %     n = labclient.Outbox.recoverStale(MaxAge=120)
     %
-    %   Two MATLABs (an ephys app, EPsych) may share one outbox: a claim is an
+    %   Two MATLABs (of different toolboxes) may share one outbox: a claim is an
     %   atomic rename, a claim that shows no life for MaxAge seconds goes back
     %   to pending, and an owner that finds its claim gone does not touch what
     %   it no longer holds (finish returns false, heartbeat writes nothing).

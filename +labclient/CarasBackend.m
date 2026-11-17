@@ -1,6 +1,6 @@
 classdef CarasBackend < labclient.Backend
     % labclient.CarasBackend  The lab database through the CarasLabDB MATLAB class (Database Toolbox).
-    %   The only code of this toolbox that calls CarasLabDB. It needs the
+    %   The only code of this package that calls CarasLabDB. It needs the
     %   CarasLabDB repository on the MATLAB path (its @CarasLabDB class
     %   folder) and the Database Toolbox; without either, open says so
     %   (labclient:NoCarasLabDB, labclient:NoDatabaseToolbox) and the apps go on
@@ -9,7 +9,7 @@ classdef CarasBackend < labclient.Backend
     %   See also labclient.Backend, labclient.DB.
 
     properties (Constant)
-        % The CarasLabDB method this toolbox needs: a CarasLabDB checkout
+        % The CarasLabDB method this package needs: a CarasLabDB checkout
         % without it is too old.
         RequiredMethod = "recordEvent"
     end

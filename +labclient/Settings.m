@@ -1,6 +1,6 @@
 classdef Settings
     % labclient.Settings  How this computer reaches the lab database (CarasLabDB): one set of settings for every toolbox.
-    %   The toolboxes (ephys_analysis, EPsych, ...) record their work in the lab's CarasLabDB database when it
+    %   The lab's toolboxes record their work in the lab's CarasLabDB database when it
     %   is enabled here, and keep working when it is not, or cannot be
     %   reached (see labclient.DB). The settings are one struct in the preference
     %   group "CarasLabDBClient" (labclient.Prefs, so the tests use a temporary
@@ -20,7 +20,7 @@ classdef Settings
     %                       (filled in by Test connection; work recorded
     %                       while offline names this person)
     %     LabTimeZone       the zone in which times written without one (old
-    %                       manifests, rig clocks) are read, e.g.
+    %                       files, rig clocks) are read, e.g.
     %                       "America/New_York" (default: this computer's)
     %     ConnectTimeout    seconds to wait for the server (default 5)
     %     StatementTimeout  seconds one statement may run (default 30)

@@ -1,11 +1,13 @@
 classdef Bundles
     % labclient.Bundles  What a toolbox records for the lab database, as files: building, sealing, reading.
     %   A bundle is one record waiting in the outbox (labclient.Outbox) to be sent
-    %   to the lab database: an event (a pipeline step that wrote files, a
-    %   copied session, ...) with the files it read and the files it wrote.
-    %   It is a JSON file in the format caraslabdb-bundle/1
-    %   (ephys_analysis documentation/file-formats.md; this package adds only
-    %   optional members, so the format stays /1):
+    %   to the lab database: an event (an analysis step that wrote files, a
+    %   recording, a behavior session, a weighing, ...) with the files it
+    %   read and the files it wrote. It is a JSON file in the format
+    %   caraslabdb-bundle/1, which this class defines
+    %   (tests/matlab/testdata/bundle_event_v1.json is a complete example;
+    %   the members added since the first records are optional, so the
+    %   format stays /1):
     %
     %     format       "caraslabdb-bundle/1"
     %     bundle_id    the event's id (a uuid the toolbox minted)
@@ -45,6 +47,7 @@ classdef Bundles
         MtimeFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSxxx"
         ItemFields = ["artifact_id" "path" "root" "rel" "bytes" "mtime" "sha256" "role" ...
             "format" "kind" "replaces" "attributes_json"]
+        Untagged = "(untagged)"   % what toolOf gives for a dataset record that names no tool; never a tool's name
     end
 
     methods (Static)
@@ -302,9 +305,10 @@ classdef Bundles
             %   name, folder, session_id, subject_folder_id, recording_start
             %   as the toolbox that owns the dataset knows them, and TOOL: the
             %   name that toolbox registered with labclient.Sync.registerTool
-            %   ("" for a record of no dataset; a record with a folder and no
-            %   tool is read as "ephys_analysis", the only tool before the
-            %   package existed).
+            %   ("" for a record of no dataset). A record with a folder
+            %   names its tool: one that names none (written before records
+            %   named their tool) is sent only by the tool registered with
+            %   TakesUntagged=true (see toolOf).
             d = struct("name", "", "folder", "", "session_id", "", "subject_folder_id", "", ...
                 "recording_start", "", "tool", "");
         end
@@ -320,6 +324,11 @@ classdef Bundles
 
         function tool = toolOf(b)
             %toolOf  The tool whose hooks sending bundle B needs: "" for a record of no dataset folder.
+            %   A record of a dataset folder gives the tool it names
+            %   (dataset.tool). One that names none gives
+            %   labclient.Bundles.Untagged: no tool is assumed for it, and
+            %   labclient.Sync sends it only through the tool that registered
+            %   with TakesUntagged=true.
             tool = "";
             if ~isstruct(b) || ~isfield(b, "record") || ~isfield(b.record, "dataset"); return; end
             d = b.record.dataset;
@@ -327,7 +336,7 @@ classdef Bundles
             if isfield(d, "tool") && strlength(string(d.tool)) > 0
                 tool = string(d.tool);
             else
-                tool = "ephys_analysis";
+                tool = labclient.Bundles.Untagged;
             end
         end
 

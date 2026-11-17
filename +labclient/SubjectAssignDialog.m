@@ -15,9 +15,10 @@ classdef SubjectAssignDialog < handle
     %
     %   "Also for the other datasets ..." applies the choice to every dataset
     %   waiting with the same folder subject id. The choice is noted in each
-    %   dataset's session file (<Name>_labdb.json, subject_id); the folders
-    %   and their names are never changed. The records held for them are then
-    %   sent again (labclient.Sync.release).
+    %   dataset's session file by the toolbox that owns it (its assignSubject
+    %   hook, labclient.Sync.registerTool); the folders and their names are
+    %   never changed. The records held for them are then sent again
+    %   (labclient.Sync.release).
     %
     %   Keys: Enter OK · Esc cancel · Ctrl+? list the keys.
     %

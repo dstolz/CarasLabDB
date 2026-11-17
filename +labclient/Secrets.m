@@ -11,7 +11,7 @@ classdef Secrets
     %     labclient.Secrets.remove(s)
     %
     %   S is the labclient.Settings struct. The password is never written to the
-    %   preferences, a config, a script, a manifest or the outbox, and the
+    %   preferences, a config, a script, a data file or the outbox, and the
     %   apps never see it typed: setSecret's dialog takes it.
     %
     %   Tests do not touch the vault: useFake() keeps secrets in memory until
