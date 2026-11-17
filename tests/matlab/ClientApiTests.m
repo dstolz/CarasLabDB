@@ -177,6 +177,33 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             tc.verifyEmpty(conn.Log, "nothing is sent for a record that fails its checks");
         end
 
+        function recordEventHusbandryChecksItsColumns(tc)
+            [db, conn] = ClientApiTests.recordingDb();
+            t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            base = {"EventId", ClientApiTests.EventId, "Digest", ClientApiTests.Digest, "OccurredAt", t, ...
+                "SubjectId", "MT-1"};
+            tc.verifyError(@() db.recordEvent("husbandry", base{:}, "Detail", struct("bogus", 1)), ...
+                "CarasLabDB:invalidValue", "a column of no husbandry table");
+            tc.verifyError(@() db.recordEvent("husbandry", base{:}, "Detail", struct("task", "x")), ...
+                "CarasLabDB:invalidValue", "a behavior column");
+            tc.verifyEmpty(conn.Log, "nothing is sent for a record that fails its checks");
+            conn.Results("RETURNING event_id") = table(ClientApiTests.EventId, 'VariableNames', {'event_id'});
+            out = db.recordEvent("husbandry", base{:}, "Detail", ...
+                struct("measure", "weight", "weight_g", 24.5, "water_ml", 1.25, "health_status", "good"));
+            tc.verifyEqual(out.Outcome, "inserted");
+            first = @(pattern) find(contains(conn.Log, pattern), 1);
+            tc.assertNotEmpty(first("INSERT INTO lab.husbandry_event"), "the husbandry detail row");
+            row = conn.Log(first("INSERT INTO lab.husbandry_event"));
+            tc.verifySubstring(row, "'weight'");
+            tc.verifySubstring(row, "24.5");
+            tc.verifySubstring(row, "1.25");
+            tc.verifySubstring(row, "'good'");
+            ev = conn.Log(first("INSERT INTO lab.event "));
+            tc.verifySubstring(ev, "'husbandry'");
+            tc.verifySubstring(ev, "'MT-1'");
+            tc.verifySubstring(ev, """client_digest"":""" + ClientApiTests.Digest + """");
+        end
+
         function recordEventWritesInOneTransaction(tc)
             [db, conn] = ClientApiTests.recordingDb();
             conn.Results("RETURNING event_id") = table(ClientApiTests.EventId, 'VariableNames', {'event_id'});
@@ -457,6 +484,37 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                 "artifact_id"), 1, "restored: present again");
             T = db.getArtifactDispositions(ArtifactId=aid);
             tc.verifyEqual(LabScratchDb.column(T, "disposition"), ["restored"; "deleted"], "newest first");
+        end
+
+        function recordEventHusbandryWritesOnceAndFeedsTheSubjectView(tc)
+            % A weight, as the behavior rig records it: for a subject, no session; sent twice, written once.
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("hb", 1);
+            eid = ClientApiTests.newId(fx);
+            digest = string(fx.checksum(fx.next()));
+            t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            args = {"EventId", eid, "Digest", digest, "OccurredAt", t, "SubjectId", w.SubjectId, ...
+                "Detail", struct("measure", "weight", "weight_g", 23.75, "health_status", "ok")};
+            before = fx.counts();
+            out = db.recordEvent("husbandry", args{:});
+            tc.verifyEqual(out.Outcome, "inserted");
+            tc.verifyEqual(fx.counts().events - before.events, 1);
+            again = db.recordEvent("husbandry", args{:});
+            tc.verifyEqual(again.Outcome, "existing");
+            tc.verifyEqual(fx.counts().events - before.events, 1, "sent again: written once");
+            other = args; other{4} = string(repmat('2', 1, 64));
+            tc.verifyError(@() db.recordEvent("husbandry", other{:}), "CarasLabDB:idConflict");
+            E = db.getEvents(EventId=eid);
+            tc.verifyEqual(LabScratchDb.column(E, "subject_id"), w.SubjectId);
+            tc.verifyTrue(ismissing(string(E.session_id(1))) || string(E.session_id(1)) == "", "no session");
+            tc.verifyEqual(double(fx.scalar("SELECT weight_g FROM lab.husbandry_event WHERE event_id = " + ...
+                LabScratchDb.quote(eid))), 23.75);
+            S = db.getSubjectCurrent(SubjectId=w.SubjectId);
+            tc.verifyEqual(double(S.latest_weight_g(1)), 23.75, "the subject's latest weight");
+            tc.verifyError(@() db.recordEvent("husbandry", "EventId", ClientApiTests.newId(fx), ...
+                "Digest", digest, "OccurredAt", t, "Detail", struct("measure", "weight")), ?MException, ...
+                "a husbandry event with no subject is an entry error");
         end
 
         function recordEventRecordsReplacedAndRestoredFiles(tc)
