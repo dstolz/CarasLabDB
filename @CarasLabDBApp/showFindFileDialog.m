@@ -20,7 +20,9 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
 %   considered at all; "Ignore case" (on by default) matches regardless of
 %   letter case. It matches anywhere in the name unless anchored: ^raw\.dat$
 %   is exactly raw.dat, \.dat$ any .dat file. An invalid expression is
-%   refused before anything is read.
+%   refused before anything is read: one regexp rejects, and also one with
+%   a group or character class left open, which regexp itself may accept
+%   without an error (write \( \) \[ for those characters in a name).
 %
 %   Search (Ctrl+F) lists the files below the folder, one folder at a time,
 %   and reads the candidates, computing their checksum with the missing
@@ -326,11 +328,17 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
         nameOk = @(names) true(size(names));
         patternText = "";
         if usePattern
-            try
-                regexp('x', char(pattern), 'once', caseOpt{:});
-            catch reErr
+            why = local_patternProblem(pattern);
+            if strlength(why) == 0
+                try
+                    regexp('x', char(pattern), 'once', caseOpt{:});
+                catch reErr
+                    why = string(reErr.message);
+                end
+            end
+            if strlength(why) > 0
                 uialert(f, "The file-name pattern is not a valid regular expression: " + ...
-                    string(reErr.message), "Find files");
+                    why + ". Nothing was read.", "Find files");
                 return
             end
             nameOk = @(names) local_nameMatches(names, pattern, caseOpt);
@@ -793,6 +801,71 @@ function [paths, sizes, counts] = local_listFiles(folder, nameOk, tick)
     if ~isempty(keptPaths)
         paths = vertcat(keptPaths{:});
         sizes = vertcat(keptSizes{:});
+    end
+end
+
+function why = local_patternProblem(pattern)
+    %LOCAL_PATTERNPROBLEM Why PATTERN is not a well-formed regular expression ("" when it is).
+    %   MATLAB's regexp accepts some malformed patterns without an error (an
+    %   unclosed parenthesis, for one), and what it matches then is not
+    %   documented. A typo must not quietly leave files out of a search, so
+    %   every group and character class is checked to be closed here (an
+    %   escaped character, \x, is skipped; a ] right after [ or [^ is part of
+    %   the class), before regexp itself is asked. A valid but unusual
+    %   pattern refused here can be written with escapes.
+    why = "";
+    c = char(pattern);
+    n = numel(c);
+    depth = 0;
+    k = 1;
+    while k <= n
+        ch = c(k);
+        if ch == '\'
+            if k == n
+                why = "it ends with a lone \";
+                return
+            end
+            k = k + 2;
+            continue
+        elseif ch == '['
+            j = k + 1;
+            if j <= n && c(j) == '^'
+                j = j + 1;
+            end
+            if j <= n && c(j) == ']'
+                j = j + 1;
+            end
+            closed = false;
+            while j <= n
+                if c(j) == '\'
+                    j = j + 2;
+                    continue
+                end
+                if c(j) == ']'
+                    closed = true;
+                    break
+                end
+                j = j + 1;
+            end
+            if ~closed
+                why = "a [ is not closed by a ] (write \[ for a bracket in the name)";
+                return
+            end
+            k = j + 1;
+            continue
+        elseif ch == '('
+            depth = depth + 1;
+        elseif ch == ')'
+            depth = depth - 1;
+            if depth < 0
+                why = "a ) closes no ( (write \) for a parenthesis in the name)";
+                return
+            end
+        end
+        k = k + 1;
+    end
+    if depth > 0
+        why = "a ( is not closed by a ) (write \( for a parenthesis in the name)";
     end
 end
 

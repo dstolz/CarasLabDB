@@ -637,8 +637,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyEqual(obs("head"), "Looking for the file of artifact " + aid + ...
                 " by its size and checksum.");
             tc.verifyEqual(obs("listed"), aid, "only the selected finding's file");
-            tc.verifyEqual(obs("state"), "no size recorded: looked for only with a file-name pattern", ...
-                "a file registered without its size is looked for by name only, and says so");
+            tc.verifyTrue(startsWith(obs("state"), "no size recorded: looked for only with a file-name pattern · "), ...
+                "a file registered without its size is looked for by name only, and says so: " + obs("state"));
+            tc.verifySubstring(obs("state"), "artifact_never_verified: ", ...
+                "before a search, the row shows the finding it came from");
 
             function local_look(f, obs)
                 bold = findall(f, "Type", "uilabel", "FontWeight", "bold");
@@ -803,7 +805,9 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyTrue(startsWith(obs("sizedNoPattern"), "found"), "without a pattern, by size");
             tc.verifySubstring(obs("statusNoPattern"), "Listed 3 file(s) in 5 folder(s)");
             tc.verifySubstring(obs("statusNoPattern"), "Read 1 of 1 candidate(s)");
-            tc.verifySubstring(obs("badAlert"), "not a valid regular expression");
+            bad = obs("badAlert");
+            tc.verifySubstring(bad(1), "not a valid regular expression: a ( is not closed", "pattern '('");
+            tc.verifySubstring(bad(2), "not a valid regular expression: a [ is not closed", "pattern 'a[b'");
             tc.verifySubstring(obs("caseState"), "among the files named like /^nosize/", ...
                 "case-sensitive: NoSize-2026.dat is not a candidate, nosize-copy.dat has other bytes");
             tc.verifyEqual(obs("nFound"), 1, "a name match with other bytes is not a find");
@@ -837,12 +841,20 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("sizedNoPattern") = stateOf(aSized);
                 obs("statusNoPattern") = string(status.Text);
 
-                tc.typeIn(pattern, "(");
-                setappdata(groot, "TagGuiTests_alerts", []);
-                tc.pressOn(search);
-                a = TagGuiTests.alerts();
-                obs("badAlert") = strjoin([a.Message], newline);
-                tc.dismissAlert(f);
+                % "(" is accepted by regexp itself without an error; the
+                % dialog refuses it (an unclosed group), as it does "a[b".
+                bad = strings(1, 0);
+                for typo = ["(", "a[b"]
+                    tc.typeIn(pattern, typo);
+                    setappdata(groot, "TagGuiTests_alerts", []);
+                    tc.pressOn(search);
+                    a = TagGuiTests.alerts();
+                    bad(end+1) = strjoin([strings(1, 0), a.Message], newline); %#ok<AGROW>
+                    if ~isempty(a)
+                        tc.dismissAlert(f);
+                    end
+                end
+                obs("badAlert") = bad;
 
                 tc.typeIn(pattern, "^nosize");
                 anyCase.Value = false;
