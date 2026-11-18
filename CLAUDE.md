@@ -509,7 +509,16 @@ service, under Xvfb for the GUI tests; `tests/run_matlab_tests.m` is its
 entry point and fails the job if a test fails or a database test did not
 run. It does not run on Windows. A separate job parses every MATLAB file
 with GNU Octave (`tests/check_matlab_syntax.py`), which is a syntax check and
-nothing more -- Octave cannot run this code. There is no package.json. Practical ways
+nothing more -- Octave cannot run this code. The `consumers` job clones the
+toolboxes that record through `+labclient` (epsych2, ephys_analysis; their
+default branches) and runs `tests/check_consumers.py` on them: every
+`labclient.` reference in their code must name a class or function of the
+package, a member usable from outside its class (Static method, Constant
+property, public) and only `Name=Value` options the method declares. It reads
+text; a method called on an object the package returned is beyond it. A red
+`consumers` job on a change here means the change breaks a toolbox (or a
+toolbox already calls what is not here): fix the call's target or coordinate
+the toolbox, do not loosen the check. There is no package.json. Practical ways
 to exercise the code:
 
 - **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,

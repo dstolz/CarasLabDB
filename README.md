@@ -211,6 +211,15 @@ water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know
 
 Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server).
 
+**A toolbox's calls are checked from here.** The package and the toolboxes are
+separate repositories, so `python tests/check_consumers.py <checkout> ...`
+reads a toolbox's code and compares every `labclient.` reference with the
+package: the name exists, is usable from outside its class, and takes the
+`Name=Value` options passed. CI runs it on the default branches of epsych2 and
+ephys_analysis for every change here (job `consumers`). It reads text and runs
+nothing; its header lists what it cannot see (a method called on an object the
+package returned, for one).
+
 ## Getting started
 
 **Apply the schema and privileges** (for a quick local trial; a real
