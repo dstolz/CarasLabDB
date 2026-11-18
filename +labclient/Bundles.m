@@ -34,6 +34,7 @@ classdef Bundles
     %     b = labclient.Bundles.event(Name=Value)     % build a bundle
     %     it = labclient.Bundles.item(path, Role=, Kind=, ...)   % an input or output file
     %     b = labclient.Bundles.seal(b)               % the digest, once complete
+    %     p = labclient.Bundles.problems(b)           % what the database would refuse in it (none: "")
     %     txt = labclient.Bundles.encode(b); b = labclient.Bundles.decode(txt)
     %
     %   The other helpers: timeText (a zoned datetime as text), newId (a
@@ -48,6 +49,8 @@ classdef Bundles
         ItemFields = ["artifact_id" "path" "root" "rel" "bytes" "mtime" "sha256" "role" ...
             "format" "kind" "replaces" "attributes_json"]
         Untagged = "(untagged)"   % what toolOf gives for a dataset record that names no tool; never a tool's name
+        JsonDetail = ["parameters" "environment"]   % detail columns that hold JSON: carried as text, as <name>_json
+        Statuses = ["running" "succeeded" "failed"] % what an analysis event's status may be
     end
 
     methods (Static)
@@ -396,6 +399,110 @@ classdef Bundles
             tf = strlength(string(b.digest)) == 64;
         end
 
+        function p = problems(b)
+            %problems  What the database would refuse in record B: a row of sentences, empty when there is nothing.
+            %   P = labclient.Bundles.problems(B) reads an event record as
+            %   the sender will send it and says what cannot be recorded,
+            %   so that this is known where the record is made and not when
+            %   the database is reached (labclient.Outbox.put keeps such a
+            %   record held, with these sentences as the reason):
+            %     - no time it happened, or one not written as timeText
+            %       writes it;
+            %     - a Detail field that is not a column of that type of
+            %       event (detailColumns; a JsonDetail column may be given
+            %       as <name>_json), a started_at or finished_at that is
+            %       not time text, an analysis status given as text that is
+            %       none of Statuses, a husbandry event with no measure.
+            %   It judges what the sender judges and no more: a husbandry
+            %   field that was not measured is not sent, so its name is not
+            %   looked at (notMeasured). It never says a record is wrong
+            %   that the database would take. It changes nothing in B, and
+            %   has nothing to say about an "edges" or a "files" record.
+            %   It does not fail: what it cannot read it leaves to the
+            %   sender.
+            p = strings(1, 0);
+            try
+                if string(b.type) ~= "event"; return; end
+                ev = b.record.event;
+                type = string(ev.event_type);
+                cols = labclient.Bundles.detailColumns(type);
+            catch
+                return
+            end
+            try
+                when = string(ev.occurred_at);
+                if ~isscalar(when) || ismissing(when) || strlength(when) == 0
+                    p(end + 1) = "it does not say when it happened (OccurredAt is empty)";
+                elseif ~labclient.Bundles.isTimeText(when)
+                    p(end + 1) = "its time, " + when + ", is not written as labclient.Bundles.timeText writes one";
+                end
+            catch
+            end
+            try
+                d = ev.detail;
+                if isempty(d) || ~isstruct(d); d = struct(); end
+                for f = reshape(string(fieldnames(d)), 1, [])
+                    v = d.(f);
+                    if type == "husbandry" && labclient.Bundles.notMeasured(v); continue; end   % not sent at all
+                    column = f;
+                    if endsWith(f, "_json") && any(extractBefore(f, strlength(f) - 4) == labclient.Bundles.JsonDetail)
+                        column = extractBefore(f, strlength(f) - 4);
+                    end
+                    if ~any(column == cols)
+                        p(end + 1) = "Detail field " + f + " is not a column of a " + type + ...
+                            " event (it has " + strjoin(cols, ", ") + ")"; %#ok<AGROW>
+                    elseif any(f == ["started_at" "finished_at"]) && ~isempty(v) ...
+                            && ~(labclient.Bundles.isText(v) && (strlength(string(v)) == 0 ...
+                            || labclient.Bundles.isTimeText(string(v))))
+                        p(end + 1) = "Detail " + f + " is not a time written as labclient.Bundles.timeText writes one"; %#ok<AGROW>
+                    elseif type == "analysis" && f == "status" && labclient.Bundles.isText(v) ...
+                            && ~any(string(v) == labclient.Bundles.Statuses)
+                        p(end + 1) = "Detail status is """ + string(v) + """: it must be one of " + ...
+                            strjoin(labclient.Bundles.Statuses, ", "); %#ok<AGROW>
+                    end
+                end
+                if type == "husbandry"
+                    named = isfield(d, "measure") && ~labclient.Bundles.notMeasured(d.measure) ...
+                        && labclient.Bundles.isText(d.measure) && strlength(strtrim(string(d.measure))) > 0;
+                    if ~named
+                        p(end + 1) = "a husbandry event must say what was measured (Detail measure)";
+                    end
+                end
+            catch
+            end
+        end
+
+        function cols = detailColumns(eventType)
+            %detailColumns  The Detail fields a record of EVENTTYPE may carry: the columns the database has for it.
+            %   A row of names, for "analysis", "recording", "behavior" or
+            %   "husbandry". It is a copy of CarasLabDB.recordEventColumns:
+            %   a record is made with no database and no CarasLabDB class
+            %   at hand, and this package reaches that class only through
+            %   a backend. A test holds the two equal. A column of
+            %   JsonDetail is carried as text under <name>_json.
+            switch string(eventType)
+                case "analysis"
+                    cols = ["pipeline_id" "pipeline_name" "code_version" "parameters" ...
+                        "environment" "started_at" "finished_at" "status"];
+                case "recording"
+                    cols = ["acquisition_system_code" "probe_id" "modality" "sample_rate_hz" ...
+                        "n_channels" "duration_s" "stimulus_protocol" "hardware_config"];
+                case "behavior"
+                    cols = ["task" "paradigm" "stage" "trials_completed" "performance" "reward"];
+                case "husbandry"
+                    cols = ["measure" "weight_g" "water_ml" "health_status"];
+                otherwise
+                    error("labclient:Bundles:EventType", "No %s events are recorded through a bundle.", eventType);
+            end
+        end
+
+        function tf = notMeasured(v)
+            %notMeasured  True for a husbandry value that says nothing was measured: empty, "" or NaN.
+            %   Such a field is left out of what is sent (the database keeps
+            %   the column NULL), however it was written.
+            tf = isempty(v) || (isstring(v) && all(strlength(v) == 0)) || (isnumeric(v) && isscalar(v) && isnan(v));
+        end
+
         function txt = encode(b)
             %encode  B as the canonical JSON text written to its file.
             e = b;
@@ -468,6 +575,21 @@ classdef Bundles
     end
 
     methods (Static, Access = private)
+        function tf = isText(v)
+            %isText  True for one piece of text: a char row or a string scalar.
+            tf = (ischar(v) && (isrow(v) || isempty(v))) || (isstring(v) && isscalar(v) && ~ismissing(v));
+        end
+
+        function tf = isTimeText(txt)
+            %isTimeText  True when TXT reads as a time written by timeText (what the sender parses).
+            tf = false;
+            try
+                t = datetime(string(txt), "InputFormat", labclient.Bundles.TimeFormat, "TimeZone", "UTC");
+                tf = isscalar(t) && ~isnat(t);
+            catch
+            end
+        end
+
         function id = uuidWithoutJava()
             %uuidWithoutJava  A version 4 uuid from a private stream (never the global one).
             persistent stream count

@@ -16,7 +16,10 @@ classdef FakeBackend < labclient.Backend
     %   addDisposition refuses what the database's policy refuses: a file
     %   already gone, a "replaced" file whose successor is not other bytes
     %   at the same path, a "moved" one whose successor is not the same
-    %   bytes at another place, a "deleted" one with a successor. Fail makes the next
+    %   bytes at another place, a "deleted" or "restored" one with a
+    %   successor, no time. recordEvent refuses a Detail field that is not
+    %   a column of the event's type (labclient.Bundles.detailColumns), an
+    %   analysis status that is none of the three, and no time. Fail makes the next
     %   call of a method fail: struct("Method", "recordEvent", "Identifier",
     %   "CarasLabDB:transactionInterrupted", "Message", "...", "AfterWrite",
     %   false); AfterWrite true writes first and then fails, as a commit
@@ -64,6 +67,7 @@ classdef FakeBackend < labclient.Backend
             strings(0, 1), strings(0, 1), NaT(0, 1, "TimeZone", "UTC"), 'VariableNames', {'entity_kind', ...
             'entity_id', 'variable', 'value', 'value_num', 'value_text', 'units', 'set_at'})
         Fail struct = struct("Method", {}, "Identifier", {}, "Message", {}, "AfterWrite", {})
+        DispositionTimes (1,1) logical = true   % false: dispositions come back with no occurred_at, as a backend that gives none
         Verifications table = table(strings(0, 1), strings(0, 1), NaT(0, 1, "TimeZone", "UTC"), ...
             'VariableNames', {'artifact_id', 'status', 'verified_at'})
     end
@@ -228,13 +232,28 @@ classdef FakeBackend < labclient.Backend
             if ~any(string(req.EventType) == ["analysis" "recording" "behavior" "husbandry"])
                 error("MATLAB:validators:mustBeMember", "EventType %s cannot be recorded (fake).", req.EventType);
             end
+            if isnat(req.OccurredAt)
+                error("labclient:Refused", "null value in column occurred_at (fake not-null constraint)");
+            end
+            % as CarasLabDB.recordEvent: a Detail field must be a column of that type of event
+            % (a JSON column arrives as <name>_json, which labclient.CarasBackend renames)
+            allowed = labclient.Bundles.detailColumns(string(req.EventType));
+            given = reshape(string(fieldnames(req.Detail)), 1, []);
+            for j = labclient.Bundles.JsonDetail
+                given(given == j + "_json") = j;
+            end
+            bad = setdiff(given, allowed);
+            if ~isempty(bad)
+                error("CarasLabDB:invalidValue", "Detail cannot set %s (allowed: %s).", ...
+                    strjoin(bad, ", "), strjoin(allowed, ", "));
+            end
+            if string(req.EventType) == "analysis" && isfield(req.Detail, "status") ...
+                    && (ischar(req.Detail.status) || isstring(req.Detail.status)) ...
+                    && ~any(string(req.Detail.status) == labclient.Bundles.Statuses)
+                error("CarasLabDB:invalidValue", "Detail.status must be one of %s (fake).", ...
+                    strjoin(labclient.Bundles.Statuses, ", "));
+            end
             if string(req.EventType) == "husbandry"
-                allowed = ["measure" "weight_g" "water_ml" "health_status"];
-                bad = setdiff(reshape(string(fieldnames(req.Detail)), 1, []), allowed);
-                if ~isempty(bad)
-                    error("CarasLabDB:invalidValue", "Detail cannot set %s (allowed: %s).", ...
-                        strjoin(bad, ", "), strjoin(allowed, ", "));
-                end
                 if ~isfield(req.Detail, "measure") || strlength(strtrim(string(req.Detail.measure))) == 0
                     error("labclient:Refused", "a husbandry event needs a measure (fake check)");
                 end
@@ -355,6 +374,7 @@ classdef FakeBackend < labclient.Backend
         function T = dispositions(obj, artifactId)
             obj.requireOpen("dispositions");
             T = flipud(obj.Dispositions(obj.Dispositions.artifact_id == string(artifactId), :));   % newest first
+            if ~obj.DispositionTimes; T.occurred_at = []; end
         end
 
         function T = lineage(obj, artifactId, direction)
@@ -440,8 +460,11 @@ classdef FakeBackend < labclient.Backend
                         obj.Artifacts.relative_path(j) ~= obj.Artifacts.relative_path(k)
                     error("labclient:Refused", "a replaced file's successor must be other bytes at the same path (fake)");
                 end
-            elseif d.Disposition == "deleted" && strlength(d.SuccessorArtifactId) > 0
-                error("labclient:Refused", "a deleted file has no successor (fake)");
+            elseif any(d.Disposition == ["deleted" "restored"]) && strlength(d.SuccessorArtifactId) > 0
+                error("labclient:Refused", "a %s file has no successor (fake)", d.Disposition);
+            end
+            if ~isdatetime(d.OccurredAt) || ~isscalar(d.OccurredAt) || isnat(d.OccurredAt)
+                error("labclient:Refused", "null value in column occurred_at (fake not-null constraint)");
             end
             at = d.OccurredAt;   % kept as the database keeps it: when it happened, a zoned instant
             at.TimeZone = "UTC";

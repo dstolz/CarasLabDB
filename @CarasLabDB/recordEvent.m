@@ -131,7 +131,7 @@ function out = recordEvent(obj, eventType, opts)
     local_requireZone(opts.OccurredAt, "OccurredAt");
     local_requireZone(opts.RecordedAt, "RecordedAt");
 
-    detailColumns = local_detailColumns(eventType);
+    detailColumns = CarasLabDB.recordEventColumns(eventType);
     local_onlyFields(opts.Detail, detailColumns, "Detail");
     detail = struct();
     for f = reshape(string(fieldnames(opts.Detail)), 1, [])
@@ -218,22 +218,6 @@ function out = recordEvent(obj, eventType, opts)
 end
 
 % -------------------------------------------------------------------------
-function cols = local_detailColumns(eventType)
-%LOCAL_DETAILCOLUMNS The detail columns RECORDEVENT may write, per event type.
-    switch eventType
-        case "analysis"
-            cols = ["pipeline_id", "pipeline_name", "code_version", "parameters", ...
-                    "environment", "started_at", "finished_at", "status"];
-        case "recording"
-            cols = ["acquisition_system_code", "probe_id", "modality", "sample_rate_hz", ...
-                    "n_channels", "duration_s", "stimulus_protocol", "hardware_config"];
-        case "behavior"
-            cols = ["task", "paradigm", "stage", "trials_completed", "performance", "reward"];
-        case "husbandry"
-            cols = ["measure", "weight_g", "water_ml", "health_status"];
-    end
-end
-
 function local_onlyFields(s, allowed, what)
 %LOCAL_ONLYFIELDS Refuse a struct field that is not one of ALLOWED.
     bad = setdiff(reshape(string(fieldnames(s)), 1, []), allowed);

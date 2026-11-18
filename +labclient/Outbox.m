@@ -21,7 +21,8 @@ classdef Outbox
     %   to a temporary name and renamed into place, so a crash never leaves
     %   half a file. A claim is a rename, which only one process can win.
     %
-    %     status = labclient.Outbox.put(b)           % a new bundle, pending; or the newer version of an unsent one
+    %     status = labclient.Outbox.put(b)           % a new bundle, pending; or the newer version of an unsent one;
+    %                                                % held, with the reason, when the database would refuse it
     %     claim = labclient.Outbox.take(id)          % like claim, for an unsent record in any state (put uses it)
     %     [b, state] = labclient.Outbox.read(id)
     %     labclient.Outbox.update(b)                 % rewrite a pending or claimed bundle
@@ -43,6 +44,7 @@ classdef Outbox
 
     properties (Constant)
         States = ["pending" "claimed" "held" "failed" "done" "discarded"]
+        NotSendable = "not_sendable"   % the flag of a record held because the database would refuse it (put)
     end
 
     methods (Static)
@@ -60,7 +62,7 @@ classdef Outbox
             f = string(fullfile(labclient.Outbox.root(), state, labclient.Outbox.checkId(id) + ".json"));
         end
 
-        function status = put(b)
+        function [status, why] = put(b)
             %put  Write bundle B as pending: new, or the newer version of a record not sent yet.
             %   STATUS says what happened:
             %     "added"      B's id is new here; B waits to be sent
@@ -68,7 +70,8 @@ classdef Outbox
             %                  already (in any state): nothing was written
             %     "replaced"   a bundle of this id that was not sent yet (to
             %                  send, held or failed) is replaced by B, which
-            %                  goes to pending with no flags; what its hash jobs
+            %                  goes to pending with no flags (or is held: see
+            %                  WHY); what its hash jobs
             %                  had is dropped. A toolbox that saves a session
             %                  again before the record was sent, or corrects a
             %                  weight the same day, puts the new bundle under
@@ -82,11 +85,33 @@ classdef Outbox
             %   A replacement takes the record the way a sender does (a
             %   rename into "claimed" that one process wins), so it can never
             %   be sent half old, half new, nor lose a race with a sender.
+            %
+            %   WHY is what the database would refuse in B, a row of
+            %   sentences (labclient.Bundles.problems), empty when there is
+            %   nothing. A record with something in it is kept all the same
+            %   (STATUS says "added" or "replaced" as for any other), but
+            %   HELD, with WHY as its reason and the flag NotSendable, and
+            %   it is not sent until a person releases it in the Database
+            %   window. So nothing a toolbox recorded is lost, and what is
+            %   wrong shows here and now ("need you" on the lamp) instead of
+            %   as a failed record once the database is reached. A corrected
+            %   record put under the same id replaces it and goes to pending.
             id = labclient.Outbox.checkId(b.bundle_id);
             txt = labclient.Bundles.encode(b);
+            why = labclient.Bundles.problems(b);
+            reason = "";
+            if ~isempty(why)
+                reason = "The database would refuse this record: " + strjoin(why, "; ") + ...
+                    ". It is kept and not sent: correct what records it and record again, or discard it.";
+            end
             [old, state] = labclient.Outbox.readText(id);
             if state == ""
-                writeJsonFile(labclient.Outbox.file(id, "pending"), txt, Text=true);
+                if isempty(why)
+                    writeJsonFile(labclient.Outbox.file(id, "pending"), txt, Text=true);
+                else
+                    writeJsonFile(labclient.Outbox.file(id, "held"), txt, Text=true);
+                    labclient.Outbox.moveTo(id, "held", "held", reason, labclient.Outbox.NotSendable);   % its note
+                end
                 status = "added";
                 return
             end
@@ -111,8 +136,12 @@ classdef Outbox
                 labclient.Outbox.finish(c, "pending", Reason="its replacement could not be written: " + string(ME.message));
                 rethrow(ME);
             end
-            labclient.Outbox.finish(c, "pending", Reason="replaced by a newer version of the record (it was " + ...
-                state + ")", Flags=strings(1, 0));
+            if isempty(why)
+                labclient.Outbox.finish(c, "pending", Reason="replaced by a newer version of the record (it was " + ...
+                    state + ")", Flags=strings(1, 0));
+            else
+                labclient.Outbox.finish(c, "held", Reason=reason, Flags=labclient.Outbox.NotSendable);
+            end
             status = "replaced";
         end
 

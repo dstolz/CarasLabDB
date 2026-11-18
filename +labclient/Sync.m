@@ -465,7 +465,8 @@ classdef Sync
             note = labclient.Outbox.note(claim.id, "claimed");
             % What a person decided (send as me) stays; what the last try
             % found missing is found again by the next.
-            keep = reshape(setdiff(note.flags, [labclient.Sync.NeedsSubject, labclient.Sync.NeedsLogin], "stable"), 1, []);
+            keep = reshape(setdiff(note.flags, [labclient.Sync.NeedsSubject, labclient.Sync.NeedsLogin, ...
+                labclient.Outbox.NotSendable], "stable"), 1, []);
             flags = strings(1, 0);
             st = labclient.Sync.state();
             st.Claim = claim;
@@ -695,8 +696,7 @@ classdef Sync
             if ev.event_type == "husbandry"
                 % a column not measured is not sent (the database leaves it NULL), whatever way it was written
                 for f = reshape(string(fieldnames(d)), 1, [])
-                    v = d.(f);
-                    if isempty(v) || (isstring(v) && all(strlength(v) == 0)) || (isnumeric(v) && isscalar(v) && isnan(v))
+                    if labclient.Bundles.notMeasured(d.(f))
                         d = rmfield(d, f);
                     end
                 end
