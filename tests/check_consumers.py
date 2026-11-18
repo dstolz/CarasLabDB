@@ -22,12 +22,13 @@ is in THIS repository:
 Nothing is run: this reads text. It exists because the package and the
 toolboxes are separate repositories, so a member renamed here fails nowhere
 until a lab computer has both. It is not a test of behavior
-(tests/matlab/LabClientTests.m is).
+(tests/matlab/LabClientTests.m and BackendContractTests.m are).
 
 What it cannot see, and so does not check:
   * a method called on an OBJECT the package returned (`b =
     labclient.DB.connect(); b.subjects(f)`): the object's class is not known
-    from the text;
+    from the text. What a backend's methods give is BackendContractTests' to
+    hold;
   * options passed the old way, as `"Name", value` pairs, and the names in a
     struct handed to a method;
   * a class or member named in a string that is built at run time, and the

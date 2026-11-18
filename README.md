@@ -230,7 +230,10 @@ ok = exist("labclient.Api", "class") == 8;          % a package from before vers
 if ok; [ok, why] = labclient.Api.atLeast(3); end    % WHY says to update the checkout
 ```
 
-Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server).
+Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server) and
+`tests/matlab/BackendContractTests.m` (the same assertions against the fake
+backend and against PostgreSQL through `labclient.CarasBackend`, records sent
+with `labclient.Sync`).
 
 **A toolbox's calls are checked from here.** The package and the toolboxes are
 separate repositories, so `python tests/check_consumers.py <checkout> ...`

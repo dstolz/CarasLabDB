@@ -491,6 +491,16 @@ Rules a change must keep:
 Tests: `tests/matlab/LabClientTests.m` (`FakeBackend`, temp prefs/vault/folder;
 no server, no Database Toolbox). Backend methods are the only seam to
 `@CarasLabDB`; keep `Backend`, `CarasBackend` and `FakeBackend` in step.
+`tests/matlab/BackendContractTests.m` holds them to it: every test runs twice
+(`Kind` `fake` and `real`) with the same lines, sending records with
+`labclient.Sync` and reading through the backend, the real kind connecting
+as the client connects (`Settings`, the vault's fake, `DB.connect()`, no
+`useBackend`) to the scratch database of `LabScratchDb`. It is the only test
+of the send path against PostgreSQL. When the two kinds disagree the database
+is right: change `FakeBackend` (or the client), never the assertion for one
+kind. A test there keeps to itself on the shared scratch database: its own
+subject (`makeWorld`), paths under its own key, bytes no other test writes
+(equal bytes are, rightly, a copy of the other event's file).
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →
@@ -575,7 +585,7 @@ to exercise the code:
   `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
   creates and drops a scratch `lab_mtest` database; it is opt-in through
   `CARASLABDB_MTEST_ADMIN` (see its help), and without it only the
-  database-free tests run. `LabClientTests` tests the shared client (`+labclient`) against its own `FakeBackend`, needing no database. `RecordingConnection` is the fake connection of
+  database-free tests run. `LabClientTests` tests the shared client (`+labclient`) against its own `FakeBackend`, needing no database; `BackendContractTests` runs one set of assertions against that fake and, when the scratch database is there, against `labclient.CarasBackend`. `RecordingConnection` is the fake connection of
   the database-free tests. The GUI tests drive modal windows from a timer
   callback, where `matlab.uitest` does not wait for the app: steps there use
   `typeIn`/`pressOn`/`chooseIn`/`dismissAlert`, not the plain gestures. See
