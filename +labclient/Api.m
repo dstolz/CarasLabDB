@@ -30,7 +30,8 @@ classdef Api
     %        the file (Sync.replaceFile follows it to the one at the path, in
     %        whatever order the records arrive). Bundles.problems says what
     %        the database would refuse in a record, and Outbox.put keeps such
-    %        a record held, with the reason, instead of sending it to fail.
+    %        a record held, with the reason, instead of sending it to fail;
+    %        Bundles.isTimeText is the one test of a time in a record.
     %        FakeBackend holds a record to the database's rules: the Detail
     %        fields of every event type, when a disposition happened, and the
     %        policy for a replaced file.

@@ -496,6 +496,27 @@ classdef Bundles
             end
         end
 
+        function tf = isTimeText(txt)
+            %isTimeText  True when TXT is a time as timeText writes one: digits, with its offset, that read as an instant.
+            %   The one test of a time in a record, for what is said of it
+            %   where it is made (problems) and for the sender
+            %   (labclient.Sync). The shape is looked at before the text is
+            %   read: datetime reads the words "now", "today", "yesterday"
+            %   and "tomorrow" as dates whatever format it is given, and such
+            %   a word must not become the time something happened.
+            tf = false;
+            try
+                txt = string(txt);
+                if ~isscalar(txt) || ismissing(txt); return; end
+                if isempty(regexp(txt, "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:?\d{2}|Z)$", "once"))
+                    return
+                end
+                t = datetime(txt, "InputFormat", labclient.Bundles.TimeFormat, "TimeZone", "UTC");
+                tf = isscalar(t) && ~isnat(t);
+            catch
+            end
+        end
+
         function tf = notMeasured(v)
             %notMeasured  True for a husbandry value that says nothing was measured: empty, "" or NaN.
             %   Such a field is left out of what is sent (the database keeps
@@ -578,16 +599,6 @@ classdef Bundles
         function tf = isText(v)
             %isText  True for one piece of text: a char row or a string scalar.
             tf = (ischar(v) && (isrow(v) || isempty(v))) || (isstring(v) && isscalar(v) && ~ismissing(v));
-        end
-
-        function tf = isTimeText(txt)
-            %isTimeText  True when TXT reads as a time written by timeText (what the sender parses).
-            tf = false;
-            try
-                t = datetime(string(txt), "InputFormat", labclient.Bundles.TimeFormat, "TimeZone", "UTC");
-                tf = isscalar(t) && ~isnat(t);
-            catch
-            end
         end
 
         function id = uuidWithoutJava()

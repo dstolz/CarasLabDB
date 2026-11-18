@@ -1272,6 +1272,10 @@ classdef Sync
                 t = NaT("TimeZone", "UTC");
                 return
             end
+            if ~labclient.Bundles.isTimeText(txt)
+                % refused, not guessed at: datetime would read "today" or "yesterday" as a date
+                error("labclient:Sync:Time", "'%s' is not a time written as labclient.Bundles.timeText writes one.", txt);
+            end
             t = datetime(txt, "InputFormat", labclient.Bundles.TimeFormat, "TimeZone", "UTC");
         end
 

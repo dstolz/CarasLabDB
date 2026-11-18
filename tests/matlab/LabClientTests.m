@@ -655,6 +655,12 @@ classdef LabClientTests < matlab.unittest.TestCase
             % no time, and a time that is not written as timeText writes one
             tc.verifySubstring(said("behavior", struct("task", "t"), ""), "when it happened");
             tc.verifySubstring(said("behavior", struct("task", "t"), "2026-11-18 09:00"), "timeText");
+            % a word that datetime would read as a date is not a time either
+            tc.verifySubstring(said("behavior", struct("task", "t"), "today"), "timeText");
+            tc.verifyFalse(labclient.Bundles.isTimeText("yesterday"));
+            tc.verifyFalse(labclient.Bundles.isTimeText("now"));
+            tc.verifyTrue(labclient.Bundles.isTimeText(at));
+            tc.verifyTrue(labclient.Bundles.isTimeText("2026-07-02T14:29:00.000000-04:00"));
             % a field that is not a column of that type of event
             p = labclient.Bundles.problems(labclient.Bundles.event(EventId=labclient.Bundles.newId(), ...
                 EventType="behavior", OccurredAt=at, Detail=struct("task", "t", "trials", 12), SubjectId="SUBJ-1"));
