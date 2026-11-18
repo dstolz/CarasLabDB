@@ -446,7 +446,18 @@ Rules a change must keep:
   subject than that event's is held.
 - **Replacement files**: `Bundles.files(EventId=E, Outputs=items)` with an
   item's `Replaces` registers new bytes at the same path of an event already
-  sent and records the old file `replaced` (`Sync.sendFiles`).
+  sent and records the old file `replaced` (`Sync.sendFiles`). `Replaces` may
+  name any earlier version (EPsych names the first at every save):
+  `Sync.replaceFile` follows a version that was replaced since, by its
+  `replaced` dispositions, to the one present at the path. Two rules a change
+  must keep: a hop is followed only when it happened no later than this
+  record's `captured_at` (records can arrive out of order; when the hop is
+  later, the file sent late is the one recorded as replaced, never the newer
+  bytes by the older), and a time that does not read as a datetime means
+  nothing is recorded. `FakeBackend` keeps `occurred_at` and refuses what
+  `fn_artifact_disposition_policy` refuses, so the tests hold the sender to
+  the database's rules. An EVENT record's output is different:
+  `recordEvent`'s `replaces` must name the row present at the path.
 - **Husbandry** events (`measure`, `weight_g`, `water_ml`, `health_status`)
   go through `Bundles.event`, `Sync`, both backends and `CarasLabDB.recordEvent`.
 - `SubjectCache` keeps `lab.subject_current` + the `baseline weight` subject

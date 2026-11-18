@@ -245,10 +245,19 @@ classdef Bundles
             %       and its Replaces is the artifact_id of the file it takes
             %       the place of. The new file is registered as a file of E
             %       and the old one recorded as "replaced" by it, so the
-            %       database does not hold two present files at one path. An
-            %       earlier file the database does not have, or that is gone
-            %       already, is noted and left. A file already registered with
-            %       the same bytes is that file.
+            %       database does not hold two present files at one path.
+            %       Replaces may name any earlier version of the file (the
+            %       first one, each time it is saved again): one that was
+            %       replaced since is followed to the version at the path
+            %       now, which is the one recorded as replaced. When a later
+            %       save reached the database first, this file is the
+            %       earlier version and is the one recorded as replaced
+            %       (labclient.Sync.replaceFile). An earlier file the
+            %       database does not have is noted and left; one moved or
+            %       deleted since is left. A file already registered with
+            %       the same bytes is that file. (An output of an EVENT
+            %       record is different: its Replaces must name the file
+            %       present at the path, see CarasLabDB.recordEvent.)
             %   Dispositions a struct array (labclient.Bundles.disposition).
             %   It is sealed when every file's SHA-256 is known (the hasher
             %   takes it, as for an event).

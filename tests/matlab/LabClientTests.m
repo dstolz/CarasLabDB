@@ -17,7 +17,9 @@ classdef LabClientTests < matlab.unittest.TestCase
 %   owner left without a claim, stale claims); labclient.Hasher; sending
 %   (labclient.Sync): an event of no dataset naming its subject, held for a
 %   subject the database does not have and re-targeted to another, husbandry
-%   events, a replacement file registered beside the one it replaces, a record
+%   events, a replacement file registered beside the one it replaces (also
+%   when it names a version replaced before, and when a later save was sent
+%   first), a record
 %   recorded as a copy of a file already in the database whichever of two
 %   toolboxes sent it first, a record whose tool is not running here never
 %   claimed, a dataset record that names no tool sent only through the tool
@@ -124,6 +126,16 @@ classdef LabClientTests < matlab.unittest.TestCase
                 Detail=struct("task", "detect", "trials_completed", 12), Attributes=struct("rig", "r1"), ...
                 Outputs=it, SubjectId=opts.Subject, Dataset=opts.Dataset, Notes=opts.Notes);
             b = labclient.Bundles.seal(b);
+        end
+
+        function [fb, id] = savedAgain(tc, ev, rel, bytes, replaces, at)
+            %savedAgain  A sealed files record: new BYTES at REL, a file of event record EV in place of REPLACES, captured at AT.
+            f = tc.file(rel, bytes);
+            id = labclient.Bundles.newId();
+            it = labclient.Bundles.item(f, Role="raw", Kind="session", ArtifactId=id, Root="nas", Rel=rel, ...
+                Sha256=labclient.fileSha256(f), Replaces=replaces);
+            fb = labclient.Bundles.files(EventId=ev.bundle_id, Outputs=it);
+            fb.captured_at = labclient.Bundles.timeText(at);   % the order of the captures is the test's to set (not in the digest)
         end
 
         function b = golden(~)
@@ -757,6 +769,125 @@ classdef LabClientTests < matlab.unittest.TestCase
             labclient.Sync.flush(Budget=10);
             tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
             tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "not marked replaced");
+        end
+
+        function aFileSavedAgainAndAgainNamingItsFirstVersion(tc)
+            % a toolbox that names the FIRST version as the one replaced, every time it saves
+            rel = "rig/again.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            be = labclient.DB.connect();
+            here = struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true);
+
+            [fb1, a1] = tc.savedAgain(ev, rel, 1:60, a0, t0 + minutes(1));
+            labclient.Outbox.put(fb1);
+            labclient.Sync.flush(Budget=10);
+            [fb2, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));   % still names the first
+            labclient.Outbox.put(fb2);
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 1, r.message);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual([D.artifact_id, D.disposition, D.successor_artifact_id], ...
+                [a0, "replaced", a1; a1, "replaced", a2], "each version replaced by the next, and nothing else");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2, "one present file at the path: the newest");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "its present version " + a1);
+
+            for id = [fb1.bundle_id, fb2.bundle_id]   % sent again, either one: nothing twice
+                labclient.Outbox.move(id, "pending");
+                labclient.Sync.flush(Budget=10);
+            end
+            tc.verifyEqual(height(tc.Fake.Artifacts), 3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 2);
+
+            [fb3, a3] = tc.savedAgain(ev, rel, 1:80, a0, t0 + minutes(3));   % followed over two replacements
+            labclient.Outbox.put(fb3);
+            labclient.Sync.flush(Budget=10);
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual(height(D), 3);
+            tc.verifyEqual([D.artifact_id(3), D.disposition(3), D.successor_artifact_id(3)], [a2, "replaced", a3]);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a3);
+
+            % the version at the path was deleted since: nothing of the chain is there to replace
+            be.addDisposition(struct("ArtifactId", a3, "Disposition", "deleted", "SuccessorArtifactId", "", ...
+                "OccurredAt", t0 + minutes(4), "Note", "cleaned up", "AttributesJson", "{}"));
+            [fb4, a4] = tc.savedAgain(ev, rel, 1:90, a0, t0 + minutes(5));
+            labclient.Outbox.put(fb4);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb4.bundle_id), "done", "left alone, not an error");
+            tc.verifyEqual(height(tc.Fake.Dispositions), 4, "nothing recorded for a chain that ends in a deleted file");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a4, "the deleted file is not present; the new one is");
+        end
+
+        function aReplacementSentAfterANewerOneIsTheOneReplaced(tc)
+            % three saves of one path, each naming the first version; the third is sent before the second
+            rel = "rig/late.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            be = labclient.DB.connect();
+            here = struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true);
+            [fb2, a1] = tc.savedAgain(ev, rel, 1:60, a0, t0 + minutes(1));   % captured, and kept back
+            [fb3, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));   % the bytes on disk now
+            labclient.Outbox.put(fb3);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2);
+
+            labclient.Outbox.put(fb2);   % the earlier save arrives late
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual([D.artifact_id, D.disposition, D.successor_artifact_id], ...
+                [a0, "replaced", a2; a1, "replaced", a2], "the late, earlier version is the one replaced");
+            tc.verifyTrue(D.occurred_at(2) == t0 + minutes(2), "when the newer version took the place");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2, "the newest bytes stay the present file");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "was sent first");
+
+            for id = [fb2.bundle_id, fb3.bundle_id]   % sent again, either one: nothing twice
+                labclient.Outbox.move(id, "pending");
+                labclient.Sync.flush(Budget=10);
+            end
+            tc.verifyEqual(height(tc.Fake.Artifacts), 3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 2);
+
+            [fb4, a3] = tc.savedAgain(ev, rel, 1:80, a0, t0 + minutes(3));   % in order again: replaces the newest
+            labclient.Outbox.put(fb4);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 3);
+        end
+
+        function aReplacementWhoseTimeCannotBeReadIsLeft(tc)
+            % the order of two versions is told by when each took the place; without that, neither is touched
+            rel = "rig/untimed.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            be = labclient.DB.connect();
+            % a second version, and the first recorded as replaced by it with no time (as a
+            % database row whose time does not read as one would be)
+            a1 = labclient.Bundles.newId();
+            be.addArtifact(struct("ArtifactId", a1, "ProducedByEventId", ev.bundle_id, "StorageRootId", 1, ...
+                "RelativePath", rel, "Checksum", string(repmat('c', 1, 64)), "SizeBytes", 60, "Role", "raw", ...
+                "Format", "mat", "AttributesJson", "{}"));
+            be.addDisposition(struct("ArtifactId", a0, "Disposition", "replaced", "SuccessorArtifactId", a1, ...
+                "OccurredAt", NaT("TimeZone", "UTC"), "Note", "", "AttributesJson", "{}"));
+            tc.verifyTrue(isnat(tc.Fake.Dispositions.occurred_at(1)));
+            [fb2, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));
+            labclient.Outbox.put(fb2);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done", "left, not an error");
+            tc.verifyEqual(height(tc.Fake.Dispositions), 1, "nothing recorded when the order cannot be told");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "could not be read");
+            P = be.artifacts(struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true));
+            tc.verifyEqual(sort(P.artifact_id), sort([a1; a2]), "both stay present, as before this rule: reported, not guessed");
         end
 
         function aFilesRecordWaitsForItsEventAndHoldsAWrongCopy(tc)

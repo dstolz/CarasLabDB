@@ -11,7 +11,12 @@ classdef FakeBackend < labclient.Backend
     %   CarasLabDB:idConflict, a session or subject that is not there is
     %   refused (the foreign keys), a file already registered with the same
     %   bytes at the same path is reused (Unchanged), an input or a
-    %   "replaces" row that is not there is skipped. Fail makes the next
+    %   "replaces" row that is not there is skipped. Dispositions keeps
+    %   when each happened (occurred_at, as the database does), and
+    %   addDisposition refuses what the database's policy refuses: a file
+    %   already gone, a "replaced" file whose successor is not other bytes
+    %   at the same path, a "moved" one whose successor is not the same
+    %   bytes at another place, a "deleted" one with a successor. Fail makes the next
     %   call of a method fail: struct("Method", "recordEvent", "Identifier",
     %   "CarasLabDB:transactionInterrupted", "Message", "...", "AfterWrite",
     %   false); AfterWrite true writes first and then fails, as a commit
@@ -68,8 +73,8 @@ classdef FakeBackend < labclient.Backend
             "session_id", {}, "digest", {}, "recorded_by", {}, "notes", {}, "attributes", {}, "detail", {})
         Inputs table = table(strings(0, 1), strings(0, 1), strings(0, 1), ...
             'VariableNames', {'event_id', 'artifact_id', 'role'})
-        Dispositions table = table(strings(0, 1), strings(0, 1), strings(0, 1), ...
-            'VariableNames', {'artifact_id', 'disposition', 'successor_artifact_id'})
+        Dispositions table = table(strings(0, 1), strings(0, 1), strings(0, 1), NaT(0, 1, "TimeZone", "UTC"), ...
+            'VariableNames', {'artifact_id', 'disposition', 'successor_artifact_id', 'occurred_at'})
     end
 
     properties (SetAccess = private)
@@ -304,11 +309,16 @@ classdef FakeBackend < labclient.Backend
             end
             skippedRep = strings(0, 1);
             dsp = obj.Dispositions([], :);
+            doneAt = req.OccurredAt;   % as CarasLabDB.recordEvent: when the run finished, else when it occurred
+            if isfield(req.Detail, "finished_at") && isdatetime(req.Detail.finished_at) && ~isnat(req.Detail.finished_at)
+                doneAt = req.Detail.finished_at;
+            end
+            doneAt.TimeZone = "UTC";
             for j = 1:n
                 r = string(req.Outputs(j).replaces);
                 if r == "" || unchanged(j); continue; end
                 if ~any(obj.Artifacts.artifact_id == r); skippedRep(end + 1, 1) = r; continue; end %#ok<AGROW>
-                dsp = [dsp; table(r, "replaced", ids(j), 'VariableNames', ...
+                dsp = [dsp; table(r, "replaced", ids(j), doneAt, 'VariableNames', ...
                     obj.Dispositions.Properties.VariableNames)]; %#ok<AGROW>
             end
             % everything checked: written at once, as one transaction
@@ -423,11 +433,20 @@ classdef FakeBackend < labclient.Backend
                         obj.Artifacts.relative_path(j) == obj.Artifacts.relative_path(k))
                     error("labclient:Refused", "a moved file's successor must be the same bytes at another place (fake)");
                 end
+            elseif d.Disposition == "replaced" && strlength(d.SuccessorArtifactId) > 0
+                j = find(obj.Artifacts.artifact_id == d.SuccessorArtifactId, 1);
+                if isempty(j) || obj.Artifacts.checksum(j) == obj.Artifacts.checksum(k) || ...
+                        obj.Artifacts.storage_root_id(j) ~= obj.Artifacts.storage_root_id(k) || ...
+                        obj.Artifacts.relative_path(j) ~= obj.Artifacts.relative_path(k)
+                    error("labclient:Refused", "a replaced file's successor must be other bytes at the same path (fake)");
+                end
             elseif d.Disposition == "deleted" && strlength(d.SuccessorArtifactId) > 0
                 error("labclient:Refused", "a deleted file has no successor (fake)");
             end
+            at = d.OccurredAt;   % kept as the database keeps it: when it happened, a zoned instant
+            at.TimeZone = "UTC";
             obj.Dispositions = [obj.Dispositions; table(string(d.ArtifactId), string(d.Disposition), ...
-                string(d.SuccessorArtifactId), 'VariableNames', obj.Dispositions.Properties.VariableNames)];
+                string(d.SuccessorArtifactId), at, 'VariableNames', obj.Dispositions.Properties.VariableNames)];
         end
 
         function T = subjectCurrent(obj, ids)

@@ -200,7 +200,11 @@ water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know
 - **A replacement file for an event already sent**: `labclient.Bundles.files(
   EventId=E, Outputs=items)` with each item's `Replaces` the artifact id of
   the file it takes the place of registers the new bytes at the same path as a
-  file of E and records the old one as replaced.
+  file of E and records the old one as replaced. `Replaces` may name any
+  earlier version (the first one, every time the file is saved again): a
+  version replaced since is followed to the one at the path now. When a later
+  save reached the database first, the file sent late is the one recorded as
+  replaced, never the newer bytes.
 - **Files already in the database.** A record whose raw file is, by its
   SHA-256, a file of a recording or behavior event already there (from either
   toolbox) is recorded as a copy of that event's file, not as a second event.

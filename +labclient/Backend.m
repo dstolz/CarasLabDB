@@ -26,7 +26,9 @@ classdef (Abstract) Backend < handle
     %     tf = b.addEventInput(eventId, artifactId, role)   % false when it was there
     %     T = b.eventRows(filters)   % filters: EventId, SessionId (event_id, event_type, occurred_at, ...)
     %     T = b.verifications(id)    % the checks of artifact ID, newest first (status, verified_at, ...)
-    %     T = b.dispositions(id)     % what became of artifact ID's file, newest first (disposition, ...)
+    %     T = b.dispositions(id)     % what became of artifact ID's file, newest first: the rows recorded
+    %                                %   against that artifact (disposition, successor_artifact_id,
+    %                                %   occurred_at as a datetime, ...)
     %     T = b.lineage(id, dir)     % depth, event_id, artifact_id; dir "up" (what it came from) or "down"
     %
     %     id = b.addArtifact(a)      % a: ArtifactId, ProducedByEventId, StorageRootId, RelativePath,

@@ -44,7 +44,9 @@ classdef Sync
     %   Sending a "files" record (labclient.Bundles.files) registers copies of
     %   files an event produced, once each, after the event; an item that
     %   names the artifact it Replaces (new bytes at the same path of a file
-    %   of an event already sent) records that file as replaced by it.
+    %   of an event already sent) records that file as replaced by it -- or,
+    %   when that file was replaced before, the version at the path now
+    %   (replaceFile; safe when the records arrive out of order).
     %   A "husbandry" event goes as any other (Detail measure, weight_g,
     %   water_ml, health_status; a column not measured is not sent).
     %   A record whose raw files are byte for byte files of a recording or
@@ -89,6 +91,7 @@ classdef Sync
         Period = 15          % seconds between ticks
         TickWait = 2         % seconds a tick waits for the server at most
         EdgesRetry = 600     % seconds an edges record waiting for its files steps aside (unless a record was sent since)
+        ReplaceHops = 100    % versions of one file followed from the one a replacement names to the one at the path now
         NeedsSubject = "needs_subject"
         NeedsLogin = "needs_login"       % captured under another login: a person must say "send as me"
         OnBehalf = "on_behalf"
@@ -861,6 +864,8 @@ classdef Sync
             %   Waits while the event that produced the files is not in the
             %   database. A copy whose SHA-256 is not its source's is held. A
             %   copy that overwrote a file records that file as replaced. A
+            %   file that names the one it Replaces records that one, or the
+            %   version of it at the path now, as replaced (replaceFile). A
             %   file already registered with the same bytes at the same place
             %   is that file. A disposition already recorded is not recorded
             %   again.
@@ -949,25 +954,121 @@ classdef Sync
             %replaceFile  Record the file item IT replaces (its "replaces" artifact id) as replaced by NEWID, once.
             %   The new bytes are at the same path as the earlier file's,
             %   which is how a file of an event already sent is replaced
-            %   (Bundles.files). An earlier file the database does not have,
-            %   or that is gone already, is noted and left.
+            %   (Bundles.files). An earlier file the database does not have
+            %   is noted and left.
+            %
+            %   An earlier file that is gone already was replaced before (a
+            %   toolbox may name the first version every time it saves): its
+            %   "replaced" dispositions are followed, successor by successor,
+            %   to the version at the path now, and that one is recorded as
+            %   replaced. Records can arrive out of order (a record that
+            %   failed is sent again later): a replacement that happened
+            %   after this file was captured (CAPTUREDAT) means this file is
+            %   the earlier version, and it is the one recorded as replaced,
+            %   by that successor -- never the newer bytes by the older. A
+            %   chain that ends in a file moved or deleted, or in bytes never
+            %   registered, is left; so is a version the database does not
+            %   show as present at the new file's place, and a replacement
+            %   whose time cannot be read (noted). Sent again, nothing is
+            %   recorded twice.
             notes = strings(1, 0);
             old = string(it.replaces);
-            if old == "" || old == string(newId); return; end
+            newId = string(newId);
+            if old == "" || old == newId; return; end
             if height(be.artifacts(struct("ArtifactId", old))) == 0
                 notes = "the replaced file " + old + " is not in the database, not marked replaced";
                 return
             end
-            if labclient.Sync.disposed(be, old); return; end
-            be.addDisposition(struct("ArtifactId", old, "Disposition", "replaced", ...
-                "SuccessorArtifactId", string(newId), "OccurredAt", labclient.Sync.parseTime(capturedAt), ...
+            when = labclient.Sync.parseTime(capturedAt);
+            if ~labclient.Sync.disposed(be, old)
+                be.addDisposition(struct("ArtifactId", old, "Disposition", "replaced", ...
+                    "SuccessorArtifactId", newId, "OccurredAt", when, ...
+                    "Note", "replaced by a newer version of the file", "AttributesJson", "{}"));
+                return
+            end
+            % OLD is gone: follow what replaced it to the version at the path now.
+            cur = old;
+            seen = old;
+            atPath = false;
+            for hop = 1:labclient.Sync.ReplaceHops
+                D = be.dispositions(cur);
+                if height(D) == 0 || string(D.disposition(1)) == "restored"   % newest first
+                    atPath = true;
+                    break
+                end
+                if string(D.disposition(1)) ~= "replaced"; return; end   % moved or deleted: nothing of this chain is at the path
+                next = string(D.successor_artifact_id(1));
+                if ismissing(next) || next == ""; return; end   % replaced by bytes that were never registered
+                if next == newId; return; end                   % the chain leads to the new file: recorded before
+                if any(seen == next); return; end               % a loop: left
+                at = labclient.Sync.whenOf(D);
+                if isnat(at) || isnat(when)
+                    % which of the two is newer cannot be told: neither is touched
+                    notes = "the replaced file " + old + " was replaced before, at a time that could not be read: left";
+                    return
+                end
+                if at > when
+                    % NEXT took the place after this file was captured: this record was sent
+                    % late, its file is the earlier version, and NEXT replaced it too.
+                    N = be.artifacts(struct("ArtifactId", newId, "PresentOnly", true));
+                    S = be.artifacts(struct("ArtifactId", next));
+                    if labclient.Sync.otherBytesAtTheSamePlace(N, S)
+                        be.addDisposition(struct("ArtifactId", newId, "Disposition", "replaced", ...
+                            "SuccessorArtifactId", next, "OccurredAt", at, ...
+                            "Note", "an earlier version, sent after the one that replaced it", "AttributesJson", "{}"));
+                        notes = "a newer version of this file (" + next + ") was sent first: this one is recorded as replaced by it";
+                    end
+                    return
+                end
+                seen(end + 1) = next; %#ok<AGROW>
+                cur = next;
+            end
+            if ~atPath
+                notes = "the replaced file " + old + " was replaced more than " + labclient.Sync.ReplaceHops + ...
+                    " times: its present version was not looked for";
+                return
+            end
+            % Present as the database sees it (by file, not by this row's dispositions), at
+            % the new file's place and with other bytes: what its disposition policy asks, so
+            % that nothing recorded here is something it refuses.
+            P = be.artifacts(struct("ArtifactId", cur, "PresentOnly", true));
+            N = be.artifacts(struct("ArtifactId", newId));
+            if ~labclient.Sync.otherBytesAtTheSamePlace(P, N); return; end
+            be.addDisposition(struct("ArtifactId", cur, "Disposition", "replaced", ...
+                "SuccessorArtifactId", newId, "OccurredAt", when, ...
                 "Note", "replaced by a newer version of the file", "AttributesJson", "{}"));
+            notes = "the replaced file " + old + " was replaced before: its present version " + cur + ...
+                " is recorded as replaced";
         end
 
         function tf = disposed(be, id)
             %disposed  True when artifact ID's file is recorded as gone (replaced, moved or deleted, not restored since).
             D = be.dispositions(id);
             tf = height(D) > 0 && string(D.disposition(1)) ~= "restored";   % newest first
+        end
+
+        function t = whenOf(D)
+            %whenOf  When the newest disposition of D happened, zoned (NaT when it cannot be told).
+            %   D is what a backend's dispositions gives, newest first. The
+            %   database's driver gives a time with no zone, read in this
+            %   computer's (CarasLabDB sets the session's zone to it); a time
+            %   that is no datetime is not guessed at.
+            t = NaT("TimeZone", "UTC");
+            if height(D) == 0 || ~any(string(D.Properties.VariableNames) == "occurred_at"); return; end
+            x = D.occurred_at(1);
+            if iscell(x); x = x{1}; end
+            if ~isdatetime(x) || ~isscalar(x) || isnat(x); return; end
+            if isempty(x.TimeZone); x.TimeZone = "local"; end
+            t = x;
+        end
+
+        function tf = otherBytesAtTheSamePlace(A, B)
+            %otherBytesAtTheSamePlace  True when artifact rows A and B (one row each) are other bytes at one root and path.
+            %   What the database asks of a file and the file that replaced it.
+            tf = height(A) == 1 && height(B) == 1 ...
+                && double(A.storage_root_id(1)) == double(B.storage_root_id(1)) ...
+                && string(A.relative_path(1)) == string(B.relative_path(1)) ...
+                && string(A.checksum(1)) ~= string(B.checksum(1));
         end
 
         function [sid, subject, why, need] = resolveSession(be, rec, roots, s)
