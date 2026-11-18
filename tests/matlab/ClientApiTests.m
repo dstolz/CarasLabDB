@@ -10,8 +10,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
 %   inputs the database does not have yet skipped and added later with
 %   addEventInput(IfExists="skip")), JSON text sent as written
 %   (CarasLabDB.jsonText, CarasLabDBJson.withMember), the file-location
-%   filters of getArtifacts / getSessions, and the time limits
-%   (ConnectTimeout=, StatementTimeout=, LockTimeout=).
+%   filters of getArtifacts / getSessions, file dispositions and
+%   recordArtifactMove (a file found at another path), the checks of a
+%   file across its rows (getArtifactVerifications ByFile=), and the time
+%   limits (ConnectTimeout=, StatementTimeout=, LockTimeout=).
 %
 %   Like TAGTESTS, the tests tagged "Database" run against the scratch
 %   database of the shared fixture LABSCRATCHDB (opt-in; see "help
@@ -177,6 +179,33 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             tc.verifyEmpty(conn.Log, "nothing is sent for a record that fails its checks");
         end
 
+        function recordEventHusbandryChecksItsColumns(tc)
+            [db, conn] = ClientApiTests.recordingDb();
+            t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            base = {"EventId", ClientApiTests.EventId, "Digest", ClientApiTests.Digest, "OccurredAt", t, ...
+                "SubjectId", "MT-1"};
+            tc.verifyError(@() db.recordEvent("husbandry", base{:}, "Detail", struct("bogus", 1)), ...
+                "CarasLabDB:invalidValue", "a column of no husbandry table");
+            tc.verifyError(@() db.recordEvent("husbandry", base{:}, "Detail", struct("task", "x")), ...
+                "CarasLabDB:invalidValue", "a behavior column");
+            tc.verifyEmpty(conn.Log, "nothing is sent for a record that fails its checks");
+            conn.Results("RETURNING event_id") = table(ClientApiTests.EventId, 'VariableNames', {'event_id'});
+            out = db.recordEvent("husbandry", base{:}, "Detail", ...
+                struct("measure", "weight", "weight_g", 24.5, "water_ml", 1.25, "health_status", "good"));
+            tc.verifyEqual(out.Outcome, "inserted");
+            first = @(pattern) find(contains(conn.Log, pattern), 1);
+            tc.assertNotEmpty(first("INSERT INTO lab.husbandry_event"), "the husbandry detail row");
+            row = conn.Log(first("INSERT INTO lab.husbandry_event"));
+            tc.verifySubstring(row, "'weight'");
+            tc.verifySubstring(row, "24.5");
+            tc.verifySubstring(row, "1.25");
+            tc.verifySubstring(row, "'good'");
+            ev = conn.Log(first("INSERT INTO lab.event "));
+            tc.verifySubstring(ev, "'husbandry'");
+            tc.verifySubstring(ev, "'MT-1'");
+            tc.verifySubstring(ev, """client_digest"":""" + ClientApiTests.Digest + """");
+        end
+
         function recordEventWritesInOneTransaction(tc)
             [db, conn] = ClientApiTests.recordingDb();
             conn.Results("RETURNING event_id") = table(ClientApiTests.EventId, 'VariableNames', {'event_id'});
@@ -290,6 +319,27 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
             out = db.recordEvent("analysis", args{:}, MissingInputs="skip");
             tc.verifyEqual(out.SkippedReplaces, old);
             tc.verifyFalse(any(contains(conn.Log, "INSERT INTO lab.artifact_disposition")));
+        end
+
+        function recordArtifactMoveChecksItsArgumentsFirst(tc)
+            % Wrong arguments are refused before anything is sent.
+            [db, conn] = ClientApiTests.recordingDb();
+            t = datetime(2026, 11, 3, 9, 0, 0, "TimeZone", "UTC");
+            tc.verifyError(@() db.recordArtifactMove("x", StorageRootId=1, RelativePath="a/b.dat", ...
+                OccurredAt=t), "CarasLabDB:invalidValue");
+            tc.verifyError(@() db.recordArtifactMove(ClientApiTests.OutputId, StorageRootId=1, ...
+                RelativePath="a/b.dat", OccurredAt=t, ObservedChecksum=ClientApiTests.Hash), ...
+                "CarasLabDB:invalidValue", "a checksum needs the time it was computed");
+            tc.verifyError(@() db.recordArtifactMove(ClientApiTests.OutputId, StorageRootId=1, ...
+                RelativePath="a/b.dat", OccurredAt=t, VerifiedAt=t), ...
+                "CarasLabDB:invalidValue", "a check time needs the checksum");
+            tc.verifyError(@() db.recordArtifactMove(ClientApiTests.OutputId, StorageRootId=1, ...
+                RelativePath=" ", OccurredAt=t), "CarasLabDB:invalidValue");
+            tc.verifyEmpty(conn.Log, "nothing was sent");
+            tc.verifyError(@() db.getArtifactVerifications(ByFile=true), "CarasLabDB:invalidValue");
+            db.getArtifactVerifications(ArtifactId=ClientApiTests.OutputId, ByFile=true);
+            tc.verifySubstring(conn.Log(end), "a.relative_path = f.relative_path");
+            tc.verifySubstring(conn.Log(end), "a.artifact_id = '" + ClientApiTests.OutputId + "'::uuid");
         end
 
         function presentOnlyReadsArtifactPresent(tc)
@@ -457,6 +507,130 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                 "artifact_id"), 1, "restored: present again");
             T = db.getArtifactDispositions(ArtifactId=aid);
             tc.verifyEqual(LabScratchDb.column(T, "disposition"), ["restored"; "deleted"], "newest first");
+            % When a disposition happened reads back as the instant written. The shared client
+            % tells which of two versions of a file is the newer by it (labclient.Sync.replaceFile,
+            % whenOf), reading a time that comes back with no zone as this computer's, which is
+            % the zone the class gives the session.
+            at = T.occurred_at(1);
+            tc.assertClass(at, "datetime", "occurred_at comes back as a datetime");
+            if isempty(at.TimeZone); at.TimeZone = "local"; end
+            tc.verifyTrue(at == t + days(1), "the instant that was written: " + string(at));
+        end
+
+        function moveRecordsTheFileAtItsNewPlace(tc)
+            % recordArtifactMove: the new row (copied from the old one), the
+            % check made of it and the 'moved' disposition, in one
+            % transaction; a row already registered there is used; a wrong
+            % checksum, the same path, or a file already gone write nothing.
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("move", 2);
+            aid = w.ArtifactIds(1);
+            chk = LabScratchDb.column(db.getArtifacts(ArtifactId=aid), "checksum");
+            t = datetime(2026, 11, 3, 9, 0, 0, "TimeZone", "UTC");
+            newRel = "mt/" + w.Key + "/archive/f.dat";
+            before = fx.counts();
+            tc.verifyError(@() db.recordArtifactMove(aid, StorageRootId=fx.RootId, RelativePath=newRel, ...
+                OccurredAt=t, ObservedChecksum=fx.checksum(fx.next()), VerifiedAt=t), ...
+                "CarasLabDB:checksumMismatch");
+            tc.verifyError(@() db.recordArtifactMove(aid, StorageRootId=fx.RootId, ...
+                RelativePath=LabScratchDb.column(db.getArtifacts(ArtifactId=aid), "relative_path"), ...
+                OccurredAt=t), "CarasLabDB:invalidValue", "a move is to another path");
+            tc.verifyEqual(fx.counts(), before, "nothing written");
+
+            out = db.recordArtifactMove(aid, StorageRootId=fx.RootId, RelativePath=newRel, ...
+                OccurredAt=t, ObservedChecksum=upper(chk), VerifiedAt=t + hours(1), ...
+                Note="found by its checksum");
+            tc.verifyTrue(out.Registered);
+            tc.verifyEqual(fx.counts().artifacts - before.artifacts, 1);
+            S = db.getArtifacts(ArtifactId=out.SuccessorArtifactId, PresentOnly=true);
+            tc.assertEqual(height(S), 1);
+            tc.verifyEqual(LabScratchDb.column(S, "relative_path"), newRel);
+            tc.verifyEqual(LabScratchDb.column(S, "checksum"), chk);
+            tc.verifyEqual(LabScratchDb.column(S, "produced_by_event_id"), w.EventId);
+            tc.verifyEqual(LabScratchDb.column(S, "role"), "raw");
+            tc.verifyEqual(LabScratchDb.column(S, "subject_id"), w.SubjectId);
+            tc.verifyEqual(LabScratchDb.column(S, "session_id"), w.SessionId);
+            tc.verifyTrue(ismissing(string(S.supersedes(1))) || string(S.supersedes(1)) == "", ...
+                "the new row is not a correction of the old one");
+            tc.verifyEmpty(db.getArtifacts(ArtifactId=aid, PresentOnly=true), "the old file is not present");
+            tc.verifyNumElements(LabScratchDb.column(db.getArtifacts(ArtifactId=aid), "artifact_id"), 1, ...
+                "the old row is still active");
+            L = db.getArtifactDispositions(ArtifactId=aid);
+            tc.verifyEqual(LabScratchDb.column(L, "disposition"), "moved");
+            tc.verifyEqual(LabScratchDb.column(L, "successor_artifact_id"), out.SuccessorArtifactId);
+            tc.verifyEqual(LabScratchDb.column(L, "note"), "found by its checksum");
+            V = db.getArtifactVerifications(ArtifactId=out.SuccessorArtifactId);
+            tc.verifyEqual(LabScratchDb.column(V, "status"), "ok");
+            tc.verifyEqual(LabScratchDb.column(V, "observed_checksum"), chk);
+            tc.verifyEqual(double(V.verification_id(1)), out.VerificationId);
+
+            before = fx.counts();
+            tc.verifyError(@() db.recordArtifactMove(aid, StorageRootId=fx.RootId, ...
+                RelativePath="mt/" + w.Key + "/elsewhere.dat", OccurredAt=t), ?MException, ...
+                "a file recorded as moved cannot move again");
+            tc.verifyEqual(fx.counts(), before, "the new row of the refused move was rolled back");
+
+            % The bytes are registered at the new path already: that row is used.
+            a2 = w.ArtifactIds(2);
+            chk2 = LabScratchDb.column(db.getArtifacts(ArtifactId=a2), "checksum");
+            copyRel = "mt/" + w.Key + "/copy2.dat";
+            there = db.addArtifact(ProducedByEventId=w.EventId, StorageRootId=fx.RootId, ...
+                RelativePath=copyRel, Checksum=chk2, SubjectId=w.SubjectId, SessionId=w.SessionId);
+            out2 = db.recordArtifactMove(a2, StorageRootId=fx.RootId, RelativePath=copyRel, OccurredAt=t);
+            tc.verifyFalse(out2.Registered);
+            tc.verifyEqual(out2.SuccessorArtifactId, there);
+            tc.verifyTrue(isnan(out2.VerificationId), "no checksum given: no check recorded");
+        end
+
+        function verificationsByFileFollowACorrection(tc)
+            % A check recorded against a row is a check of its file: the
+            % row that corrects it shares it (ByFile=true), its own rows do not.
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("vbyfile", 1);
+            aid = w.ArtifactIds(1);
+            db.addArtifactVerification(ArtifactId=aid, Status="missing");
+            fixed = db.supersedeArtifact(aid, Overrides=struct("format", "bin"));
+            tc.verifyEmpty(db.getArtifactVerifications(ArtifactId=fixed));
+            V = db.getArtifactVerifications(ArtifactId=fixed, ByFile=true);
+            tc.verifyEqual(LabScratchDb.column(V, "artifact_id"), aid);
+            tc.verifyEqual(LabScratchDb.column(V, "status"), "missing");
+            other = fx.makeWorld("vbyfile", 1);
+            db.addArtifactVerification(ArtifactId=other.ArtifactIds(1), Status="ok");
+            tc.verifyNumElements(LabScratchDb.column(db.getArtifactVerifications(ArtifactId=fixed, ...
+                ByFile=true), "verification_id"), 1, "another file's checks are not listed");
+        end
+
+        function recordEventHusbandryWritesOnceAndFeedsTheSubjectView(tc)
+            % A weight, as the behavior rig records it: for a subject, no session; sent twice, written once.
+            db = tc.requireDb();
+            fx = tc.Fx;
+            w = fx.makeWorld("hb", 1);
+            eid = ClientApiTests.newId(fx);
+            digest = string(fx.checksum(fx.next()));
+            t = datetime(2026, 11, 14, 9, 0, 0, "TimeZone", "UTC");
+            args = {"EventId", eid, "Digest", digest, "OccurredAt", t, "SubjectId", w.SubjectId, ...
+                "Detail", struct("measure", "weight", "weight_g", 23.75, "health_status", "ok")};
+            before = fx.counts();
+            out = db.recordEvent("husbandry", args{:});
+            tc.verifyEqual(out.Outcome, "inserted");
+            tc.verifyEqual(fx.counts().events - before.events, 1);
+            again = db.recordEvent("husbandry", args{:});
+            tc.verifyEqual(again.Outcome, "existing");
+            tc.verifyEqual(fx.counts().events - before.events, 1, "sent again: written once");
+            other = args; other{4} = string(repmat('2', 1, 64));
+            tc.verifyError(@() db.recordEvent("husbandry", other{:}), "CarasLabDB:idConflict");
+            E = db.getEvents(EventId=eid);
+            tc.verifyEqual(LabScratchDb.column(E, "subject_id"), w.SubjectId);
+            tc.verifyTrue(ismissing(string(E.session_id(1))) || string(E.session_id(1)) == "", "no session");
+            tc.verifyEqual(double(fx.scalar("SELECT weight_g FROM lab.husbandry_event WHERE event_id = " + ...
+                LabScratchDb.quote(eid))), 23.75);
+            S = db.getSubjectCurrent(SubjectId=w.SubjectId);
+            tc.verifyEqual(double(S.latest_weight_g(1)), 23.75, "the subject's latest weight");
+            tc.verifyError(@() db.recordEvent("husbandry", "EventId", ClientApiTests.newId(fx), ...
+                "Digest", digest, "OccurredAt", t, "Detail", struct("measure", "weight")), ?MException, ...
+                "a husbandry event with no subject is an entry error");
         end
 
         function recordEventRecordsReplacedAndRestoredFiles(tc)

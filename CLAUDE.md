@@ -370,7 +370,8 @@ Key behaviors baked into the class:
   the same path is reused and listed in `attributes.unchanged_outputs`;
   `MissingInputs="skip"` leaves out inputs not yet in the database
   (`addEventInput(..., IfExists="skip")` adds them later). Its Detail and
-  Outputs field names are checked against fixed column lists. Every datetime
+  Outputs field names are checked against fixed column lists (the Detail
+  columns are `CarasLabDB.recordEventColumns(type)`, static, the one list). Every datetime
   it is given must be zoned (`CarasLabDB:unzonedTime`).
   `CarasLabDB.jsonText(text)` (a `CarasLabDBJson` value, at the repository
   root) sends JSON text to a jsonb column as written, never through
@@ -382,12 +383,138 @@ Key behaviors baked into the class:
   `getArtifactDispositions(LatestPerFile=)` (inline) write and read the
   disposition log; `recordEvent` records an output's `replaces` row as
   `replaced` and a reused file that was gone as `restored`.
+  `recordArtifactMove(id, StorageRootId=, RelativePath=, OccurredAt=,
+  ObservedChecksum=, VerifiedAt=, Note=)` (own file) records a file found at
+  another path with the same bytes in one `pTransact`: the row there (an
+  active present one, else a new row copied as exact text from the old one,
+  not a correction, no tags or variables), the caller's `ok` check of it,
+  and the `moved` disposition. `getArtifactVerifications(ByFile=true)` lists
+  the checks of the file across every row describing it.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
   retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
   daily husbandry entry grid (Ctrl+H) and an
-  integrity view (Ctrl+I); Ctrl+? lists the shortcuts. Its settings persist
+  integrity view (Ctrl+I) with File… (Ctrl+Shift+F) and Find files… (Ctrl+F,
+  `showFindFileDialog`: lists a mounted storage root folder by folder,
+  reads only candidates -- files of a missing file's size, narrowed by an
+  optional file-name regex, which is also how a file with no recorded size
+  is looked for -- matches by checksum only, shows a progress window with
+  counts, bytes, time and Stop for every phase, and records a move or an
+  `ok` check after a confirmation); `fileChecksum(ProgressFcn=)` reports
+  bytes read per chunk. Ctrl+? lists the shortcuts. Its settings persist
   through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
+
+## The shared client (`+labclient`)
+
+`+labclient/` (a MATLAB package at the repo root, beside `@CarasLabDB`) is the
+one client the lab's MATLAB toolboxes (ephys_analysis, EPsych) record through
+when the database may be off or out of reach. It was extracted from
+ephys_analysis (`LabDB` -> `labclient.DB`, `LabDBSettings` -> `Settings`,
+`LabDBSecrets` -> `Secrets`, `LabRoots` -> `Roots`, `LabBundles` -> `Bundles`,
+`LabOutbox` -> `Outbox`, `LabHasher` -> `Hasher`, `LabDBBackend`/`CarasBackend`/
+`FakeBackend`, `LabDBPanel`/`LabDBLamp` -> `Panel`/`Lamp`, the generic part of
+`LabSync` -> `Sync`) and adds `Prefs`, `SubjectCache`, `pathKey`. The invariant
+is the old one: **nothing waits for the database and nothing fails because of
+it** — `DB.connect` returns `[]` (never an error), every record is written to
+the outbox first, and the sender sends once (the database keeps id + digest).
+Rules a change must keep:
+
+- **One setup per computer.** Settings are one struct in the MATLAB preference
+  group `CarasLabDBClient` (`labclient.Prefs`; tests use `Prefs.useTemporary`,
+  env `CARASLABDB_CLIENT_PREFS_FILE`), the password is in the MATLAB vault, the
+  client folder is `%LOCALAPPDATA%\caraslabdb\client` (env
+  `CARASLABDB_CLIENT_DIR`; `DB.useTemporary` in tests). Never reintroduce a
+  toolbox-specific store. Read prefs with `ispref` before `getpref`.
+- **No dependency on a toolbox.** The package may not name a toolbox, its
+  classes or its files (`EphysDataset`, `AppPrefs`, `LabCapture`, `EPsych`,
+  `ephys_analysis`...), in code or in comments — a toolbox is reached only
+  through **tool hooks**: `Sync.registerTool(name, struct(readSession=,
+  copyOfSession=, assignSubject=), TakesUntagged=)` for records about a
+  dataset *folder* (`dataset.tool`). A dataset record that names no tool
+  (written before records named their tool) is `Bundles.Untagged`: no tool is
+  assumed for it, and it is sent only through the one tool per MATLAB that
+  registered with `TakesUntagged=true` (the toolbox that wrote such records
+  says so itself); with none it waits untouched. Private JSON helpers live in
+  `+labclient/private`.
+- **The shared-outbox rule.** Two MATLAB processes (of different toolboxes) may
+  run over one outbox. A process never claims a record it cannot fully send:
+  `Sync.nextIds` skips an event whose tool is not registered here (untouched:
+  not claimed, not failed); a record of no dataset needs no hooks. The claim is
+  an atomic rename (`Outbox.take`/`claim`); a claim keeps a heartbeat
+  (`Sync.beat` during long sends) and `recoverStale` gives back one whose
+  MATLAB stopped; the old owner then neither finishes nor beats it
+  (`Outbox.owns`). Double sends are harmless by id + digest.
+- **`Outbox.put`** returns `added|unchanged|replaced`; a record not sent yet
+  (pending, held, failed) is replaced through a take (never half old, half
+  new; hash jobs dropped), and `labclient:Outbox:Claimed|Sent|Discarded`
+  are raised for the rest. `Outbox.update` ignores a capture that was replaced.
+- **A record the database would refuse is kept, held, never dropped and never
+  thrown back.** `Bundles.problems(b)` is the one judgment (no time, a
+  `Detail` field that is not a column of the event's type, a bad analysis
+  `status`, a husbandry event with no measure); `Outbox.put` writes such a
+  record in `held` with the sentences as the reason and the flag
+  `Outbox.NotSendable`, and returns them as its second output. A toolbox's
+  capture must not fail and its record must not be lost, so `Bundles.event`
+  stays permissive and `problems` never throws. Two rules: `problems` judges
+  exactly what the send path judges (a husbandry field that
+  `Bundles.notMeasured` is not sent, so its name is not looked at) and never
+  faults what the database would take; and `Bundles.detailColumns` is a copy
+  of `CarasLabDB.recordEventColumns` (the package has no database at hand
+  when a record is made), held equal by
+  `LabClientTests/theDetailColumnsAreTheOnesRecordEventTakes`. `FakeBackend`
+  refuses the same things as `recordEvent`, so a toolbox's tests against the
+  fake see them.
+- **The interface has a version**: `labclient.Api.Version`, a whole number,
+  with `[ok, why] = labclient.Api.atLeast(n)`. Raise it by one, and add a line
+  to the list in `Api.m`, in any change that adds something a toolbox can
+  call or changes what a call means (one raise per pull request is enough).
+  A toolbox states the version it needs where it decides the client is
+  usable; a package from before the class (versions 1 and 2) has no
+  `labclient.Api`.
+- **Records of no dataset** (`Bundles.event(..., SubjectId=)`): sent for that
+  subject, no session; an unknown subject holds the record
+  (`NeedsSubject`), and `Sync.subjectHolds`/`release` and the subject dialog
+  re-target it (rewrite `record.subject_id`, re-seal). Optional bundle members
+  (`dataset.tool`, `record.subject_id`) are left out of the JSON while empty,
+  so older records and the golden bundle `tests/matlab/testdata/
+  bundle_event_v1.json` stay byte-exact; `caraslabdb-bundle/1` stays.
+- **Copies.** A record whose raw file is byte for byte a file of a recording
+  or behavior event already in the database (`Sync.copyOf`) is recorded as a
+  copy of that event, whichever toolbox sent it first; a record naming another
+  subject than that event's is held.
+- **Replacement files**: `Bundles.files(EventId=E, Outputs=items)` with an
+  item's `Replaces` registers new bytes at the same path of an event already
+  sent and records the old file `replaced` (`Sync.sendFiles`). `Replaces` may
+  name any earlier version (EPsych names the first at every save):
+  `Sync.replaceFile` follows a version that was replaced since, by its
+  `replaced` dispositions, to the one present at the path. Two rules a change
+  must keep: a hop is followed only when it happened no later than this
+  record's `captured_at` (records can arrive out of order; when the hop is
+  later, the file sent late is the one recorded as replaced, never the newer
+  bytes by the older), and a time that does not read as a datetime means
+  nothing is recorded. `FakeBackend` keeps `occurred_at` and refuses what
+  `fn_artifact_disposition_policy` refuses, so the tests hold the sender to
+  the database's rules. An EVENT record's output is different:
+  `recordEvent`'s `replaces` must name the row present at the path.
+- **Husbandry** events (`measure`, `weight_g`, `water_ml`, `health_status`)
+  go through `Bundles.event`, `Sync`, both backends and `CarasLabDB.recordEvent`.
+- `SubjectCache` keeps `lab.subject_current` + the `baseline weight` subject
+  variable in a JSON file; `status` never touches the network, `refresh` probes
+  first and never throws.
+
+Tests: `tests/matlab/LabClientTests.m` (`FakeBackend`, temp prefs/vault/folder;
+no server, no Database Toolbox). Backend methods are the only seam to
+`@CarasLabDB`; keep `Backend`, `CarasBackend` and `FakeBackend` in step.
+`tests/matlab/BackendContractTests.m` holds them to it: every test runs twice
+(`Kind` `fake` and `real`) with the same lines, sending records with
+`labclient.Sync` and reading through the backend, the real kind connecting
+as the client connects (`Settings`, the vault's fake, `DB.connect()`, no
+`useBackend`) to the scratch database of `LabScratchDb`. It is the only test
+of the send path against PostgreSQL. When the two kinds disagree the database
+is right: change `FakeBackend` (or the client), never the assertion for one
+kind. A test there keeps to itself on the shared scratch database: its own
+subject (`makeWorld`), paths under its own key, bytes no other test writes
+(equal bytes are, rightly, a copy of the other event's file).
 
 See `examples/carasLabDB_demo.m` for the intended usage flow end-to-end
 (connect → reference data → subject/session → recording event → artifact →
@@ -430,7 +557,16 @@ service, under Xvfb for the GUI tests; `tests/run_matlab_tests.m` is its
 entry point and fails the job if a test fails or a database test did not
 run. It does not run on Windows. A separate job parses every MATLAB file
 with GNU Octave (`tests/check_matlab_syntax.py`), which is a syntax check and
-nothing more -- Octave cannot run this code. There is no package.json. Practical ways
+nothing more -- Octave cannot run this code. The `consumers` job clones the
+toolboxes that record through `+labclient` (epsych2, ephys_analysis; their
+default branches) and runs `tests/check_consumers.py` on them: every
+`labclient.` reference in their code must name a class or function of the
+package, a member usable from outside its class (Static method, Constant
+property, public) and only `Name=Value` options the method declares. It reads
+text; a method called on an object the package returned is beyond it. A red
+`consumers` job on a change here means the change breaks a toolbox (or a
+toolbox already calls what is not here): fix the call's target or coordinate
+the toolbox, do not loosen the check. There is no package.json. Practical ways
 to exercise the code:
 
 - **Database schema**: `createdb lab && psql -d lab -f design_docs/schema.sql`,
@@ -463,7 +599,7 @@ to exercise the code:
   `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
   creates and drops a scratch `lab_mtest` database; it is opt-in through
   `CARASLABDB_MTEST_ADMIN` (see its help), and without it only the
-  database-free tests run. `RecordingConnection` is the fake connection of
+  database-free tests run. `LabClientTests` tests the shared client (`+labclient`) against its own `FakeBackend`, needing no database; `BackendContractTests` runs one set of assertions against that fake and, when the scratch database is there, against `labclient.CarasBackend`. `RecordingConnection` is the fake connection of
   the database-free tests. The GUI tests drive modal windows from a timer
   callback, where `matlab.uitest` does not wait for the app: steps there use
   `typeIn`/`pressOn`/`chooseIn`/`dismissAlert`, not the plain gestures. See

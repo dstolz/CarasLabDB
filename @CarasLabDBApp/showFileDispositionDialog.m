@@ -1,7 +1,7 @@
-function showFileDispositionDialog(obj, artifactId)
+function saved = showFileDispositionDialog(obj, artifactId)
 %SHOWFILEDISPOSITIONDIALOG Record what became of an artifact's file (Ctrl+Shift+F).
 %
-%   showFileDispositionDialog(obj, artifactId)
+%   saved = showFileDispositionDialog(obj, artifactId)
 %
 %   An artifact row is a permanent record that a file with these bytes was
 %   produced at this path. When the file is later overwritten, moved or
@@ -21,7 +21,12 @@ function showFileDispositionDialog(obj, artifactId)
 %   happened (a date picker and a time, in this computer's time zone) and,
 %   optionally, a note. Save (Ctrl+S) writes one disposition; Cancel (Esc)
 %   writes nothing. The database refuses a disposition that does not fit
-%   the file's state, and the message is shown as it comes.
+%   the file's state, and the message is shown as it comes. SAVED is true
+%   when a disposition was written.
+%
+%   Opened from the Artifacts tab and from the integrity report (File…).
+%   To look for a missing file by its checksum and record where it moved,
+%   use Find files… in the integrity report (SHOWFINDFILEDIALOG).
 %
 %   See also CARASLABDB/ADDARTIFACTDISPOSITION, CARASLABDB/GETARTIFACTDISPOSITIONS,
 %   CARASLABDBAPP/SHOWRETRACTDIALOG.

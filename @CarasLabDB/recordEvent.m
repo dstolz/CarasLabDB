@@ -4,7 +4,7 @@ function out = recordEvent(obj, eventType, opts)
 %   out = recordEvent(db, "analysis", EventId=eid, Digest=d, ...
 %           OccurredAt=datetime(2026,11,14,9,30,0,"TimeZone","America/New_York"), ...
 %           SessionId=sid, ...
-%           Detail=struct("pipeline_name", "ephys_analysis/signals", ...
+%           Detail=struct("pipeline_name", "my_toolbox/signals", ...
 %                         "code_version", "c677202", ...
 %                         "parameters", CarasLabDB.jsonText(optionsJson), ...
 %                         "started_at", t0, "finished_at", t1, "status", "succeeded"), ...
@@ -49,7 +49,7 @@ function out = recordEvent(obj, eventType, opts)
 %        error, or with MissingInputs="skip" is listed in out.SkippedReplaces.
 %   Any failure rolls the whole transaction back: nothing is half written.
 %
-%   EventType is "analysis", "recording" or "behavior". Detail holds that
+%   EventType is "analysis", "recording", "behavior" or "husbandry". Detail holds that
 %   type's detail columns, by their names in design_docs/schema.sql:
 %     analysis:  pipeline_id, pipeline_name, code_version, parameters,
 %                environment, started_at, finished_at, status
@@ -57,6 +57,10 @@ function out = recordEvent(obj, eventType, opts)
 %                sample_rate_hz, n_channels, duration_s, stimulus_protocol,
 %                hardware_config
 %     behavior:  task, paradigm, stage, trials_completed, performance, reward
+%     husbandry: measure (required, e.g. "weight", "water"), weight_g, water_ml,
+%                health_status. A husbandry event is about an animal: it
+%                needs SubjectId (or a SessionId, which gives it), and its
+%                id and digest make it as safe to send twice as any other.
 %   A jsonb value (parameters, environment, hardware_config, Attributes, an
 %   output's attributes) is a struct (sent through jsonencode) or
 %   CarasLabDB.jsonText(text) (sent as written). Every datetime must carry
@@ -98,7 +102,7 @@ function out = recordEvent(obj, eventType, opts)
 
     arguments
         obj (1,1) CarasLabDB
-        eventType (1,1) string {mustBeMember(eventType, ["analysis", "recording", "behavior"])}
+        eventType (1,1) string {mustBeMember(eventType, ["analysis", "recording", "behavior", "husbandry"])}
         opts.EventId (1,1) string
         opts.Digest (1,1) string
         opts.OccurredAt (1,1) datetime
@@ -127,7 +131,7 @@ function out = recordEvent(obj, eventType, opts)
     local_requireZone(opts.OccurredAt, "OccurredAt");
     local_requireZone(opts.RecordedAt, "RecordedAt");
 
-    detailColumns = local_detailColumns(eventType);
+    detailColumns = CarasLabDB.recordEventColumns(eventType);
     local_onlyFields(opts.Detail, detailColumns, "Detail");
     detail = struct();
     for f = reshape(string(fieldnames(opts.Detail)), 1, [])
@@ -214,20 +218,6 @@ function out = recordEvent(obj, eventType, opts)
 end
 
 % -------------------------------------------------------------------------
-function cols = local_detailColumns(eventType)
-%LOCAL_DETAILCOLUMNS The detail columns RECORDEVENT may write, per event type.
-    switch eventType
-        case "analysis"
-            cols = ["pipeline_id", "pipeline_name", "code_version", "parameters", ...
-                    "environment", "started_at", "finished_at", "status"];
-        case "recording"
-            cols = ["acquisition_system_code", "probe_id", "modality", "sample_rate_hz", ...
-                    "n_channels", "duration_s", "stimulus_protocol", "hardware_config"];
-        case "behavior"
-            cols = ["task", "paradigm", "stage", "trials_completed", "performance", "reward"];
-    end
-end
-
 function local_onlyFields(s, allowed, what)
 %LOCAL_ONLYFIELDS Refuse a struct field that is not one of ALLOWED.
     bad = setdiff(reshape(string(fieldnames(s)), 1, []), allowed);

@@ -567,6 +567,20 @@ no key-press gesture), so it tests each shortcut through the window's
 tag editor, Ctrl+Enter, Ctrl+S, Delete, Ctrl+R, Esc and Ctrl+?, and that
 Enter in the editor's Value box moves focus to Add or Set.
 
+**The toolboxes that use `+labclient`.** With a checkout of a toolbox that
+records through the package at hand (epsych2, ephys_analysis), check its calls
+against the package as it is here. This needs Python only, no MATLAB:
+
+```bash
+python tests/check_consumers.py --self-test
+python tests/check_consumers.py ../epsych2 ../ephys_analysis
+```
+
+**Pass:** `0 problems` for each. A problem names the toolbox's file and line
+and what does not fit (no such member, a private one, an option the method
+does not declare). A toolbox with no reference at all is a warning: nothing of
+it was checked.
+
 ### 2.8 Clean up
 
 ```matlab
@@ -603,6 +617,19 @@ Log in against `localhost` / `lab_test` / `test_rw`, then verify each surface
       leaves the table while "Active only" is on.
 - [ ] Ctrl+H opens the daily husbandry grid and writes the day's weights in
       one go; Ctrl+I shows the integrity report.
+- [ ] In the integrity report, a missing file's finding (move a registered
+      file to another folder of its storage root and run
+      `tools/verify_artifacts.py` first): Find files… (Ctrl+F) with the
+      root's folder finds it at its new path; Record… asks, then writes a
+      `moved` disposition, the file's row at its new path and an `ok` check;
+      the finding is gone after the report refreshes. File… (Ctrl+Shift+F)
+      on such a finding opens the disposition dialog for that artifact.
+- [ ] Find files with a file-name pattern (e.g. `\.dat$`): only matching
+      names are read; an invalid pattern such as `(` is refused before
+      anything is read. On a large folder the progress window counts folders
+      and files while listing, then fills by bytes read with the file name,
+      time taken and time left; Stop ends the search, and the status line
+      says what was listed, read and found.
 - [ ] Ctrl+? lists the shortcuts.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).

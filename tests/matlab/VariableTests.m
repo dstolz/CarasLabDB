@@ -180,6 +180,9 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
                 @() db.getEntityTags("artifact", id)
                 @() db.checkIntegrity()
                 @() db.artifactLineage(id)
+                @() db.recordArtifactMove(id, StorageRootId=1, RelativePath="a/b.dat", ...
+                        OccurredAt=datetime(2026, 11, 3, 9, 0, 0, "TimeZone", "UTC"))
+                @() db.getArtifactVerifications(ArtifactId=id, ByFile=true)
                 @() db.runQuery("SELECT 1 AS one;")};
             writes = ["INSERT ", "UPDATE ", "DELETE ", "fn_tag(", "fn_set_variable(", ...
                 "fn_unset_variable(", "fn_define_variable(", "fn_retract(", "fn_rename_subject("];
@@ -330,6 +333,18 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
             tc.verifyError(@() CarasLabDB.fileChecksum(fullfile(folder, "no_such_file")), ...
                 "CarasLabDB:fileNotFound");
             tc.verifyError(@() CarasLabDB.fileChecksum(abc, Algo="sha1"), "MATLAB:validators:mustBeMember");
+
+            % ProgressFcn hears the bytes read so far after each chunk, and an
+            % error it throws stops the reading and reaches the caller.
+            seen = zeros(1, 0);
+            tc.verifyEqual(CarasLabDB.fileChecksum(big, ProgressFcn=@local_note), VariableTests.BigSha256);
+            tc.verifyEqual(seen, [8 * 2^20, n], "one call per chunk, cumulative");
+            tc.verifyError(@() CarasLabDB.fileChecksum(big, ProgressFcn=@(~) error("Test:stop", "stop")), ...
+                "Test:stop");
+
+            function local_note(bytesRead)
+                seen(end+1) = bytesRead;
+            end
         end
 
         function artifactFromFileWorksOutPathSizeAndChecksum(tc)

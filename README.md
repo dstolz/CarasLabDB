@@ -35,6 +35,7 @@ reading an analysis event rather than reverse-engineering a folder.
 |---|---|
 | `design_docs/schema.sql` | Canonical PostgreSQL 14+ DDL (schema `lab`) — the single source of truth for the data model |
 | `@CarasLabDB/` | MATLAB class wrapping the database with typed insert/retrieve helpers for every table |
+| `+labclient/` | The shared MATLAB **client** every lab toolbox (ephys_analysis, EPsych) records through when the database may be out of reach: settings, vault password, storage roots, outbox, sender, lamp, Database window, subject cache |
 | `@CarasLabDBApp/` | MATLAB GUI (programmatic `uifigure` app) for interactive metadata entry and browsing |
 | `web/lab-dashboard.html` | Standalone HTML/JS dashboard visualizing the data model with seeded synthetic data (no backend) |
 | `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
@@ -150,11 +151,101 @@ and browse subjects, sessions, events and artifacts (including by tag, e.g.
 `stage:raw -qc:fail`); add and correct events; edit a row's tags (Ctrl+T) and
 variables (Ctrl+L); retract a row (Ctrl+Delete); record that a file was replaced,
 moved or deleted (Ctrl+Shift+F); enter the day's husbandry
-for all animals in one grid (Ctrl+H); show the integrity report (Ctrl+I); run
+for all animals in one grid (Ctrl+H); show the integrity report (Ctrl+I), where
+a missing file can be looked for by its size and checksum, optionally only
+among files whose name matches a regular expression, with a progress window,
+and its new place recorded (Find files…, Ctrl+F); run
 vetted read-only custom SQL. Ctrl+? lists the shortcuts. Because the schema is append-only, "editing" an
 event creates a superseding correction rather than mutating in place.
 
 **Requirements:** MATLAB R2024b or later with the Database Toolbox.
+
+### The shared client (`+labclient`)
+
+A toolbox that records work while the server may be switched off or out of
+reach (the lab's ephys pipeline, the EPsych behavior rig) must never wait for
+the database and never fail because of it. `+labclient`, beside `@CarasLabDB`
+at the repository root, is the one client they share, so a computer is set up
+**once**, whichever toolbox records:
+
+| | |
+|---|---|
+| `labclient.Settings`, `Secrets`, `Roots`, `Prefs` | one settings struct (MATLAB preference group `CarasLabDBClient`), the password in MATLAB's vault, the map of storage roots to folders on this computer |
+| `labclient.DB` | the connection and its state (`off`, `connected`, `offline`, `attention`), probed with a bounded timeout first; never an error |
+| `labclient.Bundles`, `Outbox`, `Hasher` | what is recorded, as `caraslabdb-bundle/1` files in `%LOCALAPPDATA%\caraslabdb\client\outbox`, SHA-256 taken in or out of process |
+| `labclient.Sync` | sends the outbox when the server answers (a timer, `flush`), once each: the database keeps every record's id and digest |
+| `labclient.Panel`, `Lamp`, `SubjectAssignDialog` | the Database window, the status-bar lamp, the window for a subject the database does not have |
+| `labclient.SubjectCache` | what the database last said about each subject (endpointed, last and baseline weight), read from a file with no network |
+| `labclient.Backend` / `CarasBackend` / `FakeBackend` | the one seam to `@CarasLabDB`, and an in-memory database for tests |
+| `labclient.Api` | the version of the package's interface, for a toolbox to require the one it needs |
+
+Events of type `analysis`, `recording`, `behavior` and `husbandry` (weights,
+water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know:
+
+- **Records of no dataset name their subject**: `labclient.Bundles.event(...,
+  SubjectId="G-0421")` is sent for that subject with no session; a subject the
+  database does not have holds the record until a person creates it or
+  assigns another (`Sync.subjectHolds`, `Sync.release`, the subject window).
+- **Tools and hooks.** A record about a dataset *folder* needs the toolbox
+  that made it for reading and writing the folder's session file. A toolbox
+  registers three function handles once (`labclient.Sync.registerTool(name,
+  struct(readSession=, copyOfSession=, assignSubject=))`); its records say
+  `dataset.tool`. The package knows no toolbox by name: a dataset record that
+  names no tool (written before records named their tool) is sent only through
+  the tool that registered with `TakesUntagged=true`, and waits untouched
+  while none has. **The shared-outbox rule:** several MATLABs may run over one
+  outbox; a process never claims a record it cannot fully send, so a record
+  whose tool is not registered in this MATLAB is left untouched for one that
+  has it. Records of no dataset need no hooks: any process sends them.
+- **Replacing an unsent record.** `Outbox.put` of an id that is already there
+  and not sent (to send, held, failed) replaces it (`"replaced"`); one being
+  sent, sent or discarded raises `labclient:Outbox:Claimed`, `:Sent`,
+  `:Discarded` (a sent record is corrected by a new event that supersedes it).
+- **A record the database would refuse is kept, held.** `Outbox.put` asks
+  `labclient.Bundles.problems(b)` what cannot be recorded: no time it
+  happened, a `Detail` field that is not a column of that type of event, an
+  analysis `status` that is none of the three, a husbandry event with no
+  measure. Such a record is written all the same, in `held`, with the
+  sentences as its reason and the flag `Outbox.NotSendable`, and `[status,
+  why] = Outbox.put(b)` returns them. Nothing a toolbox recorded is dropped,
+  and what is wrong shows on the lamp at once instead of as a failed record
+  when the database is reached. A corrected record under the same id replaces
+  it. `FakeBackend` refuses the same things, so a toolbox's tests see them.
+- **A replacement file for an event already sent**: `labclient.Bundles.files(
+  EventId=E, Outputs=items)` with each item's `Replaces` the artifact id of
+  the file it takes the place of registers the new bytes at the same path as a
+  file of E and records the old one as replaced. `Replaces` may name any
+  earlier version (the first one, every time the file is saved again): a
+  version replaced since is followed to the one at the path now. When a later
+  save reached the database first, the file sent late is the one recorded as
+  replaced, never the newer bytes.
+- **Files already in the database.** A record whose raw file is, by its
+  SHA-256, a file of a recording or behavior event already there (from either
+  toolbox) is recorded as a copy of that event's file, not as a second event.
+
+**The interface has a version.** `labclient.Api.Version` is a whole number
+that goes up whenever something a toolbox can call, or the meaning of
+something it calls, changes (the class's help lists what each version added).
+A toolbox asks once, where it decides whether the lab database can be used:
+
+```matlab
+ok = exist("labclient.Api", "class") == 8;          % a package from before versions has none
+if ok; [ok, why] = labclient.Api.atLeast(3); end    % WHY says to update the checkout
+```
+
+Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server) and
+`tests/matlab/BackendContractTests.m` (the same assertions against the fake
+backend and against PostgreSQL through `labclient.CarasBackend`, records sent
+with `labclient.Sync`).
+
+**A toolbox's calls are checked from here.** The package and the toolboxes are
+separate repositories, so `python tests/check_consumers.py <checkout> ...`
+reads a toolbox's code and compares every `labclient.` reference with the
+package: the name exists, is usable from outside its class, and takes the
+`Name=Value` options passed. CI runs it on the default branches of epsych2 and
+ephys_analysis for every change here (job `consumers`). It reads text and runs
+nothing; its header lists what it cannot see (a method called on an object the
+package returned, for one).
 
 ## Getting started
 
@@ -289,6 +380,7 @@ design_docs/         Schema DDL and design documentation
   deployment-linux.md
   deployment-synology.md
 @CarasLabDB/         MATLAB class: typed DB interface
++labclient/          MATLAB shared client: outbox, sender, settings, lamp (see "The shared client")
 @CarasLabDBApp/      MATLAB GUI (uifigure)
 web/                 Standalone dashboard (synthetic data)
   live/                Live dashboard: /api/data server + query
