@@ -171,7 +171,14 @@ function showIntegrityReport(obj)
             ids = reshape(string(data.Subject(failed)), [], 1);
             found = reshape("artifact_verification_failed: " + string(data.Detail(failed)), [], 1);
         end
-        n = obj.showFindFileDialog(ids, found);
+        try
+            n = obj.showFindFileDialog(ids, found);
+        catch findErr
+            if isvalid(f)
+                uialert(f, string(findErr.message), "Find files");
+            end
+            return
+        end
         if n > 0 && isvalid(f)
             reload();
         end

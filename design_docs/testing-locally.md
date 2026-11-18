@@ -610,6 +610,12 @@ Log in against `localhost` / `lab_test` / `test_rw`, then verify each surface
       `moved` disposition, the file's row at its new path and an `ok` check;
       the finding is gone after the report refreshes. File… (Ctrl+Shift+F)
       on such a finding opens the disposition dialog for that artifact.
+- [ ] Find files with a file-name pattern (e.g. `\.dat$`): only matching
+      names are read; an invalid pattern such as `(` is refused before
+      anything is read. On a large folder the progress window counts folders
+      and files while listing, then fills by bytes read with the file name,
+      time taken and time left; Stop ends the search, and the status line
+      says what was listed, read and found.
 - [ ] Ctrl+? lists the shortcuts.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).

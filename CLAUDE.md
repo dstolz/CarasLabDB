@@ -394,9 +394,13 @@ Key behaviors baked into the class:
   retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
   daily husbandry entry grid (Ctrl+H) and an
   integrity view (Ctrl+I) with File… (Ctrl+Shift+F) and Find files… (Ctrl+F,
-  `showFindFileDialog`: searches a mounted storage root, reading only files
-  of a missing file's size, and records a move or an `ok` check after a
-  confirmation); Ctrl+? lists the shortcuts. Its settings persist
+  `showFindFileDialog`: lists a mounted storage root folder by folder,
+  reads only candidates -- files of a missing file's size, narrowed by an
+  optional file-name regex, which is also how a file with no recorded size
+  is looked for -- matches by checksum only, shows a progress window with
+  counts, bytes, time and Stop for every phase, and records a move or an
+  `ok` check after a confirmation); `fileChecksum(ProgressFcn=)` reports
+  bytes read per chunk. Ctrl+? lists the shortcuts. Its settings persist
   through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
 
 ## The shared client (`+labclient`)

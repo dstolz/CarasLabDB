@@ -137,7 +137,10 @@ by nobody:
       in. A file moved within the root is found; the "Found at" path uses `/`
       and the case of the names on disk; a folder outside the root is
       refused; a folder holding another root's `.caraslabdb-root.json` is
-      refused. Cancel during a long search stops between files. Record… on a
+      refused. Stop in the progress window ends a long search within a
+      large file (between 8 MiB chunks) and while listing; the listing
+      counts go up a few times a second. A file-name pattern with Ignore
+      case matches `RAW.DAT` for `^raw\.dat$` on Windows. Record… on a
       moved file writes the row at the new path, an `ok` check and the
       `moved` disposition (check them in `lab.artifact_disposition`).
 - [ ] **Login.** With a mapped login and a blank email there is no prompt and

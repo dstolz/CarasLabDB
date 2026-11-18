@@ -637,8 +637,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.verifyEqual(obs("head"), "Looking for the file of artifact " + aid + ...
                 " by its size and checksum.");
             tc.verifyEqual(obs("listed"), aid, "only the selected finding's file");
-            tc.verifyEqual(obs("state"), "no size recorded: not searched (files are matched by size first)", ...
-                "a file registered without its size cannot be looked for, and says so");
+            tc.verifyEqual(obs("state"), "no size recorded: looked for only with a file-name pattern", ...
+                "a file registered without its size is looked for by name only, and says so");
 
             function local_look(f, obs)
                 bold = findall(f, "Type", "uilabel", "FontWeight", "bold");
@@ -693,6 +693,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 
             tc.verifyEqual(obs("before"), ["not searched yet"; "not searched yet"]);
             tc.verifyEqual(obs("nMoved"), 1, "the moved file is found once; the decoy is not");
+            tc.verifySubstring(obs("status"), "Listed 3 file(s) in ");
+            tc.verifySubstring(obs("status"), "Read 3 of 3 candidate(s)", ...
+                "the moved file's size: it and the decoy; the other file's size: it");
+            tc.verifySubstring(obs("status"), "Found 2.");
             tc.verifyTrue(endsWith(obs("foundAt"), ":" + relNew));
             tc.verifyEqual(obs("time"), string(missedAt, "HH:mm"), ...
                 "'When it moved' starts at the check that did not find it");
@@ -734,7 +738,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("before") = reshape(extractBefore(string(list.Data.State) + " · ", " · "), [], 1);
                 tc.typeIn(findall(f, "Type", "uieditfield", ...
                     "Placeholder", "the folder this storage root is on this computer"), char(mount));
+                labels = findall(f, "Type", "uilabel");
+                status = labels(startsWith(string({labels.Text}), "Choose where to look"));
                 tc.pressOn(findall(f, "Type", "uibutton", "Text", "Search"));
+                obs("status") = string(status.Text);
                 D = list.Data;
                 isMoved = string(D.Artifact) == aMoved & strlength(string(D.("Found at"))) > 0;
                 obs("nMoved") = nnz(isMoved);
@@ -756,6 +763,105 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 obs("after") = reshape(string(list.Data.State), [], 1);
                 c = getappdata(groot, "TagGuiTests_confirms");
                 obs("questions") = reshape([c.Message], [], 1);
+                TagGuiTests.key(f, "escape", {});
+            end
+        end
+
+        function findFilesByNamePattern(tc)
+            % File name (regex): only files whose name matches are
+            % candidates, for every file looked for; a file with no recorded
+            % size is looked for only with a pattern; Ignore case decides
+            % letter case; a name match with other bytes is not a find; an
+            % invalid pattern is refused before anything is read. The status
+            % line says what was listed, read and found.
+            db = tc.Fx.Db;
+            fx = tc.Fx;
+            w = fx.makeWorld("gui-name", 0);
+            mount = string(tempname);
+            mkdir(mount);
+            tc.addTeardown(@() rmdir(mount, "s"));
+            base = "mt/" + w.Key;
+            bytesN = uint8(char("no size recorded, " + w.Key));
+            bytesS = uint8(char("sized file, " + w.Key));
+            TagGuiTests.writeBytes(mount, base + "/renamed/NoSize-2026.dat", bytesN);
+            TagGuiTests.writeBytes(mount, base + "/renamed/nosize-copy.dat", [bytesN, uint8('x')]);
+            TagGuiTests.writeBytes(mount, base + "/moved/other.bin", bytesS);
+            chkN = CarasLabDB.fileChecksum(fullfile(mount, "mt", w.Key, "renamed", "NoSize-2026.dat"));
+            chkS = CarasLabDB.fileChecksum(fullfile(mount, "mt", w.Key, "moved", "other.bin"));
+            aNo = db.addArtifact(ProducedByEventId=w.EventId, StorageRootId=fx.RootId, ...
+                RelativePath=base + "/nosize.dat", Checksum=chkN, Role="raw", Format="dat", ...
+                SubjectId=w.SubjectId, SessionId=w.SessionId);
+            aSized = db.addArtifact(ProducedByEventId=w.EventId, StorageRootId=fx.RootId, ...
+                RelativePath=base + "/sized.bin", Checksum=chkS, SizeBytes=numel(bytesS), ...
+                Role="raw", Format="bin", SubjectId=w.SubjectId, SessionId=w.SessionId);
+
+            obs = tc.withWindow("Find files", @() tc.App.showFindFileDialog([aNo; aSized]), ...
+                @(f, obs) local_steps(f, obs));
+
+            tc.verifyEqual(obs("initial"), "no size recorded: looked for only with a file-name pattern");
+            tc.verifySubstring(obs("noPattern"), "give a file-name pattern");
+            tc.verifyTrue(startsWith(obs("sizedNoPattern"), "found"), "without a pattern, by size");
+            tc.verifySubstring(obs("statusNoPattern"), "Listed 3 file(s) in 5 folder(s)");
+            tc.verifySubstring(obs("statusNoPattern"), "Read 1 of 1 candidate(s)");
+            tc.verifySubstring(obs("badAlert"), "not a valid regular expression");
+            tc.verifySubstring(obs("caseState"), "among the files named like /^nosize/", ...
+                "case-sensitive: NoSize-2026.dat is not a candidate, nosize-copy.dat has other bytes");
+            tc.verifyEqual(obs("nFound"), 1, "a name match with other bytes is not a find");
+            tc.verifyTrue(endsWith(obs("foundAt"), ":" + base + "/renamed/NoSize-2026.dat"));
+            tc.verifySubstring(obs("sizedWithPattern"), "among the files named like /^nosize/ (any case)", ...
+                "the pattern applies to every file looked for");
+            tc.verifySubstring(obs("statusPattern"), "; 2 named like /^nosize/ (any case)");
+            tc.verifySubstring(obs("statusPattern"), "Read 2 of 2 candidate(s)");
+            tc.verifySubstring(obs("statusPattern"), "Found 1.");
+
+            L = db.getArtifactDispositions(ArtifactId=aNo);
+            tc.assertEqual(height(L), 1, "the file found by name and checksum was recorded");
+            tc.verifyEqual(string(L.disposition(1)), "moved");
+            S = db.getArtifacts(ArtifactId=string(L.successor_artifact_id(1)));
+            tc.verifyEqual(LabScratchDb.column(S, "relative_path"), base + "/renamed/NoSize-2026.dat");
+
+            function local_steps(f, obs)
+                list = findall(f, "Type", "uitable");
+                stateOf = @(id) string(list.Data.State(find(string(list.Data.Artifact) == id, 1)));
+                labels = findall(f, "Type", "uilabel");
+                status = labels(startsWith(string({labels.Text}), "Choose where to look"));
+                search = findall(f, "Type", "uibutton", "Text", "Search");
+                pattern = findall(f, "Type", "uieditfield", "Placeholder", ...
+                    "optional: a regular expression the file's name must match, e.g. ^G-0421_.*\.dat$");
+                anyCase = findall(f, "Type", "uicheckbox", "Text", "Ignore case");
+                obs("initial") = stateOf(aNo);
+                tc.typeIn(findall(f, "Type", "uieditfield", ...
+                    "Placeholder", "the folder this storage root is on this computer"), char(mount));
+                tc.pressOn(search);
+                obs("noPattern") = stateOf(aNo);
+                obs("sizedNoPattern") = stateOf(aSized);
+                obs("statusNoPattern") = string(status.Text);
+
+                tc.typeIn(pattern, "(");
+                setappdata(groot, "TagGuiTests_alerts", []);
+                tc.pressOn(search);
+                a = TagGuiTests.alerts();
+                obs("badAlert") = strjoin([a.Message], newline);
+                tc.dismissAlert(f);
+
+                tc.typeIn(pattern, "^nosize");
+                anyCase.Value = false;
+                tc.pressOn(search);
+                obs("caseState") = stateOf(aNo);
+                anyCase.Value = true;
+                tc.pressOn(search);
+                D = list.Data;
+                found = string(D.Artifact) == aNo & strlength(string(D.("Found at"))) > 0;
+                obs("nFound") = nnz(found);
+                r = find(found, 1);
+                obs("foundAt") = string(D.("Found at")(r));
+                obs("sizedWithPattern") = stateOf(aSized);
+                obs("statusPattern") = string(status.Text);
+
+                tc.chooseIn(list, [r 1]);
+                setappdata(groot, "TagGuiTests_confirmAnswer", "Record");
+                tc.pressOn(findall(f, "Type", "uibutton", "Text", "Record…"));
+                setappdata(groot, "TagGuiTests_confirmAnswer", []);
                 TagGuiTests.key(f, "escape", {});
             end
         end

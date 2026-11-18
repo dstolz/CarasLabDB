@@ -1,13 +1,13 @@
 function nRecorded = showFindFileDialog(obj, artifactIds, findings)
-%SHOWFINDFILEDIALOG Look for missing files by size and checksum, and record where they are.
+%SHOWFINDFILEDIALOG Look for missing files by checksum, optionally by name, and record where they are.
 %
 %   n = showFindFileDialog(obj, artifactIds)
 %   n = showFindFileDialog(obj, artifactIds, findings)
 %
 %   Opened from the integrity report (Find files…, Ctrl+F) for the files
 %   whose latest check did not find them. ARTIFACTIDS are artifact rows;
-%   FINDINGS, when given, is the integrity finding about each (shown as the
-%   row's tooltip text in the state column until a search is run).
+%   FINDINGS, when given, is the integrity finding about each (shown in the
+%   state column until a search is run).
 %
 %   Where to look: a storage root, the folder it is mounted at on this
 %   computer (filled in from the computer's CarasLabDB client settings when
@@ -15,13 +15,35 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
 %   below it to search instead of the whole root. A folder holding the
 %   storage-root marker of another root (.caraslabdb-root.json) is refused.
 %
-%   Search (Ctrl+F) lists every file below the folder and reads only those
-%   whose size in bytes is the recorded size of a missing file, computing
-%   their checksum with the missing file's algorithm (sha256 or md5;
-%   CarasLabDB.fileChecksum). A file is reported as found only when its
-%   checksum is the missing file's. Files with no recorded size, or with a
-%   blake3 checksum, are not searched for, and say so. Nothing is written
-%   by a search, and files are only read.
+%   File name (optional): a regular expression (MATLAB regexp syntax) that
+%   a file's name -- the name only, not its folder -- must match to be
+%   considered at all; "Ignore case" (on by default) matches regardless of
+%   letter case. It matches anywhere in the name unless anchored: ^raw\.dat$
+%   is exactly raw.dat, \.dat$ any .dat file. An invalid expression is
+%   refused before anything is read.
+%
+%   Search (Ctrl+F) lists the files below the folder, one folder at a time,
+%   and reads the candidates, computing their checksum with the missing
+%   file's algorithm (sha256 or md5; CarasLabDB.fileChecksum). The
+%   candidates for a missing file are the files of its recorded size (that
+%   also match the name pattern, when one is given); for a missing file
+%   with no recorded size, every file that matches the name pattern -- so
+%   such a file is looked for only when a pattern is given. A file is
+%   reported as found only when its checksum is the missing file's: a name
+%   match alone is not a find. A blake3 checksum cannot be computed here.
+%   Nothing is written by a search, and files are only read.
+%
+%   Progress: a progress window is shown while the database records of the
+%   files are read, while the folders are listed (folders and files so far,
+%   files matching the name pattern, the folder being listed, time taken;
+%   the total is not known in advance, so this bar does not fill) and while
+%   the candidates are read (a bar of the bytes read, the file being read
+%   and its number, bytes read of the total, time taken and an estimate of
+%   the time left, and the files found so far). Stop ends the search between
+%   two folders or two chunks of a file: after listing was stopped nothing
+%   is read; after reading was stopped the files found so far are listed and
+%   the others say the search was stopped. The status line under the search
+%   fields then sums up what was listed, read and found.
 %
 %   Each result is one row. Select a found file, check "When it moved" and
 %   the note, and Record (Ctrl+S); a confirmation lists what will be
@@ -41,7 +63,7 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
 %   Returns the number of files recorded. Esc or Close ends the dialog.
 %
 %   See also CARASLABDBAPP/SHOWINTEGRITYREPORT, CARASLABDB/RECORDARTIFACTMOVE,
-%   CARASLABDBAPP/SHOWFILEDISPOSITIONDIALOG, CARASLABDB.FILECHECKSUM.
+%   CARASLABDBAPP/SHOWFILEDISPOSITIONDIALOG, CARASLABDB.FILECHECKSUM, REGEXP.
 
     arguments
         obj (1,1) CarasLabDBApp
@@ -53,64 +75,69 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
     nRecorded = 0;
     busy = false;
     searchedIn = "";
+    ids = unique(artifactIds, "stable");
 
-    % ---- what to look for -------------------------------------------------
     roots = db.getStorageRoots();
     rootIds = reshape(double(roots.root_id), [], 1);
     rootNames = local_text(roots.name);
-    targets = local_targets(db, unique(artifactIds, "stable"), artifactIds, findings, ...
-        rootIds, rootNames);
-    rows = local_initialRows(targets);
+    targets = local_noTargets();
+    rows = local_emptyRows();
 
     % ---- window -------------------------------------------------------------
     f = uifigure("Name", "Find files by checksum", ...
-        "Position", local_center(1120, 620), "WindowStyle", "modal", ...
+        "Position", local_center(1120, 650), "WindowStyle", "modal", ...
         "KeyPressFcn", @(~,e) onKey(e));
     g = uigridlayout(f, [7 1]);
-    g.RowHeight = {22, 58, 22, '1x', 26, 26, 30};
+    g.RowHeight = {22, 90, 34, '1x', 26, 26, 30};
     g.ColumnWidth = {'1x'};
     g.Padding = [12 12 12 12];
     g.RowSpacing = 6;
 
-    headLbl = uilabel(g, "FontWeight", "bold", "Text", local_heading(targets));
+    headLbl = uilabel(g, "FontWeight", "bold", "Text", ...
+        "Reading what the database has on " + string(numel(ids)) + " file(s)…");
 
-    where = uigridlayout(g, [2 6]);
-    where.ColumnWidth = {90, 170, 120, '1x', 80, 90};
-    where.RowHeight = {26, 26};
+    where = uigridlayout(g, [3 6]);
+    where.ColumnWidth = {110, 170, 120, '1x', 90, 90};
+    where.RowHeight = {26, 26, 26};
     where.Padding = [0 0 0 0];
     where.RowSpacing = 6;
-    uilabel(where, "Text", "Storage root");
-    rootItems = rootNames + " (" + string(rootIds) + ")";
+    local_at(uilabel(where, "Text", "Storage root"), 1, 1);
     if isempty(rootIds)
         rootDd = uidropdown(where, "Items", {'(no storage roots)'}, "Enable", "off");
     else
-        rootDd = uidropdown(where, "Items", cellstr(rootItems), "ItemsData", num2cell(rootIds), ...
-            "Value", local_firstRoot(targets, rootIds), ...
+        rootDd = uidropdown(where, "Items", cellstr(rootNames + " (" + string(rootIds) + ")"), ...
+            "ItemsData", num2cell(rootIds), "Value", rootIds(1), ...
             "Tooltip", "The storage root the files are looked for in", ...
             "ValueChangedFcn", @(~,~) onRootChanged());
     end
-    uilabel(where, "Text", "Mounted here at", "HorizontalAlignment", "right");
+    local_at(rootDd, 1, 2);
+    local_at(uilabel(where, "Text", "Mounted here at", "HorizontalAlignment", "right"), 1, 3);
     mountEf = uieditfield(where, "text", "Placeholder", "the folder this storage root is on this computer", ...
         "Tooltip", "Where this storage root is on this computer, e.g. Z:\ or /mnt/nas-main");
-    uibutton(where, "Text", "Browse…", "Tooltip", "Choose the folder of the storage root", ...
-        "ButtonPushedFcn", @(~,~) onBrowse(mountEf));
-    uilabel(where, "Text", "");
-    uilabel(where, "Text", "Search in");
+    local_at(mountEf, 1, 4);
+    local_at(uibutton(where, "Text", "Browse…", "Tooltip", "Choose the folder of the storage root", ...
+        "ButtonPushedFcn", @(~,~) onBrowse(mountEf)), 1, 5);
+    local_at(uilabel(where, "Text", "Search in"), 2, 1);
     folderEf = uieditfield(where, "text", "Placeholder", "the whole storage root, or a folder below it", ...
         "Tooltip", "Only files below this folder are looked at; empty: the whole storage root");
-    folderEf.Layout.Row = 2;
-    folderEf.Layout.Column = [2 4];
-    b = uibutton(where, "Text", "Browse…", "Tooltip", "Choose a folder below the storage root", ...
-        "ButtonPushedFcn", @(~,~) onBrowse(folderEf));
-    b.Layout.Row = 2;
-    b.Layout.Column = 5;
-    b = uibutton(where, "Text", "Search", "Tooltip", "Look for the files (Ctrl+F)", ...
-        "ButtonPushedFcn", @(~,~) onSearch());
-    b.Layout.Row = 2;
-    b.Layout.Column = 6;
+    local_at(folderEf, 2, [2 4]);
+    local_at(uibutton(where, "Text", "Browse…", "Tooltip", "Choose a folder below the storage root", ...
+        "ButtonPushedFcn", @(~,~) onBrowse(folderEf)), 2, 5);
+    local_at(uibutton(where, "Text", "Search", "Tooltip", "Look for the files (Ctrl+F)", ...
+        "ButtonPushedFcn", @(~,~) onSearch()), 2, 6);
+    local_at(uilabel(where, "Text", "File name (regex)"), 3, 1);
+    patternEf = uieditfield(where, "text", "Placeholder", ...
+        "optional: a regular expression the file's name must match, e.g. ^G-0421_.*\.dat$", ...
+        "Tooltip", "Only files whose name (not folder) matches are considered. With a pattern, a " + ...
+        "missing file with no recorded size is looked for too: every file whose name matches is read.");
+    local_at(patternEf, 3, [2 4]);
+    ignoreCb = uicheckbox(where, "Text", "Ignore case", "Value", true, ...
+        "Tooltip", "Match the file-name pattern regardless of upper and lower case");
+    local_at(ignoreCb, 3, [5 6]);
 
-    statusLbl = uilabel(g, "FontColor", [0.35 0.35 0.35], "Text", ...
-        "Choose where to look, then Search (Ctrl+F). Only files of a missing file's size are read; nothing is written.");
+    statusLbl = uilabel(g, "FontColor", [0.35 0.35 0.35], "WordWrap", "on", "Text", ...
+        "Choose where to look, then Search (Ctrl+F). Only candidates are read: files of a missing " + ...
+        "file's size (and name pattern, when given). Nothing is written by a search.");
 
     tbl = uitable(g, "RowName", {}, "ColumnSortable", false, ...
         "SelectionType", "row", "Multiselect", "off", ...
@@ -147,8 +174,13 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
     uibutton(foot, "Text", "Record…", "Tooltip", "Record the selected found file (Ctrl+S)", ...
         "ButtonPushedFcn", @(~,~) onRecord());
 
-    onRootChanged();
-    showRows();
+    % ---- what to look for: the database's record of each file ---------------
+    try
+        loadTargets();
+    catch loadErr
+        delete(f);
+        rethrow(loadErr);
+    end
 
     uiwait(f);
     if isvalid(f), delete(f); end
@@ -159,6 +191,34 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
     return
 
     % ---- nested callbacks -------------------------------------------------
+    function loadTargets()
+        %LOADTARGETS Read each file's row and check history, with a progress bar.
+        n = numel(ids);
+        dlg = uiprogressdlg(f, "Title", "Find files: reading the database", ...
+            "Message", "Reading the database's record of " + string(n) + " file(s)…", ...
+            "Value", 0, "ShowPercentage", "on");
+        cleanup = onCleanup(@() local_close(dlg)); %#ok<NASGU>
+        t0 = tic;
+        last = -Inf;
+        for k = 1:n
+            targets(end+1) = local_target(db, ids(k), artifactIds, findings, ...
+                rootIds, rootNames); %#ok<AGROW>
+            if toc(t0) - last >= 0.2 || k == n
+                last = toc(t0);
+                dlg.Value = k / n;
+                dlg.Message = "Reading the database's record of file " + string(k) + ...
+                    " of " + string(n) + " (" + ids(k) + ") · " + local_duration(toc(t0));
+            end
+        end
+        headLbl.Text = local_heading(targets);
+        if ~isempty(rootIds)
+            rootDd.Value = local_firstRoot(targets, rootIds);
+        end
+        onRootChanged();
+        rows = local_initialRows(targets);
+        showRows();
+    end
+
     function onKey(e)
         %ONKEY Ctrl+F searches, Ctrl+S records, Esc closes, Ctrl+? lists the shortcuts.
         mods = string(e.Modifier);
@@ -223,7 +283,7 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
     end
 
     function onSearch()
-        %ONSEARCH Search (Ctrl+F): list the files below the folder, hash those of a missing size.
+        %ONSEARCH Search (Ctrl+F): list the files below the folder, read the candidates.
         if busy || isempty(rootIds)
             return
         end
@@ -255,6 +315,31 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
                 return
             end
         end
+
+        % The name pattern, checked before anything is read.
+        pattern = string(patternEf.Value);
+        usePattern = strlength(strtrim(pattern)) > 0;
+        caseOpt = {};
+        if ignoreCb.Value
+            caseOpt = {'ignorecase'};
+        end
+        nameOk = @(names) true(size(names));
+        patternText = "";
+        if usePattern
+            try
+                regexp('x', char(pattern), 'once', caseOpt{:});
+            catch reErr
+                uialert(f, "The file-name pattern is not a valid regular expression: " + ...
+                    string(reErr.message), "Find files");
+                return
+            end
+            nameOk = @(names) local_nameMatches(names, pattern, caseOpt);
+            patternText = "/" + pattern + "/";
+            if ignoreCb.Value
+                patternText = patternText + " (any case)";
+            end
+        end
+
         openRows = find(~[rows.Done] & ismember([rows.Kind], ["pending", "none", "hit", "inplace", "gone"]));
         want = unique([rows(openRows).T]);
         if isempty(want)
@@ -263,68 +348,128 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
         end
 
         busy = true;
-        dlg = uiprogressdlg(f, "Title", "Find files", "Indeterminate", "on", ...
-            "Cancelable", "on", "Message", "Listing the files below " + folder + "…");
+        t0 = tic;
+        last = -Inf;
+        listed = struct("Folders", 0, "Files", 0, "Matched", 0, "TooDeep", 0, ...
+            "Unreadable", 0, "Current", folder);
+        dlg = uiprogressdlg(f, "Title", "Find files: listing", "Indeterminate", "on", ...
+            "Cancelable", "on", "CancelText", "Stop", ...
+            "Message", "Listing the files below " + folder + "…");
         cleanup = onCleanup(@() local_close(dlg)); %#ok<NASGU>
-        try
-            L = dir(fullfile(char(folder), "**", "*"));
-            L = L(~[L.isdir]);
-            L = L(string({L.name}) ~= ".caraslabdb-root.json");
-            sizes = reshape([L.bytes], [], 1);
-            paths = strings(numel(L), 1);
-            for i = 1:numel(L)
-                paths(i) = string(fullfile(L(i).folder, L(i).name));
-            end
 
-            % What has to be read: each file once per checksum algorithm.
-            need = strings(0, 1);       % "fileIndex|algo"
-            for k = want
-                if ~isnan(targets(k).Size) && ismember(targets(k).Algo, ["sha256", "md5"])
-                    c = find(sizes == targets(k).Size);
-                    need = [need; string(c) + "|" + targets(k).Algo]; %#ok<AGROW>
-                end
+        % 1. List the files, folder by folder.
+        try
+            [paths, sizes, listed] = local_listFiles(folder, nameOk, @listTick);
+        catch listErr
+            busy = false;
+            local_close(dlg);
+            if listErr.identifier == "CarasLabDBApp:searchStopped"
+                note = "Search stopped while listing, after " + string(listed.Folders) + ...
+                    " folder(s) and " + string(listed.Files) + " file(s) below " + folder + ...
+                    " (" + local_duration(toc(t0)) + "): nothing was read, and the results " + ...
+                    "below are those of the last search.";
+                statusLbl.Text = note;
+                statusLbl.Tooltip = note;
+            else
+                uialert(f, string(listErr.message), "Search failed");
             end
-            need = unique(need);
-            hashes = containers.Map('KeyType', 'char', 'ValueType', 'any');
-            total = 0;
-            for j = 1:numel(need)
-                total = total + sizes(str2double(extractBefore(need(j), "|")));
+            return
+        end
+        listedIn = toc(t0);
+
+        % 2. What has to be read: each candidate once per checksum algorithm.
+        need = strings(0, 1);       % "fileIndex|algo"
+        sumsOf = containers.Map('KeyType', 'char', 'ValueType', 'any');
+        for k = want
+            t = targets(k);
+            if ~t.Active || ~ismember(t.Algo, ["sha256", "md5"])
+                continue
             end
-            unreadable = strings(0, 1);
-            cancelled = false;
+            if ~isnan(t.Size)
+                c = find(sizes == t.Size);
+            elseif usePattern
+                c = (1:numel(paths))';
+            else
+                continue
+            end
+            need = [need; string(c) + "|" + t.Algo]; %#ok<AGROW>
+            if isKey(sumsOf, char(t.Algo))
+                sumsOf(char(t.Algo)) = [sumsOf(char(t.Algo)), t.Checksum];
+            else
+                sumsOf(char(t.Algo)) = t.Checksum;
+            end
+        end
+        need = unique(need);
+        nNeed = numel(need);
+        totalBytes = 0;
+        for j = 1:nNeed
+            totalBytes = totalBytes + sizes(str2double(extractBefore(need(j), "|")));
+        end
+
+        % 3. Read them, with a bar of the bytes read.
+        hashes = containers.Map('KeyType', 'char', 'ValueType', 'any');
+        unreadable = strings(0, 1);
+        stopped = false;
+        readSoFar = 0;
+        hitsSoFar = 0;
+        nDone = 0;                  % candidates read (or found unreadable)
+        current = "";
+        j = 0;
+        tRead = tic;
+        if nNeed > 0
+            dlg.Title = "Find files: reading";
             dlg.Indeterminate = "off";
-            readSoFar = 0;
-            for j = 1:numel(need)
-                if dlg.CancelRequested
-                    cancelled = true;
+            dlg.ShowPercentage = "on";
+            dlg.Value = 0;
+        end
+        for j = 1:nNeed
+            i = str2double(extractBefore(need(j), "|"));
+            algo = extractAfter(need(j), "|");
+            current = paths(i);
+            try
+                readTick(0, true);
+                h = CarasLabDB.fileChecksum(paths(i), Algo=algo, ...
+                    ProgressFcn=@(b) readTick(b, false));
+                hashes(char(need(j))) = struct("Hash", h, ...
+                    "At", datetime("now", "TimeZone", "local"));
+                if ismember(h, sumsOf(char(algo)))
+                    hitsSoFar = hitsSoFar + 1;
+                end
+            catch readErr
+                if readErr.identifier == "CarasLabDBApp:searchStopped"
+                    stopped = true;
                     break
                 end
-                i = str2double(extractBefore(need(j), "|"));
-                algo = extractAfter(need(j), "|");
-                dlg.Message = "Reading " + paths(i) + " (" + string(j) + " of " + ...
-                    string(numel(need)) + ")";
-                dlg.Value = min(1, readSoFar / max(total, 1));
-                try
-                    h = CarasLabDB.fileChecksum(paths(i), Algo=algo);
-                    hashes(char(need(j))) = struct("Hash", h, ...
-                        "At", datetime("now", "TimeZone", "local"));
-                catch
-                    unreadable(end+1) = paths(i); %#ok<AGROW>
-                end
-                readSoFar = readSoFar + sizes(i);
+                unreadable(end+1) = paths(i); %#ok<AGROW>
             end
+            readSoFar = readSoFar + sizes(i);
+            nDone = nDone + 1;
+        end
+        readIn = toc(tRead);
+        local_close(dlg);
 
-            % The results, per target looked for.
+        % 4. The results, per missing file looked for.
+        try
             keep = rows([rows.Done] | ~ismember([rows.T], want));
             fresh = local_emptyRows();
             for k = want
                 t = targets(k);
-                if ~t.Active || isnan(t.Size) || ~ismember(t.Algo, ["sha256", "md5"])
+                if ~t.Active || ~ismember(t.Algo, ["sha256", "md5"])
                     fresh(end+1) = local_skipRow(k, t); %#ok<AGROW>
                     continue
                 end
+                if isnan(t.Size) && ~usePattern
+                    fresh(end+1) = local_row(k, "none", "no size recorded: give a file-name " + ...
+                        "pattern to look for it (every file whose name matches is then read)"); %#ok<AGROW>
+                    continue
+                end
+                if isnan(t.Size)
+                    cand = 1:numel(paths);
+                else
+                    cand = reshape(find(sizes == t.Size), 1, []);
+                end
                 hits = 0;
-                for i = reshape(find(sizes == t.Size), 1, [])
+                for i = cand
                     key = char(string(i) + "|" + t.Algo);
                     if ~isKey(hashes, key)
                         continue
@@ -351,8 +496,10 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
                 end
                 if hits == 0
                     r = local_row(k, "none", "");
-                    if cancelled
-                        r.State = "search cancelled before every candidate was read";
+                    if stopped
+                        r.State = "search stopped before every candidate was read";
+                    elseif usePattern
+                        r.State = "not found below " + folder + " among the files named like " + patternText;
                     else
                         r.State = "not found below " + folder;
                     end
@@ -361,26 +508,81 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
             end
             rows = local_sortRows([keep, fresh]);
             searchedIn = folder;
-        catch searchErr
+        catch resultErr
             busy = false;
-            uialert(f, string(searchErr.message), "Search failed");
+            local_close(dlg);
+            uialert(f, string(resultErr.message), "Search failed");
             return
         end
         busy = false;
         showRows();
+
         nFound = nnz(ismember([rows.Kind], ["hit", "inplace"]) & ~[rows.Done]);
-        note = string(numel(L)) + " file(s) below " + searchedIn + "; " + ...
-            string(numel(need)) + " of a missing file's size read; " + ...
-            string(nFound) + " found.";
-        if cancelled
-            note = note + " Cancelled before the end.";
+        note = "Listed " + string(listed.Files) + " file(s) in " + string(listed.Folders) + ...
+            " folder(s) below " + searchedIn + " in " + local_duration(listedIn);
+        if usePattern
+            note = note + "; " + string(listed.Matched) + " named like " + patternText;
+        end
+        note = note + ". Read " + string(nDone) + " of " + string(nNeed) + ...
+            " candidate(s), " + local_bytes(readSoFar) + ", in " + local_duration(readIn) + ...
+            ". Found " + string(nFound) + ".";
+        if stopped
+            note = note + " Stopped before the end.";
+        end
+        if listed.Unreadable > 0
+            note = note + " " + string(listed.Unreadable) + " folder(s) could not be listed.";
+        end
+        if listed.TooDeep > 0
+            note = note + " " + string(listed.TooDeep) + " folder(s) deeper than " + ...
+                string(local_maxDepth()) + " levels were not listed.";
         end
         if ~isempty(unreadable)
-            note = note + " " + string(numel(unreadable)) + " could not be read (e.g. " + ...
+            note = note + " " + string(numel(unreadable)) + " file(s) could not be read (e.g. " + ...
                 unreadable(1) + ").";
         end
         statusLbl.Text = note;
         statusLbl.Tooltip = note;
+
+        function listTick(soFar)
+            %LISTTICK Progress of the listing (called a few times a second): counts so far.
+            listed = soFar;
+            if dlg.CancelRequested
+                error("CarasLabDBApp:searchStopped", "The search was stopped.");
+            end
+            lines = "Listing the files below " + folder;
+            counts = string(soFar.Folders) + " folder(s), " + string(soFar.Files) + " file(s) so far";
+            if usePattern
+                counts = counts + "; " + string(soFar.Matched) + " named like " + patternText;
+            end
+            lines(end+1) = counts + " · " + local_duration(toc(t0));
+            lines(end+1) = "Now in: " + local_below(soFar.Current, folder);
+            dlg.Message = strjoin(lines, newline);
+        end
+
+        function readTick(bytesInFile, force)
+            %READTICK Progress of the reading (after each chunk): bytes, file, time, finds.
+            if dlg.CancelRequested
+                error("CarasLabDBApp:searchStopped", "The search was stopped.");
+            end
+            if ~force && toc(t0) - last < 0.2
+                return
+            end
+            last = toc(t0);
+            done = readSoFar + bytesInFile;
+            dlg.Value = min(1, done / max(totalBytes, 1));
+            took = toc(tRead);
+            timing = local_bytes(done) + " of " + local_bytes(totalBytes) + " read · " + ...
+                local_duration(took);
+            if done > 0 && took >= 2 && totalBytes > done
+                timing = timing + " · about " + local_duration((totalBytes - done) * took / done) + " left";
+            end
+            lines = "Reading candidate " + string(j) + " of " + string(nNeed) + ": " + ...
+                local_below(current, folder);
+            lines(end+1) = timing;
+            lines(end+1) = "Found so far: " + string(hitsSoFar) + " · listed " + ...
+                string(listed.Files) + " file(s) in " + string(listed.Folders) + " folder(s)";
+            dlg.Message = strjoin(lines, newline);
+        end
     end
 
     function onPick()
@@ -494,36 +696,161 @@ function nRecorded = showFindFileDialog(obj, artifactIds, findings)
 end
 
 % =============================================================================
-function targets = local_targets(db, ids, allIds, findings, rootIds, rootNames)
-    %LOCAL_TARGETS The files to look for, with what the database knows of each.
+function targets = local_noTargets()
+    %LOCAL_NOTARGETS An empty list of files to look for.
     targets = struct("Id", {}, "Active", {}, "RootId", {}, "RootName", {}, "Rel", {}, ...
         "Checksum", {}, "Algo", {}, "Size", {}, "Finding", {}, "GoneSince", {}, ...
         "LastSeen", {}, "Created", {});
-    for k = 1:numel(ids)
-        t = struct("Id", ids(k), "Active", false, "RootId", NaN, "RootName", "", "Rel", "", ...
-            "Checksum", "", "Algo", "", "Size", NaN, "Finding", "", ...
-            "GoneSince", NaT("TimeZone", "local"), "LastSeen", NaT("TimeZone", "local"), ...
-            "Created", NaT("TimeZone", "local"));
-        hit = find(allIds == ids(k), 1);
-        if ~isempty(hit) && hit <= numel(findings)
-            t.Finding = findings(hit);
-        end
-        A = db.getArtifacts(ArtifactId=ids(k), ActiveOnly=true);
-        if height(A) > 0
-            t.Active = true;
-            t.RootId = double(A.storage_root_id(1));
-            name = rootNames(rootIds == t.RootId);
-            if ~isempty(name)
-                t.RootName = name(1);
+end
+
+function t = local_target(db, id, allIds, findings, rootIds, rootNames)
+    %LOCAL_TARGET One file to look for, with what the database knows of it.
+    t = struct("Id", id, "Active", false, "RootId", NaN, "RootName", "", "Rel", "", ...
+        "Checksum", "", "Algo", "", "Size", NaN, "Finding", "", ...
+        "GoneSince", NaT("TimeZone", "local"), "LastSeen", NaT("TimeZone", "local"), ...
+        "Created", NaT("TimeZone", "local"));
+    hit = find(allIds == id, 1);
+    if ~isempty(hit) && hit <= numel(findings)
+        t.Finding = findings(hit);
+    end
+    A = db.getArtifacts(ArtifactId=id, ActiveOnly=true);
+    if height(A) == 0
+        return
+    end
+    t.Active = true;
+    t.RootId = double(A.storage_root_id(1));
+    name = rootNames(rootIds == t.RootId);
+    if ~isempty(name)
+        t.RootName = name(1);
+    end
+    t.Rel = local_text(A.relative_path(1));
+    t.Checksum = lower(strtrim(local_text(A.checksum(1))));
+    t.Algo = local_text(A.checksum_algo(1));
+    t.Size = local_num(A.size_bytes(1));
+    t.Created = local_time(A.created_at(1));
+    [t.GoneSince, t.LastSeen] = local_history(db, id);
+end
+
+function [paths, sizes, counts] = local_listFiles(folder, nameOk, tick)
+    %LOCAL_LISTFILES The files below FOLDER (subfolders included) whose name NAMEOK accepts.
+    %   One folder at a time, so that TICK(counts) can report progress a few
+    %   times a second (and stop the listing by throwing). COUNTS has
+    %   Folders and Files (all seen), Matched (kept), Unreadable (folders
+    %   that could not be listed), TooDeep (folders below the depth limit,
+    %   not listed: a guard against a link that loops back) and Current (the
+    %   folder last listed). PATHS and SIZES are columns. The storage-root
+    %   marker file is not a candidate.
+    counts = struct("Folders", 0, "Files", 0, "Matched", 0, "TooDeep", 0, ...
+        "Unreadable", 0, "Current", string(folder));
+    stack = {char(folder)};
+    depths = 0;
+    keptPaths = {};
+    keptSizes = {};
+    last = tic;
+    while ~isempty(stack)
+        here = stack{end};
+        depth = depths(end);
+        stack(end) = [];
+        depths(end) = [];
+        d = dir(here);
+        counts.Folders = counts.Folders + 1;
+        counts.Current = string(here);
+        if isempty(d)
+            counts.Unreadable = counts.Unreadable + 1;   % a readable folder lists . and ..
+        else
+            names = string({d.name});
+            isDir = [d.isdir];
+            sub = names(isDir & names ~= "." & names ~= "..");
+            if depth < local_maxDepth()
+                for k = numel(sub):-1:1
+                    stack{end+1} = fullfile(here, char(sub(k))); %#ok<AGROW>
+                    depths(end+1) = depth + 1; %#ok<AGROW>
+                end
+            else
+                counts.TooDeep = counts.TooDeep + numel(sub);
             end
-            t.Rel = local_text(A.relative_path(1));
-            t.Checksum = lower(strtrim(local_text(A.checksum(1))));
-            t.Algo = local_text(A.checksum_algo(1));
-            t.Size = local_num(A.size_bytes(1));
-            t.Created = local_time(A.created_at(1));
-            [t.GoneSince, t.LastSeen] = local_history(db, ids(k));
+            isFile = ~isDir & names ~= ".caraslabdb-root.json";
+            fileNames = names(isFile);
+            counts.Files = counts.Files + numel(fileNames);
+            if ~isempty(fileNames)
+                keep = reshape(logical(nameOk(fileNames)), 1, []);
+                if any(keep)
+                    bytes = [d(isFile).bytes];
+                    keptPaths{end+1} = reshape(string(fullfile(here, cellstr(fileNames(keep)))), [], 1); %#ok<AGROW>
+                    keptSizes{end+1} = reshape(double(bytes(keep)), [], 1); %#ok<AGROW>
+                    counts.Matched = counts.Matched + nnz(keep);
+                end
+            end
         end
-        targets(end+1) = t; %#ok<AGROW>
+        if toc(last) >= 0.2
+            tick(counts);
+            last = tic;
+        end
+    end
+    tick(counts);
+    paths = strings(0, 1);
+    sizes = zeros(0, 1);
+    if ~isempty(keptPaths)
+        paths = vertcat(keptPaths{:});
+        sizes = vertcat(keptSizes{:});
+    end
+end
+
+function n = local_maxDepth()
+    %LOCAL_MAXDEPTH How many folder levels below the search folder are listed.
+    n = 64;
+end
+
+function tf = local_nameMatches(names, pattern, caseOpt)
+    %LOCAL_NAMEMATCHES Whether each file name matches the regular expression PATTERN.
+    hits = regexp(cellstr(names), char(pattern), 'once', caseOpt{:});
+    tf = ~cellfun(@isempty, hits);
+end
+
+function local_at(component, row, col)
+    %LOCAL_AT Put COMPONENT in cell (ROW, COL) of its grid.
+    component.Layout.Row = row;
+    component.Layout.Column = col;
+end
+
+function s = local_duration(seconds)
+    %LOCAL_DURATION A time span as "12 s", "3 min 05 s" or "1 h 02 min".
+    seconds = max(0, round(seconds));
+    if seconds < 60
+        s = string(seconds) + " s";
+    elseif seconds < 3600
+        s = string(floor(seconds / 60)) + " min " + string(sprintf("%02d", mod(seconds, 60))) + " s";
+    else
+        s = string(floor(seconds / 3600)) + " h " + ...
+            string(sprintf("%02d", floor(mod(seconds, 3600) / 60))) + " min";
+    end
+end
+
+function s = local_bytes(n)
+    %LOCAL_BYTES A number of bytes for people: "512 B", "3.4 MiB", "12.1 GiB".
+    units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    k = 1;
+    while n >= 1024 && k < numel(units)
+        n = n / 1024;
+        k = k + 1;
+    end
+    if k == 1
+        s = string(sprintf("%d", n)) + " B";
+    else
+        s = string(sprintf("%.1f", n)) + " " + units(k);
+    end
+end
+
+function s = local_below(path, folder)
+    %LOCAL_BELOW PATH as written below FOLDER ("." for FOLDER itself), else in full.
+    path = string(path);
+    prefix = local_prefix(string(folder));
+    if path == string(folder)
+        s = ".";
+    elseif startsWith(path, prefix)
+        s = extractAfter(path, strlength(prefix));
+    else
+        s = path;
     end
 end
 
@@ -574,8 +901,11 @@ function rows = local_initialRows(targets)
     rows = local_emptyRows();
     for k = 1:numel(targets)
         t = targets(k);
-        if ~t.Active || isnan(t.Size) || ~ismember(t.Algo, ["sha256", "md5"])
+        if ~t.Active || ~ismember(t.Algo, ["sha256", "md5"])
             rows(end+1) = local_skipRow(k, t); %#ok<AGROW>
+        elseif isnan(t.Size)
+            rows(end+1) = local_row(k, "pending", ...
+                "no size recorded: looked for only with a file-name pattern"); %#ok<AGROW>
         else
             rows(end+1) = local_row(k, "pending", "not searched yet"); %#ok<AGROW>
         end
@@ -583,11 +913,9 @@ function rows = local_initialRows(targets)
 end
 
 function r = local_skipRow(k, t)
-    %LOCAL_SKIPROW The row of a target that cannot be looked for by size and checksum.
+    %LOCAL_SKIPROW The row of a target that cannot be looked for by its checksum.
     if ~t.Active
         r = local_row(k, "skip", "not an active row any more: nothing to look for");
-    elseif isnan(t.Size)
-        r = local_row(k, "skip", "no size recorded: not searched (files are matched by size first)");
     else
         r = local_row(k, "skip", "checksum algorithm " + t.Algo + " cannot be computed here: not searched");
     end
