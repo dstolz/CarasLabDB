@@ -3,7 +3,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 %
 %   The class also holds the app's other GUI tests that share this fixture:
 %   the browse filters and columns, the toolbar and shortcut list, the typed
-%   number rule (CarasLabDBApp.parseNumber) and the variables editor.
+%   number rule (CarasLabDBApp.parseNumber), the variables editor, and the
+%   integrity report's file actions with the find-files dialog.
 %
 %   results = runtests("tests/matlab/TagGuiTests.m")
 %
@@ -28,7 +29,11 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 %
 %   Alerts: the folder alertSpy is put on the path, where its uialert
 %   records each alert's text and then shows the real alert, which the tests
-%   dismiss with dismissAlertDialog (proving that it appeared).
+%   dismiss with dismissAlertDialog (proving that it appeared). Its
+%   uiconfirm records each confirmation and, while the groot appdata
+%   "TagGuiTests_confirmAnswer" holds an option, answers with it instead of
+%   showing the dialog (a uiconfirm cannot be answered from the timer that
+%   drives a modal window); otherwise the real dialog is shown.
 %
 %   The user's own CarasLabDBApp preferences are saved before the tests and
 %   restored afterwards; the tests start from the defaults.
@@ -60,8 +65,10 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.addTeardown(@() TagGuiTests.restorePrefs(had, saved));
 
             setappdata(groot, "TagGuiTests_realUialert", @uialert);
+            setappdata(groot, "TagGuiTests_realUiconfirm", @uiconfirm);
             tc.applyFixture(PathFixture(fullfile(fileparts(mfilename("fullpath")), "alertSpy")));
             tc.addTeardown(@() rmappdata(groot, "TagGuiTests_realUialert"));
+            tc.addTeardown(@() rmappdata(groot, "TagGuiTests_realUiconfirm"));
             tc.applyFixture(SuppressedWarningsFixture("MATLAB:uiautomation:Driver:WarnInHGCallbacks"));
         end
     end
@@ -75,6 +82,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                 rmpref("CarasLabDBApp", "Prefs");
             end
             setappdata(groot, "TagGuiTests_alerts", []);
+            setappdata(groot, "TagGuiTests_confirms", []);
+            setappdata(groot, "TagGuiTests_confirmAnswer", []);
             % A window that nothing answers (a modal dialog the test did not
             % expect) would otherwise block the whole run.
             watchdog = timer("StartDelay", TagGuiTests.TimeLimit, ...
@@ -599,6 +608,158 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             tc.dismissAlertDialog(m.Fig);
         end
 
+        function integrityReportOffersTheFileActions(tc)
+            % The integrity report has File… (Ctrl+Shift+F) and Find files…
+            % (Ctrl+F). File… needs a finding about a file; Ctrl+F on such
+            % a finding looks for that one file.
+            w = tc.Fx.makeWorld("gui-report", 1);
+            aid = w.ArtifactIds(1);         % never verified: a finding about its file
+            rep = tc.openReport();
+            for txt = ["File…", "Find files…", "Refresh"]
+                tc.verifyNumElements(findall(rep, "Type", "uibutton", "Text", txt), 1, txt);
+            end
+            list = findall(rep, "Type", "uitable");
+            list.Selection = [];
+            TagGuiTests.key(rep, "f", {'control', 'shift'}, char(6));
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifyEqual(a.Title, "File disposition");
+            tc.verifyEqual(a.Message, "Select a finding about a file first.");
+            tc.dismissAlertDialog(rep);
+
+            r = find(string(list.Data.Check) == "artifact_never_verified" & ...
+                string(list.Data.Subject) == aid, 1);
+            tc.assertNotEmpty(r, "the report lists artifact " + aid + " as never verified");
+            list.Selection = r;
+            obs = tc.withWindow("Find files", ...
+                @() TagGuiTests.key(rep, "f", {'control'}, char(6)), ...
+                @(f, obs) local_look(f, obs));
+            tc.verifyEqual(obs("head"), "Looking for the file of artifact " + aid + ...
+                " by its size and checksum.");
+            tc.verifyEqual(obs("listed"), aid, "only the selected finding's file");
+            tc.verifyEqual(obs("state"), "no size recorded: not searched (files are matched by size first)", ...
+                "a file registered without its size cannot be looked for, and says so");
+
+            function local_look(f, obs)
+                bold = findall(f, "Type", "uilabel", "FontWeight", "bold");
+                obs("head") = string(bold(1).Text);
+                dlgTable = findall(f, "Type", "uitable");
+                D = dlgTable.Data;
+                obs("listed") = reshape(string(D.Artifact), [], 1);
+                obs("state") = string(D.State(1));
+                TagGuiTests.key(f, "escape", {});
+            end
+        end
+
+        function findFilesRecordsAMoveAndAFileThatCameBack(tc)
+            % Find files: a file that moved within the storage root is found
+            % by its size and checksum (a file of the same size with other
+            % bytes is not), and Record writes its new row, the check and
+            % the 'moved' disposition; a file back at its own path gets an
+            % 'ok' check. Each write is confirmed first.
+            db = tc.Fx.Db;
+            fx = tc.Fx;
+            w = fx.makeWorld("gui-find", 0);
+            mount = string(tempname);
+            mkdir(mount);
+            tc.addTeardown(@() rmdir(mount, "s"));
+            base = "mt/" + w.Key;
+            relOld = base + "/old.dat";
+            relNew = base + "/archive/moved.dat";
+            relBack = base + "/back.dat";
+            bytesA = uint8(char("moved file of " + w.Key));
+            bytesB = uint8(char("file that came back, " + w.Key));
+            decoy = bytesA;
+            decoy(end) = decoy(end) + 1;            % same size, other bytes
+            TagGuiTests.writeBytes(mount, relNew, bytesA);
+            TagGuiTests.writeBytes(mount, relBack, bytesB);
+            TagGuiTests.writeBytes(mount, base + "/decoy.dat", decoy);
+            chkA = CarasLabDB.fileChecksum(fullfile(mount, "mt", w.Key, "archive", "moved.dat"));
+            chkB = CarasLabDB.fileChecksum(fullfile(mount, "mt", w.Key, "back.dat"));
+            add = @(rel, chk, n) db.addArtifact(ProducedByEventId=w.EventId, StorageRootId=fx.RootId, ...
+                RelativePath=rel, Checksum=chk, SizeBytes=n, Role="raw", Format="dat", ...
+                SubjectId=w.SubjectId, SessionId=w.SessionId);
+            aMoved = add(relOld, chkA, numel(bytesA));
+            aBack = add(relBack, chkB, numel(bytesB));
+            missedAt = dateshift(datetime("now", "TimeZone", "local") - hours(3), "start", "minute");
+            db.addArtifactVerification(ArtifactId=aMoved, Status="missing", VerifiedAt=missedAt);
+            db.addArtifactVerification(ArtifactId=aBack, Status="missing", VerifiedAt=missedAt);
+
+            obs = tc.withWindow("Find files", ...
+                @() setappdata(groot, "TagGuiTests_found", tc.App.showFindFileDialog([aMoved; aBack])), ...
+                @(f, obs) local_steps(f, obs));
+            n = getappdata(groot, "TagGuiTests_found");
+            rmappdata(groot, "TagGuiTests_found");
+
+            tc.verifyEqual(obs("before"), ["not searched yet"; "not searched yet"]);
+            tc.verifyEqual(obs("nMoved"), 1, "the moved file is found once; the decoy is not");
+            tc.verifyTrue(endsWith(obs("foundAt"), ":" + relNew));
+            tc.verifyEqual(obs("time"), string(missedAt, "HH:mm"), ...
+                "'When it moved' starts at the check that did not find it");
+            tc.verifySubstring(obs("note"), "Found by its checksum at ");
+            tc.verifySubstring(obs("note"), "Never checked ok at its old path");
+            q = obs("questions");
+            tc.assertNumElements(q, 2, "each Record asks first");
+            tc.verifySubstring(q(1), "From: ");
+            tc.verifySubstring(q(1), ":" + relOld);
+            tc.verifySubstring(q(1), "a new artifact row for it there");
+            tc.verifySubstring(q(2), "is at its own path again");
+            tc.verifyTrue(all(startsWith(obs("after"), "recorded: ")), "both rows are recorded");
+            tc.verifyEqual(n, 2, "the dialog returns the number of files recorded");
+
+            L = db.getArtifactDispositions(ArtifactId=aMoved);
+            tc.assertEqual(height(L), 1);
+            tc.verifyEqual(string(L.disposition(1)), "moved");
+            succ = string(L.successor_artifact_id(1));
+            tc.verifyEqual(string(fx.scalar("SELECT (occurred_at = " + CarasLabDB.sqlLiteral(missedAt) + ...
+                ")::text FROM lab.artifact_disposition WHERE artifact_id = " + LabScratchDb.quote(aMoved))), ...
+                "true", "occurred_at is the check that did not find the file");
+            S = db.getArtifacts(ArtifactId=succ, PresentOnly=true);
+            tc.assertEqual(height(S), 1, "the new row is present");
+            tc.verifyEqual(string(S.relative_path(1)), relNew);
+            tc.verifyEqual(string(S.checksum(1)), chkA);
+            tc.verifyEqual(string(S.produced_by_event_id(1)), w.EventId);
+            tc.verifyEqual(double(S.size_bytes(1)), numel(bytesA));
+            V = db.getArtifactVerifications(ArtifactId=succ);
+            tc.verifyEqual(LabScratchDb.column(V, "status"), "ok");
+            tc.verifyEqual(LabScratchDb.column(V, "observed_checksum"), chkA);
+            V = db.getArtifactVerifications(ArtifactId=aBack);
+            tc.verifyEqual(LabScratchDb.column(V, "status"), ["ok"; "missing"], "newest first");
+            tc.verifyEmpty(db.getArtifactDispositions(ArtifactId=aBack), "a file back in place is not disposed of");
+            I = fx.integrity([aMoved; aBack; succ], ["artifact_verification_failed", "artifact_never_verified"]);
+            tc.verifyEqual(height(I), 0, "neither file has a finding left");
+
+            function local_steps(f, obs)
+                list = findall(f, "Type", "uitable");
+                obs("before") = reshape(extractBefore(string(list.Data.State) + " · ", " · "), [], 1);
+                tc.typeIn(findall(f, "Type", "uieditfield", ...
+                    "Placeholder", "the folder this storage root is on this computer"), char(mount));
+                tc.pressOn(findall(f, "Type", "uibutton", "Text", "Search"));
+                D = list.Data;
+                isMoved = string(D.Artifact) == aMoved & strlength(string(D.("Found at"))) > 0;
+                obs("nMoved") = nnz(isMoved);
+                rMoved = find(isMoved, 1);
+                obs("foundAt") = string(D.("Found at")(rMoved));
+                tc.chooseIn(list, [rMoved 1]);
+                timeBox = findall(f, "Type", "uieditfield", "Tooltip", "The time it moved, HH:mm (24-hour)");
+                noteBox = findall(f, "Type", "uieditfield", "Placeholder", "recorded with the move");
+                obs("time") = string(timeBox.Value);
+                obs("note") = string(noteBox.Value);
+                record = findall(f, "Type", "uibutton", "Text", "Record…");
+                setappdata(groot, "TagGuiTests_confirmAnswer", "Record");
+                tc.pressOn(record);
+                rBack = find(string(list.Data.Artifact) == aBack & ...
+                    strlength(string(list.Data.("Found at"))) > 0, 1);
+                tc.chooseIn(list, [rBack 1]);
+                tc.pressOn(record);
+                setappdata(groot, "TagGuiTests_confirmAnswer", []);
+                obs("after") = reshape(string(list.Data.State), [], 1);
+                c = getappdata(groot, "TagGuiTests_confirms");
+                obs("questions") = reshape([c.Message], [], 1);
+                TagGuiTests.key(f, "escape", {});
+            end
+        end
+
         function rowActionsNeedASelectedRow(tc)
             % Ctrl+L (variables) and Ctrl+Delete (retract) act on the
             % selected row only; without one a message says so. Retraction
@@ -841,6 +1002,14 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             end
         end
 
+        function rep = openReport(tc)
+            %OPENREPORT Open the integrity report (not modal) and close it after the test.
+            tc.App.showIntegrityReport();
+            rep = findall(groot, "Type", "figure", "Tag", "CarasLabDBApp:integrity");
+            tc.assertNumElements(rep, 1, "the integrity report opened");
+            tc.addTeardown(@() delete(findall(groot, "Type", "figure", "Tag", "CarasLabDBApp:integrity")));
+        end
+
         function chooseTab(tc, key)
             tc.choose(findall(tc.App.Fig, "Type", "uitab", "Tag", key));
         end
@@ -976,6 +1145,8 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
         function closeAll(tc)
             TagGuiTests.closeEditors();
             TagGuiTests.closeWindows("Variables ");
+            TagGuiTests.closeWindows("Find files");
+            setappdata(groot, "TagGuiTests_confirmAnswer", []);
             if ~isempty(tc.App) && isvalid(tc.App)
                 delete(tc.App);
             end
@@ -1165,6 +1336,19 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
                     end
                 end
             end
+        end
+
+        function writeBytes(root, rel, bytes)
+            %WRITEBYTES Write BYTES to the file REL ('/' separators) below folder ROOT.
+            file = fullfile(root, strjoin(split(rel, "/"), filesep));
+            folder = fileparts(file);
+            if ~isfolder(folder)
+                mkdir(folder);
+            end
+            fid = fopen(file, "w");
+            assert(fid >= 0, "cannot write " + file);
+            fwrite(fid, bytes, "uint8");
+            fclose(fid);
         end
 
         function f = findWindow(prefix)

@@ -382,11 +382,21 @@ Key behaviors baked into the class:
   `getArtifactDispositions(LatestPerFile=)` (inline) write and read the
   disposition log; `recordEvent` records an output's `replaces` row as
   `replaced` and a reused file that was gone as `restored`.
+  `recordArtifactMove(id, StorageRootId=, RelativePath=, OccurredAt=,
+  ObservedChecksum=, VerifiedAt=, Note=)` (own file) records a file found at
+  another path with the same bytes in one `pTransact`: the row there (an
+  active present one, else a new row copied as exact text from the old one,
+  not a correction, no tags or variables), the caller's `ok` check of it,
+  and the `moved` disposition. `getArtifactVerifications(ByFile=true)` lists
+  the checks of the file across every row describing it.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
   retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
   daily husbandry entry grid (Ctrl+H) and an
-  integrity view (Ctrl+I); Ctrl+? lists the shortcuts. Its settings persist
+  integrity view (Ctrl+I) with File… (Ctrl+Shift+F) and Find files… (Ctrl+F,
+  `showFindFileDialog`: searches a mounted storage root, reading only files
+  of a missing file's size, and records a move or an `ok` check after a
+  confirmation); Ctrl+? lists the shortcuts. Its settings persist
   through `getpref`/`setpref` (`loadPrefs`/`savePrefs`).
 
 ## The shared client (`+labclient`)

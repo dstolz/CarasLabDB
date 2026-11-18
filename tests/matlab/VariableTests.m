@@ -180,6 +180,9 @@ classdef (SharedTestFixtures = {LabScratchDb}) VariableTests < matlab.unittest.T
                 @() db.getEntityTags("artifact", id)
                 @() db.checkIntegrity()
                 @() db.artifactLineage(id)
+                @() db.recordArtifactMove(id, StorageRootId=1, RelativePath="a/b.dat", ...
+                        OccurredAt=datetime(2026, 11, 3, 9, 0, 0, "TimeZone", "UTC"))
+                @() db.getArtifactVerifications(ArtifactId=id, ByFile=true)
                 @() db.runQuery("SELECT 1 AS one;")};
             writes = ["INSERT ", "UPDATE ", "DELETE ", "fn_tag(", "fn_set_variable(", ...
                 "fn_unset_variable(", "fn_define_variable(", "fn_retract(", "fn_rename_subject("];

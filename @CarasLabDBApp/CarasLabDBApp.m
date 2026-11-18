@@ -8,7 +8,8 @@ classdef CarasLabDBApp < handle
 %   user-defined variables (Ctrl+L) of any row; retract an event or artifact
 %   that should never have been recorded (Ctrl+Delete); enter the day's
 %   weights and water for all animals at once (Ctrl+H); show the database's
-%   integrity report (Ctrl+I); export any filtered table to the base
+%   integrity report (Ctrl+I), from which a missing file is looked for by
+%   its checksum and its new place recorded; export any filtered table to the base
 %   workspace; and run vetted read-only custom SQL with history recall.
 %   Window geometry, connection (minus password), the active view toggle,
 %   and SQL history persist between sessions.
@@ -61,7 +62,8 @@ classdef CarasLabDBApp < handle
         showTagEditor(obj, kind, entityId)
         showVariableEditor(obj, kind, entityId)
         showRetractDialog(obj, kind, entityId)
-        showFileDispositionDialog(obj, artifactId)
+        saved = showFileDispositionDialog(obj, artifactId)
+        nRecorded = showFindFileDialog(obj, artifactIds, findings)
         showHusbandryEntry(obj)
         showIntegrityReport(obj)
         runCustomSQL(obj)

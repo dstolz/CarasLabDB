@@ -603,6 +603,13 @@ Log in against `localhost` / `lab_test` / `test_rw`, then verify each surface
       leaves the table while "Active only" is on.
 - [ ] Ctrl+H opens the daily husbandry grid and writes the day's weights in
       one go; Ctrl+I shows the integrity report.
+- [ ] In the integrity report, a missing file's finding (move a registered
+      file to another folder of its storage root and run
+      `tools/verify_artifacts.py` first): Find files… (Ctrl+F) with the
+      root's folder finds it at its new path; Record… asks, then writes a
+      `moved` disposition, the file's row at its new path and an `ok` check;
+      the finding is gone after the report refreshes. File… (Ctrl+Shift+F)
+      on such a finding opens the disposition dialog for that artifact.
 - [ ] Ctrl+? lists the shortcuts.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).
