@@ -132,6 +132,17 @@ by nobody:
       the cell turns amber and the summary says "BELOW 85%".
 - [ ] **Integrity (Ctrl+I).** Opens non-modal, errors on top; a second Ctrl+I
       brings the same window forward; closing the main window closes it.
+- [ ] **Find files (Ctrl+F in the integrity report), on Windows.** With a
+      storage root mapped in the client settings, "Mounted here at" is filled
+      in. A file moved within the root is found; the "Found at" path uses `/`
+      and the case of the names on disk; a folder outside the root is
+      refused; a folder holding another root's `.caraslabdb-root.json` is
+      refused. Stop in the progress window ends a long search within a
+      large file (between 8 MiB chunks) and while listing; the listing
+      counts go up a few times a second. A file-name pattern with Ignore
+      case matches `RAW.DAT` for `^raw\.dat$` on Windows. Record… on a
+      moved file writes the row at the new path, an `ok` check and the
+      `moved` disposition (check them in `lab.artifact_disposition`).
 - [ ] **Login.** With a mapped login and a blank email there is no prompt and
       the status bar shows the person. With an unmapped login and a blank
       email the "No person set" confirmation appears, and "Go back" leaves no

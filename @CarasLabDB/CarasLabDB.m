@@ -94,7 +94,7 @@ classdef CarasLabDB < handle
 %       supersedeArtifact, artifactLineage, runReadOnlyQuery, updateSubject,
 %       updateSession, addTagNamespace, registerTag, addTag, removeTag,
 %       setTag, getEntityTags, findByTags, setVariable, getVariables,
-%       defineVariable, recordEvent.
+%       defineVariable, recordEvent, recordArtifactMove.
 %   Defined in this file: the add/get methods of the reference, project,
 %   subject and session tables; getEvents, getEventDetail, getArtifacts and
 %   the other readers; getTagNamespaces, getTags, updateTagNamespace,
@@ -155,7 +155,9 @@ classdef CarasLabDB < handle
 %   database's own list of what needs attention (errors first).
 %   addHusbandryBatch writes one weigh-in sheet as one transaction, and
 %   addArtifactFromFile registers a file from its path, computing the size
-%   and SHA-256 itself (static fileChecksum).
+%   and SHA-256 itself (static fileChecksum). recordArtifactMove records a
+%   file found at another path with the same bytes: the row of the new
+%   place, its check and the 'moved' disposition, in one transaction.
 %
 %   Requires MATLAB R2024b or later and the Database Toolbox.
 %
@@ -215,6 +217,7 @@ classdef CarasLabDB < handle
         eventIds    = addHusbandryBatch(obj, T, opts)
         [artifactId, info] = addArtifactFromFile(obj, filePath, opts)
         out         = recordEvent(obj, eventType, opts)
+        out         = recordArtifactMove(obj, artifactId, opts)
     end
 
     methods (Static)
@@ -1083,14 +1086,35 @@ classdef CarasLabDB < handle
         end
 
         function T = getArtifactVerifications(obj, opts)
-            %GETARTIFACTVERIFICATIONS Retrieve checksum verification history.
+            %GETARTIFACTVERIFICATIONS Retrieve checksum verification history, newest first.
+            %   T = getArtifactVerifications(ArtifactId=aid)
+            %       the checks recorded against this artifact row
+            %   T = getArtifactVerifications(ArtifactId=aid, ByFile=true)
+            %       the checks of its file: those recorded against any row
+            %       describing the same (storage root, path, checksum), as
+            %       lab.artifact_verification_latest counts them, so a
+            %       correction of the row does not hide its file's history
             arguments
                 obj (1,1) CarasLabDB
                 opts.ArtifactId (1,1) string = string(missing)
+                opts.ByFile (1,1) logical = false
             end
-            f = obj.pSet(struct(), "artifact_id", opts.ArtifactId);
-            T = obj.pSelectFrom(obj.pT("artifact_verification"), f, ...
-                OrderBy="verified_at DESC, verification_id DESC");
+            if ~opts.ByFile
+                f = obj.pSet(struct(), "artifact_id", opts.ArtifactId);
+                T = obj.pSelectFrom(obj.pT("artifact_verification"), f, ...
+                    OrderBy="verified_at DESC, verification_id DESC");
+                return
+            end
+            if ~obj.pIsProvided(opts.ArtifactId)
+                error("CarasLabDB:invalidValue", "ByFile=true needs ArtifactId=.");
+            end
+            id = obj.sqlLiteral(CarasLabDB.pCheckUuid(opts.ArtifactId, "ArtifactId")) + "::uuid";
+            sameFile = "artifact_id IN (SELECT f.artifact_id FROM " + obj.pT("artifact") + ...
+                " f JOIN " + obj.pT("artifact") + " a ON a.storage_root_id = f.storage_root_id " + ...
+                "AND a.relative_path = f.relative_path AND a.checksum = f.checksum " + ...
+                "WHERE a.artifact_id = " + id + ")";
+            T = obj.pSelectFrom(obj.pT("artifact_verification"), struct(), ...
+                OrderBy="verified_at DESC, verification_id DESC", Where=sameFile);
         end
 
         function T = getSubjectCurrent(obj, opts)

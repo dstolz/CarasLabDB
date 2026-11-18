@@ -151,7 +151,10 @@ and browse subjects, sessions, events and artifacts (including by tag, e.g.
 `stage:raw -qc:fail`); add and correct events; edit a row's tags (Ctrl+T) and
 variables (Ctrl+L); retract a row (Ctrl+Delete); record that a file was replaced,
 moved or deleted (Ctrl+Shift+F); enter the day's husbandry
-for all animals in one grid (Ctrl+H); show the integrity report (Ctrl+I); run
+for all animals in one grid (Ctrl+H); show the integrity report (Ctrl+I), where
+a missing file can be looked for by its size and checksum, optionally only
+among files whose name matches a regular expression, with a progress window,
+and its new place recorded (Find files…, Ctrl+F); run
 vetted read-only custom SQL. Ctrl+? lists the shortcuts. Because the schema is append-only, "editing" an
 event creates a superseding correction rather than mutating in place.
 

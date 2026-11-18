@@ -26,13 +26,19 @@ function checksum = fileChecksum(filePath, opts)
 %   Requires the Java virtual machine (MATLAB not started with -nojvm).
 %
 %   Name=Value:
-%       Algo - "sha256" (default) or "md5"
+%       Algo       - "sha256" (default) or "md5"
+%       ProgressFcn - a function called as ProgressFcn(bytesRead) after each
+%                    chunk, with the number of bytes read so far (for a
+%                    progress bar). An error it throws stops the reading and
+%                    reaches the caller unchanged; that is how a caller
+%                    cancels. Default: none.
 %
 %   See also CARASLABDB, ADDARTIFACTFROMFILE, ADDARTIFACT, ADDARTIFACTVERIFICATION.
 
     arguments
         filePath (1,1) string
         opts.Algo (1,1) string {mustBeMember(opts.Algo, ["sha256", "md5"])} = "sha256"
+        opts.ProgressFcn {mustBeA(opts.ProgressFcn, ["function_handle", "double"])} = []
     end
 
     if ~usejava('jvm')
@@ -57,6 +63,7 @@ function checksum = fileChecksum(filePath, opts)
     closeFile = onCleanup(@() fclose(fid)); %#ok<NASGU>
 
     chunkBytes = 8 * 2^20;
+    bytesRead = 0;
     while true
         bytes = fread(fid, chunkBytes, '*uint8');
         if isempty(bytes)
@@ -65,6 +72,10 @@ function checksum = fileChecksum(filePath, opts)
         % update(byte[] input, int offset, int len): the three-argument form,
         % so that a one-byte chunk cannot be taken for update(byte).
         digester.update(bytes, 0, numel(bytes));
+        bytesRead = bytesRead + numel(bytes);
+        if ~isempty(opts.ProgressFcn)
+            opts.ProgressFcn(bytesRead);
+        end
     end
 
     % digest() returns Java bytes, which arrive as SIGNED int8 (-128..127).

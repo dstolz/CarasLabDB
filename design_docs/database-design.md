@@ -798,6 +798,18 @@ checks only present files. `duplicate_active_path` then means a file was
 overwritten without a `replaced` disposition, and `disposed_file_found` that
 one recorded as gone was later found intact.
 
+A file that the verifier reports `missing` because it was moved is recorded
+from the MATLAB app's integrity report: Find files… looks for it by size and
+checksum under a mounted storage root (optionally only among files whose
+name matches a regular expression, which is also how a file registered
+without its size is looked for), and `CarasLabDB.recordArtifactMove`
+writes, in one transaction, the row of the bytes at their new path (a new
+row copying the old one's event, checksum, size, role, format, subject,
+session and attributes, unless one is registered there already), the check
+just made of it, and the `moved` disposition. When the file moved is not
+known; the app proposes the first check that did not find it, an upper
+bound, and says so in the note.
+
 ---
 
 ## 5. Provenance & the lineage query
