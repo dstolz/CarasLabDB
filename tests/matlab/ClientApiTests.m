@@ -507,6 +507,14 @@ classdef (SharedTestFixtures = {LabScratchDb}) ClientApiTests < matlab.unittest.
                 "artifact_id"), 1, "restored: present again");
             T = db.getArtifactDispositions(ArtifactId=aid);
             tc.verifyEqual(LabScratchDb.column(T, "disposition"), ["restored"; "deleted"], "newest first");
+            % When a disposition happened reads back as the instant written. The shared client
+            % tells which of two versions of a file is the newer by it (labclient.Sync.replaceFile,
+            % whenOf), reading a time that comes back with no zone as this computer's, which is
+            % the zone the class gives the session.
+            at = T.occurred_at(1);
+            tc.assertClass(at, "datetime", "occurred_at comes back as a datetime");
+            if isempty(at.TimeZone); at.TimeZone = "local"; end
+            tc.verifyTrue(at == t + days(1), "the instant that was written: " + string(at));
         end
 
         function moveRecordsTheFileAtItsNewPlace(tc)

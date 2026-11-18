@@ -101,8 +101,8 @@ classdef CarasLabDB < handle
 %   retireTag; unsetVariable, getVariableValues, getVariableDefinitions,
 %   updateVariableDefinition, retireVariable; retractEvent,
 %   retractArtifact, getRetractions; checkIntegrity; and the static helpers
-%   sqlLiteral, jsonText, normalizeTag, parseTag, displayTag,
-%   normalizeVariableName.
+%   sqlLiteral, jsonText, recordEventColumns, normalizeTag, parseTag,
+%   displayTag, normalizeVariableName.
 %
 %   Tags. Events, artifacts, subjects, sessions and projects can carry
 %   namespace:value tags (stage:raw, cohort:a, qc:fail; a bare tag such as
@@ -2904,6 +2904,34 @@ classdef CarasLabDB < handle
             %   text must parse as JSON (CarasLabDB:invalidJson).
             %   See also CARASLABDBJSON.
             j = CarasLabDBJson(text);
+        end
+
+        function cols = recordEventColumns(eventType)
+            %RECORDEVENTCOLUMNS The detail columns RECORDEVENT may write for an event type.
+            %   cols = CarasLabDB.recordEventColumns("behavior")
+            %   A row of names for "analysis", "recording", "behavior" or
+            %   "husbandry", the types recordEvent takes. recordEvent refuses
+            %   a Detail field that is not one of them
+            %   (CarasLabDB:invalidValue). This is the one list: a client that
+            %   judges a record before it is sent (labclient.Bundles.problems
+            %   keeps a copy, since it has no database at hand) is held equal
+            %   to it by a test.
+            %   See also RECORDEVENT.
+            arguments
+                eventType (1,1) string {mustBeMember(eventType, ["analysis", "recording", "behavior", "husbandry"])}
+            end
+            switch eventType
+                case "analysis"
+                    cols = ["pipeline_id", "pipeline_name", "code_version", "parameters", ...
+                            "environment", "started_at", "finished_at", "status"];
+                case "recording"
+                    cols = ["acquisition_system_code", "probe_id", "modality", "sample_rate_hz", ...
+                            "n_channels", "duration_s", "stimulus_protocol", "hardware_config"];
+                case "behavior"
+                    cols = ["task", "paradigm", "stage", "trials_completed", "performance", "reward"];
+                case "husbandry"
+                    cols = ["measure", "weight_g", "water_ml", "health_status"];
+            end
         end
 
         function tags = normalizeTag(tags, opts)

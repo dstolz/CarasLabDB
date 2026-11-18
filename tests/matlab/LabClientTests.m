@@ -17,11 +17,16 @@ classdef LabClientTests < matlab.unittest.TestCase
 %   owner left without a claim, stale claims); labclient.Hasher; sending
 %   (labclient.Sync): an event of no dataset naming its subject, held for a
 %   subject the database does not have and re-targeted to another, husbandry
-%   events, a replacement file registered beside the one it replaces, a record
+%   events, a replacement file registered beside the one it replaces (also
+%   when it names a version replaced before, and when a later save was sent
+%   first), a record
 %   recorded as a copy of a file already in the database whichever of two
 %   toolboxes sent it first, a record whose tool is not running here never
 %   claimed, a dataset record that names no tool sent only through the tool
-%   registered to take such records; labclient.SubjectCache.
+%   registered to take such records; a record the database would refuse
+%   (labclient.Bundles.problems) kept held with its reason, and the fake
+%   refusing what the database refuses; the interface's version
+%   (labclient.Api); labclient.SubjectCache.
 %
 %   See also LABSCRATCHDB, CLIENTAPITESTS.
 
@@ -124,6 +129,16 @@ classdef LabClientTests < matlab.unittest.TestCase
                 Detail=struct("task", "detect", "trials_completed", 12), Attributes=struct("rig", "r1"), ...
                 Outputs=it, SubjectId=opts.Subject, Dataset=opts.Dataset, Notes=opts.Notes);
             b = labclient.Bundles.seal(b);
+        end
+
+        function [fb, id] = savedAgain(tc, ev, rel, bytes, replaces, at)
+            %savedAgain  A sealed files record: new BYTES at REL, a file of event record EV in place of REPLACES, captured at AT.
+            f = tc.file(rel, bytes);
+            id = labclient.Bundles.newId();
+            it = labclient.Bundles.item(f, Role="raw", Kind="session", ArtifactId=id, Root="nas", Rel=rel, ...
+                Sha256=labclient.fileSha256(f), Replaces=replaces);
+            fb = labclient.Bundles.files(EventId=ev.bundle_id, Outputs=it);
+            fb.captured_at = labclient.Bundles.timeText(at);   % the order of the captures is the test's to set (not in the digest)
         end
 
         function b = golden(~)
@@ -384,6 +399,21 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifySubstring(string(lamp.Button.Text), "1 to send");
         end
 
+        function theInterfaceHasAVersion(tc)
+            % what a toolbox asks before it uses the package (labclient.Api)
+            tc.verifyEqual(exist("labclient.Api", "class"), 8);
+            v = labclient.Api.Version;
+            tc.verifyTrue(isnumeric(v) && isscalar(v) && v == fix(v) && v >= 3, "a whole number, 3 or later");
+            [ok, why] = labclient.Api.atLeast(v);
+            tc.verifyTrue(ok);
+            tc.verifyEqual(why, "");
+            tc.verifyTrue(labclient.Api.atLeast(1));
+            [ok, why] = labclient.Api.atLeast(v + 1);
+            tc.verifyFalse(ok, "a toolbox that needs a later version is told so");
+            tc.verifySubstring(why, "version " + (v + 1));
+            tc.verifySubstring(why, "Update the CarasLabDB checkout");
+        end
+
         % ---- SHA-256, bundles ---------------------------------------------------------------------
 
         function sha256KnownVectors(tc)
@@ -612,6 +642,138 @@ classdef LabClientTests < matlab.unittest.TestCase
             tc.verifyEqual(r.record.outputs.sha256, labclient.fileSha256(f));
         end
 
+        % ---- a record the database would refuse: said where it is made, kept, held ---------------------
+
+        function problemsSaysWhatTheDatabaseWouldRefuse(tc)
+            ok = tc.record(tc.file("rig/p0.mat", 1:10), Subject="SUBJ-1");
+            tc.verifyEmpty(labclient.Bundles.problems(ok));
+            tc.verifyEmpty(labclient.Bundles.problems(tc.golden()), "the golden record");
+            at = labclient.Bundles.now();
+            said = @(type, detail, when) strjoin(labclient.Bundles.problems(labclient.Bundles.event( ...
+                EventId=labclient.Bundles.newId(), EventType=type, OccurredAt=when, Detail=detail, ...
+                SubjectId="SUBJ-1")), "; ");
+            % no time, and a time that is not written as timeText writes one
+            tc.verifySubstring(said("behavior", struct("task", "t"), ""), "when it happened");
+            tc.verifySubstring(said("behavior", struct("task", "t"), "2026-11-18 09:00"), "timeText");
+            % a word that datetime would read as a date is not a time either
+            tc.verifySubstring(said("behavior", struct("task", "t"), "today"), "timeText");
+            tc.verifyFalse(labclient.Bundles.isTimeText("yesterday"));
+            tc.verifyFalse(labclient.Bundles.isTimeText("now"));
+            tc.verifyTrue(labclient.Bundles.isTimeText(at));
+            tc.verifyTrue(labclient.Bundles.isTimeText("2026-07-02T14:29:00.000000-04:00"));
+            % a field that is not a column of that type of event
+            p = labclient.Bundles.problems(labclient.Bundles.event(EventId=labclient.Bundles.newId(), ...
+                EventType="behavior", OccurredAt=at, Detail=struct("task", "t", "trials", 12), SubjectId="SUBJ-1"));
+            tc.verifyNumElements(p, 1);
+            tc.verifySubstring(p, "Detail field trials ");
+            tc.verifySubstring(p, "trials_completed", "it names the columns there are");
+            tc.verifySubstring(said("recording", struct("task", "t"), at), "Detail field task", "a behavior column on a recording");
+            % a JSON column goes under <name>_json: parameters and environment, and no other
+            tc.verifyEmpty(labclient.Bundles.problems(labclient.Bundles.event(EventId=labclient.Bundles.newId(), ...
+                EventType="analysis", OccurredAt=at, Detail=struct("pipeline_name", "p", "parameters_json", "{}", ...
+                "environment_json", "{}", "started_at", "", "finished_at", at, "status", "succeeded"))));
+            tc.verifySubstring(said("recording", struct("hardware_config_json", "{}"), at), "hardware_config_json");
+            % an analysis event's times and status
+            tc.verifySubstring(said("analysis", struct("finished_at", "yesterday"), at), "finished_at");
+            tc.verifySubstring(said("analysis", struct("status", "done"), at), "status");
+            % husbandry: what was not measured is not sent, so its name is not judged; the measure is needed
+            tc.verifyEmpty(labclient.Bundles.problems(labclient.Bundles.event(EventId=labclient.Bundles.newId(), ...
+                EventType="husbandry", OccurredAt=at, SubjectId="SUBJ-1", Detail=struct("measure", "weight", ...
+                "weight_g", 20, "water_ml", NaN, "health_status", "", "not_a_column", []))));
+            tc.verifySubstring(said("husbandry", struct("measure", "weight", "grams", 20), at), "Detail field grams");
+            tc.verifySubstring(said("husbandry", struct("weight_g", 20), at), "what was measured");
+            % nothing to say about a files record, and nothing in the record is changed by asking
+            tc.verifyEmpty(labclient.Bundles.problems(labclient.Bundles.files(EventId=ok.bundle_id)));
+            before = labclient.Bundles.encode(ok);
+            labclient.Bundles.problems(ok);
+            tc.verifyEqual(labclient.Bundles.encode(ok), before);
+        end
+
+        function theDetailColumnsAreTheOnesRecordEventTakes(tc)
+            % labclient keeps a copy of the list (a record is made with no database at hand):
+            % it must be CarasLabDB's own, name for name
+            for type = ["analysis" "recording" "behavior" "husbandry"]
+                tc.verifyEqual(sort(labclient.Bundles.detailColumns(type)), sort(CarasLabDB.recordEventColumns(type)), type);
+            end
+            tc.verifyTrue(all(ismember(labclient.Bundles.JsonDetail, CarasLabDB.recordEventColumns("analysis"))));
+            tc.verifyError(@() labclient.Bundles.detailColumns("surgery"), "labclient:Bundles:EventType");
+        end
+
+        function aRecordTheDatabaseWouldRefuseIsKeptHeld(tc)
+            id = labclient.Bundles.newId();
+            bad = labclient.Bundles.event(EventId=id, EventType="behavior", OccurredAt=labclient.Bundles.now(), ...
+                Detail=struct("task", "detect", "trials", 12), SubjectId="SUBJ-1");   % trials: not a column
+            bad = labclient.Bundles.seal(bad);
+            [status, why] = labclient.Outbox.put(bad);
+            tc.verifyEqual(status, "added", "it is kept: nothing a toolbox recorded is dropped");
+            tc.verifySubstring(strjoin(why, "; "), "Detail field trials ");
+            tc.verifyEqual(labclient.Outbox.stateOf(id), "held", "and held, where it is seen at once");
+            n = labclient.Outbox.note(id, "held");
+            tc.verifySubstring(n.reason, "Detail field trials ");
+            tc.verifyTrue(any(n.flags == labclient.Outbox.NotSendable));
+            tc.verifyEqual(labclient.Outbox.read(id).record.event.detail.trials, 12, "as it was recorded");
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 0, "not sent");
+            tc.verifyEmpty(tc.Fake.Events);
+            tc.verifyEqual(labclient.Outbox.counts().held, 1);
+
+            % the same record again changes nothing; a corrected one under the same id replaces it and is sent
+            tc.verifyEqual(labclient.Outbox.put(bad), "unchanged");
+            good = labclient.Bundles.event(EventId=id, EventType="behavior", OccurredAt=bad.record.event.occurred_at, ...
+                Detail=struct("task", "detect", "trials_completed", 12), SubjectId="SUBJ-1");
+            [status, why] = labclient.Outbox.put(labclient.Bundles.seal(good));
+            tc.verifyEqual(status, "replaced");
+            tc.verifyEmpty(why);
+            tc.verifyEqual(labclient.Outbox.stateOf(id), "pending");
+            tc.verifyEmpty(labclient.Outbox.note(id, "pending").flags, "no flag left on it");
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 1, r.message);
+            tc.verifyEqual(tc.Fake.Events(1).detail.trials_completed, 12);
+
+            % a waiting record replaced by one the database would refuse is held too
+            id2 = labclient.Bundles.newId();
+            fine = labclient.Bundles.seal(labclient.Bundles.event(EventId=id2, EventType="husbandry", ...
+                OccurredAt=labclient.Bundles.now(), SubjectId="SUBJ-1", Detail=struct("measure", "weight", "weight_g", 21)));
+            tc.verifyEqual(labclient.Outbox.put(fine), "added");
+            tc.verifyEqual(labclient.Outbox.stateOf(id2), "pending");
+            worse = labclient.Bundles.seal(labclient.Bundles.event(EventId=id2, EventType="husbandry", ...
+                OccurredAt="", SubjectId="SUBJ-1", Detail=struct("measure", "weight", "weight_g", 22)));
+            [status, why] = labclient.Outbox.put(worse);
+            tc.verifyEqual(status, "replaced");
+            tc.verifySubstring(strjoin(why, "; "), "when it happened");
+            tc.verifyEqual(labclient.Outbox.stateOf(id2), "held");
+            tc.verifyTrue(any(labclient.Outbox.note(id2, "held").flags == labclient.Outbox.NotSendable));
+        end
+
+        function aHeldRecordReleasedByAPersonFailsAsTheDatabaseSays(tc)
+            % the fake refuses what the database refuses, so a toolbox's tests see it too
+            id = labclient.Bundles.newId();
+            bad = labclient.Bundles.seal(labclient.Bundles.event(EventId=id, EventType="behavior", ...
+                OccurredAt=labclient.Bundles.now(), Detail=struct("trials", 12), SubjectId="SUBJ-1"));
+            labclient.Outbox.put(bad);
+            labclient.Outbox.move(id, "pending", Reason="released by a person");   % flags kept, as the window does
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 0);
+            tc.verifyEqual(labclient.Outbox.stateOf(id), "failed");
+            n = labclient.Outbox.note(id, "failed");
+            tc.verifySubstring(n.reason, "Detail cannot set trials");
+            tc.verifyFalse(any(n.flags == labclient.Outbox.NotSendable), "the flag was the hold's, not the record's");
+            tc.verifyEmpty(tc.Fake.Events);
+            % directly, for each type the fake used not to look at
+            be = labclient.DB.connect();
+            req = struct("EventType", "recording", "EventId", labclient.Bundles.newId(), "Digest", repmat('a', 1, 64), ...
+                "OccurredAt", datetime("now", "TimeZone", "UTC"), "SubjectId", "SUBJ-1", "SessionId", "", "Notes", "", ...
+                "AttributesJson", "{}", "RecordedBy", "", "Detail", struct("task", "t"), ...
+                "Inputs", struct("artifact_id", {}, "role", {}), "Outputs", struct("artifact_id", {}));
+            tc.verifyError(@() be.recordEvent(req), "CarasLabDB:invalidValue");
+            req.EventType = "analysis";
+            req.Detail = struct("status", "done");
+            tc.verifyError(@() be.recordEvent(req), "CarasLabDB:invalidValue");
+            req.Detail = struct("status", "succeeded");
+            req.OccurredAt = NaT("TimeZone", "UTC");
+            tc.verifyError(@() be.recordEvent(req), "labclient:Refused");
+        end
+
         % ---- sending: records of no dataset ---------------------------------------------------------
 
         function aRecordOfNoDatasetIsSentForItsSubject(tc)
@@ -757,6 +919,122 @@ classdef LabClientTests < matlab.unittest.TestCase
             labclient.Sync.flush(Budget=10);
             tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
             tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "not marked replaced");
+        end
+
+        function aFileSavedAgainAndAgainNamingItsFirstVersion(tc)
+            % a toolbox that names the FIRST version as the one replaced, every time it saves
+            rel = "rig/again.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            be = labclient.DB.connect();
+            here = struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true);
+
+            [fb1, a1] = tc.savedAgain(ev, rel, 1:60, a0, t0 + minutes(1));
+            labclient.Outbox.put(fb1);
+            labclient.Sync.flush(Budget=10);
+            [fb2, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));   % still names the first
+            labclient.Outbox.put(fb2);
+            r = labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(r.sent, 1, r.message);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual([D.artifact_id, D.disposition, D.successor_artifact_id], ...
+                [a0, "replaced", a1; a1, "replaced", a2], "each version replaced by the next, and nothing else");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2, "one present file at the path: the newest");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "its present version " + a1);
+
+            for id = [fb1.bundle_id, fb2.bundle_id]   % sent again, either one: nothing twice
+                labclient.Outbox.move(id, "pending");
+                labclient.Sync.flush(Budget=10);
+            end
+            tc.verifyEqual(height(tc.Fake.Artifacts), 3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 2);
+
+            [fb3, a3] = tc.savedAgain(ev, rel, 1:80, a0, t0 + minutes(3));   % followed over two replacements
+            labclient.Outbox.put(fb3);
+            labclient.Sync.flush(Budget=10);
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual(height(D), 3);
+            tc.verifyEqual([D.artifact_id(3), D.disposition(3), D.successor_artifact_id(3)], [a2, "replaced", a3]);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a3);
+
+            % the version at the path was deleted since: nothing of the chain is there to replace
+            be.addDisposition(struct("ArtifactId", a3, "Disposition", "deleted", "SuccessorArtifactId", "", ...
+                "OccurredAt", t0 + minutes(4), "Note", "cleaned up", "AttributesJson", "{}"));
+            [fb4, a4] = tc.savedAgain(ev, rel, 1:90, a0, t0 + minutes(5));
+            labclient.Outbox.put(fb4);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb4.bundle_id), "done", "left alone, not an error");
+            tc.verifyEqual(height(tc.Fake.Dispositions), 4, "nothing recorded for a chain that ends in a deleted file");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a4, "the deleted file is not present; the new one is");
+        end
+
+        function aReplacementSentAfterANewerOneIsTheOneReplaced(tc)
+            % three saves of one path, each naming the first version; the third is sent before the second
+            rel = "rig/late.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            be = labclient.DB.connect();
+            here = struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true);
+            [fb2, a1] = tc.savedAgain(ev, rel, 1:60, a0, t0 + minutes(1));   % captured, and kept back
+            [fb3, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));   % the bytes on disk now
+            labclient.Outbox.put(fb3);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2);
+
+            labclient.Outbox.put(fb2);   % the earlier save arrives late
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done");
+            D = tc.Fake.Dispositions;
+            tc.verifyEqual([D.artifact_id, D.disposition, D.successor_artifact_id], ...
+                [a0, "replaced", a2; a1, "replaced", a2], "the late, earlier version is the one replaced");
+            tc.verifyTrue(D.occurred_at(2) == t0 + minutes(2), "when the newer version took the place");
+            tc.verifyEqual(be.artifacts(here).artifact_id, a2, "the newest bytes stay the present file");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "was sent first");
+
+            for id = [fb2.bundle_id, fb3.bundle_id]   % sent again, either one: nothing twice
+                labclient.Outbox.move(id, "pending");
+                labclient.Sync.flush(Budget=10);
+            end
+            tc.verifyEqual(height(tc.Fake.Artifacts), 3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 2);
+
+            [fb4, a3] = tc.savedAgain(ev, rel, 1:80, a0, t0 + minutes(3));   % in order again: replaces the newest
+            labclient.Outbox.put(fb4);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(be.artifacts(here).artifact_id, a3);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 3);
+        end
+
+        function aReplacementWhoseTimeCannotBeReadIsLeft(tc)
+            % the order of two versions is told by when each took the place; from a backend
+            % that does not say when, neither is touched
+            rel = "rig/untimed.mat";
+            ev = tc.record(tc.file(rel, 1:50), Subject="SUBJ-1");
+            labclient.Outbox.put(ev);
+            labclient.Sync.flush(Budget=10);
+            a0 = tc.Fake.Artifacts.artifact_id(1);
+            t0 = datetime(2026, 11, 18, 9, 0, 0, "TimeZone", "America/New_York");
+            [fb1, a1] = tc.savedAgain(ev, rel, 1:60, a0, t0 + minutes(1));
+            labclient.Outbox.put(fb1);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(height(tc.Fake.Dispositions), 1, "the first replaced by the second, as ever");
+            tc.Fake.DispositionTimes = false;
+            [fb2, a2] = tc.savedAgain(ev, rel, 1:70, a0, t0 + minutes(2));
+            labclient.Outbox.put(fb2);
+            labclient.Sync.flush(Budget=10);
+            tc.verifyEqual(labclient.Outbox.stateOf(fb2.bundle_id), "done", "left, not an error");
+            tc.verifyEqual(height(tc.Fake.Dispositions), 1, "nothing recorded when the order cannot be told");
+            tc.verifySubstring(labclient.Outbox.note(fb2.bundle_id, "done").reason, "could not be read");
+            be = labclient.DB.connect();
+            P = be.artifacts(struct("StorageRootId", 1, "RelativePath", rel, "PresentOnly", true));
+            tc.verifyEqual(sort(P.artifact_id), sort([a1; a2]), "both stay present, as before this rule: reported, not guessed");
         end
 
         function aFilesRecordWaitsForItsEventAndHoldsAWrongCopy(tc)

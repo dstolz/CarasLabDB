@@ -1,7 +1,9 @@
 # Schema, privilege, live-dashboard, verifier and MCP server checks
-# against every supported PostgreSQL major version. Nothing here needs MATLAB:
-# the MATLAB tests in tests/matlab/ run locally only
-# (design_docs/testing-locally.md).
+# against every supported PostgreSQL major version (job `tests`); the MATLAB
+# files parsed with Octave (`matlab-syntax`); the toolboxes' calls into
+# +labclient (`consumers`); and the MATLAB tests of tests/matlab/ in MATLAB,
+# against a PostgreSQL service (`matlab`; design_docs/testing-locally.md §2.7
+# is how to run those on a workstation).
 
 name: tests
 on:
@@ -101,10 +103,10 @@ jobs:
           sed -i 's/\r$//' web/live/lab-dashboard-live.html
           git diff --exit-code web/live/lab-dashboard-live.html
 
-  # CI has no MATLAB, and Octave cannot run this code (no string type,
-  # datetime, table, Database Toolbox or matlab.unittest). It can parse it,
-  # so this is a syntax check only; see tests/check_matlab_syntax.py for what
-  # is and is not covered.
+  # Octave cannot run this code (no string type, datetime, table, Database
+  # Toolbox or matlab.unittest). It can parse it, so this is a syntax check
+  # only, of every MATLAB file including the ones no MATLAB test loads; see
+  # tests/check_matlab_syntax.py for what is and is not covered.
   matlab-syntax:
     name: MATLAB syntax (Octave)
     runs-on: ubuntu-latest
@@ -120,7 +122,35 @@ jobs:
       - name: Parse every MATLAB file
         run: python3 tests/check_matlab_syntax.py
 
-  # The MATLAB class and GUI, run in MATLAB. The repository is public, so the
+  # The lab's toolboxes record through +labclient from their own repositories,
+  # so a member renamed here fails nowhere until a computer has both. This
+  # reads their code as it is on their default branches and compares every
+  # reference to the package with the package of this commit: the name exists,
+  # is usable from outside its class, and takes the Name=Value options passed.
+  # Text only, nothing is run (tests/check_consumers.py says what it cannot
+  # see). A failure names the toolbox's file and line: either this change
+  # breaks that toolbox, or the toolbox already calls something that is not
+  # here. Both repositories are public: no token.
+  consumers:
+    name: Toolboxes' calls into labclient
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the check
+        run: python3 tests/check_consumers.py --self-test
+
+      - name: Check out the toolboxes that record through labclient
+        run: |
+          for repo in epsych2 ephys_analysis; do
+            git clone --quiet --depth 1 "https://github.com/dstolz/$repo.git" "$RUNNER_TEMP/$repo"
+            git -C "$RUNNER_TEMP/$repo" log -1 --format="$repo at %H (%cs)"
+          done
+
+      - name: Every labclient name they use is there, usable and takes what they pass
+        run: python3 tests/check_consumers.py "$RUNNER_TEMP/epsych2" "$RUNNER_TEMP/ephys_analysis"
+
   # The MATLAB class and GUI, run in MATLAB (tests/matlab, about five minutes
   # per release). MathWorks actions license MATLAB and the Database Toolbox
   # without a token because the repository is public; a private repository

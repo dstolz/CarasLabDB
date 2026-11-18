@@ -177,6 +177,7 @@ at the repository root, is the one client they share, so a computer is set up
 | `labclient.Panel`, `Lamp`, `SubjectAssignDialog` | the Database window, the status-bar lamp, the window for a subject the database does not have |
 | `labclient.SubjectCache` | what the database last said about each subject (endpointed, last and baseline weight), read from a file with no network |
 | `labclient.Backend` / `CarasBackend` / `FakeBackend` | the one seam to `@CarasLabDB`, and an in-memory database for tests |
+| `labclient.Api` | the version of the package's interface, for a toolbox to require the one it needs |
 
 Events of type `analysis`, `recording`, `behavior` and `husbandry` (weights,
 water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know:
@@ -200,15 +201,51 @@ water; `@CarasLabDB/recordEvent`) can be recorded. Things a caller needs to know
   and not sent (to send, held, failed) replaces it (`"replaced"`); one being
   sent, sent or discarded raises `labclient:Outbox:Claimed`, `:Sent`,
   `:Discarded` (a sent record is corrected by a new event that supersedes it).
+- **A record the database would refuse is kept, held.** `Outbox.put` asks
+  `labclient.Bundles.problems(b)` what cannot be recorded: no time it
+  happened, a `Detail` field that is not a column of that type of event, an
+  analysis `status` that is none of the three, a husbandry event with no
+  measure. Such a record is written all the same, in `held`, with the
+  sentences as its reason and the flag `Outbox.NotSendable`, and `[status,
+  why] = Outbox.put(b)` returns them. Nothing a toolbox recorded is dropped,
+  and what is wrong shows on the lamp at once instead of as a failed record
+  when the database is reached. A corrected record under the same id replaces
+  it. `FakeBackend` refuses the same things, so a toolbox's tests see them.
 - **A replacement file for an event already sent**: `labclient.Bundles.files(
   EventId=E, Outputs=items)` with each item's `Replaces` the artifact id of
   the file it takes the place of registers the new bytes at the same path as a
-  file of E and records the old one as replaced.
+  file of E and records the old one as replaced. `Replaces` may name any
+  earlier version (the first one, every time the file is saved again): a
+  version replaced since is followed to the one at the path now. When a later
+  save reached the database first, the file sent late is the one recorded as
+  replaced, never the newer bytes.
 - **Files already in the database.** A record whose raw file is, by its
   SHA-256, a file of a recording or behavior event already there (from either
   toolbox) is recorded as a copy of that event's file, not as a second event.
 
-Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server).
+**The interface has a version.** `labclient.Api.Version` is a whole number
+that goes up whenever something a toolbox can call, or the meaning of
+something it calls, changes (the class's help lists what each version added).
+A toolbox asks once, where it decides whether the lab database can be used:
+
+```matlab
+ok = exist("labclient.Api", "class") == 8;          % a package from before versions has none
+if ok; [ok, why] = labclient.Api.atLeast(3); end    % WHY says to update the checkout
+```
+
+Tests: `tests/matlab/LabClientTests.m` (the fake backend, no server) and
+`tests/matlab/BackendContractTests.m` (the same assertions against the fake
+backend and against PostgreSQL through `labclient.CarasBackend`, records sent
+with `labclient.Sync`).
+
+**A toolbox's calls are checked from here.** The package and the toolboxes are
+separate repositories, so `python tests/check_consumers.py <checkout> ...`
+reads a toolbox's code and compares every `labclient.` reference with the
+package: the name exists, is usable from outside its class, and takes the
+`Name=Value` options passed. CI runs it on the default branches of epsych2 and
+ephys_analysis for every change here (job `consumers`). It reads text and runs
+nothing; its header lists what it cannot see (a method called on an object the
+package returned, for one).
 
 ## Getting started
 

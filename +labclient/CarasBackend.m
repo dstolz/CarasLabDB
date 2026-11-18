@@ -152,7 +152,7 @@ classdef CarasBackend < labclient.Backend
             %recordEvent  CarasLabDB.recordEvent, with the JSON text sent as written (CarasLabDB.jsonText).
             obj.requireOpen();
             d = req.Detail;
-            for f = ["parameters" "environment"]
+            for f = labclient.Bundles.JsonDetail
                 if isfield(d, f + "_json")
                     d.(f) = CarasLabDB.jsonText(d.(f + "_json"));
                     d = rmfield(d, f + "_json");

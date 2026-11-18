@@ -567,6 +567,20 @@ no key-press gesture), so it tests each shortcut through the window's
 tag editor, Ctrl+Enter, Ctrl+S, Delete, Ctrl+R, Esc and Ctrl+?, and that
 Enter in the editor's Value box moves focus to Add or Set.
 
+**The toolboxes that use `+labclient`.** With a checkout of a toolbox that
+records through the package at hand (epsych2, ephys_analysis), check its calls
+against the package as it is here. This needs Python only, no MATLAB:
+
+```bash
+python tests/check_consumers.py --self-test
+python tests/check_consumers.py ../epsych2 ../ephys_analysis
+```
+
+**Pass:** `0 problems` for each. A problem names the toolbox's file and line
+and what does not fit (no such member, a private one, an option the method
+does not declare). A toolbox with no reference at all is a warning: nothing of
+it was checked.
+
 ### 2.8 Clean up
 
 ```matlab
