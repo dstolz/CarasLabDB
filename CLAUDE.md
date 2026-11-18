@@ -370,7 +370,8 @@ Key behaviors baked into the class:
   the same path is reused and listed in `attributes.unchanged_outputs`;
   `MissingInputs="skip"` leaves out inputs not yet in the database
   (`addEventInput(..., IfExists="skip")` adds them later). Its Detail and
-  Outputs field names are checked against fixed column lists. Every datetime
+  Outputs field names are checked against fixed column lists (the Detail
+  columns are `CarasLabDB.recordEventColumns(type)`, static, the one list). Every datetime
   it is given must be zoned (`CarasLabDB:unzonedTime`).
   `CarasLabDB.jsonText(text)` (a `CarasLabDBJson` value, at the repository
   root) sends JSON text to a jsonb column as written, never through
@@ -433,6 +434,29 @@ Rules a change must keep:
   (pending, held, failed) is replaced through a take (never half old, half
   new; hash jobs dropped), and `labclient:Outbox:Claimed|Sent|Discarded`
   are raised for the rest. `Outbox.update` ignores a capture that was replaced.
+- **A record the database would refuse is kept, held, never dropped and never
+  thrown back.** `Bundles.problems(b)` is the one judgment (no time, a
+  `Detail` field that is not a column of the event's type, a bad analysis
+  `status`, a husbandry event with no measure); `Outbox.put` writes such a
+  record in `held` with the sentences as the reason and the flag
+  `Outbox.NotSendable`, and returns them as its second output. A toolbox's
+  capture must not fail and its record must not be lost, so `Bundles.event`
+  stays permissive and `problems` never throws. Two rules: `problems` judges
+  exactly what the send path judges (a husbandry field that
+  `Bundles.notMeasured` is not sent, so its name is not looked at) and never
+  faults what the database would take; and `Bundles.detailColumns` is a copy
+  of `CarasLabDB.recordEventColumns` (the package has no database at hand
+  when a record is made), held equal by
+  `LabClientTests/theDetailColumnsAreTheOnesRecordEventTakes`. `FakeBackend`
+  refuses the same things as `recordEvent`, so a toolbox's tests against the
+  fake see them.
+- **The interface has a version**: `labclient.Api.Version`, a whole number,
+  with `[ok, why] = labclient.Api.atLeast(n)`. Raise it by one, and add a line
+  to the list in `Api.m`, in any change that adds something a toolbox can
+  call or changes what a call means (one raise per pull request is enough).
+  A toolbox states the version it needs where it decides the client is
+  usable; a package from before the class (versions 1 and 2) has no
+  `labclient.Api`.
 - **Records of no dataset** (`Bundles.event(..., SubjectId=)`): sent for that
   subject, no session; an unknown subject holds the record
   (`NeedsSubject`), and `Sync.subjectHolds`/`release` and the subject dialog
