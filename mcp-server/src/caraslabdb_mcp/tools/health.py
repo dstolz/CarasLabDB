@@ -10,7 +10,7 @@ def register(app):
 
         An empty result means healthy. Each row is (severity, check_name,
         subject, detail): severity is "error" or "warning", and subject is the
-        id (or storage_root:path) of the offending row. The 15 checks:
+        id (or storage_root:path) of the offending row. The 16 checks:
 
         - event_missing_detail (error): a typed event with no detail row.
         - artifact_verification_failed (error): the latest checksum check of
@@ -47,6 +47,10 @@ def register(app):
         - observation_invalid (warning): an active form entry (an
           observation event) whose current values break the rules of the
           form version it was made on, e.g. a required value unset since.
+        - scan_directory_overlap (warning): two directories of the NAS
+          search list (get_scan_directories), neither switched off, that
+          are the same directory or lie one inside the other; their files
+          would be read under two layouts.
 
         Errors are listed first, then by check_name and subject. Returns
         {"row_count", "limit", "truncated", "rows"}; `truncated` true means

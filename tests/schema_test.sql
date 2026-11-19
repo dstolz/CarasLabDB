@@ -557,6 +557,18 @@ SELECT pg_temp.assert(
 INSERT INTO lab.artifact_verification (artifact_id, status, observed_checksum)
 VALUES ('00000000-0000-0000-0000-0000000000f1', 'mismatch', repeat('cd', 32));
 INSERT INTO lab.maintenance_log (operation) VALUES ('test');
+-- One row in each scan log (a directory that is 'off', one run of it with its
+-- result, one file in the scan memory).
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode)
+VALUES ((SELECT root_id FROM lab.storage_root WHERE name = 'nas-test'),
+        'append-only-fixture', 'epsych', 'UTC', 60, 'off');
+INSERT INTO lab.scan_run (scan_directory_id, command, mode)
+SELECT scan_directory_id, 'run', 'report' FROM lab.scan_directory;
+INSERT INTO lab.scan_run_result (scan_run_id, outcome) SELECT scan_run_id, 'ok' FROM lab.scan_run;
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns, status)
+SELECT r.scan_run_id, d.storage_root_id, 'append-only-fixture/a.mat', 1, 1, 'pending'
+FROM lab.scan_run r JOIN lab.scan_directory d USING (scan_directory_id);
 
 DO $$
 DECLARE t text;
@@ -564,7 +576,7 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'event','recording_event','artifact','event_input',
         'artifact_verification','maintenance_log','row_history','schema_version',
-        'tag_assignment'
+        'tag_assignment','scan_run','scan_run_result','scan_file'
     ] LOOP
         PERFORM pg_temp.expect_error(format('DELETE FROM lab.%I', t), 'not allowed');
         PERFORM pg_temp.expect_error(format('TRUNCATE lab.%I CASCADE', t), 'not allowed');
@@ -577,6 +589,12 @@ BEGIN
     PERFORM pg_temp.expect_error('UPDATE lab.maintenance_log SET operation = ''x''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.schema_version SET description = ''x''', 'append-only log');
     PERFORM pg_temp.expect_error('UPDATE lab.tag_assignment SET op = ''remove''', 'append-only log');
+    PERFORM pg_temp.expect_error('UPDATE lab.scan_run SET host = ''x''', 'append-only log');
+    PERFORM pg_temp.expect_error('UPDATE lab.scan_run_result SET outcome = ''failed''', 'append-only log');
+    PERFORM pg_temp.expect_error('UPDATE lab.scan_file SET status = ''cleared''', 'append-only log');
+    -- The list of directories is not a log, but emptying it would take the
+    -- logs that refer to it along.
+    PERFORM pg_temp.expect_error('TRUNCATE lab.scan_directory CASCADE', 'not allowed');
 END;
 $$;
 
@@ -1675,6 +1693,990 @@ SELECT pg_temp.assert(lab.fn_record_observation(
     '00000000-0000-0000-0000-00000000f001', :'sf1', '2026-11-14 14:30Z', '2026-11-14 09:30',
     (SELECT v FROM obs_vals WHERE k = 'first'), 'Bright and alert.') = 'existing',
     'an entry stored before a rename is still recognised when it is sent again');
+
+-- ===========================================================================
+-- Searching listed directories (lab.scan_layout, scan_directory, scan_run,
+-- scan_run_result, scan_file; lab.fn_scan_status)
+-- ===========================================================================
+-- Fixture at this point: one directory ('append-only-fixture' on nas-test,
+-- 'off') with one run, its result and one file in the scan memory. Everything
+-- below is on two storage roots of its own.
+INSERT INTO lab.storage_root (name) VALUES ('nas-scan'), ('nas-scan-2');
+
+CREATE FUNCTION pg_temp.scan_root(p_root text DEFAULT 'nas-scan') RETURNS smallint
+LANGUAGE sql STABLE AS $$
+    SELECT root_id FROM lab.storage_root WHERE name = p_root;
+$$;
+-- The id of a directory, by its path.
+CREATE FUNCTION pg_temp.scan_dir(p_path text, p_root text DEFAULT 'nas-scan') RETURNS integer
+LANGUAGE sql STABLE AS $$
+    SELECT scan_directory_id FROM lab.scan_directory
+    WHERE storage_root_id = pg_temp.scan_root(p_root) AND relative_path = p_path;
+$$;
+-- Add a directory with the settings the policy tests do not care about.
+CREATE FUNCTION pg_temp.scan_add(p_path text, p_mode text DEFAULT 'register',
+                                 p_root text DEFAULT 'nas-scan') RETURNS integer
+LANGUAGE sql AS $$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                    scan_interval_min, mode)
+    VALUES (pg_temp.scan_root(p_root), p_path, 'epsych', 'America/New_York', 1440, p_mode)
+    RETURNING scan_directory_id;
+$$;
+-- Record a run of a directory, with its result when an outcome is given.
+CREATE FUNCTION pg_temp.scan_ran(p_path text, p_due timestamptz, p_started timestamptz,
+                                 p_outcome text DEFAULT NULL, p_finished timestamptz DEFAULT NULL,
+                                 p_command text DEFAULT 'run') RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE v_run bigint;
+BEGIN
+    INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at, started_at)
+    VALUES (pg_temp.scan_dir(p_path), p_command, 'register', p_due, p_started)
+    RETURNING scan_run_id INTO v_run;
+    IF p_outcome IS NOT NULL THEN
+        INSERT INTO lab.scan_run_result (scan_run_id, outcome, finished_at)
+        VALUES (v_run, p_outcome, p_finished);
+    END IF;
+    RETURN v_run;
+END;
+$$;
+-- Put a directory's mode_changed_at at a fixed instant, as if its mode had
+-- last changed then. Only the database sets that column, so this goes around
+-- the trigger that keeps it, the way the rows of an earlier day would be
+-- loaded.
+CREATE FUNCTION pg_temp.scan_mode_changed(p_path text, p_at timestamptz) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    ALTER TABLE lab.scan_directory DISABLE TRIGGER trg_scan_directory_policy;
+    UPDATE lab.scan_directory SET mode_changed_at = p_at
+    WHERE scan_directory_id = pg_temp.scan_dir(p_path);
+    ALTER TABLE lab.scan_directory ENABLE TRIGGER trg_scan_directory_policy;
+END;
+$$;
+-- The schedule of one directory at a fixed instant.
+CREATE FUNCTION pg_temp.sched(p_path text, p_now timestamptz) RETURNS lab.scan_directory_status
+LANGUAGE sql STABLE AS $$
+    SELECT s.* FROM lab.fn_scan_status(p_now) s
+    WHERE s.scan_directory_id = pg_temp.scan_dir(p_path);
+$$;
+-- Minutes of [p_from, p_to) in which a directory's window is open.
+CREATE FUNCTION pg_temp.open_minutes(p_path text, p_from timestamptz, p_to timestamptz)
+RETURNS bigint LANGUAGE sql STABLE AS $$
+    SELECT count(*) FROM generate_series(p_from, p_to - make_interval(mins => 1),
+                                         make_interval(mins => 1)) g(t)
+    WHERE lab.fn_scan_window_open(pg_temp.scan_dir(p_path), g.t);
+$$;
+
+SELECT pg_temp.assert(
+    (SELECT string_agg(code, ',' ORDER BY code) FROM lab.scan_layout) = 'epsych,intan',
+    'the two layouts of the tool are seeded');
+
+-- ---------------------------------------------------------------------------
+-- A directory: what its columns accept
+-- ---------------------------------------------------------------------------
+-- The path is normalised like a session's; the creator is stamped; the
+-- defaults are a day's wait and 'report'.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, created_login)
+VALUES (pg_temp.scan_root(), ' epsych_files\Data ', 'epsych', 'America/New_York', 1440, 'someone_else');
+SELECT pg_temp.assert(
+    (SELECT relative_path || '|' || mode || '|' || min_age_min || '|' || created_login || '|' || created_by
+            || '|' || (window_start IS NULL AND window_end IS NULL AND pair_with IS NULL)
+     FROM lab.scan_directory WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data'))
+    = 'epsych_files/Data|report|1440|' || session_user || '|00000000-0000-0000-0000-0000000000a1|true',
+    'a directory: path normalised, defaults report / 1440, login stamped whatever is sent, '
+    'person defaulted from the login');
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, min_age_min, mode, created_by,
+                                window_start, window_end, rig, notes)
+VALUES (pg_temp.scan_root(), '.hidden/a..b/ok', 'intan', 'UTC', 527040, 0, 'off',
+        '00000000-0000-0000-0000-0000000000a2', '23:59', '00:00', 'RIG3', 'limits'),
+       (pg_temp.scan_root(), 'interval-one', 'intan', 'UTC', 1, 0, 'off', NULL, NULL, NULL, NULL, NULL);
+SELECT pg_temp.assert(
+    (SELECT created_by FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('.hidden/a..b/ok'))
+    = '00000000-0000-0000-0000-0000000000a2',
+    'the limits of interval and minimum age are accepted; a named creator is kept; '
+    'a dot inside a name is not a dot segment');
+
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (pg_temp.scan_root(), %L, 'epsych', 'UTC', 60)$q$, v.path), 'scan_directory_path_ck')
+FROM (VALUES (''), ('   '), ('/abs/Data'), ('\\nas\share'), ('C:/Data'), ('c:\Data'), ('a/../b'),
+             ('../a'), ('a/..'), ('a/./b'), ('./a'), ('a/.'), ('.'), ('a//b'), ('a/'), ('a\')) AS v(path);
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, layout, time_zone, scan_interval_min)
+    VALUES (pg_temp.scan_root(), 'epsych', 'UTC', 60)$q$, 'null value in column "relative_path"');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (pg_temp.scan_root(), 'limits/interval', 'epsych', 'UTC', %s)$q$, v.n), 'scan_directory_interval_ck')
+FROM (VALUES (0), (-5), (527041)) AS v(n);
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min, min_age_min)
+    VALUES (pg_temp.scan_root(), 'limits/age', 'epsych', 'UTC', 60, -1)$q$, 'scan_directory_min_age_ck');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min, mode)
+    VALUES (pg_temp.scan_root(), 'limits/mode', 'epsych', 'UTC', 60, 'on')$q$, 'scan_directory_mode_ck');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (pg_temp.scan_root(), 'limits/layout', 'openephys', 'UTC', 60)$q$, 'scan_directory_layout_fkey');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (-1, 'limits/root', 'epsych', 'UTC', 60)$q$, 'scan_directory_storage_root_id_fkey');
+-- The window: both or neither, unequal, whole minutes before 24:00.
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                    scan_interval_min, window_start, window_end)
+    VALUES (pg_temp.scan_root(), 'limits/window', 'epsych', 'UTC', 60, %L, %L)$q$, v.s, v.e),
+    'scan_directory_window_ck')
+FROM (VALUES ('22:00', NULL), (NULL, '06:00'), ('22:00', '22:00'), ('24:00', '06:00'),
+             ('22:00', '24:00'), ('22:00:30', '06:00'), ('22:00', '06:00:00.5')) AS v(s, e);
+-- The time zone: a name the server knows, spelled as it is there.
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (pg_temp.scan_root(), 'limits/zone', 'epsych', %L, 60)$q$, v.tz),
+    'is not a time zone name this server knows')
+FROM (VALUES ('EDT'), ('america/new_york'), ('-05'), ('America/New_York '), ('Mars/Olympus'), ('')) AS v(tz);
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, scan_interval_min)
+    VALUES (pg_temp.scan_root(), 'limits/zone', 'epsych', 60)$q$, 'null value in column "time_zone"');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.scan_directory WHERE relative_path LIKE 'limits/%'),
+    'no refused directory was stored');
+
+-- ---------------------------------------------------------------------------
+-- No two searched directories on one root are equal or nested
+-- ---------------------------------------------------------------------------
+-- epsych_files/Data is 'report'. Equal, inside and around it are refused, in
+-- any case.
+SELECT pg_temp.expect_error(format($q$SELECT pg_temp.scan_add(%L)$q$, v.path),
+    'scan directory [0-9]+ \(epsych_files/Data\) is the same directory, contains it or lies inside it')
+FROM (VALUES ('epsych_files/Data'), ('EPSYCH_FILES/DATA'), ('epsych_files/Data/SUBJ-ID-1'),
+             ('Epsych_Files/data/subj/deeper'), ('epsych_files'), ('EPSYCH_files')) AS v(path);
+SELECT pg_temp.expect_error($q$SELECT pg_temp.scan_add('epsych_files/data', 'report')$q$,
+                            'cannot be searched: scan directory [0-9]+ \(epsych_files/Data\)');
+DO $$
+DECLARE v_state text; v_hint text;
+BEGIN
+    BEGIN
+        PERFORM pg_temp.scan_add('epsych_files/Data/inner');
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_hint = PG_EXCEPTION_HINT;
+    END;
+    PERFORM pg_temp.assert(v_state = '23P01' AND v_hint ~ 'Turn one of them off',
+                           'an overlap is an exclusion_violation with a HINT');
+END;
+$$;
+-- Not nested: siblings whose names only start the same, two paths that a
+-- LIKE pattern would match because '_' is its wildcard (one that would lie
+-- inside, one that would contain), and the same path on another root.
+SELECT pg_temp.scan_add('epsych_files/Database');
+SELECT pg_temp.scan_add('epsych_files/Dat');
+SELECT pg_temp.scan_add('epsychXfiles/Data/SUBJ-ID-1');
+SELECT pg_temp.scan_add('epsych_file_');
+SELECT pg_temp.scan_add('epsych_files/Data/SUBJ-ID-1', 'register', 'nas-scan-2');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_directory
+      WHERE mode <> 'off' AND storage_root_id IN (pg_temp.scan_root(), pg_temp.scan_root('nas-scan-2'))) = 6,
+    'siblings, paths that only a LIKE wildcard would match, and another root are not nested');
+-- A directory that is 'off' takes no part, whichever of the two it is; it
+-- cannot be turned on while the other is.
+SELECT pg_temp.scan_add('epsych_files/Data/SUBJ-ID-2', 'off');
+SELECT pg_temp.scan_add('EPSYCH_FILES/DATA', 'off');
+SELECT pg_temp.scan_add('epsych_files', 'off');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'report'
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data/SUBJ-ID-2')$q$,
+    '\(epsych_files/Data\) is the same directory, contains it or lies inside it');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'register'
+    WHERE scan_directory_id = pg_temp.scan_dir('EPSYCH_FILES/DATA')$q$, '\(epsych_files/Data\) is the same');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'register'
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files')$q$, '\(epsych_files/Data\) is the same');
+-- Moving a searched directory into another is refused like adding it there.
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET relative_path = 'epsych_files/Data/moved'
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Dat')$q$, '\(epsych_files/Data\) is the same');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET storage_root_id = pg_temp.scan_root()
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data/SUBJ-ID-1', 'nas-scan-2')$q$,
+    '\(epsych_files/Data\) is the same');
+-- Replacing a directory: turn it off, and the inner one can be turned on.
+UPDATE lab.scan_directory SET mode = 'off' WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data');
+UPDATE lab.scan_directory SET mode = 'report'
+WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data/SUBJ-ID-2');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'report'
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data')$q$,
+    '\(epsych_files/Data/SUBJ-ID-2\) is the same');
+UPDATE lab.scan_directory SET mode = 'off'
+WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data/SUBJ-ID-2');
+UPDATE lab.scan_directory SET mode = 'report' WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'scan_directory_overlap'),
+    'the list the policy accepted has no overlap to report');
+
+-- pair_with names another directory on the same storage root.
+SELECT pg_temp.scan_add('intan_files/Data');
+UPDATE lab.scan_directory SET pair_with = pg_temp.scan_dir('epsych_files/Data'), layout = 'intan'
+WHERE scan_directory_id = pg_temp.scan_dir('intan_files/Data');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET pair_with = scan_directory_id
+    WHERE scan_directory_id = pg_temp.scan_dir('intan_files/Data')$q$, 'scan_directory_pair_ck');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory
+    SET pair_with = pg_temp.scan_dir('epsych_files/Data/SUBJ-ID-1', 'nas-scan-2')
+    WHERE scan_directory_id = pg_temp.scan_dir('intan_files/Data')$q$, 'scan_directory_pair_fk');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET pair_with = -1
+    WHERE scan_directory_id = pg_temp.scan_dir('intan_files/Data')$q$, 'scan_directory_pair_fk');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_directory
+    WHERE scan_directory_id = pg_temp.scan_dir('epsych_files/Data')$q$, 'scan_directory_pair_fk');
+
+-- ---------------------------------------------------------------------------
+-- Edits are recorded; what a run was made under is frozen by the run
+-- ---------------------------------------------------------------------------
+-- Before its first run every setting of a directory can change.
+SELECT pg_temp.scan_add('before-run/a');
+UPDATE lab.scan_directory
+   SET relative_path = 'before-run\b', layout = 'intan', time_zone = 'UTC',
+       storage_root_id = pg_temp.scan_root('nas-scan-2')
+ WHERE scan_directory_id = pg_temp.scan_dir('before-run/a');
+UPDATE lab.scan_directory SET notes = NULL                       -- no-op: not logged
+ WHERE scan_directory_id = pg_temp.scan_dir('before-run/b', 'nas-scan-2');
+SELECT pg_temp.assert(
+    (SELECT count(*) || '|' || min(operation) || '|' || min(old_row ->> 'relative_path') || '>'
+            || min(new_row ->> 'relative_path') || '|' || min(changed_by)
+     FROM lab.row_history
+     WHERE table_name = 'scan_directory'
+       AND row_key = jsonb_build_object('scan_directory_id', pg_temp.scan_dir('before-run/b', 'nas-scan-2')))
+    = '1|UPDATE|before-run/a>before-run/b|' || session_user,
+    'before its first run a directory''s root, path, layout and zone can change; the edit '
+    'is in row_history, a no-op is not');
+-- The key and the creator never change, run or no run.
+SELECT pg_temp.expect_error(format($q$UPDATE lab.scan_directory SET %s
+    WHERE scan_directory_id = pg_temp.scan_dir('before-run/b', 'nas-scan-2')$q$, v.assignment),
+    'never change')
+FROM (VALUES ('created_at = now() + interval ''1 day'''), ('created_by = NULL'),
+             ('created_login = ''someone_else'''), ('scan_directory_id = DEFAULT')) AS v(assignment);
+-- A directory with no run can be deleted, and the deletion is recorded.
+DELETE FROM lab.scan_directory WHERE scan_directory_id = pg_temp.scan_dir('before-run/b', 'nas-scan-2');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.row_history
+      WHERE table_name = 'scan_directory' AND operation = 'DELETE'
+        AND old_row ->> 'relative_path' = 'before-run/b') = 1,
+    'deleting a directory that was never searched is recorded in row_history');
+UPDATE lab.scan_layout SET label = 'Intan RHX (traditional format)' WHERE code = 'intan';
+SELECT pg_temp.assert(
+    (SELECT row_key ->> 'code' FROM lab.row_history WHERE table_name = 'scan_layout') = 'intan',
+    'an edit of a layout is recorded in row_history');
+
+-- A run, even one with no result yet, freezes root, path, layout and zone.
+SELECT pg_temp.scan_add('frozen/Data');
+INSERT INTO lab.scan_run (scan_directory_id, command, mode, run_login, host, tool_version)
+VALUES (pg_temp.scan_dir('frozen/Data'), 'apply', 'report', 'someone_else', 'rig3-pc', '1.0.0');
+SELECT pg_temp.assert(
+    (SELECT run_login || '|' || (due_at IS NULL) || '|' || (started_at >= now())
+     FROM lab.scan_run WHERE scan_directory_id = pg_temp.scan_dir('frozen/Data'))
+    = session_user || '|true|true'
+    AND NOT EXISTS (SELECT 1 FROM lab.scan_run WHERE run_login IS DISTINCT FROM session_user)
+    AND NOT EXISTS (SELECT 1 FROM lab.scan_directory WHERE created_login IS DISTINCT FROM session_user),
+    'run_login and created_login hold session_user whatever the client sends; started_at is '
+    'the database clock');
+SELECT pg_temp.expect_error(format($q$UPDATE lab.scan_directory SET %s
+    WHERE scan_directory_id = pg_temp.scan_dir('frozen/Data')$q$, v.assignment),
+    'has been searched: its storage root, path, layout and time zone can no longer change')
+FROM (VALUES ('relative_path = ''frozen/Elsewhere'''), ('relative_path = ''FROZEN/DATA'''),
+             ('layout = ''intan'''), ('time_zone = ''UTC'''),
+             ('storage_root_id = pg_temp.scan_root(''nas-scan-2'')')) AS v(assignment);
+-- Everything else stays editable, and writing a frozen column unchanged (or
+-- in a spelling the normalisation undoes) is no change.
+UPDATE lab.scan_directory
+   SET rig = 'RIG3', notes = 'edited after a run', scan_interval_min = 60, min_age_min = 30,
+       window_start = '22:00', window_end = '06:00', mode = 'off', pair_with = NULL,
+       relative_path = 'frozen\Data', layout = 'epsych', time_zone = 'America/New_York'
+ WHERE scan_directory_id = pg_temp.scan_dir('frozen/Data');
+SELECT pg_temp.assert(
+    (SELECT rig || '|' || scan_interval_min || '|' || min_age_min || '|' || window_start || '|' || mode
+     FROM lab.scan_directory WHERE scan_directory_id = pg_temp.scan_dir('frozen/Data'))
+    = 'RIG3|60|30|22:00:00|off',
+    'after a run the other settings of a directory can still be edited');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_directory
+    WHERE scan_directory_id = pg_temp.scan_dir('frozen/Data')$q$, 'scan_run_scan_directory_id_fkey');
+-- Replaced, as the HINT says: turned off, and another added at the new path.
+SELECT pg_temp.scan_add('frozen/Elsewhere');
+
+-- mode_changed_at is the database's: the time the row was added, whatever
+-- the client sends, and then the time of each change of mode.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode, mode_changed_at)
+VALUES (pg_temp.scan_root(), 'mode/changes', 'epsych', 'UTC', 60, 'off', '2000-01-01 00:00Z');
+SELECT pg_temp.assert(
+    (SELECT mode_changed_at = now() AND created_at = now() FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('mode/changes'))
+    AND NOT EXISTS (SELECT 1 FROM lab.scan_directory WHERE mode_changed_at <> now()),
+    'mode_changed_at is the time the row was added, whatever the client sends');
+-- As if the row had been added on 1 May 2026.
+SELECT pg_temp.scan_mode_changed('mode/changes', '2026-05-01 00:00Z');
+-- An edit that leaves mode alone leaves it, also when it writes mode again;
+-- a client cannot set it.
+UPDATE lab.scan_directory SET notes = 'edited', scan_interval_min = 30, mode = 'off'
+WHERE scan_directory_id = pg_temp.scan_dir('mode/changes');
+SELECT pg_temp.assert(
+    (SELECT mode_changed_at = '2026-05-01 00:00Z' AND notes = 'edited' FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('mode/changes')),
+    'an edit that does not change mode leaves mode_changed_at');
+SELECT pg_temp.expect_error(format($q$UPDATE lab.scan_directory SET %s
+    WHERE scan_directory_id = pg_temp.scan_dir('mode/changes')$q$, v.assignment),
+    'mode_changed_at is kept by the database and cannot be set')
+FROM (VALUES ('mode_changed_at = now()'), ('mode_changed_at = ''2000-01-01 00:00Z'', notes = ''x'''),
+             ('mode_changed_at = DEFAULT')) AS v(assignment);
+-- A change of mode sets it, again whatever the client sends, and the edit is
+-- in row_history with both times.
+UPDATE lab.scan_directory SET mode = 'report', mode_changed_at = '2000-01-01 00:00Z'
+WHERE scan_directory_id = pg_temp.scan_dir('mode/changes');
+SELECT pg_temp.assert(
+    (SELECT mode_changed_at = now() AND mode = 'report' FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('mode/changes'))
+    AND (SELECT (h.old_row ->> 'mode') || '>' || (h.new_row ->> 'mode') || '|'
+                || ((h.old_row ->> 'mode_changed_at')::timestamptz = '2026-05-01 00:00Z') || '|'
+                || ((h.new_row ->> 'mode_changed_at')::timestamptz = now())
+         FROM lab.row_history h
+         WHERE h.table_name = 'scan_directory'
+           AND h.row_key = jsonb_build_object('scan_directory_id', pg_temp.scan_dir('mode/changes'))
+         ORDER BY h.history_id DESC LIMIT 1) = 'off>report|true|true',
+    'a change of mode sets mode_changed_at to now, whatever the client sends; the edit is '
+    'in row_history');
+SELECT pg_temp.scan_mode_changed('mode/changes', '2026-05-01 00:00Z');
+UPDATE lab.scan_directory SET mode = 'register'
+WHERE scan_directory_id = pg_temp.scan_dir('mode/changes');
+UPDATE lab.scan_directory SET mode = 'off'
+WHERE scan_directory_id = pg_temp.scan_dir('mode/changes');
+SELECT pg_temp.assert(
+    (SELECT mode_changed_at = now() FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('mode/changes')),
+    'every change of mode sets mode_changed_at: report to register, and to off');
+
+-- ---------------------------------------------------------------------------
+-- Runs and results: what their columns accept
+-- ---------------------------------------------------------------------------
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run (scan_directory_id, command, mode)
+    VALUES (pg_temp.scan_dir('frozen/Data'), 'scan', 'report')$q$, 'scan_run_command_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run (scan_directory_id, command, mode)
+    VALUES (pg_temp.scan_dir('frozen/Data'), 'run', 'off')$q$, 'scan_run_mode_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run (scan_directory_id, command, mode)
+    VALUES (-1, 'run', 'report')$q$, 'scan_run_scan_directory_id_fkey');
+-- Only a 'run' answers a scheduled time, and never one that has not come.
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at)
+    VALUES (pg_temp.scan_dir('frozen/Data'), 'apply', 'report', now())$q$, 'scan_run_due_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at)
+    VALUES (pg_temp.scan_dir('frozen/Data'), 'run', 'report', now() + interval '1 hour')$q$,
+    'scan_run_due_ck');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at, started_at)
+    VALUES (pg_temp.scan_dir('frozen/Data'), 'run', 'report', '2026-06-01 02:00:01Z', '2026-06-01 02:00Z')$q$,
+    'scan_run_due_ck');
+INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at)
+VALUES (pg_temp.scan_dir('frozen/Data'), 'run', 'report', now());
+
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run_result (scan_run_id, outcome)
+    SELECT max(scan_run_id), 'done' FROM lab.scan_run$q$, 'scan_run_result_outcome_ck');
+SELECT pg_temp.expect_error(format($q$INSERT INTO lab.scan_run_result (scan_run_id, outcome, %I)
+    SELECT max(scan_run_id), 'ok', -1 FROM lab.scan_run$q$, v.counter), 'scan_run_result_counts_ck')
+FROM (VALUES ('files_listed'), ('files_unchanged'), ('files_pending'), ('files_registered'),
+             ('files_known'), ('files_held'), ('files_ignored'), ('files_cleared'),
+             ('groups_registered'), ('groups_waiting'), ('groups_held'), ('bytes_read')) AS v(counter);
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run_result (scan_run_id, outcome, details)
+    SELECT max(scan_run_id), 'ok', '[1, 2]' FROM lab.scan_run$q$, 'scan_run_result_details_object_ck');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run_result (scan_run_id, outcome)
+    VALUES (-1, 'ok')$q$, 'scan_run_result_scan_run_id_fkey');
+INSERT INTO lab.scan_run_result (scan_run_id, outcome, files_listed, bytes_read, message, details)
+SELECT max(scan_run_id), 'unreachable', 0, 5000000000, 'the directory is empty', '{"skipped_roots": 0}'
+FROM lab.scan_run;
+SELECT pg_temp.assert(
+    (SELECT x.finished_at >= r.started_at AND x.files_held = 0 AND x.bytes_read = 5000000000
+     FROM lab.scan_run_result x JOIN lab.scan_run r USING (scan_run_id)
+     WHERE x.outcome = 'unreachable'),
+    'a result: counters default to 0, bytes_read is a bigint, finished_at is the database clock');
+-- A run ends once.
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_run_result (scan_run_id, outcome)
+    SELECT max(scan_run_id), 'ok' FROM lab.scan_run$q$, 'scan_run_result_pkey');
+
+-- ---------------------------------------------------------------------------
+-- The schedule, at fixed instants (lab.fn_scan_status)
+-- ---------------------------------------------------------------------------
+-- A daily search with no window, listed on 1 June 2026 at 02:00 UTC.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode, created_at)
+VALUES (pg_temp.scan_root(), 'sched/daily', 'epsych', 'America/New_York', 1440, 'register',
+        '2026-06-01 02:00Z');
+SELECT pg_temp.scan_mode_changed('sched/daily', '2026-06-01 02:00Z');
+
+-- Never searched: due from the moment it was listed; overdue one interval
+-- and 26 hours after that, and not a second before.
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-01 02:00Z' AND NOT s.is_due AND NOT s.is_overdue AND NOT s.is_running
+            AND s.window_open AND s.last_run_id IS NULL AND s.last_ok_run_id IS NULL
+            AND s.window_start_text IS NULL AND s.window_end_text IS NULL
+            AND s.storage_root = 'nas-scan' AND s.scan_interval_min = 1440
+            AND s.mode = 'register' AND s.mode_changed_at = '2026-06-01 02:00Z'
+            AND s.n_pending = 0 AND s.n_held = 0
+     FROM pg_temp.sched('sched/daily', '2026-06-01 01:59:59Z') s),
+    'never searched: due_at is created_at, and before it nothing is due');
+SELECT pg_temp.assert(
+    (SELECT s.is_due AND s.due_at = '2026-06-01 02:00Z'
+     FROM pg_temp.sched('sched/daily', '2026-06-01 02:00Z') s)
+    AND (SELECT s.is_due AND NOT s.is_overdue AND s.due_at = '2026-06-01 02:00Z'
+         FROM pg_temp.sched('sched/daily', '2026-06-03 04:00Z') s)
+    AND (SELECT s.is_due AND s.is_overdue AND s.due_at = '2026-06-01 02:00Z'
+         FROM pg_temp.sched('sched/daily', '2026-06-03 04:00:01Z') s),
+    'never searched: due at created_at, overdue after created_at + interval + 26 h');
+
+-- After 'ok': the next is that run's due_at plus the interval, whenever the
+-- run actually started and ended. Two daily runs, each started late, keep
+-- the time of day.
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-01 02:00Z', '2026-06-01 02:07Z', 'ok', '2026-06-01 02:31Z')
+       AS sched_run1 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-02 02:00Z' AND NOT s.is_due AND NOT s.is_overdue
+            AND s.last_run_id = :sched_run1 AND s.last_run_command = 'run'
+            AND s.last_run_mode = 'register' AND s.last_run_outcome = 'ok'
+            AND s.last_run_started_at = '2026-06-01 02:07Z'
+            AND s.last_run_finished_at = '2026-06-01 02:31Z'
+            AND s.last_ok_run_id = :sched_run1 AND s.last_ok_due_at = '2026-06-01 02:00Z'
+            AND s.last_ok_finished_at = '2026-06-01 02:31Z'
+     FROM pg_temp.sched('sched/daily', '2026-06-02 01:59:59Z') s)
+    AND (SELECT s.is_due AND s.due_at = '2026-06-02 02:00Z'
+         FROM pg_temp.sched('sched/daily', '2026-06-02 02:14Z') s),
+    'after ok: due one interval after the run''s due_at, not after its start or end');
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-02 02:00Z', '2026-06-02 02:14Z', 'ok', '2026-06-02 02:40Z')
+       AS sched_run2 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 02:00Z' AND NOT s.is_due AND s.last_ok_run_id = :sched_run2
+     FROM pg_temp.sched('sched/daily', '2026-06-02 12:00Z') s),
+    'anchored: two daily runs that each started late are due at the same time of day');
+
+-- A run made by hand (no due_at) is the latest run but never moves the
+-- schedule, whatever its outcome.
+SELECT pg_temp.scan_ran('sched/daily', NULL, '2026-06-02 10:00Z', 'ok', '2026-06-02 10:20Z', 'apply')
+       AS sched_hand1 \gset
+SELECT pg_temp.scan_ran('sched/daily', NULL, '2026-06-02 11:00Z', 'failed', '2026-06-02 11:01Z')
+       AS sched_hand2 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 02:00Z' AND NOT s.is_due
+            AND s.last_run_id = :sched_hand2 AND s.last_run_outcome = 'failed'
+            AND s.last_ok_run_id = :sched_run2 AND s.last_ok_due_at = '2026-06-02 02:00Z'
+     FROM pg_temp.sched('sched/daily', '2026-06-02 12:00Z') s),
+    'a run with no due_at does not move the schedule and is not the last ok scheduled run');
+
+-- Far behind: when the next due time is more than one interval before now,
+-- one search is owed, now. The overdue flag keeps counting from the last ok
+-- search: it is raised although due_at has moved up to now.
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 02:00Z' AND s.is_due AND NOT s.is_overdue
+     FROM pg_temp.sched('sched/daily', '2026-06-04 02:00Z') s)
+    AND (SELECT s.due_at = '2026-06-04 02:00:01Z' AND s.is_due AND NOT s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-06-04 02:00:01Z') s)
+    AND (SELECT s.due_at = '2026-06-05 04:00Z' AND s.is_due AND NOT s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-06-05 04:00Z') s)
+    AND (SELECT s.due_at = '2026-06-05 04:00:01Z' AND s.is_due AND s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-06-05 04:00:01Z') s)
+    AND (SELECT s.due_at = '2026-07-01 00:00Z' AND s.is_due AND s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-07-01 00:00Z') s),
+    'far behind: due_at moves up to now once it is more than one interval back; overdue '
+    'is counted from the last ok search, interval + 26 h after one was due');
+
+-- After 'partial': the rest is due at once. The last ok search stays the one
+-- before.
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-03 02:00Z', '2026-06-03 02:05Z', 'partial', '2026-06-03 03:00Z')
+       AS sched_run3 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 03:00:30Z' AND s.is_due AND NOT s.is_overdue
+            AND s.last_run_outcome = 'partial' AND s.last_ok_run_id = :sched_run2
+     FROM pg_temp.sched('sched/daily', '2026-06-03 03:00:30Z') s)
+    AND (SELECT s.due_at = '2026-06-04 12:00Z' AND s.is_due
+         FROM pg_temp.sched('sched/daily', '2026-06-04 12:00Z') s),
+    'after partial: due at once, at whatever instant it is asked');
+
+-- After 'failed' or 'unreachable': again after the interval or 60 minutes,
+-- whichever is shorter, counted from the end of the failed run.
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-03 03:00:30Z', '2026-06-03 03:00:40Z', 'failed',
+                        '2026-06-03 03:10Z') AS sched_run4 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 04:10Z' AND NOT s.is_due AND s.last_run_outcome = 'failed'
+            AND s.last_ok_run_id = :sched_run2
+     FROM pg_temp.sched('sched/daily', '2026-06-03 04:09:59Z') s)
+    AND (SELECT s.due_at = '2026-06-03 04:10Z' AND s.is_due
+         FROM pg_temp.sched('sched/daily', '2026-06-03 04:10Z') s),
+    'after failed: due 60 minutes after the run ended when the interval is longer');
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-03 04:10Z', '2026-06-03 04:15Z', 'unreachable',
+                        '2026-06-03 04:15:20Z') AS sched_run5 \gset
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 05:15:20Z' AND NOT s.is_due
+     FROM pg_temp.sched('sched/daily', '2026-06-03 05:00Z') s),
+    'after unreachable: the same wait as after failed');
+-- A directory searched every 15 minutes waits 15, not 60.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode, created_at)
+VALUES (pg_temp.scan_root(), 'sched/often', 'epsych', 'UTC', 15, 'report', '2026-06-01 00:00Z');
+SELECT pg_temp.scan_ran('sched/often', '2026-06-01 00:00Z', '2026-06-01 00:01Z', 'failed', '2026-06-01 00:02Z');
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-01 00:17Z' AND NOT s.is_due
+     FROM pg_temp.sched('sched/often', '2026-06-01 00:16:59Z') s)
+    AND (SELECT s.is_due FROM pg_temp.sched('sched/often', '2026-06-01 00:17Z') s),
+    'after failed: due one interval after the run ended when the interval is under 60 minutes');
+-- Searches that fail do not keep the directory from being overdue: that is
+-- counted from the last ok search (run 2, due 2 June 02:00, so the next was
+-- due on the 3rd at 02:00), not from due_at, which every failure moves.
+SELECT pg_temp.assert(
+    (SELECT NOT s.is_overdue FROM pg_temp.sched('sched/daily', '2026-06-05 04:00Z') s)
+    AND (SELECT s.is_overdue AND s.is_due AND s.due_at = '2026-06-03 05:15:20Z'
+         FROM pg_temp.sched('sched/daily', '2026-06-05 04:00:01Z') s),
+    'overdue is counted from the last ok search, so failing searches do not hide it');
+
+-- A run with no result is running, for 24 hours; it does not count for the
+-- schedule, so the directory stays as due as it was.
+SELECT pg_temp.scan_ran('sched/daily', '2026-06-03 05:15:20Z', '2026-06-03 05:20Z') AS sched_run6 \gset
+SELECT pg_temp.assert(
+    (SELECT s.is_running AND s.is_due AND s.due_at = '2026-06-03 05:15:20Z'
+            AND s.last_run_id = :sched_run6 AND s.last_run_started_at = '2026-06-03 05:20Z'
+            AND s.last_run_outcome IS NULL AND s.last_run_finished_at IS NULL
+     FROM pg_temp.sched('sched/daily', '2026-06-03 06:00Z') s)
+    AND (SELECT s.is_running FROM pg_temp.sched('sched/daily', '2026-06-04 05:19:59Z') s)
+    AND (SELECT NOT s.is_running AND s.is_due FROM pg_temp.sched('sched/daily', '2026-06-04 05:20Z') s),
+    'a run with no result is running for 24 hours and leaves the directory due');
+-- Its result, when it comes, counts: the schedule is anchored again.
+INSERT INTO lab.scan_run_result (scan_run_id, outcome, finished_at)
+VALUES (:sched_run6, 'ok', '2026-06-03 05:45Z');
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-04 05:15:20Z' AND NOT s.is_due AND NOT s.is_running
+            AND NOT s.is_overdue AND s.last_ok_run_id = :sched_run6
+     FROM pg_temp.sched('sched/daily', '2026-06-03 06:00Z') s),
+    'the result of a run moves the schedule when it is written');
+
+-- 'off': never due and never overdue, however long ago. Back on, a search is
+-- owed at once, but the directory is not overdue for the time it was off:
+-- that is counted again from the change of mode (here as if made on
+-- 1 September), one interval and 26 hours.
+UPDATE lab.scan_directory SET mode = 'off' WHERE scan_directory_id = pg_temp.scan_dir('sched/daily');
+SELECT pg_temp.assert(
+    (SELECT NOT s.is_due AND NOT s.is_overdue AND s.mode = 'off' AND s.due_at = '2026-09-01 00:00Z'
+            AND s.mode_changed_at = now()
+     FROM pg_temp.sched('sched/daily', '2026-09-01 00:00Z') s),
+    'a directory that is off is neither due nor overdue');
+UPDATE lab.scan_directory SET mode = 'report' WHERE scan_directory_id = pg_temp.scan_dir('sched/daily');
+SELECT pg_temp.scan_mode_changed('sched/daily', '2026-09-01 00:00Z');
+SELECT pg_temp.assert(
+    (SELECT s.is_due AND NOT s.is_overdue AND s.due_at = '2026-09-01 00:00Z'
+            AND s.mode_changed_at = '2026-09-01 00:00Z' AND s.last_ok_due_at = '2026-06-03 05:15:20Z'
+     FROM pg_temp.sched('sched/daily', '2026-09-01 00:00Z') s)
+    AND (SELECT s.is_due AND NOT s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-09-03 02:00Z') s)
+    AND (SELECT s.is_due AND s.is_overdue
+         FROM pg_temp.sched('sched/daily', '2026-09-03 02:00:01Z') s),
+    'turned on again after a long time: due at once, and overdue only one interval and '
+    '26 h after it was turned on');
+-- The same for a directory that was listed 'off' and never searched: its
+-- due_at is still created_at.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode, created_at)
+VALUES (pg_temp.scan_root(), 'sched/late', 'epsych', 'UTC', 1440, 'off', '2026-01-01 00:00Z');
+SELECT pg_temp.scan_mode_changed('sched/late', '2026-01-01 00:00Z');
+SELECT pg_temp.assert(
+    (SELECT NOT s.is_due AND NOT s.is_overdue AND s.due_at = '2026-01-01 00:00Z'
+     FROM pg_temp.sched('sched/late', '2026-08-31 00:00Z') s),
+    'listed off: neither due nor overdue, however long');
+UPDATE lab.scan_directory SET mode = 'register' WHERE scan_directory_id = pg_temp.scan_dir('sched/late');
+SELECT pg_temp.assert(
+    (SELECT mode_changed_at = now() FROM lab.scan_directory
+      WHERE scan_directory_id = pg_temp.scan_dir('sched/late')),
+    'turning a directory on sets mode_changed_at');
+SELECT pg_temp.scan_mode_changed('sched/late', '2026-09-01 00:00Z');
+SELECT pg_temp.assert(
+    (SELECT s.is_due AND NOT s.is_overdue AND s.due_at = '2026-01-01 00:00Z'
+            AND s.mode_changed_at = '2026-09-01 00:00Z'
+     FROM pg_temp.sched('sched/late', '2026-09-01 00:00Z') s)
+    AND (SELECT s.is_due AND NOT s.is_overdue FROM pg_temp.sched('sched/late', '2026-09-03 02:00Z') s)
+    AND (SELECT s.is_due AND s.is_overdue FROM pg_temp.sched('sched/late', '2026-09-03 02:00:01Z') s),
+    'listed off and turned on long after: due at once, not overdue until one interval and '
+    '26 h after it was turned on');
+-- A shorter interval takes effect from the last scheduled run.
+UPDATE lab.scan_directory SET scan_interval_min = 120
+WHERE scan_directory_id = pg_temp.scan_dir('sched/daily');
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-06-03 07:15:20Z' AND NOT s.is_due AND s.scan_interval_min = 120
+     FROM pg_temp.sched('sched/daily', '2026-06-03 07:00Z') s),
+    'a changed interval is counted from the last scheduled run''s due_at');
+UPDATE lab.scan_directory SET scan_interval_min = 1440
+WHERE scan_directory_id = pg_temp.scan_dir('sched/daily');
+
+-- ---------------------------------------------------------------------------
+-- The window, in the directory's time zone
+-- ---------------------------------------------------------------------------
+-- 22:00 to 06:00 New York time: wraps midnight. In January New York is UTC-5.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode, created_at, window_start, window_end)
+VALUES (pg_temp.scan_root(), 'sched/night', 'epsych', 'America/New_York', 1440, 'register',
+        '2026-01-01 00:00Z', '22:00', '06:00');
+SELECT pg_temp.assert(
+    (SELECT NOT s.window_open AND NOT s.is_due AND s.due_at = '2026-01-01 00:00Z'
+            AND s.window_start_text = '22:00' AND s.window_end_text = '06:00'
+     FROM pg_temp.sched('sched/night', '2026-01-10 02:59:59Z') s)
+    AND (SELECT s.window_open AND s.is_due FROM pg_temp.sched('sched/night', '2026-01-10 03:00Z') s)
+    AND (SELECT s.window_open AND s.is_due FROM pg_temp.sched('sched/night', '2026-01-10 05:00Z') s)
+    AND (SELECT s.window_open AND s.is_due FROM pg_temp.sched('sched/night', '2026-01-10 10:59:59Z') s)
+    AND (SELECT NOT s.window_open AND NOT s.is_due FROM pg_temp.sched('sched/night', '2026-01-10 11:00Z') s)
+    AND (SELECT NOT s.window_open AND NOT s.is_due FROM pg_temp.sched('sched/night', '2026-01-10 17:00Z') s),
+    'a window that wraps midnight is open from its start to its end, [start, end), and a '
+    'directory whose due time has passed waits for it');
+SELECT pg_temp.assert(
+    lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 03:00Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 11:00Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/daily'), '2026-01-10 11:00Z')
+    AND lab.fn_scan_window_open(-1, '2026-01-10 11:00Z') IS NULL
+    AND pg_temp.open_minutes('sched/night', '2026-01-10 00:00Z', '2026-01-11 00:00Z') = 480,
+    'fn_scan_window_open: the window test alone; no window is always open; no directory, NULL');
+-- In July New York is UTC-4: the same window, an hour earlier in UTC.
+SELECT pg_temp.assert(
+    NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-07-10 01:59:59Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-07-10 02:00Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-07-10 09:59:59Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-07-10 10:00Z'),
+    'the window follows the directory''s time zone through daylight saving');
+-- 09:00 to 17:00: does not wrap. An end at 00:00 means "until midnight".
+UPDATE lab.scan_directory SET window_start = '09:00', window_end = '17:00'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+SELECT pg_temp.assert(
+    NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 13:59:59Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 14:00Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 21:59:59Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 22:00Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 05:00Z'),
+    'a window that does not wrap is open from its start to its end only');
+UPDATE lab.scan_directory SET window_start = '22:30', window_end = '00:00'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+SELECT pg_temp.assert(
+    (SELECT s.window_start_text = '22:30' AND s.window_end_text = '00:00'
+     FROM pg_temp.sched('sched/night', '2026-01-10 12:00Z') s)
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 03:29:59Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 03:30Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 04:59:59Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 05:00Z')
+    AND pg_temp.open_minutes('sched/night', '2026-01-10 00:00Z', '2026-01-11 00:00Z') = 90,
+    'a window that ends at 00:00 is open until midnight');
+
+-- Daylight saving in America/New_York, 2026. On 8 March the clocks go from
+-- 02:00 to 03:00: a window inside the skipped hour does not open that day
+-- (it does the day before), and one across it is open for the hours that
+-- exist. The local day of 8 March is 23 hours long.
+UPDATE lab.scan_directory SET window_start = '02:15', window_end = '02:45'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+SELECT pg_temp.assert(
+    pg_temp.open_minutes('sched/night', '2026-03-07 05:00Z', '2026-03-08 05:00Z') = 30
+    AND pg_temp.open_minutes('sched/night', '2026-03-08 05:00Z', '2026-03-09 04:00Z') = 0
+    AND pg_temp.open_minutes('sched/night', '2026-03-09 04:00Z', '2026-03-10 04:00Z') = 30
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-07 07:20Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 07:20Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 06:20Z')
+    AND (SELECT NOT s.is_due AND NOT s.window_open
+         FROM pg_temp.sched('sched/night', '2026-03-08 07:20Z') s),
+    'spring forward: a window inside the skipped hour does not open that day');
+UPDATE lab.scan_directory SET window_start = '01:30', window_end = '03:30'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+SELECT pg_temp.assert(
+    pg_temp.open_minutes('sched/night', '2026-03-07 05:00Z', '2026-03-08 05:00Z') = 120
+    AND pg_temp.open_minutes('sched/night', '2026-03-08 05:00Z', '2026-03-09 04:00Z') = 60
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 06:29:59Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 06:30Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 07:29:59Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-03-08 07:30Z'),
+    'spring forward: a window across the skipped hour is open for the hours that exist');
+-- On 1 November the clocks go from 02:00 back to 01:00: the hour from 01:00
+-- comes twice, and a window inside it is open twice. The local day is 25
+-- hours long.
+UPDATE lab.scan_directory SET window_start = '01:15', window_end = '01:45'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+SELECT pg_temp.assert(
+    pg_temp.open_minutes('sched/night', '2026-10-31 04:00Z', '2026-11-01 04:00Z') = 30
+    AND pg_temp.open_minutes('sched/night', '2026-11-01 04:00Z', '2026-11-02 05:00Z') = 60
+    AND pg_temp.open_minutes('sched/night', '2026-11-02 05:00Z', '2026-11-03 05:00Z') = 30
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-11-01 05:30Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-11-01 05:50Z')
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-11-01 06:10Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-11-01 06:30Z')
+    AND (SELECT s.is_due AND s.window_open FROM pg_temp.sched('sched/night', '2026-11-01 06:30Z') s),
+    'fall back: a window inside the repeated hour is open twice that day');
+UPDATE lab.scan_directory SET window_start = '22:00', window_end = '06:00'
+WHERE scan_directory_id = pg_temp.scan_dir('sched/night');
+
+-- The session's time zone changes nothing. A daily search whose last ok run
+-- was due on 7 March at 03:30 New York time (08:30 UTC) is due 1440 minutes
+-- later -- 08:30 UTC on the 8th, which is 04:30 on the wall clock there --
+-- whatever zone the session is in; "one day later" in a session set to New
+-- York would be 03:30 there, 07:30 UTC.
+SELECT pg_temp.scan_ran('sched/night', '2026-03-07 08:30Z', '2026-03-07 08:31Z', 'ok', '2026-03-07 08:50Z');
+SELECT current_setting('TimeZone') AS scan_tz_before \gset
+SET LOCAL TimeZone = 'UTC';
+CREATE TEMP TABLE scan_sched_utc AS
+SELECT v.t AS asked_at, s.*
+FROM (VALUES ('2026-01-10 02:59:59Z'::timestamptz), ('2026-01-10 03:00Z'), ('2026-03-08 06:59Z'),
+             ('2026-03-08 07:30Z'), ('2026-03-08 08:29:59Z'), ('2026-03-08 08:30Z'),
+             ('2026-06-03 04:10Z'),
+             ('2026-06-05 04:00:01Z'), ('2026-11-01 05:30Z'), ('2026-11-01 06:30Z'),
+             ('2026-11-02 12:00Z')) AS v(t)
+CROSS JOIN LATERAL lab.fn_scan_status(v.t) s;
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-03-08 08:30Z' AND NOT s.is_due AND s.window_open
+     FROM pg_temp.sched('sched/night', '2026-03-08 08:29:59Z') s)
+    AND (SELECT s.is_due AND s.window_open FROM pg_temp.sched('sched/night', '2026-03-08 08:30Z') s),
+    'a daily interval is 1440 minutes: across the spring change the next search is due at '
+    'the same UTC time');
+SET LOCAL TimeZone = 'America/New_York';
+SELECT pg_temp.assert(
+    (SELECT s.due_at = '2026-03-08 08:30Z' AND NOT s.is_due
+     FROM pg_temp.sched('sched/night', '2026-03-08 08:29:59Z') s)
+    AND (SELECT s.is_due FROM pg_temp.sched('sched/night', '2026-03-08 08:30Z') s)
+    AND (SELECT count(*) FROM scan_sched_utc) >= 100
+    AND NOT EXISTS (
+        (SELECT * FROM scan_sched_utc
+         EXCEPT
+         SELECT v.asked_at, s.* FROM (SELECT DISTINCT asked_at FROM scan_sched_utc) v
+         CROSS JOIN LATERAL lab.fn_scan_status(v.asked_at) s)
+        UNION ALL
+        (SELECT v.asked_at, s.* FROM (SELECT DISTINCT asked_at FROM scan_sched_utc) v
+         CROSS JOIN LATERAL lab.fn_scan_status(v.asked_at) s
+         EXCEPT
+         SELECT * FROM scan_sched_utc)),
+    'the schedule is the same with the session in America/New_York as in UTC');
+SET LOCAL TimeZone = 'Pacific/Kiritimati';
+SELECT pg_temp.assert(
+    NOT EXISTS (
+        (SELECT * FROM scan_sched_utc
+         EXCEPT
+         SELECT v.asked_at, s.* FROM (SELECT DISTINCT asked_at FROM scan_sched_utc) v
+         CROSS JOIN LATERAL lab.fn_scan_status(v.asked_at) s)
+        UNION ALL
+        (SELECT v.asked_at, s.* FROM (SELECT DISTINCT asked_at FROM scan_sched_utc) v
+         CROSS JOIN LATERAL lab.fn_scan_status(v.asked_at) s
+         EXCEPT
+         SELECT * FROM scan_sched_utc))
+    AND NOT lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 02:59:59Z')
+    AND lab.fn_scan_window_open(pg_temp.scan_dir('sched/night'), '2026-01-10 03:00Z'),
+    'the schedule and the window are the same with the session 14 hours ahead of UTC');
+SET LOCAL TimeZone = :'scan_tz_before';
+
+-- What is due, the one longest due first; the view is the schedule now.
+SELECT pg_temp.assert(
+    (SELECT string_agg(f.relative_path, ',' ORDER BY f.ordinality)
+     FROM lab.fn_scan_due('2026-06-03 06:30Z') WITH ORDINALITY AS f
+     WHERE f.relative_path LIKE 'sched/%')
+    = 'sched/late,sched/often,sched/night'
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_scan_due('2026-06-03 06:30Z') f WHERE NOT f.is_due)
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_scan_due('2026-06-03 06:30Z') f WHERE f.mode = 'off'),
+    'fn_scan_due lists what is due at that instant, earliest due_at first: not what is '
+    'off, not yet due, or outside its window');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_directory_status) = (SELECT count(*) FROM lab.scan_directory)
+    AND NOT EXISTS (SELECT * FROM lab.scan_directory_status
+                    EXCEPT SELECT * FROM lab.fn_scan_status(now()))
+    AND NOT EXISTS (SELECT * FROM lab.fn_scan_status(NULL)
+                    EXCEPT SELECT * FROM lab.fn_scan_status())
+    AND NOT EXISTS (SELECT * FROM lab.fn_scan_due()
+                    EXCEPT SELECT * FROM lab.scan_directory_status WHERE is_due),
+    'scan_directory_status is fn_scan_status at now(), one row per directory; no instant '
+    'means now; fn_scan_due is its due rows');
+
+-- ---------------------------------------------------------------------------
+-- The scan memory (lab.scan_file, scan_file_latest, scan_held)
+-- ---------------------------------------------------------------------------
+-- A registered recording under intan_files/Data, to be named by the memory.
+INSERT INTO lab.subject (subject_id, project_id) VALUES ('SC1', '00000000-0000-0000-0000-0000000000b1');
+INSERT INTO lab.session (session_id, subject_id, label, storage_root_id, relative_path)
+VALUES ('00000000-0000-0000-0000-00000005c001', 'SC1', 'SC1_260601_101500', pg_temp.scan_root(),
+        'intan_files/Data/SC1/SC1_260601_101500');
+INSERT INTO lab.event (event_id, event_type, session_id, occurred_at)
+VALUES ('00000000-0000-0000-0000-00000005e001', 'recording',
+        '00000000-0000-0000-0000-00000005c001', '2026-06-01 14:15Z');
+INSERT INTO lab.recording_event (event_id) VALUES ('00000000-0000-0000-0000-00000005e001');
+INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, relative_path,
+                          checksum, session_id)
+VALUES ('00000000-0000-0000-0000-00000005a001', '00000000-0000-0000-0000-00000005e001',
+        pg_temp.scan_root(), 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', repeat('5a', 32),
+        '00000000-0000-0000-0000-00000005c001'),
+       ('00000000-0000-0000-0000-00000005a002', '00000000-0000-0000-0000-00000005e001',
+        pg_temp.scan_root('nas-scan-2'), 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', repeat('5b', 32),
+        '00000000-0000-0000-0000-00000005c001');
+
+-- First run: everything it sees is new. One file is held; one lies beside
+-- the directory, at a path a LIKE wildcard would put inside it.
+SELECT pg_temp.scan_ran('intan_files/Data', NULL, '2026-06-10 03:00Z', 'ok', '2026-06-10 03:05Z')
+       AS mem_run1 \gset
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                           group_key, status, reason_code, reason)
+VALUES (:mem_run1, pg_temp.scan_root(), ' intan_files\Data\SC1\SC1_260601_101500\a.rhd ', 1000,
+        1780000000123456789, 'SC1_260601_101500', 'pending', NULL, NULL),
+       (:mem_run1, pg_temp.scan_root(), 'intan_files/Data/SC1/SC1_260601_101500/b.rhd', 2000,
+        1780000060123456789, 'SC1_260601_101500', 'pending', NULL, NULL),
+       (:mem_run1, pg_temp.scan_root(), 'intan_files/Data/XX9/XX9_260601_120000/a.rhd', 0,
+        1780000000000000001, 'XX9_260601_120000', 'held', 'unknown_subject', 'XX9 is not a subject'),
+       (:mem_run1, pg_temp.scan_root(), 'INTAN_FILES/data/SC1/notes.txt', 12,
+        1780000000000000002, NULL, 'held', 'unrecognised_file', NULL),
+       (:mem_run1, pg_temp.scan_root(), 'intanXfiles/Data/SC1/c.rhd', 5, 5, NULL, 'pending', NULL, NULL),
+       (:mem_run1, pg_temp.scan_root(), 'intan_files/Database/d.rhd', 6, 6, NULL, 'held', 'x', NULL),
+       (:mem_run1, pg_temp.scan_root('nas-scan-2'), 'intan_files/Data/SC1/e.rhd', 7, 7, NULL,
+        'pending', NULL, NULL);
+SELECT pg_temp.assert(
+    (SELECT relative_path || '|' || mtime_ns FROM lab.scan_file
+      WHERE scan_run_id = :mem_run1 AND size_bytes = 1000)
+    = 'intan_files/Data/SC1/SC1_260601_101500/a.rhd|1780000000123456789',
+    'a memory row: path normalised like an artifact''s, mtime_ns kept to the nanosecond');
+SELECT pg_temp.assert(
+    (SELECT s.n_pending = 2 AND s.n_held = 2 FROM pg_temp.sched('intan_files/Data', now()) s)
+    AND (SELECT s.n_pending = 0 AND s.n_held = 0 FROM pg_temp.sched('epsych_files/Data', now()) s),
+    'n_pending and n_held count the latest rows under the directory on its root, without '
+    'regard to case, and not a sibling path or one only a LIKE wildcard would match');
+
+-- What a memory row may say.
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                               status, reason_code, artifact_id)
+    VALUES (%s, pg_temp.scan_root(), 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', %s)$q$,
+    :mem_run1, v.rest), v.pattern)
+FROM (VALUES
+    ('1, 1, ''seen'', NULL, NULL',                                             'scan_file_status_ck'),
+    ('-1, 1, ''pending'', NULL, NULL',                                         'scan_file_size_ck'),
+    ('NULL, 1, ''pending'', NULL, NULL',                                       'scan_file_listing_ck'),
+    ('1, NULL, ''held'', ''x'', NULL',                                         'scan_file_listing_ck'),
+    ('1, 1, ''held'', NULL, NULL',                                             'scan_file_held_ck'),
+    ('1, 1, ''held'', ''  '', NULL',                                           'scan_file_held_ck'),
+    ('1, 1, ''registered'', NULL, NULL',                                       'scan_file_artifact_ck'),
+    ('1, 1, ''known'', NULL, NULL',                                            'scan_file_artifact_ck'),
+    ('1, 1, ''pending'', NULL, ''00000000-0000-0000-0000-00000005a001''',      'scan_file_artifact_ck'),
+    ('1, 1, ''held'', ''x'', ''00000000-0000-0000-0000-00000005a001''',        'scan_file_artifact_ck'),
+    ('NULL, NULL, ''cleared'', NULL, ''00000000-0000-0000-0000-00000005a001''', 'scan_file_artifact_ck'),
+    ('1, 1, ''registered'', NULL, ''00000000-0000-0000-0000-0000000000ff''',   'scan_file_artifact_fk')
+    ) AS v(rest, pattern);
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns, status)
+    VALUES (%s, pg_temp.scan_root(), %L, 1, 1, 'pending')$q$, :mem_run1, v.path), 'scan_file_path_ck')
+FROM (VALUES (''), ('/abs/a.rhd'), ('S:/Data/a.rhd'), ('a/../b.rhd')) AS v(path);
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns, status)
+    VALUES (-1, pg_temp.scan_root(), 'a.rhd', 1, 1, 'pending')$q$, 'scan_file_scan_run_id_fkey');
+-- A 'registered' or 'known' row names an artifact at its own root and path:
+-- not the artifact of another path, of the same path in another case, or of
+-- the same path on another root.
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                               status, artifact_id)
+    VALUES (%s, pg_temp.scan_root(%L), %L, 1000, 1, %L, %L)$q$,
+    :mem_run1, v.root, v.path, v.status, v.artifact), 'scan_file_artifact_fk')
+FROM (VALUES
+    ('nas-scan', 'intan_files/Data/SC1/SC1_260601_101500/b.rhd', 'registered',
+     '00000000-0000-0000-0000-00000005a001'),
+    ('nas-scan', 'intan_files/Data/SC1/SC1_260601_101500/A.rhd', 'known',
+     '00000000-0000-0000-0000-00000005a001'),
+    ('nas-scan-2', 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', 'registered',
+     '00000000-0000-0000-0000-00000005a001'),
+    ('nas-scan', 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', 'known',
+     '00000000-0000-0000-0000-00000005a002')) AS v(root, path, status, artifact);
+
+-- Second run, a day later: a.rhd is registered; b.rhd has grown and waits
+-- again; the unknown subject's file changed and is still held for the same
+-- reason; the text file is gone.
+SELECT pg_temp.scan_ran('intan_files/Data', NULL, '2026-06-11 03:00Z', 'ok', '2026-06-11 03:05Z')
+       AS mem_run2 \gset
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                           group_key, status, reason_code, reason, artifact_id)
+VALUES (:mem_run2, pg_temp.scan_root(), 'intan_files/Data/SC1/SC1_260601_101500/a.rhd', 1000,
+        1780000000123456789, 'SC1_260601_101500', 'registered', NULL, NULL,
+        '00000000-0000-0000-0000-00000005a001'),
+       (:mem_run2, pg_temp.scan_root(), 'intan_files/Data/SC1/SC1_260601_101500/b.rhd', 2500,
+        1780090000123456789, 'SC1_260601_101500', 'pending', NULL, NULL, NULL),
+       (:mem_run2, pg_temp.scan_root(), 'intan_files/Data/XX9/XX9_260601_120000/a.rhd', 64,
+        1780090000000000001, 'XX9_260601_120000', 'held', 'unknown_subject', 'XX9 is not a subject', NULL),
+       (:mem_run2, pg_temp.scan_root(), 'INTAN_FILES/data/SC1/notes.txt', NULL, NULL, NULL,
+        'cleared', NULL, NULL, NULL);
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_file_latest WHERE scan_run_id IN (:mem_run1, :mem_run2)) = 7
+    AND (SELECT string_agg(status || ' ' || coalesce(size_bytes::text, '-'), ','
+                           ORDER BY relative_path COLLATE "C")
+         FROM lab.scan_file_latest
+         WHERE storage_root_id = pg_temp.scan_root() AND lower(relative_path) LIKE 'intan\_files/data/%')
+        = 'cleared -,registered 1000,pending 2500,held 64'
+    AND (SELECT artifact_id FROM lab.scan_file_latest WHERE status = 'registered')
+        = '00000000-0000-0000-0000-00000005a001',
+    'scan_file_latest is the latest row per storage root and path, by insertion order');
+SELECT pg_temp.assert(
+    (SELECT s.n_pending = 1 AND s.n_held = 1 FROM pg_temp.sched('intan_files/Data', now()) s),
+    'the counts follow the latest rows: a registered and a cleared file are counted no more');
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_held WHERE storage_root = 'nas-scan') = 2
+    AND (SELECT h.scan_directory_id = pg_temp.scan_dir('intan_files/Data')
+                AND h.scan_run_id = :mem_run2 AND h.storage_root_id = pg_temp.scan_root()
+                AND h.size_bytes = 64 AND h.mtime_ns = 1780090000000000001
+                AND h.group_key = 'XX9_260601_120000' AND h.reason = 'XX9 is not a subject'
+                AND h.held_at = '2026-06-11 03:00Z' AND h.first_held_at = '2026-06-10 03:00Z'
+         FROM lab.scan_held h WHERE h.reason_code = 'unknown_subject')
+    AND (SELECT h.first_held_at = '2026-06-10 03:00Z' AND h.held_at = '2026-06-10 03:00Z'
+         FROM lab.scan_held h WHERE h.relative_path = 'intan_files/Database/d.rhd'),
+    'scan_held: the latest rows that are held, with the directory of the run, the root''s '
+    'name and when the file was first held for that reason');
+-- A hold for another reason, or one that was lifted in between, starts again.
+SELECT pg_temp.scan_ran('intan_files/Data', NULL, '2026-06-12 03:00Z', 'ok', '2026-06-12 03:05Z')
+       AS mem_run3 \gset
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                           status, reason_code)
+VALUES (:mem_run3, pg_temp.scan_root(), 'intan_files/Data/XX9/XX9_260601_120000/a.rhd', 64,
+        1780090000000000001, 'held', 'mislabelled_folder'),
+       (:mem_run3, pg_temp.scan_root(), 'intan_files/Database/d.rhd', 6, 6, 'pending', NULL);
+SELECT pg_temp.scan_ran('intan_files/Data', NULL, '2026-06-13 03:00Z', 'ok', '2026-06-13 03:05Z')
+       AS mem_run4 \gset
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                           status, reason_code)
+VALUES (:mem_run4, pg_temp.scan_root(), 'intan_files/Database/d.rhd', 6, 6, 'held', 'x');
+SELECT pg_temp.assert(
+    (SELECT h.first_held_at = '2026-06-12 03:00Z' FROM lab.scan_held h
+      WHERE h.reason_code = 'mislabelled_folder')
+    AND (SELECT h.first_held_at = '2026-06-13 03:00Z' AND h.scan_run_id = :mem_run4
+         FROM lab.scan_held h WHERE h.relative_path = 'intan_files/Database/d.rhd')
+    AND NOT EXISTS (SELECT 1 FROM lab.scan_held h WHERE h.reason_code = 'unknown_subject'),
+    'first_held_at starts again when the reason changes or the hold was lifted in between');
+
+-- The memory is append-only, and so are the runs and their results.
+SELECT pg_temp.expect_error('UPDATE lab.scan_file SET status = ''registered''', 'append-only log');
+SELECT pg_temp.expect_error('DELETE FROM lab.scan_file', 'append-only log');
+SELECT pg_temp.expect_error('TRUNCATE lab.scan_file', 'not allowed');
+SELECT pg_temp.expect_error('UPDATE lab.scan_run SET due_at = NULL', 'append-only log');
+SELECT pg_temp.expect_error('DELETE FROM lab.scan_run_result', 'append-only log');
+
+-- Renaming the subject of a registered file leaves the memory as it is: it
+-- holds no subject, and the key it refers to is not the subject's.
+CREATE TEMP TABLE scan_file_before AS SELECT * FROM lab.scan_file;
+SELECT lab.fn_rename_subject('SC1', 'SC1-renamed');
+SELECT pg_temp.assert(
+    (SELECT a.subject_id FROM lab.scan_file_latest l JOIN lab.artifact a USING (artifact_id)
+      WHERE l.status = 'registered') = 'SC1-renamed'
+    AND NOT EXISTS (SELECT * FROM scan_file_before EXCEPT SELECT * FROM lab.scan_file)
+    AND NOT EXISTS (SELECT * FROM lab.scan_file EXCEPT SELECT * FROM scan_file_before),
+    'a subject rename passes through the artifact a memory row names and changes no memory row');
+
+-- ---------------------------------------------------------------------------
+-- Integrity: an overlap that got past the trigger is reported
+-- ---------------------------------------------------------------------------
+ALTER TABLE lab.scan_directory DISABLE TRIGGER trg_scan_directory_policy;
+SELECT pg_temp.scan_add('INTAN_FILES/data/SC1');
+SELECT pg_temp.scan_add('intanXfiles/Data');
+-- Equal paths are refused by the unique index, with or without the trigger.
+SELECT pg_temp.expect_error($q$SELECT pg_temp.scan_add('Intan_Files/DATA')$q$, 'uq_scan_directory_path');
+ALTER TABLE lab.scan_directory ENABLE TRIGGER trg_scan_directory_policy;
+SELECT pg_temp.assert(
+    (SELECT string_agg(severity || '|' || subject || '|' || detail, ';')
+     FROM lab.fn_check_integrity() WHERE check_name = 'scan_directory_overlap')
+    = format('warning|%s|directory intan_files/Data on storage root %s and scan directory %s '
+             '(INTAN_FILES/data/SC1) are equal or nested',
+             pg_temp.scan_dir('intan_files/Data'), pg_temp.scan_root(),
+             pg_temp.scan_dir('INTAN_FILES/data/SC1')),
+    'scan_directory_overlap reports a nested pair once, under the lower id, and nothing else');
+-- The rows can still be edited apart: turning one off needs no check.
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET notes = 'x'
+    WHERE scan_directory_id = pg_temp.scan_dir('INTAN_FILES/data/SC1')$q$, '\(intan_files/Data\) is the same');
+UPDATE lab.scan_directory SET mode = 'off', notes = 'overlapped intan_files/Data'
+WHERE scan_directory_id = pg_temp.scan_dir('INTAN_FILES/data/SC1');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'scan_directory_overlap'),
+    'with one of the two off the overlap is gone');
 
 -- ---------------------------------------------------------------------------
 -- Client metadata probes
