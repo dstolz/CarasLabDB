@@ -59,6 +59,7 @@ mcp-server/
       tags.py                       # get_tag_namespaces, get_tags, get_entity_tags, find_by_tags
       variables.py                  # get_variable_definitions, get_variables, find_by_variable
       summary.py                    # get_counts (fixed aggregate questions)
+      scans.py                      # get_scan_directories, get_scan_runs, get_scan_files
       health.py                     # get_integrity_report
   tests/                            # pytest: unit (no DB) + integration
 ```
@@ -224,8 +225,9 @@ unique-column tiebreaker; the tag log by `assignment_id` (the order
 by its primary or unique key (`subject_id`; `subject_id, label` for
 sessions; `event_id, artifact_id` for consumption edges; `edge_type, from_id,
 to_id` for provenance edges; and so on). The lineage walk is ordered by
-`depth, event_id, artifact_id`, and the integrity report by severity, check,
-subject and detail.
+`depth, event_id, artifact_id`, the integrity report by severity, check,
+subject and detail, and the NAS-search tools newest first (`scan_run_id`,
+`scan_file_id`; the list of directories by storage root, path and id).
 
 The `truncated` flag exists because the alternative — an LLM reading a
 silently clipped result as the complete answer and telling a researcher
@@ -234,8 +236,8 @@ one.
 
 **Paging.** The listings that grow without bound — `get_events`,
 `get_artifacts`, `get_subjects`, `get_sessions`, `get_entity_tags` (current
-tags and the assignment log), `get_variables`, `find_by_variable` and
-`get_artifact_verifications` — take an opaque `cursor` and return
+tags and the assignment log), `get_variables`, `find_by_variable`, `get_artifact_verifications`,
+`get_scan_runs` and `get_scan_files` — take an opaque `cursor` and return
 `next_cursor`: the cursor that continues after the last row of a truncated
 page, `null` when nothing is left. Calling again with the same arguments and
 `cursor=<next_cursor>` returns the next page; `limit` still caps each page
@@ -314,7 +316,8 @@ through these tools. Every list tool also takes `limit: int = 200`.
 | `tags.py` | `get_tag_namespaces` (namespaces and their policy flags, `applies_to` as a JSON list), `get_tags(namespace, include_retired)` (the vocabulary), `get_entity_tags(entity_kind, entity_id, include_history)` (current tags from `lab.tag_current` ordered by tag, or with `include_history` the full assignment log, latest first by `assignment_id`; pageable), `find_by_tags(entity_kind, all_of, any_of, none_of, active_only)` (wraps `lab.fn_find_by_tags`; returns `entity_id` rows) |
 | `variables.py` | `get_variable_definitions(entity_kind, include_retired)` (`lab.variable`), `get_variables(entity_kind, entity_id, name, current_only, active_only)` (current values from `lab.variable_current`, or with `current_only=False` the `lab.variable_value` log oldest first; pageable), `find_by_variable(entity_kind, name, equals, at_least, at_most, text_equals, active_only)` (entities by current value; pageable) |
 | `summary.py` | `get_counts(question, subject_id, project_id, entity_kind, active_only)` — exact counts: `events_by_type`, `artifacts_by_role` (with `total_size_bytes`), `subjects_by_project_species`, `sessions_per_subject`, `current_tags_by_tag`, `current_variables_by_variable` |
-| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 15 checks described in the docstring — an integration test compares the list with the function; errors first; empty means healthy) |
+| `scans.py` | The NAS search of [nas-import.md](nas-import.md): `get_scan_directories(scan_directory_id, storage_root_id, mode, due_only, overdue_only)` (`lab.scan_directory_status`: the administrator's list of directories with its schedule as the database computes it, `mode`, `due_at`, `is_due`, `is_overdue`, `is_running`, `n_pending`, `n_held`), `get_scan_runs(scan_directory_id, outcome, command, started_from, started_before)` (`lab.scan_run` joined to its `lab.scan_run_result`, newest first; the result columns are null for a run with no result; pageable), `get_scan_files(storage_root_id, relative_path, relative_path_prefix, status, reason_code, scan_run_id, group_key, latest_per_file)` (the scan memory: each file's latest state from `lab.scan_file_latest`, or with `latest_per_file=False` the log `lab.scan_file`; `status="held"` lists what waits for a person with the `reason_code` and `reason`; pageable). Paths are matched as `get_artifacts` matches them. Read only: the tool that writes is `tools/import_nas_files.py`. |
+| `health.py` | `get_integrity_report` (wraps `lab.fn_check_integrity()`, all 16 checks described in the docstring — an integration test compares the list with the function; errors first; empty means healthy) |
 
 ### Corrections: current rows, history, and lineage
 

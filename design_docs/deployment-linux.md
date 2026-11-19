@@ -56,7 +56,7 @@ substitute your actual path throughout. The logins it uses are those of
 [deployment-windows.md](deployment-windows.md) §0.1: a non-superuser owner
 `lab_admin`, the group roles `lab_rw` and `lab_ro` (never logins), one login
 per lab member, and the service logins `lab_dashboard`, `lab_mcp` (both in
-`lab_ro`) and `lab_verifier` (in `lab_rw`).
+`lab_ro`), `lab_verifier` and `lab_scanner` (both in `lab_rw`).
 
 ---
 
@@ -156,7 +156,14 @@ VALUES ('Jane Doe', 'jdoe@example.edu', 'student', 'jdoe');
 CREATE ROLE lab_dashboard LOGIN PASSWORD 'CHANGE_ME_DASH' IN ROLE lab_ro;
 CREATE ROLE lab_mcp       LOGIN PASSWORD 'CHANGE_ME_MCP'  IN ROLE lab_ro;
 CREATE ROLE lab_verifier  LOGIN PASSWORD 'CHANGE_ME_VER'  IN ROLE lab_rw;
+CREATE ROLE lab_scanner   LOGIN PASSWORD 'CHANGE_ME_SCAN' IN ROLE lab_rw;
+GRANT INSERT ON lab.scan_run, lab.scan_run_result, lab.scan_file TO lab_scanner;
 ```
+
+`lab_scanner` runs the scheduled NAS search (§5); it needs the `GRANT`
+because `grants.sql` withholds the scan logs from `lab_rw`. To let a member
+manage the list of directories it searches, `GRANT INSERT, UPDATE ON
+lab.scan_directory TO jdoe;` ([nas-import.md](nas-import.md) §3.3).
 
 The database stamps the connected login on every row a client writes and
 uses `lab.person.db_login` (through `lab.fn_current_person()`) to fill
@@ -493,6 +500,28 @@ and, as any login (e.g. `lab_dashboard`), `psql -X -tA -h localhost -U
 lab_dashboard -d lab -c "SELECT * FROM lab.fn_check_integrity()"`: an empty
 result is healthy. Schedule the verifier weekly and the integrity report
 daily from cron, with the password in that OS user's `~/.pgpass`.
+
+**Searching the NAS for new files.** `tools/import_nas_files.py` registers the
+files on the NAS that the database does not know yet, in the directories the
+administrator lists in `lab.scan_directory` ([nas-import.md](nas-import.md)).
+On a machine that mounts the NAS, as `lab_scanner` (it needs `pip install
+"psycopg[binary]"`), `run` wakes every 15 minutes and searches only the
+directories that are due, and `check` exits 1 when one is overdue. Register
+the storage root, put its `.caraslabdb-root.json` marker in it, and list the
+directories in `report` mode first. Cron *(not verified in this repository's
+testing)*, with the password in that user's `~/.pgpass`; `flock -n` keeps a
+slow search from piling up processes (the tool also takes a lock per
+directory):
+
+```cron
+*/15 * * * * PGHOST=dbhost PGDATABASE=lab PGUSER=lab_scanner flock -n /var/lock/caraslabdb-nas-search.lock python3 /srv/CarasLabDB/tools/import_nas_files.py run --root nas-rig3=/mnt/nas-rig3 --report-dir /var/lib/caraslabdb/nas-reports --cache-file /var/lib/caraslabdb/nas-headers.json --log-file /var/log/caraslabdb/nas-search.log
+15 8 * * *   PGHOST=dbhost PGDATABASE=lab PGUSER=lab_scanner python3 /srv/CarasLabDB/tools/import_nas_files.py check --root nas-rig3=/mnt/nas-rig3 --log-file /var/log/caraslabdb/nas-check.log || echo "CarasLabDB NAS search needs attention" | mail -s "CarasLabDB NAS search" admin@example.edu
+```
+
+`run` exits 1 when a directory ended `failed` or `unreachable` and 2 on a
+usage or connection error; alert on both. The folders of `--log-file` and
+`--cache-file` must exist. [deployment-windows.md](deployment-windows.md)
+§4.4 describes the exit codes and the first run.
 
 **Schema upgrades** (from launch on) follow [deployment-windows.md](deployment-windows.md) §6:
 back up, stop the clients, apply the migration as `lab_admin` with

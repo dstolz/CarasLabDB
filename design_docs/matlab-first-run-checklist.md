@@ -15,7 +15,8 @@ What this does **not** establish:
   and the fixture are written for both, but only the Linux half has been
   exercised.
 - **Most of the GUI is not covered by automated tests.** `TagGuiTests` drives
-  the browse filters, the tag editor and the variables editor. The forms, the
+  the browse filters, the tag editor, the variables editor and the "Scan
+  directories" dialog. The forms, the
   change preview, the retract dialog, the daily husbandry grid, the integrity
   window, the login dialog and export are untested by any machine.
 - **Real keys are not pressed.** `matlab.uitest` has no key-press gesture, so
@@ -143,6 +144,17 @@ by nobody:
       case matches `RAW.DAT` for `^raw\.dat$` on Windows. Record… on a
       moved file writes the row at the new path, an `ok` check and the
       `moved` disposition (check them in `lab.artifact_disposition`).
+- [ ] **Scan directories (Ctrl+Shift+D), on Windows.** With the schema owner's
+      login (or a member granted INSERT and UPDATE on `lab.scan_directory`):
+      the list shows each directory with its schedule; Ctrl+N then Ctrl+S adds
+      one in `report` mode; the interval is a number and a unit, stored as
+      whole minutes; the hours are two `HH:mm` boxes and `22:00` to `04:00` is
+      accepted; the time zone box starts as this computer's, and the name it
+      offers (an IANA name such as `America/New_York`) is accepted by the
+      database. With an ordinary member login the same list is read-only and
+      every control that writes is disabled, with a line that says so. Once
+      the tool has searched a directory its root, path, layout and time zone
+      are disabled.
 - [ ] **Login.** With a mapped login and a blank email there is no prompt and
       the status bar shows the person. With an unmapped login and a blank
       email the "No person set" confirmation appears, and "Go back" leaves no

@@ -11,6 +11,7 @@ drop — repeatedly — without touching production data. The schema, the
 privileges, the Python tools and the MCP server have
 automated tests (`tests/schema_test.sql`, `tests/roles_test.sql`,
 `tests/check_verify_artifacts.py`, `tests/check_lab_data.py`,
+`tests/check_nas_import_parsing.py`, `tests/check_import_nas_files.py`,
 `mcp-server/tests/`), which CI (`.github/workflows/tests.yml`) runs on
 PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
 `matlab.unittest` suite in `tests/matlab/` (§2.7) that runs locally only,
@@ -25,7 +26,7 @@ The parts this guide covers and how each is tested:
 |------|-----------------|------------------|
 | PostgreSQL schema (`design_docs/schema.sql`) | DDL loads; append-only triggers, views, and lineage function behave | — |
 | Privileges (`design_docs/grants.sql`) | Members of `lab_rw` / `lab_ro` can do exactly what they should | — |
-| Tools (`tools/`) | Backup, restore and file verification work against `lab_test` | — |
+| Tools (`tools/`) | Backup, restore and file verification work against `lab_test`; the NAS importer reads its fixture trees and registers them in a database of its own | — |
 | MATLAB interface (`@CarasLabDB`) + GUI (`@CarasLabDBApp`) | Connect, insert every event type, retrieve, supersede, retract, variables, read-only SQL guard | Yes |
 | Web dashboard (`web/lab-dashboard.html`) | Renders from in-page synthetic data | No |
 
@@ -369,7 +370,7 @@ dropdb -U postgres lab_roles
 
 **Pass:** it ends with `roles_test.sql: all assertions passed`.
 
-### 1.5 Test the tools: backup, restore, file verification, dashboard export
+### 1.5 Test the tools: backup, restore, file verification, NAS import, dashboard export
 
 `tools/backup_lab.py` and `tools/restore_lab.py` need only Python 3 and the
 PostgreSQL client programs, and run as a superuser (`postgres` here, with
@@ -418,6 +419,57 @@ dropdb -U postgres lab_forms
 publishes templates, records, corrects and withdraws entries, and compares
 each subject's CSV with the database byte for byte, including a file locked
 as Excel locks it and a file edited by hand.
+
+The NAS importer ([nas-import.md](nas-import.md)) has two checks. The first
+needs no database and only the standard library. It builds fixture trees in
+a temporary folder and tests the walker, the file-name grammar, the MAT 5.0
+reader (against files written by scipy, kept under `tests/testdata/nas_import`),
+the Intan `.rhd` header reader (against headers built in the test), the
+subject and overrides rules, the pairing rule and its boundaries, ids and
+digests, the header cache, and the anomalies of the first profile of the
+lab's RIG3 backup:
+
+```powershell
+python tests\check_nas_import_parsing.py
+```
+
+**Pass:** `check_nas_import_parsing: OK`.
+
+The second drives `tools\import_nas_files.py` (`run`, `check`, `scan` and
+`apply`) as a user would, against PostgreSQL. It commits rows, creates throw-away roles and
+backdates its own `lab.scan_run` rows, so run it as a superuser on a database
+of its own with the schema **and** the grants (it needs
+`pip install "psycopg[binary]"`):
+
+```powershell
+createdb -U postgres lab_nas
+psql -U postgres -d lab_nas -X -q -v ON_ERROR_STOP=1 -f design_docs/schema.sql -f design_docs/grants.sql
+$env:PGUSER = "postgres"; $env:PGDATABASE = "lab_nas"; python tests\check_import_nas_files.py
+dropdb -U postgres lab_nas
+```
+
+**Pass:** each check prints `ok` with its time, then `N checks, M assertions`
+and `check_import_nas_files: OK`. Words after the script name run only the
+checks whose name contains one of them
+(`python tests\check_import_nas_files.py first_sighting`). It covers: the
+first sighting registers nothing, the second after the minimum age does, and
+the third reads nothing; a change restarts the wait; an incomplete listing
+fails the run and writes no memory; an unmounted directory is `unreachable`;
+a touched file becomes `known`; every hold an unattended run must not
+resolve; pairing in either search order and a recording registered from a
+copy; daylight-saving times; `report` mode against `register` mode; two
+processes on one directory; the scanner login against a plain member;
+`check` exiting 1 when overdue, overlapping or a root is not given; every
+file accounted for; overrides; `--dry-run`; a lost connection, a window that
+closes and a file that changes while it is read; `scan` writes nothing and
+gives the same plan twice, and `apply` registers exactly that plan; an added
+file is one artifact, a changed file one artifact and one `replaced`
+disposition; a late recording and a subject override after registration are
+each one correction (tags and variables carried); `apply` refuses what is no
+longer as the scan found it, and `--only` applies the groups named. What it
+does **not** cover: a real NAS or a Windows share, any file written by the
+lab's software, and the Task Scheduler definitions. It never drives a clock
+option of the tool: a sighting is made old by inserting a backdated run.
 
 ---
 
@@ -528,8 +580,13 @@ syntax, the vocabulary, assigning tags, the tag filters (checked against
 `lab.fn_find_by_tags`), carry-forward on correction, subject rename, argument
 validation, transactions, and `examples/carasLabDB_demo.m`. `VariableTests`
 covers variables, retraction, the person-from-login mapping, the husbandry
-batch and file registration. `TagGuiTests` drives `CarasLabDBApp`'s browse
-filters, tag editor and variables editor with `matlab.uitest`.
+batch and file registration. `ScanDirectoryTests` covers the methods for the
+list of NAS directories searched for new files (`getScanDirectories`,
+`addScanDirectory`, `updateScanDirectory`, `getScanRuns`, `getScanFiles`,
+`canEditScanDirectories`) and the database's refusals reaching the caller.
+`TagGuiTests` drives `CarasLabDBApp`'s browse filters, tag editor, variables
+editor and "Scan directories" dialog (read-only for a member; the owner adds
+and edits a directory) with `matlab.uitest`.
 
 CI runs the whole suite on Linux in MATLAB R2024b, R2025a and the latest
 release (the `matlab` job of `.github/workflows/tests.yml`; its entry point is
@@ -564,8 +621,10 @@ pager and with no input, because MATLAB runs commands on a pseudo-terminal.
 **Pass:** no failures. The suite cannot press real keys (`matlab.uitest` has
 no key-press gesture), so it tests each shortcut through the window's
 `KeyPressFcn`. Check by hand that Ctrl+T works from the keyboard and, in the
-tag editor, Ctrl+Enter, Ctrl+S, Delete, Ctrl+R, Esc and Ctrl+?, and that
-Enter in the editor's Value box moves focus to Add or Set.
+tag editor, Ctrl+Enter, Ctrl+S, Delete, Ctrl+R, Esc and Ctrl+?, that
+Enter in the editor's Value box moves focus to Add or Set, and that
+Ctrl+Shift+D opens "Scan directories" (and Ctrl+S, Ctrl+N, Ctrl+R and Esc
+work in it).
 
 **The toolboxes that use `+labclient`.** With a checkout of a toolbox that
 records through the package at hand (epsych2, ephys_analysis), check its calls
@@ -630,6 +689,17 @@ Log in against `localhost` / `lab_test` / `test_rw`, then verify each surface
       and files while listing, then fills by bytes read with the file name,
       time taken and time left; Stop ends the search, and the status line
       says what was listed, read and found.
+- [ ] "Scan directories…" (Ctrl+Shift+D) lists the directories of
+      `lab.scan_directory` with their schedule. As `test_rw` the top line says
+      the list is read-only and every control that writes is disabled. As the
+      schema owner: New (Ctrl+N), choose a root and a layout, a path, an
+      interval of 1 hour and hours `01:00` to `05:00`, Ctrl+S: the directory is
+      listed in `report` mode and selected. A start such as `25:00` is refused
+      under the form and nothing is written; a path nested in another
+      directory's is refused with the database's message. After a run of
+      `tools/import_nas_files.py` on it, the Runs tab lists the run, "Held
+      files" lists what is held with its reason code, and its root, path,
+      layout and time zone are disabled with a tooltip.
 - [ ] Ctrl+? lists the shortcuts.
 - [ ] "Custom SQL" tab runs a `SELECT`/`WITH` query and **rejects** a write.
 - [ ] Closing the window persists preferences (reopen: fields remembered, password not).
@@ -729,6 +799,9 @@ Run top to bottom against `lab_test` before you deploy to a server:
       (`#`) narrows the tables.
 - [ ] `check_forms_server.py` prints OK (§1.5), and the forms page passes
       its checklist (§4.1).
+- [ ] `check_nas_import_parsing.py` and `check_import_nas_files.py` print OK
+      (§1.5), and the "Scan directories" dialog passes its checklist item
+      (§3).
 
 ---
 

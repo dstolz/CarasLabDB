@@ -45,7 +45,7 @@ only where noted.
 | Live dashboard | Python 3; `psql` on the PATH, or the `psycopg` package | The lab server, bound to 127.0.0.1 |
 | Forms server | Python 3 with the `psycopg` package | The lab server, bound to 127.0.0.1 |
 | Reverse proxy | IIS with URL Rewrite and Application Request Routing (ARR) | The lab server |
-| Scheduled jobs | Python 3; the PostgreSQL client programs; `psycopg` for the verifier | The lab server (the verifier on any machine that mounts the NAS) |
+| Scheduled jobs | Python 3; the PostgreSQL client programs; `psycopg` for the verifier and the NAS search | The lab server (the verifier and the NAS search on any machine that mounts the NAS) |
 | MATLAB interface + GUI | MATLAB **R2024b+** with **Database Toolbox** | Each researcher workstation |
 | Static demo dashboard | Any modern browser | Anywhere |
 
@@ -58,13 +58,14 @@ whatever you choose consistent.
 |---|---|---|---|
 | `postgres` | superuser, created by the installer | the backup job and the restore runbook only | everything |
 | `lab_admin` | login, **not** a superuser, `CREATEROLE` | the lab's database administrator: owns the database and schema, applies migrations, creates and disables logins, renames subjects | owner of `lab` |
-| `lab_rw` | group role, never a login | inherited by every lab member and by the verifier | read, append, edit the descriptive tables ([`grants.sql`](grants.sql)) |
+| `lab_rw` | group role, never a login | inherited by every lab member, by the verifier and by the NAS search | read, append, edit the descriptive tables ([`grants.sql`](grants.sql)) |
 | `lab_ro` | group role, never a login | inherited by the dashboard and the MCP server | read only |
 | `jdoe`, ... | one login per lab member, `IN ROLE lab_rw` | that person's MATLAB client and GUI | those of `lab_rw` |
 | `lab_dashboard` | login, `IN ROLE lab_ro` | the live dashboard | those of `lab_ro` |
 | `lab_mcp` | login, `IN ROLE lab_ro` | the MCP server ([mcp-server.md](mcp-server.md)) | those of `lab_ro` |
 | `lab_forms` | login, `IN ROLE lab_ro` | the forms server's CSV rewrites (§3.6); members enter data under their own logins | those of `lab_ro` |
 | `lab_verifier` | login, `IN ROLE lab_rw` | `tools\verify_artifacts.py` | those of `lab_rw` |
+| `lab_scanner` | login, `IN ROLE lab_rw` | the scheduled NAS search, `tools\import_nas_files.py run` (§4.4, [nas-import.md](nas-import.md)) | those of `lab_rw`, plus `INSERT` on `lab.scan_run`, `lab.scan_run_result` and `lab.scan_file`, which `grants.sql` withholds from `lab_rw` |
 
 Why a separate owner: the owner of the schema can drop the immutability
 triggers, and a subject rename cascades into the append-only tables with the
@@ -216,10 +217,26 @@ CREATE ROLE lab_dashboard LOGIN PASSWORD 'CHANGE_ME_DASH' IN ROLE lab_ro;
 CREATE ROLE lab_mcp       LOGIN PASSWORD 'CHANGE_ME_MCP'  IN ROLE lab_ro;
 CREATE ROLE lab_forms     LOGIN PASSWORD 'CHANGE_ME_FORMS' IN ROLE lab_ro;
 CREATE ROLE lab_verifier  LOGIN PASSWORD 'CHANGE_ME_VER'  IN ROLE lab_rw;
+CREATE ROLE lab_scanner   LOGIN PASSWORD 'CHANGE_ME_SCAN' IN ROLE lab_rw;
+GRANT INSERT ON lab.scan_run, lab.scan_run_result, lab.scan_file TO lab_scanner;
 ```
 
 They need no `lab.person` row. A login mapped to nobody is still stamped on
-every row it writes; `fn_current_person()` is then NULL.
+every row it writes; `fn_current_person()` is then NULL. For `lab_scanner` a
+row with `db_login = 'lab_scanner'` is optional: without it `recorded_by` is
+NULL on what the NAS search registers, and `recorded_login` still says who
+wrote it. The `GRANT` is needed because the scan logs decide what the search
+does next, so `grants.sql` withholds them from `lab_rw`.
+
+The list of directories the NAS search covers (`lab.scan_directory`) is
+the owner's to edit. To let a lab member manage it, grant it to that
+member's login by name, and take it back the same way
+([nas-import.md](nas-import.md) §3.3):
+
+```sql
+GRANT INSERT, UPDATE ON lab.scan_directory TO jdoe;
+REVOKE INSERT, UPDATE ON lab.scan_directory FROM jdoe;
+```
 
 **Offboarding** disables the login; it never drops it, because the name is
 in the log of every row that person wrote:
@@ -435,6 +452,7 @@ command line. One line per login, `host:port:database:user:password`. For
 localhost:5432:lab:lab_dashboard:CHANGE_ME_DASH
 localhost:5432:lab:lab_forms:CHANGE_ME_FORMS
 localhost:5432:lab:lab_verifier:CHANGE_ME_VER
+localhost:5432:lab:lab_scanner:CHANGE_ME_SCAN
 localhost:5432:*:postgres:POSTGRES_PASSWORD
 ```
 
@@ -655,6 +673,8 @@ redirected to one, and each exits non-zero on failure: have Task Scheduler
 | Backup check | daily 08:00 | `tools\backup_lab.py --check 26` (§4.1) |
 | File verification | weekly | `tools\verify_artifacts.py` (§4.2) |
 | Integrity report | daily | `lab.fn_check_integrity()` (§4.3) |
+| NAS search | every 15 minutes, do not start a new instance | `tools\import_nas_files.py run` as `lab_scanner` (§4.4) |
+| NAS search check | daily | `tools\import_nas_files.py check` (§4.4) |
 | Forms CSV rebuild | daily 03:30 | `web\forms\server.py --rebuild-csv` as `lab_forms` (§3.6): picks up corrections and withdrawals of form entries made from MATLAB |
 
 ### 4.1 Backups
@@ -723,7 +743,7 @@ files not verified in the last week and `--limit N` caps one run. Exit code
 
 ### 4.3 Integrity report
 
-`lab.fn_check_integrity()` returns one row per problem (15 checks; see
+`lab.fn_check_integrity()` returns one row per problem (16 checks; see
 [database-design.md](database-design.md) §4.2); an empty result is healthy.
 Any login can run it; use `lab_dashboard`. Save this as
 `C:\src\CarasLabDB\deploy\integrity.sql` (a file of your own). It prints every
@@ -754,6 +774,109 @@ set PGUSER=lab_dashboard
 Warnings (an unverified file, a correction that dropped a tag) are worth a
 weekly look; errors (a typed event with no detail row, a failed file check)
 are worth an alert.
+
+### 4.4 Searching the NAS for new files
+
+`tools\import_nas_files.py` looks at the NAS directories listed in
+`lab.scan_directory` and registers the files it has not seen: a session, the
+event that produced them and one artifact per file. What it does, what it
+holds for a person and how to read its reports are in
+[nas-import.md](nas-import.md). Two tasks:
+
+- `run` wakes every 15 minutes and searches only the directories that are
+  **due** (the database decides, by each directory's own interval and hours),
+  so most wakes end in a second;
+- `check` runs once a day and exits 1 when a directory is overdue, when two
+  listed directories overlap, or when a due directory's storage root was not
+  given with `--root`. A root that is not mounted here (missing or empty)
+  ends it with 2.
+
+Before the first run, once, as the owner:
+
+1. Register the storage root (`INSERT INTO lab.storage_root ...`), and put a
+   file `.caraslabdb-root.json` holding `{"name": "nas-rig3"}` in that folder
+   of the NAS, so that one folder cannot be searched under two root names.
+2. List the directories (`lab.scan_directory`) in `report` mode, which
+   searches and reports and registers nothing, and switch one to `register`
+   only after reading its report ([nas-import.md](nas-import.md) §3 and §4).
+3. Create `lab_scanner` and its `pgpass.conf` line (§1.4, §3.2).
+
+The tool needs `psycopg` (`pip install "psycopg[binary]"`) and read access to
+the share for the service account. Each `--root` maps a `lab.storage_root`
+name to where it is mounted on this machine. Use the UNC path: a mapped
+drive letter belongs to a signed-in user's session. A root whose directory is
+missing or empty is refused, so an unmounted share does not look like an
+empty one.
+
+A launcher, `C:\src\CarasLabDB\deploy\run-nas-search.cmd` (a file of your
+own; it is not in the repository):
+
+```bat
+@echo off
+set PGHOST=localhost
+set PGPORT=5432
+set PGDATABASE=lab
+set PGUSER=lab_scanner
+rem set PGPASSFILE=C:\Users\svc-caraslabdb\AppData\Roaming\postgresql\pgpass.conf
+rem add --overrides C:\ProgramData\CarasLabDB\nas-overrides.csv when there is a reviewed one
+"C:\Program Files\Python312\python.exe" C:\src\CarasLabDB\tools\import_nas_files.py run ^
+    --root "nas-rig3=\\nas\data\RIG3_Backup_2025" ^
+    --report-dir C:\ProgramData\CarasLabDB\nas-reports ^
+    --cache-file C:\ProgramData\CarasLabDB\nas-headers.json ^
+    --log-file C:\ProgramData\CarasLabDB\nas-search.log >> C:\ProgramData\CarasLabDB\nas-search.out 2>&1
+exit /b %ERRORLEVEL%
+```
+
+and `check-nas-search.cmd`, which only reads and so uses `lab_dashboard`:
+
+```bat
+@echo off
+set PGHOST=localhost
+set PGDATABASE=lab
+set PGUSER=lab_dashboard
+"C:\Program Files\Python312\python.exe" C:\src\CarasLabDB\tools\import_nas_files.py check ^
+    --root "nas-rig3=\\nas\data\RIG3_Backup_2025" ^
+    --log-file C:\ProgramData\CarasLabDB\nas-check.log >> C:\ProgramData\CarasLabDB\nas-check.out 2>&1
+exit /b %ERRORLEVEL%
+```
+
+Register both as `LAB\svc-caraslabdb`, like the dashboard task (§3.3). The
+search task must not start a second instance while one is still running (the
+first search of a large tree reads every file once and can take hours):
+
+```powershell
+$cred     = Get-Credential "LAB\svc-caraslabdb"
+$action   = New-ScheduledTaskAction -Execute "C:\src\CarasLabDB\deploy\run-nas-search.cmd"
+$trigger  = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Minutes 15) `
+                -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable
+Register-ScheduledTask -TaskName "CarasLabDB NAS search" -Action $action -Trigger $trigger `
+    -Settings $settings -User $cred.UserName -Password $cred.GetNetworkCredential().Password `
+    -RunLevel Limited
+
+$action   = New-ScheduledTaskAction -Execute "C:\src\CarasLabDB\deploy\check-nas-search.cmd"
+$trigger  = New-ScheduledTaskTrigger -Daily -At 8:15am
+Register-ScheduledTask -TaskName "CarasLabDB NAS search check" -Action $action -Trigger $trigger `
+    -User $cred.UserName -Password $cred.GetNetworkCredential().Password -RunLevel Limited
+```
+
+- The folders of `--log-file` and `--cache-file` must exist
+  (`C:\ProgramData\CarasLabDB` does, from §3.3); `--report-dir` is created.
+  Reports are written only for a run in which something happened.
+- If the task is stopped, nothing is half written: each group of files is
+  registered in one transaction, and a run with no result row does not move
+  the schedule.
+- **Exit codes.** `run`: 0 when every directory searched ended `ok` or
+  `partial`; 1 when one ended `failed` or `unreachable` (a folder that could
+  not be listed, a share that is not mounted); 2 on a usage or connection
+  error, including a login that may not write the scan logs. `check`: 0, or
+  1 for a problem, or 2 on a usage or connection error. Have Task Scheduler
+  alert on a non-zero **Last Run Result** for both. Files held for a person do
+  not fail either task: read them in the dialog, the reports or
+  `lab.scan_held` ([nas-import.md](nas-import.md) §9).
+- `--now --directory ID` searches one directory at once, by hand, whether or
+  not it is due; it does not move the schedule. `--dry-run` writes nothing.
 
 ---
 
@@ -922,6 +1045,10 @@ text)` to that person's login only, never to `lab_rw`.
       `--copy-to` directory, and the check task succeeds.
 - [ ] A restore drill (§5) ended with `restore_lab: OK`.
 - [ ] The verifier and integrity tasks ran and logged.
+- [ ] The NAS search task ran and logged, its runs ended `ok`
+      (`lab.scan_directory_status.last_run_outcome`), and the check task
+      exits 0. A login that is only in `lab_rw` is refused by `run` at start
+      with exit 2 (§4.4).
 - [ ] MATLAB: `CarasLabDB(...)` constructs without error and `CarasLabDBApp()`
       connects through its login dialog.
 

@@ -18,10 +18,12 @@ data. It has seven parts:
   version 5, the schema now called 1); nothing applies or tests them. It includes
   the tag tables (`tag_namespace`, `tag`, `tag_assignment`), the variable
   tables (`variable`, `variable_value`), the form tables (`form`,
-  `form_version`, `subject_form`, `observation_event`), `retraction` and
-  `artifact_disposition`;
-  `design_docs/tagging.md`, `design_docs/variables.md` and
-  `design_docs/forms.md` are the user-facing guides.
+  `form_version`, `subject_form`, `observation_event`), `retraction`,
+  `artifact_disposition` and the NAS-search tables (`scan_layout`,
+  `scan_directory`, `scan_run`, `scan_run_result`, `scan_file`);
+  `design_docs/tagging.md`, `design_docs/variables.md`,
+  `design_docs/forms.md` and `design_docs/nas-import.md` are the user-facing
+  guides.
 - **`@CarasLabDB/`** — a MATLAB class-folder wrapper (`CarasLabDB` class) that
   connects to that database and exposes typed insert/retrieve methods for
   every table.
@@ -82,7 +84,10 @@ data. It has seven parts:
   their detail rows, artifacts, verifications, `fn_artifact_lineage`,
   provenance edges, `fn_check_integrity`, and the tag tools `get_tag_namespaces`,
   `get_tags`, `get_entity_tags`, `find_by_tags` plus `tags`/`any_tags`/`none_tags`
-  filters on the entity tools). Its one hard invariant is that it cannot write: no write
+  filters on the entity tools, and the NAS-search tools `get_scan_directories`,
+  `get_scan_runs`, `get_scan_files` in `tools/scans.py`, over
+  `lab.scan_directory_status`, `scan_run` + `scan_run_result`, `scan_file` and
+  `scan_file_latest`). Its one hard invariant is that it cannot write: no write
   tools, every query inside a rolled-back `SET TRANSACTION READ ONLY`
   transaction, and a `SELECT`-only role. No tool accepts a table/column name or
   raw SQL, and every list tool is bounded by `limit` (default 200, max 1000).
@@ -90,15 +95,28 @@ data. It has seven parts:
   tables/columns in `src/caraslabdb_mcp/schema_map.py`, the rest in the
   per-tool filter signatures under `src/caraslabdb_mcp/tools/` — so a schema
   change must be mirrored there (and, after launch, `db.SCHEMA_VERSION`
-  bumped). See
+  bumped; a new table or view also needs its `db.DEFAULT_ORDER_BY` entry).
+  See
   `design_docs/mcp-server.md`.
 - **`tools/`** — Python scripts, cross-platform, standard library only except
-  that the verifier needs psycopg: `backup_lab.py` (database + roles +
+  that the verifier and the NAS importer need psycopg: `backup_lab.py` (database + roles +
   manifest, verified, prunes only after success, `--check HOURS` for
   monitoring, `--copy-to` for an off-machine copy), `restore_lab.py` (roles +
   database into a NEW database, checked against the manifest),
   `verify_artifacts.py` (hashes the files under mounted storage roots and
-  appends `artifact_verification` rows; needs a login inheriting `lab_rw`).
+  appends `artifact_verification` rows; needs a login inheriting `lab_rw`),
+  `import_nas_files.py` with its package `tools/nas_import/` (searches the
+  directories listed in `lab.scan_directory` for files not yet registered and
+  registers a session, an event and `artifact` rows with `ok` verifications:
+  `run` is the scheduled, unattended search of the directories that are due
+  (`lab.fn_scan_due()`), needs a login inheriting `lab_rw` that also holds
+  INSERT on the three scan logs (`lab_scanner`) or the owner, and exits 0 / 1
+  (a directory `failed` or `unreachable`) / 2 (usage, connection, missing
+  privilege); `check` is its monitor and only reads: exit 1 when a directory
+  is overdue, two overlap, or a due directory's root was not given with
+  `--root`; `scan` / `apply` are the reviewed path, a plan file a person
+  reads and then writes exactly). See `design_docs/nas-import.md` and the
+  invariants under "Directory searches" below.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are
@@ -111,7 +129,9 @@ Synology guides are alternatives). Role model (`grants.sql`): the schema is
 owned by a dedicated non-superuser admin role that also applies migrations;
 `lab_rw` and `lab_ro` are group roles, never logins; each lab member has
 their own login `IN ROLE lab_rw`, and the dashboard and MCP server each have a
-login inheriting `lab_ro`. Never document or code a shared `lab_rw` login.
+login inheriting `lab_ro`; the scheduled NAS search has `lab_scanner`, in
+`lab_rw` plus INSERT on the three scan logs, which `lab_rw` lacks. Never
+document or code a shared `lab_rw` login.
 
 ## Core design: events, not files
 
@@ -131,7 +151,8 @@ records:
   (`fn_forbid_mutation()`) on `event`, every `*_event` detail table,
   `artifact`, `event_input`, and the logs `artifact_verification`,
   `maintenance_log`, `row_history`, `schema_version`, `tag_assignment`,
-  `variable_value`, `retraction`, `artifact_disposition` and `form_version`.
+  `variable_value`, `retraction`, `artifact_disposition`, `form_version` and
+  the NAS-search logs `scan_run`, `scan_run_result` and `scan_file`.
   Corrections are made
   by inserting a new row whose `supersedes` column points at the row it
   replaces. `event_active` / `artifact_active` views filter to current rows
@@ -164,7 +185,8 @@ records:
   `applied_by` / `retracted_by` / `set_by` name a person. The database also
   stamps the login: `event.recorded_login`, `artifact.created_login`,
   `artifact_verification.verified_login`, `tag_assignment.applied_login`,
-  `retraction.retracted_login`, `variable_value.set_login` are set to
+  `retraction.retracted_login`, `variable_value.set_login` and, for the NAS
+  search, `scan_directory.created_login` and `scan_run.run_login` are set to
   `session_user` by the `trg_*_stamp_login` triggers whatever the client
   sends (NULL only on rows older than pre-launch schema version 4). Clients never send them
   and do not carry them forward in a correction. `lab.person.db_login` maps a
@@ -251,7 +273,69 @@ records:
   back (`fn_form_number_ok`; `1.50` stays `1.50`, `1e3` is refused, never
   rewritten). `observation_active` and `fn_subject_project_columns` are the
   reads (never `entity_variables`, which turns numbers into JSON numbers).
-- `lab.fn_check_integrity()` has 15 checks (see `database-design.md` §4.2);
+- **Directory searches** (`database-design.md` §3.10, `nas-import.md`).
+  `scan_directory` is the administrator's list of NAS directories to search
+  (mutable, in `row_history`, as is `scan_layout`); `scan_run`,
+  `scan_run_result` and `scan_file` are append-only logs, never a mutable
+  "status" column. `scan_file` is the scan memory: a row is appended only
+  when what is seen of a file differs from its latest row for that path
+  (`status` `pending` / `registered` / `known` / `held` / `cleared`);
+  `scan_file_latest` is each path's state and `scan_held` the held ones.
+  Like tags it stores no derived id (no subject column: a rename would have
+  to follow it); its composite FK `(artifact_id, storage_root_id,
+  relative_path)` to the `UNIQUE` on `lab.artifact` keeps a memory row from
+  naming another path's artifact. `trg_scan_directory_policy` (advisory lock
+  per storage root) allows no two directories that are not `off` on one root
+  to be equal or nested -- compared with `lower()` and `starts_with`, never
+  `LIKE` -- freezes root, path, layout and time zone once the directory has a
+  run (`trg_scan_run_policy` takes the lock it needs, shared), keeps
+  `mode_changed_at` the database's and requires a `pg_timezone_names` zone;
+  `scan_directory_overlap` is its integrity check. **`lab.fn_scan_status(p_now)`
+  is the one definition of the schedule** (due, `due_at`, overdue, running,
+  all in minutes, never the session's `TimeZone`); `scan_directory_status`,
+  `fn_scan_due` and `fn_scan_window_open` are views of it, and no client
+  does interval arithmetic. `grants.sql` revokes INSERT on all five tables
+  and the views from `lab_rw` and grants no UPDATE: a member who could write
+  `scan_run` could postpone a search, one who could write `scan_file` could
+  hide a file. The tool's login is granted INSERT on the three logs by name
+  (`lab_scanner`), a member who may manage the list INSERT / UPDATE on
+  `scan_directory`; `lab_rw` may write none of the five. Invariants a change
+  to the importer must keep:
+  - **An unattended run only adds.** It never supersedes, retracts or
+    records a disposition, never creates a subject, never writes to the NAS
+    and never follows a link. Whatever would need one of those is held with a
+    reason code (`would_correct`, `content_changed`, `late_recording`,
+    `path_case_conflict`, `registered_but_withdrawn`, ...) and left to
+    `scan` / `apply`. Anything uncertain is held and reported, never guessed.
+  - **The stability rule** (`engine.stability`). A group is registered by a
+    run only when every file listed in it has a latest memory row written by
+    an earlier run that equals what this run would write (so this run appends
+    no row for the group), no file of it is gone without a `cleared` row,
+    and `min_age_min` has passed, by the database's clock, since the start of
+    the latest run that wrote one of those rows. The first sighting never
+    registers (also with `min_age_min = 0`); a file added, changed or gone
+    restarts the wait for the whole group. Modification times never decide.
+  - **An incomplete listing fails the run** (`failed`): nothing is
+    registered and nothing is concluded from what is absent.
+  - **One transaction per group** (session, event, artifacts, `ok`
+    verifications, memory rows). Ids are `uuid5` of fixed text under a
+    namespace that never changes, the event keeps its digest in
+    `attributes.client_digest`; the advisory lock per directory only saves
+    work.
+  - **Reason codes are an interface** (`model.REASON_CODES`,
+    `engine.RUN_REASON_CODES`; stored in `scan_file.reason_code`): add,
+    never rename.
+  - What interprets a tree is database-free (`walk`, `names`, `content`,
+    `mat5`, `rhd`, `layouts/`, `subjects`, `pairing`, `interpret`, `ids`,
+    `model`): it reads the tree (and the overrides file), writes nothing and
+    keeps no state between calls. `cache.py` is the header cache, a JSON
+    file. Every statement the tool sends is in `database.py`;
+    the stability rule, the holds against the database and the registration
+    are in `engine.py`; `report.py` writes the CSV and text reports. A layout
+    is one module of `layouts/` plus a `scan_layout` row, inserted by the
+    owner. The header cache is an optimisation only: nothing may depend on it
+    for correctness.
+- `lab.fn_check_integrity()` has 16 checks (see `database-design.md` §4.2);
   a new invariant that a constraint cannot enforce gets a check there.
 
 Any schema change must preserve this pattern: never add a mutable column
@@ -390,10 +474,29 @@ Key behaviors baked into the class:
   not a correction, no tags or variables), the caller's `ok` check of it,
   and the `moved` disposition. `getArtifactVerifications(ByFile=true)` lists
   the checks of the file across every row describing it.
+- NAS directory searches: `getScanLayouts`, `getScanDirectories` (reads
+  `lab.scan_directory_status`, so the schedule is the database's),
+  `getScanRuns`, `getScanFiles(Status=, StorageRootId=, PathPrefix=,
+  ScanRunId=, LatestPerFile=)` (`mtime_ns` comes back as text), and
+  `addScanDirectory` / `updateScanDirectory(id, ..., Clear=)` (own files;
+  `Clear=` sets `"window"`, `"rig"`, `"pair_with"` or `"notes"` to NULL, the
+  others cannot be) write `lab.scan_directory`, which `lab_rw` may not:
+  `canEditScanDirectories()` asks INSERT and UPDATE separately (for
+  `current_user`) and the database's refusal reaches the caller with its own
+  message. Intervals and the minimum age travel as whole minutes and window
+  times as `HH:mm` text; the class checks the window and the mode before any
+  SQL, and never the overlap, the time zone or the freeze, which are the
+  database's. `PathPrefix=` is `starts_with`, never `LIKE`.
 - The GUI (`@CarasLabDBApp`, a programmatic `uifigure` app, not App
   Designer) adds per-row editors for tags (Ctrl+T) and variables (Ctrl+L), a
   retract action (Ctrl+Delete), a file-disposition dialog (Ctrl+Shift+F), a
-  daily husbandry entry grid (Ctrl+H) and an
+  daily husbandry entry grid (Ctrl+H), a NAS-directory dialog (Ctrl+Shift+D,
+  toolbar "Scan directories…", `showScanDirectoriesDialog`: the list with its
+  schedule, a form for `addScanDirectory` / `updateScanDirectory` (an existing
+  directory's update sends only what changed) -- interval and minimum age as
+  number and unit, hours `HH:mm`, root / path / layout / time zone disabled
+  once the directory has runs -- and tabs of its runs and held files; Ctrl+S,
+  Ctrl+N, Ctrl+R, Esc; read-only unless `canEditScanDirectories`) and an
   integrity view (Ctrl+I) with File… (Ctrl+Shift+F) and Find files… (Ctrl+F,
   `showFindFileDialog`: lists a mounted storage root folder by folder,
   reads only candidates -- files of a missing file's size, narrowed by an
@@ -546,7 +649,11 @@ CI (`.github/workflows/tests.yml`) runs on PostgreSQL 14, 15, 16 and 17. It
 applies the schema, runs `tests/schema_test.sql`, applies `grants.sql` twice
 and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), runs the
 artifact verifier end to end
-(`tests/check_verify_artifacts.py`), runs `lab_data.sql` and checks the JSON
+(`tests/check_verify_artifacts.py`), runs the NAS importer's parsing check
+(`tests/check_nas_import_parsing.py`, no database) and its `run` / `check`
+end to end against its own database (`tests/check_import_nas_files.py`, as
+the superuser: it creates throw-away roles and backdates its own run rows),
+runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
 runs the forms server end to end against its own database
 (`tests/check_forms_server.py`, as the superuser: it creates throw-away
@@ -582,6 +689,25 @@ to exercise the code:
   `--copy-to <dir>` for a second copy), then `python tools/restore_lab.py
   <dir>/lab_<stamp>.dump lab_restored` (never overwrites; exit 0 when the row
   counts match the manifest).
+- **NAS importer**: `python tests/check_nas_import_parsing.py` (standard
+  library only; prints `check_nas_import_parsing: OK`). End to end:
+  `createdb lab_nas && psql -X -q -v ON_ERROR_STOP=1 -d lab_nas -f
+  design_docs/schema.sql -f design_docs/grants.sql`, then
+  `PGDATABASE=lab_nas python tests/check_import_nas_files.py [name ...]` as a
+  superuser (needs psycopg; it commits rows, so a database of its own;
+  prints `check_import_nas_files: OK`). The tool itself: `python
+  tools/import_nas_files.py run --root <storage_root name>=<mount path>
+  [--now] [--dry-run] [--directory ID] [--report-dir DIR] [--cache-file F]
+  [--overrides F] [--log-file F]` as `lab_scanner` or the owner (connection
+  from the `PG*` environment), and `check [--root ...]`. `--dry-run` writes
+  nothing; `--now` is a run by hand that never moves the schedule. A new
+  directory starts in `report` mode, which registers nothing. The reviewed
+  path: `scan --root N=P --directory ID --out DIR` writes nothing to the NAS
+  or the database and leaves a plan (`plan_<stamp>.jsonl`, with a digest line
+  `apply` checks, plus a CSV and a text report); `apply PLANFILE --root N=P
+  [--only GROUP_KEY] [--dry-run]` writes exactly that plan, one transaction
+  per group, and refuses a group whose files, listing age or database rows
+  are no longer as the scan found them (`tools/nas_import/reviewed.py`).
 - **Forms server**: `PGDATABASE=<db> python web/forms/server.py --csv-root
   <dir> --insecure-cookie` (the `lab-forms` launch config), then sign in on
   `http://127.0.0.1:8779/` with a login in `lab_rw`. End to end:
@@ -594,9 +720,10 @@ to exercise the code:
   integration tests)
 - **MATLAB tests**: `runtests("tests/matlab")` — `TagTests` (tags,
   corrections, transactions, the demo script), `VariableTests` (variables,
-  retraction, husbandry batch, file registration) and `TagGuiTests` (the
-  app's browse filters, tag editor and variables editor, driven with
-  `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
+  retraction, husbandry batch, file registration), `ScanDirectoryTests` (the
+  scan-directory methods and the database's refusals) and `TagGuiTests` (the
+  app's browse filters, tag editor, variables editor and scan-directories
+  dialog, driven with `matlab.uitest`). The shared fixture `tests/matlab/LabScratchDb.m`
   creates and drops a scratch `lab_mtest` database; it is opt-in through
   `CARASLABDB_MTEST_ADMIN` (see its help), and without it only the
   database-free tests run. `LabClientTests` tests the shared client (`+labclient`) against its own `FakeBackend`, needing no database; `BackendContractTests` runs one set of assertions against that fake and, when the scratch database is there, against `labclient.CarasBackend`. `RecordingConnection` is the fake connection of
