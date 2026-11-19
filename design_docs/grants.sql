@@ -21,6 +21,16 @@
 --           a login that inherits it:
 --               CREATE ROLE lab_dashboard LOGIN PASSWORD '...' IN ROLE lab_ro;
 --
+-- One more login is set up by the deployment guide, not here, because it is
+-- one login and not a group: the scheduled search for new files
+-- (tools/import_nas_files.py run) connects as a member of lab_rw that is also
+-- granted INSERT on the scan logs, which this script withholds from lab_rw:
+--     CREATE ROLE lab_scanner LOGIN PASSWORD '...' IN ROLE lab_rw;
+--     GRANT INSERT ON lab.scan_run, lab.scan_run_result, lab.scan_file TO lab_scanner;
+-- The list of directories it searches (lab.scan_directory) is the schema
+-- owner's to edit, or a member's the owner grants it to:
+--     GRANT INSERT, UPDATE ON lab.scan_directory TO jdoe;
+--
 -- Each is created here as a group role (NOLOGIN) if it does not exist yet. A
 -- deployment that already made lab_rw or lab_ro a login keeps that; this
 -- script only sets privileges. Creating a missing role needs CREATEROLE.
@@ -70,6 +80,26 @@ GRANT INSERT (person_id, full_name, email, role, is_active, created_at)
 -- event of that type then reports as event_missing_detail forever. New event
 -- types arrive with a migration.
 REVOKE INSERT ON lab.event_type FROM lab_rw;
+
+-- And except everything about the unattended search for new files
+-- (design_docs/nas-import.md). The scan logs decide what the search does
+-- next: a member who could write lab.scan_run could postpone a directory's
+-- search for as long as they liked, and one who could write lab.scan_file
+-- could make the search pass over a file as already registered, or hide one
+-- that is held. The list of directories (lab.scan_directory) says what is
+-- registered without anyone looking, so it is the administrator's, like the
+-- reference tables; no UPDATE on it is granted here either. A layout
+-- (lab.scan_layout) is a module of the tool and arrives with it, as an event
+-- type does. Members read all five. No group role is added for this: the
+-- login the search runs as, and a member allowed to manage the list, are
+-- granted what they need by name (see the header).
+REVOKE INSERT ON lab.scan_layout, lab.scan_directory, lab.scan_run,
+                 lab.scan_run_result, lab.scan_file FROM lab_rw;
+-- The views over them too. None can be written through today (each has a
+-- DISTINCT, a join or a function), but a view is written with its owner's
+-- privileges, so one that was later made simple enough to be updatable would
+-- otherwise hand the scan memory back to every member.
+REVOKE INSERT ON lab.scan_file_latest, lab.scan_held, lab.scan_directory_status FROM lab_rw;
 
 -- Edit: the descriptive tables the schema leaves mutable, which the MATLAB
 -- class (updateSubject, updateSession) and the GUI editors change in place,

@@ -14,7 +14,7 @@ complete runnable DDL lives alongside it in [schema.sql](schema.sql).
 
 ## 1. Overview & ER diagram
 
-The schema has eight layers:
+The schema has nine layers:
 
 1. **Reference tables** — mostly-static vocabulary and registries (`person`,
    `probe`, `pipeline`, `storage_root`, `species`, and the categorical lookups
@@ -41,6 +41,11 @@ The schema has eight layers:
    versions in `form_version`), put to use for a subject in a project
    (`subject_form`); each entry made on one is an `observation` event whose
    values are variables on the event (§3.9).
+9. **Directory searches** — the list of NAS directories a scheduled tool
+   searches for files it has not seen (`scan_directory`, with its layouts
+   `scan_layout`), the log of its runs (`scan_run`, `scan_run_result`) and
+   its memory of every file it has looked at (`scan_file`). Written by the
+   importer, `tools/import_nas_files.py` (§3.10).
 
 Alongside the event log, `retraction` records events and artifacts withdrawn
 as entered in error (§4.3).
@@ -107,6 +112,14 @@ erDiagram
     project      ||--o{ subject_form     : in
     subject_form ||--o{ observation_event : entries
     form_version ||--o{ observation_event : made_on
+
+    storage_root ||--o{ scan_directory   : searched_under
+    scan_layout  ||--o{ scan_directory   : read_by
+    scan_directory |o--o| scan_directory : pairs_with
+    scan_directory ||--o{ scan_run       : searched_in
+    scan_run     ||--o| scan_run_result  : ends_with
+    scan_run     ||--o{ scan_file        : wrote
+    artifact     |o--o{ scan_file        : registered_as
 ```
 
 ---
@@ -155,6 +168,7 @@ erDiagram
 | `event_type` | The nine event-type codes; the discriminator that selects a detail table. |
 | `artifact_role` | Role a file plays (`raw`, `spikes`, `lfp`, `video`, `figure`, …). |
 | `acquisition_system` | Acquisition software (`intan_rhx`, `open_ephys`). |
+| `scan_layout` | The layouts the importer implements (`epsych`, `intan`): how a listed directory's tree is read (§3.10). Each is a module of `tools/import_nas_files.py`, so, like `event_type`, a row arrives with its code and `grants.sql` withholds `INSERT` from `lab_rw`. Mutable, recorded in `row_history`. |
 
 ### 3.2 Projects
 
@@ -257,6 +271,13 @@ artifact be re-pointed at a corrected event (§4.2) or have its role, format,
 session or attributes fixed. A table-wide `UNIQUE` on those three columns
 would forbid both.
 
+The one table-wide `UNIQUE` the table does have is on `(artifact_id,
+storage_root_id, relative_path)`. It is the target of the composite foreign
+key of `scan_file` (§3.10): a row of the importer's memory can then name an
+artifact only at the artifact's own root and path. `artifact_id` alone is
+already unique, so the constraint restricts nothing, and none of its three
+columns is a subject id, so a subject rename does not touch it.
+
 **`event_input`** — the second edge type: the artifacts an event consumed. It is
 general (any event may consume artifacts) but in practice is populated by
 analysis events. `artifact.produced_by_event_id` + `event_input` are the two
@@ -324,7 +345,9 @@ always one row.
 **`row_history`** — the previous and new value of every `UPDATE`, and the
 removed row of every `DELETE`, on the mutable tables (the reference tables,
 the project tables, `subject`, `session`, the tag vocabulary
-`tag_namespace` / `tag` and the variable definitions `variable`). Those
+`tag_namespace` / `tag`, the variable definitions `variable`, the form
+tables `form` and `subject_form`, and the importer's `scan_layout` and
+`scan_directory`). Those
 tables are edited in place
 by design; this table is what keeps such an edit from erasing the old value
 and who changed it. It is written by the `SECURITY DEFINER` trigger function
@@ -548,6 +571,93 @@ values as stored text, and `entry_id`, the id of the first version, which
 corrections keep) and `lab.fn_subject_project_columns` (the column order of
 a subject's CSV for a project). All run with the caller's privileges.
 
+### 3.10 Searching listed directories
+
+The importer, `tools/import_nas_files.py`, registers the files that are
+already on the NAS: a session, the event that produced them and one artifact
+per file. Its scheduled `run` searches the directories listed in
+`scan_directory`, reads only files it has not seen, and registers what is new
+and unambiguous. The user guide, the tool and the layouts are in
+[nas-import.md](nas-import.md); this is the data model.
+
+| Table | Purpose |
+|---|---|
+| `scan_layout` | `code`, `label`. Seeded `epsych` and `intan`. See §3.1. |
+| `scan_directory` | One directory to search, under a storage root. **Mutable**, recorded in `row_history`. `relative_path`, `layout`, `rig`, `pair_with` (another directory of the same root: a composite foreign key keeps the pair on one root), `time_zone` (a name from `pg_timezone_names`), `scan_interval_min` (1 to 527040), `window_start` / `window_end` (both or neither, whole minutes, wrapping midnight when the start is later), `min_age_min` (default 1440), `mode` (`off`, `report`, `register`; default `report`), `mode_changed_at`, `notes`, `created_at`, `created_by`, `created_login`. |
+| `scan_run` | **Append-only.** One row when a run of one directory starts: `command` (`run` or `apply`), `mode` (`report` or `register`), `due_at` (the scheduled time the run answers, as `fn_scan_status` gave it; NULL for a run made by hand, which never moves the schedule), `started_at` (the database's clock), `tool_version`, `host`, `run_login` (stamped). |
+| `scan_run_result` | **Append-only.** One row when a run ends: `outcome` (`ok`, `partial`, `failed`, `unreachable`), the counts of files and groups, `bytes_read`, `message` and a `details` object. A run with no result is running or was interrupted. |
+| `scan_file` | **Append-only.** The scan memory: a row is appended only when what the tool sees of a file differs from its latest row. `scan_run_id`, `storage_root_id`, `relative_path` (as spelled on disk), `size_bytes`, `mtime_ns` (`st_mtime_ns`, a whole number: it is compared for equality), `group_key`, `status`, `reason_code`, `reason`, `artifact_id`. |
+
+**`scan_file.status`** is `pending` (seen, waiting to be seen unchanged),
+`registered` (this tool registered it), `known` (another client had
+registered these bytes at this path; confirmed by reading them), `held` (left
+for a person; `reason_code` is required) or `cleared` (a pending or held file
+is no longer there). `registered` and `known` rows name an artifact, and
+only they do (a `CHECK`). The composite foreign key `(artifact_id,
+storage_root_id, relative_path)` to `artifact` (§3.5) makes the artifact the
+one at the row's own path: a memory row that named another file's artifact
+would let the tool skip a file that was never registered. There is no
+subject column and no derived id, for the reason `tag_assignment` has no
+`entity_id`: a stored copy of the subject would have to follow a rename.
+
+**Mutable list, append-only logs.** The list says what is registered without
+anyone looking, so it is an edited table with a history; the runs and the
+memory are what the tool did, so they are logs. `fn_forbid_mutation()` blocks
+`UPDATE` and `DELETE` on the three logs (and `TRUNCATE` is blocked as for the
+other logs). A directory with runs cannot be deleted: `scan_run` refers to
+it.
+
+**Policy triggers.**
+
+- `trg_scan_directory_policy` keeps `mode_changed_at` the database's (the time
+  the row was added, then the time of each change of mode); checks the time
+  zone when the row is added or the zone changes; and takes a transaction
+  advisory lock per storage root to refuse a directory that is equal to, or
+  nested with, another one that is not `off`, compared with `lower()` and
+  `starts_with` on a `/` boundary, never `LIKE` (where the `_` of
+  `epsych_files` is a wildcard). A directory that is `off` takes no part,
+  which is how one is replaced. Once the directory has a run, its storage
+  root, path, layout and time zone are frozen; `scan_directory_id` and the
+  `created_*` columns never change. `uq_scan_directory_path` is the
+  declarative half, for equal paths. `fn_check_integrity()` reports an
+  overlap that got past the trigger (`scan_directory_overlap`, §4.2).
+- `trg_scan_run_policy` takes, shared, the lock that an edit of a directory's
+  frozen columns takes exclusively, so that edit and a first run happen one
+  after the other, never at once. A client that has inserted its `scan_run`
+  row reads the directory's row again and has the values its run is
+  recorded under.
+- `trg_scan_directory_stamp_login` and `trg_scan_run_stamp_login` set
+  `created_login` and `run_login` to `session_user`. `row_history` does not
+  record an `INSERT`, so the creator of a directory is on the row.
+- `trg_scan_directory_normalize_path` and `trg_scan_file_normalize_path`
+  rewrite `\` to `/`, as for artifacts. A directory's path is also held to
+  one spelling: no `.` segment, no `//`, no trailing `/`.
+
+**The schedule has one definition**, `lab.fn_scan_status(p_now)`: one row per
+directory, with its settings (the window as `HH24:MI` text, the interval and
+the minimum age as whole minutes), its storage root's name, its latest run,
+`due_at`, `window_open`, `is_due`, `is_overdue`, `is_running` and the numbers
+of pending and held files under it. `scan_directory_status` is it at `now()`;
+`fn_scan_due(p_now)` is its due rows, the one longest due first;
+`fn_scan_window_open(id, p_now)` is the window test alone. Times of day and
+durations are built with `make_interval(mins => ...)`, so the answer does not
+depend on the session's `TimeZone`, and no client does interval arithmetic.
+The rules (due, `due_at` after each outcome, overdue, daylight saving) are
+in [nas-import.md](nas-import.md) §5. `scan_file_latest` is the latest row
+per (storage root, path), in insertion order (`scan_file_id`); `scan_held` is
+its `held` rows, with `held_at` and `first_held_at`.
+
+**Privileges.** `grants.sql` revokes `INSERT` on all five tables, and on the
+views over them, from `lab_rw`, and grants no `UPDATE`. A member who could
+write `scan_run` could postpone a directory's search as long as they liked,
+and one who could write `scan_file` could make the search pass over a file as
+registered, or hide one that is held. The list is the administrator's, like
+the reference tables; a layout arrives with its module. Members read all
+five. No group role is added: the scheduled search connects as a login that
+inherits `lab_rw` and is granted `INSERT` on the three logs (`lab_scanner`),
+and a member the owner lets manage the list is granted `INSERT, UPDATE` on
+`scan_directory` by name.
+
 ---
 
 ## 4. Immutability & corrections
@@ -555,7 +665,9 @@ a subject's CSV for a project). All run with the caller's privileges.
 Events are facts; facts do not change. The schema forbids `UPDATE` and `DELETE`
 on all event and artifact tables, `event_input`, and the logs
 `artifact_verification`, `maintenance_log`, `row_history`, `schema_version`,
-`tag_assignment`, `variable_value` and `retraction` via `fn_forbid_mutation()`. A mistake is fixed
+`tag_assignment`, `variable_value`, `retraction`, `artifact_disposition`,
+`form_version` and the importer's logs `scan_run`, `scan_run_result` and
+`scan_file` via `fn_forbid_mutation()`. A mistake is fixed
 by **appending a superseding row** whose `supersedes` points at the row it
 replaces. The partial unique index on `supersedes` keeps history *linear* — a
 given row can be corrected by at most one successor, so there are no forks.
@@ -588,7 +700,8 @@ longer in force for a current one. `fn_event_current` /
 records the *login* that was connected, in `event.recorded_login`,
 `artifact.created_login`, `artifact_verification.verified_login`,
 `tag_assignment.applied_login`, `retraction.retracted_login` and
-`variable_value.set_login`: `trg_*_stamp_login` sets each to `session_user`
+`variable_value.set_login`, and for the importer `scan_directory.created_login`
+and `scan_run.run_login`: `trg_*_stamp_login` sets each to `session_user`
 whatever the client sends, the same guarantee `row_history` gives for the
 mutable tables. With one login per lab member that identifies the writer
 without client cooperation; with a shared login it identifies nobody. Only
@@ -661,7 +774,7 @@ real event everywhere and renders as a blank row.
 
 `lab.fn_check_integrity()` is the scheduled check for that and related
 conditions — run it on a schedule (the deployment guides' scheduled jobs);
-it has 15 checks, and an empty result means healthy:
+it has 16 checks, and an empty result means healthy:
 
 ```sql
 SELECT * FROM lab.fn_check_integrity();
@@ -684,6 +797,7 @@ SELECT * FROM lab.fn_check_integrity();
 | `duplicate_active_path` | warning | Two present artifacts at one path; the file can only be one of them, so one was overwritten without a `replaced` disposition (§4.4) |
 | `disposed_file_found` | warning | A file recorded as replaced, moved or deleted that a later checksum check found at its path with its bytes: one of the two records is wrong |
 | `observation_invalid` | warning | Active form entry whose current values break the rules of the form version it was made on (a required value unset since, a number out of range); `lab.fn_record_observation` refuses such entries, so this catches values changed afterwards by another client (§3.9) |
+| `scan_directory_overlap` | warning | Two directories of the importer's list, neither `off`, that are the same directory or one inside the other on one storage root (compared without regard to case). `trg_scan_directory_policy` refuses such a row, but it is a trigger and not a constraint, so a pair that got past it (triggers off, or two writers under snapshot isolation) is reported. One row per pair, under the lower id (§3.10) |
 
 **Worked example — a recording logged with the wrong sample rate:**
 
@@ -877,14 +991,16 @@ schema; the reference/lookup tables; the `project` tables; the `subject` /
 `event_input` / `artifact_verification` / `retraction`; the tag tables
 (`tag_namespace`, `tag`, `tag_assignment`); the variable tables (`variable`,
 `variable_value`); the form tables (`form`, `form_version`, `subject_form`,
-`observation_event`); all indexes; the immutability
+`observation_event`); the importer's tables (`scan_layout`, `scan_directory`,
+`scan_run`, `scan_run_result`, `scan_file`); all indexes; the immutability
 (`UPDATE`/`DELETE` **and** `TRUNCATE`) and validation triggers; the identity
 maintenance function, `maintenance_log`, `row_history` and `schema_version`;
 the `event_active` /
 `artifact_active` / `event_version` / `artifact_version` /
 `artifact_verification_latest` / `provenance_edge` / `subject_current` /
 `tag_current` / `entity_tags` / `variable_current` / `entity_variables` /
-`observation_active` views; `fn_artifact_lineage()` and the
+`observation_active` / `scan_file_latest` / `scan_held` /
+`scan_directory_status` views; `fn_artifact_lineage()` and the
 correction-chain helpers (`fn_event_current()`, `fn_artifact_current()`,
 `fn_event_versions()`, `fn_artifact_versions()`), the tag functions (`fn_tag()`,
 `fn_register_tag()`, `fn_tag_match()`, `fn_find_by_tags()`,
@@ -894,7 +1010,9 @@ correction-chain helpers (`fn_event_current()`, `fn_artifact_current()`,
 `fn_carry_variables()`), the form functions (`fn_publish_form()`,
 `fn_add_subject_form()`, `fn_record_observation()`, `fn_set_entry_note()`,
 `fn_form_definition_problems()`, `fn_observation_problems()`,
-`fn_subject_project_columns()`, `fn_event_original()`), `fn_current_person()`,
+`fn_subject_project_columns()`, `fn_event_original()`), the schedule functions
+(`fn_scan_status()`, `fn_scan_due()`, `fn_scan_window_open()`),
+`fn_current_person()`,
 `fn_retract()` and `fn_check_integrity()`;
 and the seed vocabulary
 (including the starting tag namespaces). It
@@ -944,6 +1062,8 @@ type/idiom substitutions apply.
   history, queries, corrections, and per-client usage.
 - [forms.md](forms.md) — data-entry forms: templates, subject forms,
   entries, the CSV files, the server and the browser outbox.
+- [nas-import.md](nas-import.md) — registering the files already on the NAS:
+  the list of directories, the schedule, what is held and why, the tool.
 - [mcp-server.md](mcp-server.md) — the read-only MCP interface over this schema.
 - [testing-locally.md](testing-locally.md) — how to load and verify the schema
   on a scratch database.

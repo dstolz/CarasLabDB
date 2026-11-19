@@ -62,10 +62,18 @@ $$;
 --             table-level UPDATE on lab.subject, key column included.
 -- rt_renamer  a delegated administrator: may run lab.fn_rename_subject, but
 --             is neither the owner nor a superuser.
+-- rt_scanner  the login the scheduled search for new files runs as: a member
+--             that may also append to the scan logs.
+-- rt_lister   a member the owner lets manage the list of directories to
+--             search.
 CREATE ROLE rt_member  LOGIN IN ROLE lab_rw;
 CREATE ROLE rt_reader  LOGIN IN ROLE lab_ro;
 CREATE ROLE rt_legacy  LOGIN IN ROLE lab_rw;
 CREATE ROLE rt_renamer LOGIN IN ROLE lab_rw;
+CREATE ROLE rt_scanner LOGIN IN ROLE lab_rw;
+CREATE ROLE rt_lister  LOGIN IN ROLE lab_rw;
+GRANT INSERT ON lab.scan_run, lab.scan_run_result, lab.scan_file TO rt_scanner;
+GRANT INSERT, UPDATE ON lab.scan_directory TO rt_lister;
 GRANT UPDATE ON lab.subject TO rt_legacy, rt_renamer;
 GRANT EXECUTE ON FUNCTION lab.fn_rename_subject(text, text) TO rt_renamer;
 GRANT INSERT ON lab.maintenance_log TO rt_renamer;
@@ -421,6 +429,205 @@ SELECT pg_temp.expect_error(
     'permission denied');
 SELECT pg_temp.expect_error($q$UPDATE lab.form SET description = 'x'$q$, 'permission denied');
 SELECT pg_temp.expect_error($q$UPDATE lab.subject_form SET notes = 'x'$q$, 'permission denied');
+RESET SESSION AUTHORIZATION;
+
+-- ---------------------------------------------------------------------------
+-- The search for new files (design_docs/nas-import.md)
+-- ---------------------------------------------------------------------------
+-- The owner lists a directory: R1 on the test root, where the member's file
+-- R1/weights.csv was registered above.
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, mode)
+VALUES ((SELECT root_id FROM lab.storage_root WHERE name = 'nas-roles-test'),
+        'R1', 'epsych', 'America/New_York', 1440, 'register');
+INSERT INTO lab.scan_run (scan_directory_id, command, mode)
+SELECT scan_directory_id, 'apply', 'register' FROM lab.scan_directory;
+SELECT scan_directory_id AS rt_dir, storage_root_id AS rt_root FROM lab.scan_directory \gset
+SELECT scan_run_id AS rt_owner_run FROM lab.scan_run \gset
+
+-- A member reads the list, the logs and the schedule, and writes none of
+-- them: whoever writes lab.scan_run can postpone a search, and whoever
+-- writes lab.scan_file can make the search pass over a file.
+SET SESSION AUTHORIZATION rt_member;
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_directory) = 1
+    AND (SELECT count(*) FROM lab.scan_layout) = 2
+    AND (SELECT count(*) FROM lab.scan_run) = 1
+    AND (SELECT is_due AND is_running AND created_login <> 'rt_member'
+         FROM lab.scan_directory_status)
+    AND (SELECT count(*) FROM lab.fn_scan_due()) = 1,
+    'a member reads the list of directories, the runs and the schedule');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (%s, 'R2', 'epsych', 'UTC', 60)$q$, :rt_root), 'permission denied for table scan_directory');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_layout (code, label) VALUES ('bogus', 'Bogus')$q$,
+    'permission denied for table scan_layout');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at) VALUES (%s, 'run', 'report', now())$q$,
+    :rt_dir), 'permission denied for table scan_run');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_run_result (scan_run_id, outcome) VALUES (%s, 'ok')$q$, :rt_owner_run),
+    'permission denied for table scan_run_result');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                               status, artifact_id)
+    VALUES (%s, %s, 'R1/weights.csv', 1, 1, 'known', '00000000-0000-0000-0000-0000000000f1')$q$,
+    :rt_owner_run, :rt_root), 'permission denied for table scan_file');
+-- Nor through the views over them: none can be written through, and the
+-- privilege that would matter if one could is withheld as well.
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file_latest (scan_run_id, storage_root_id, relative_path, size_bytes,
+                                      mtime_ns, status)
+    VALUES (%s, %s, 'R1/new.mat', 1, 1, 'pending')$q$, :rt_owner_run, :rt_root),
+    'cannot insert into view "scan_file_latest"');
+SELECT pg_temp.assert(
+    NOT EXISTS (SELECT 1
+                FROM unnest(ARRAY['scan_layout', 'scan_directory', 'scan_run', 'scan_run_result',
+                                  'scan_file', 'scan_file_latest', 'scan_held',
+                                  'scan_directory_status']) AS t(name)
+                CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS p(privilege)
+                WHERE has_table_privilege(current_user, 'lab.' || t.name, p.privilege))
+    AND has_table_privilege(current_user, 'lab.scan_file', 'SELECT')
+    AND has_table_privilege(current_user, 'lab.scan_held', 'SELECT'),
+    'a member holds SELECT and nothing else on the scan tables and the views over them');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'off'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET scan_interval_min = 527040$q$,
+    'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_layout SET label = 'x'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_directory$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_run SET due_at = NULL$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_file$q$, 'permission denied');
+RESET SESSION AUTHORIZATION;
+
+-- The scanner appends to the three logs; each run carries its login,
+-- whatever it sends. It registers files as any member does. It cannot change
+-- the list it works from, nor a row it has written.
+SET SESSION AUTHORIZATION rt_scanner;
+INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at, run_login, host, tool_version)
+SELECT d.scan_directory_id, 'run', 'register', d.due_at, 'someone_else', 'lab-server', '1.0.0'
+FROM lab.fn_scan_due() d;
+SELECT max(scan_run_id) AS rt_scan_run FROM lab.scan_run \gset
+INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns,
+                           group_key, status, reason_code, artifact_id)
+VALUES (:rt_scan_run, :rt_root, 'R1/weights.csv', 120, 1780000000000000000, 'R1', 'known', NULL,
+        '00000000-0000-0000-0000-0000000000f1'),
+       (:rt_scan_run, :rt_root, 'R1/new.mat', 400, 1780000000000000001, 'R1', 'pending', NULL, NULL),
+       (:rt_scan_run, :rt_root, 'R1/stray.txt', 3, 1780000000000000002, NULL, 'held',
+        'unrecognised_file', NULL);
+INSERT INTO lab.scan_run_result (scan_run_id, outcome, files_listed, files_known, files_pending, files_held)
+VALUES (:rt_scan_run, 'ok', 3, 1, 1, 1);
+SELECT pg_temp.assert(
+    (SELECT run_login FROM lab.scan_run WHERE scan_run_id = :rt_scan_run) = 'rt_scanner'
+    AND (SELECT run_login FROM lab.scan_run WHERE scan_run_id = :rt_owner_run) <> 'rt_scanner'
+    AND (SELECT last_ok_run_id = :rt_scan_run AND last_run_outcome = 'ok' AND NOT is_due
+                AND NOT is_running AND n_pending = 1 AND n_held = 1
+         FROM lab.scan_directory_status),
+    'the scanner appends runs, results and memory rows; run_login is its login, whatever '
+    'it sends; the schedule follows');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_run SET due_at = NULL$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_run_result$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_file SET status = 'cleared'$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$TRUNCATE lab.scan_file$q$, 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'off'$q$, 'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (%s, 'R2', 'epsych', 'UTC', 60)$q$, :rt_root), 'permission denied for table scan_directory');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_layout (code, label) VALUES ('bogus', 'Bogus')$q$,
+    'permission denied for table scan_layout');
+RESET SESSION AUTHORIZATION;
+
+-- A member the owner grants INSERT and UPDATE on the list adds and edits
+-- directories. The row carries the login, the edit is in row_history under
+-- it, and the rules of the list hold for it as for the owner. The grant is
+-- the list and nothing more.
+SET SESSION AUTHORIZATION rt_lister;
+INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone,
+                                scan_interval_min, created_login)
+VALUES (:rt_root, 'R2', 'intan', 'America/New_York', 60, 'someone_else');
+SELECT scan_directory_id AS rt_dir2 FROM lab.scan_directory WHERE relative_path = 'R2' \gset
+UPDATE lab.scan_directory
+   SET scan_interval_min = 30, window_start = '22:00', window_end = '06:00', pair_with = :rt_dir
+ WHERE scan_directory_id = :rt_dir2;
+UPDATE lab.scan_directory SET notes = 'searched nightly' WHERE scan_directory_id = :rt_dir;
+SELECT pg_temp.assert(
+    (SELECT created_login || '|' || mode || '|' || scan_interval_min || '|' || pair_with
+     FROM lab.scan_directory WHERE scan_directory_id = :rt_dir2) = 'rt_lister|report|30|' || :rt_dir
+    AND (SELECT count(*) || '|' || min(changed_by) || '|' || min(operation) FROM lab.row_history
+          WHERE table_name = 'scan_directory') = '2|rt_lister|UPDATE'
+    AND (SELECT old_row ->> 'scan_interval_min' || '>' || (new_row ->> 'scan_interval_min')
+         FROM lab.row_history
+         WHERE table_name = 'scan_directory'
+           AND row_key = jsonb_build_object('scan_directory_id', :rt_dir2)) = '60>30',
+    'a delegated login adds and edits directories; the row carries its login and the edit '
+    'is in row_history under it');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (%s, 'r1/Sub', 'epsych', 'UTC', 60)$q$, :rt_root), 'lies inside it');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.scan_directory SET relative_path = 'R1-moved' WHERE scan_directory_id = %s$q$, :rt_dir),
+    'has been searched');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.scan_directory SET created_login = 'rt_member' WHERE scan_directory_id = %s$q$, :rt_dir2),
+    'never change');
+SELECT pg_temp.expect_error(format($q$
+    UPDATE lab.scan_directory SET mode_changed_at = now() - interval '1 year'
+    WHERE scan_directory_id = %s$q$, :rt_dir2), 'mode_changed_at is kept by the database');
+UPDATE lab.scan_directory SET mode = 'register', mode_changed_at = '2000-01-01 00:00Z'
+WHERE scan_directory_id = :rt_dir2;
+SELECT pg_temp.assert(
+    (SELECT mode || '|' || (mode_changed_at = now()) FROM lab.scan_directory
+      WHERE scan_directory_id = :rt_dir2) = 'register|true',
+    'a delegated login changes a directory''s mode; when it changed is the database''s to say');
+SELECT pg_temp.expect_error($q$DELETE FROM lab.scan_directory$q$, 'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_run (scan_directory_id, command, mode) VALUES (%s, 'run', 'report')$q$, :rt_dir2),
+    'permission denied for table scan_run');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns, status)
+    VALUES (%s, %s, 'R2/a.rhd', 1, 1, 'pending')$q$, :rt_scan_run, :rt_root),
+    'permission denied for table scan_file');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_layout (code, label) VALUES ('bogus', 'Bogus')$q$,
+    'permission denied for table scan_layout');
+SELECT pg_temp.expect_error($q$
+    INSERT INTO lab.row_history (table_name, operation, row_key, old_row, new_row)
+    VALUES ('scan_directory', 'UPDATE', '{}', '{}', '{}')$q$, 'permission denied');
+RESET SESSION AUTHORIZATION;
+
+-- The read-only login reads the list, the memory and the schedule through
+-- the views and functions, and writes nothing.
+SET SESSION AUTHORIZATION rt_reader;
+SELECT pg_temp.assert(
+    (SELECT count(*) FROM lab.scan_directory_status) = 2
+    AND (SELECT count(*) FROM lab.fn_scan_status()) = 2
+    AND (SELECT string_agg(relative_path || ' ' || window_start_text || '-' || window_end_text, ',')
+         FROM lab.fn_scan_status() WHERE window_start_text IS NOT NULL) = 'R2 22:00-06:00'
+    AND (SELECT count(*) FROM lab.fn_scan_due('2036-01-10 03:00Z')) = 2
+    AND (SELECT string_agg(relative_path, ',') FROM lab.fn_scan_due('2036-01-10 12:00Z')) = 'R1'
+    AND lab.fn_scan_window_open(:rt_dir)
+    AND lab.fn_scan_window_open(:rt_dir2, '2026-01-10 03:00Z')
+    AND NOT lab.fn_scan_window_open(:rt_dir2, '2026-01-10 12:00Z')
+    AND (SELECT count(*) FROM lab.scan_file_latest) = 3
+    AND (SELECT relative_path || '|' || reason_code || '|' || storage_root || '|' || scan_directory_id
+         FROM lab.scan_held) = 'R1/stray.txt|unrecognised_file|nas-roles-test|' || :rt_dir
+    AND (SELECT count(*) FROM lab.scan_run) = 2
+    AND (SELECT count(*) FROM lab.scan_run_result) = 1
+    AND NOT EXISTS (SELECT 1 FROM lab.fn_check_integrity() WHERE check_name = 'scan_directory_overlap'),
+    'the read-only login reads the scan tables, views and the schedule functions');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, time_zone, scan_interval_min)
+    VALUES (%s, 'R3', 'epsych', 'UTC', 60)$q$, :rt_root), 'permission denied');
+SELECT pg_temp.expect_error($q$INSERT INTO lab.scan_layout (code, label) VALUES ('bogus', 'Bogus')$q$,
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_run (scan_directory_id, command, mode) VALUES (%s, 'run', 'report')$q$, :rt_dir),
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_run_result (scan_run_id, outcome) VALUES (%s, 'ok')$q$, :rt_owner_run),
+    'permission denied');
+SELECT pg_temp.expect_error(format($q$
+    INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, size_bytes, mtime_ns, status)
+    VALUES (%s, %s, 'R1/x.mat', 1, 1, 'pending')$q$, :rt_scan_run, :rt_root), 'permission denied');
+SELECT pg_temp.expect_error($q$UPDATE lab.scan_directory SET mode = 'off'$q$, 'permission denied');
 RESET SESSION AUTHORIZATION;
 
 ROLLBACK;

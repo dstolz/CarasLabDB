@@ -41,7 +41,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
 | `web/forms/` | Browser data entry: build named, reusable form templates and fill them in for one session of one subject, under each member's own login; a CSV file per subject per project is kept up to date |
 | `mcp-server/` | **Read-only** Model Context Protocol server exposing typed `get*` query tools over the `lab` schema to an LLM agent |
-| `tools/` | Python scripts: `backup_lab.py` / `restore_lab.py` (backup and restore of the database and its roles) and `verify_artifacts.py` (checks the files on the NAS against their checksums) |
+| `tools/` | Python scripts: `backup_lab.py` / `restore_lab.py` (backup and restore of the database and its roles), `verify_artifacts.py` (checks the files on the NAS against their checksums) and `import_nas_files.py` (searches the NAS directories the administrator lists in the database and registers the files it has not seen; holds everything uncertain for a person) |
 
 ## The data model
 
@@ -88,6 +88,11 @@ The schema is built around an **append-only event log**:
   (`subject_form`). Each entry is an `observation` event whose values are
   variables on the event, stored exactly as typed. See
   `design_docs/forms.md`.
+- **Directory searches** — the list of NAS directories a scheduled tool
+  searches for files it has not seen and how often (`scan_directory`), its
+  run log (`scan_run`, `scan_run_result`) and its memory of each file
+  (`scan_file`). The list is edited by the administrator; the tool only adds,
+  and holds what it is unsure of. See `design_docs/nas-import.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale.
@@ -117,6 +122,10 @@ Read `design_docs/overview.md` first for the conceptual model, then
   and read variables; `checkIntegrity()` returns the database's integrity
   report; `addHusbandryBatch` enters a day's weigh-ins in one transaction;
   `addArtifactFromFile` registers a file, computing its size and SHA-256.
+- `getScanDirectories` / `getScanRuns` / `getScanFiles` read the list of NAS
+  directories searched for new files, its runs and its memory of each file;
+  `addScanDirectory` / `updateScanDirectory` edit the list, for the schema
+  owner or a login granted that (`canEditScanDirectories`).
 
 ```matlab
 db  = CarasLabDB(Username="jdoe", Password=secret, ...   % your own login
@@ -154,7 +163,9 @@ moved or deleted (Ctrl+Shift+F); enter the day's husbandry
 for all animals in one grid (Ctrl+H); show the integrity report (Ctrl+I), where
 a missing file can be looked for by its size and checksum, optionally only
 among files whose name matches a regular expression, with a progress window,
-and its new place recorded (Find files…, Ctrl+F); run
+and its new place recorded (Find files…, Ctrl+F); see and, for the owner,
+edit the NAS directories searched for new files, with their held files
+(Scan directories…, Ctrl+Shift+D); run
 vetted read-only custom SQL. Ctrl+? lists the shortcuts. Because the schema is append-only, "editing" an
 event creates a superseding correction rather than mutating in place.
 
@@ -269,7 +280,9 @@ triggers against a freshly loaded database, `tests/roles_test.sql` what
 members of `lab_rw` and `lab_ro` may do (run as a superuser after
 `grants.sql`), `tests/check_verify_artifacts.py` the
 file verifier, `tests/check_lab_data.py` the live dashboard's export,
-`tests/check_forms_server.py` the forms server and its CSV files, and
+`tests/check_forms_server.py` the forms server and its CSV files,
+`tests/check_nas_import_parsing.py` (no database) and
+`tests/check_import_nas_files.py` the NAS importer, and
 `mcp-server/tests/` the MCP server. CI runs them on PostgreSQL 14, 15, 16
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
 run in CI too, in MATLAB R2024b, R2025a and the latest release on Linux
@@ -338,6 +351,16 @@ files on the NAS against their checksums. `SELECT * FROM
 lab.fn_check_integrity();` lists anything that needs attention. The
 deployment guides schedule all four.
 
+**Register the files already on the NAS:** the administrator lists the NAS
+directories to search, and how often, in `lab.scan_directory` (or in the
+MATLAB app's "Scan directories…" dialog, Ctrl+Shift+D). `tools/import_nas_files.py
+run`, scheduled every 15 minutes as the `lab_scanner` login, searches the
+directories that are due, reads only files it has not seen, and registers a
+session, an event and an artifact per file when a group of files has been
+seen unchanged long enough; everything uncertain is held and reported.
+`import_nas_files.py check` is its monitor. A new directory starts in
+`report` mode, which registers nothing. See `design_docs/nas-import.md`.
+
 **Query the schema from an LLM agent:** `mcp-server/` is a **read-only** MCP
 server that exposes typed `get*` tools (subjects, sessions, events, artifacts,
 lineage, tags, variables) over the `lab` schema — no insert, update or supersede surface, and no
@@ -373,6 +396,7 @@ design_docs/         Schema DDL and design documentation
   tagging.md           Tags: syntax, policy flags, filters, corrections
   variables.md         User-defined variables: names, units, history, queries
   forms.md             Browser forms: templates, entries, CSV files, outbox
+  nas-import.md        NAS import: the list of directories, the schedule, held files
   testing-locally.md   Local testing guide
   mcp-server.md        Read-only MCP server: design and setup
   deployment-requirements.md   Server-side requirements summary for IT
@@ -386,7 +410,7 @@ web/                 Standalone dashboard (synthetic data)
   live/                Live dashboard: /api/data server + query
   forms/               Forms: server, page and per-subject CSV export
 mcp-server/          Read-only MCP server (Python): typed query tools for LLM agents
-tools/               Backup, restore and file verification (Python)
+tools/               Backup, restore, file verification and NAS import (Python)
 examples/            End-to-end demo scripts
 tests/               Schema and role assertions (psql), tool checks (Python)
   matlab/              MATLAB unit and GUI tests (CI and local)

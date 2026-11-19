@@ -109,6 +109,16 @@ CREATE TABLE lab.acquisition_system (
     label text NOT NULL
 );
 
+-- How a listed directory is laid out (see lab.scan_directory). Each layout is
+-- one module of tools/import_nas_files.py, so a row added here without its
+-- module names a layout nothing can read: like lab.event_type, new rows
+-- arrive with the code that implements them (design_docs/grants.sql
+-- withholds INSERT from lab_rw).
+CREATE TABLE lab.scan_layout (
+    code  text PRIMARY KEY,
+    label text NOT NULL
+);
+
 -- ---------------------------------------------------------------------------
 -- Projects
 -- ---------------------------------------------------------------------------
@@ -195,10 +205,11 @@ CREATE TABLE lab.subject (
     created_by    uuid REFERENCES lab.person(person_id)
 );
 
--- Relative-path rules (applied to lab.session, lab.artifact and
--- lab.project_artifact). Paths are stored *relative* to a storage root so they
--- resolve on every machine that mounts the NAS, which only works if the stored
--- text is genuinely relative and canonical:
+-- Relative-path rules (applied to lab.session, lab.artifact,
+-- lab.project_artifact, lab.scan_directory and lab.scan_file). Paths are
+-- stored *relative* to a storage root so they resolve on every machine that
+-- mounts the NAS, which only works if the stored text is genuinely relative
+-- and canonical:
 --   * non-empty and not whitespace-padded;
 --   * no leading '/' or '\' and no 'C:' drive letter — an absolute path baked
 --     in from one workstation resolves nowhere else;
@@ -451,6 +462,10 @@ CREATE TABLE lab.artifact (
     -- NO ACTION for the same reason as event_session_subject_fk above.
     CONSTRAINT artifact_session_subject_fk FOREIGN KEY (session_id, subject_id)
         REFERENCES lab.session(session_id, subject_id),
+    -- FK target for lab.scan_file, so a row of the scan memory cannot name an
+    -- artifact that describes another path than its own. None of the three
+    -- columns is a subject id, so a subject rename does not touch the key.
+    UNIQUE (artifact_id, storage_root_id, relative_path),
     -- This whole table exists to make file integrity checkable, so a checksum
     -- that cannot possibly be one is worse than useless: a nightly verifier
     -- would report 'mismatch' forever with no way to tell a corrupted file from
@@ -903,6 +918,262 @@ CREATE TABLE lab.observation_event (
 );
 
 -- ---------------------------------------------------------------------------
+-- Searching listed directories for new files
+-- ---------------------------------------------------------------------------
+-- tools/import_nas_files.py registers the files that are already on the NAS:
+-- a session, the event that produced them and one lab.artifact row per file.
+-- Its scheduled `run` looks at the directories listed in lab.scan_directory,
+-- reads only files it has not seen, and registers what is new and
+-- unambiguous. Registration is permanent, so the tables here are built to
+-- make an unattended run safe to repeat and easy to audit:
+--
+--   scan_directory   which directories are searched, how they are laid out
+--                    and how often. Mutable; edited by the administrator, or
+--                    by a login the administrator grants it to
+--                    (design_docs/grants.sql). Every UPDATE and DELETE goes
+--                    to lab.row_history.
+--   scan_run         one row when a run of one directory starts,
+--   scan_run_result  and one when it ends. A run with no result is running
+--                    or was interrupted. Both append-only.
+--   scan_file        the scan memory, append-only: what the tool last saw of
+--                    each file and what it concluded. It is what lets a run
+--                    skip a file unread, and wait until a group of files has
+--                    been seen unchanged before registering it.
+--
+-- lab.fn_scan_status is the one definition of the schedule (when each
+-- directory is due); no client computes it.
+
+-- One directory to search, under a registered storage root.
+--   relative_path      the directory, by the relative-path rules above
+--                      lab.session and three more that make one directory one
+--                      spelling: no '.' segment, no empty segment ('//') and
+--                      no trailing '/'. The storage root itself cannot be
+--                      listed (the path is not empty): list its folders.
+--   layout             the module of the tool that reads it.
+--   rig                recorded on the sessions registered from it.
+--   pair_with          another directory on the same storage root whose
+--                      files belong with this one's (the behavior files of a
+--                      rig, for its recordings). The composite foreign key
+--                      keeps the pair on one root.
+--   time_zone          the zone of the wall-clock times in the file names,
+--                      and of the window. A name from pg_timezone_names,
+--                      spelled as it is there (trg_scan_directory_policy):
+--                      a zone such as America/New_York follows daylight
+--                      saving, which a bare offset or an abbreviation such
+--                      as EDT would not.
+--   scan_interval_min  minutes between searches: 1 to 527040 (366 days).
+--   window_start,      the hours of the day, in time_zone, in which the
+--   window_end         directory may be searched: [start, end), both or
+--                      neither, wrapping midnight when start > end. Whole
+--                      minutes before 24:00, so that the 'HH24:MI' text
+--                      every client reads and writes (lab.fn_scan_status) is
+--                      the stored value.
+--   min_age_min        how long a group of files must have been seen
+--                      unchanged before it is registered.
+--   mode               'off' (not searched), 'report' or 'register'. A
+--                      'report' search writes what it saw to the scan memory
+--                      ('pending', 'held' and 'cleared' rows are
+--                      observations, so its report can say which groups have
+--                      been seen unchanged and would be registered) but
+--                      registers nothing: no session, event or artifact, and
+--                      no 'registered' or 'known' row.
+--   mode_changed_at    when mode last changed, or the row was added. Kept by
+--                      trg_scan_directory_policy and never set by a client:
+--                      lab.fn_scan_status uses it so that a directory that
+--                      was 'off' is not reported overdue for that time.
+--   created_*          lab.row_history does not record an INSERT, so the
+--                      creator is on the row: created_login is stamped by
+--                      trg_scan_directory_stamp_login whatever the client
+--                      sends, and none of the three ever changes.
+-- Among the directories that are not 'off', no two on one storage root may be
+-- equal or nested (trg_scan_directory_policy; the unique index below is the
+-- declarative half, for equal paths). Root, path, layout and time zone are
+-- frozen once the directory has a run: to change them, turn it 'off' and add
+-- another. A directory with runs cannot be deleted (lab.scan_run refers to
+-- it).
+CREATE TABLE lab.scan_directory (
+    scan_directory_id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    storage_root_id   smallint NOT NULL REFERENCES lab.storage_root(root_id),
+    relative_path     text NOT NULL,
+    layout            text NOT NULL REFERENCES lab.scan_layout(code),
+    rig               text,
+    pair_with         integer,
+    time_zone         text NOT NULL,
+    scan_interval_min integer NOT NULL,
+    window_start      time,
+    window_end        time,
+    min_age_min       integer NOT NULL DEFAULT 1440,
+    mode              text NOT NULL DEFAULT 'report',
+    mode_changed_at   timestamptz NOT NULL DEFAULT now(),
+    notes             text,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    created_by        uuid REFERENCES lab.person(person_id),
+    created_login     text,
+    UNIQUE (scan_directory_id, storage_root_id),     -- FK target for pair_with
+    CONSTRAINT scan_directory_pair_fk FOREIGN KEY (pair_with, storage_root_id)
+        REFERENCES lab.scan_directory(scan_directory_id, storage_root_id),
+    CONSTRAINT scan_directory_pair_ck CHECK (pair_with <> scan_directory_id),
+    CONSTRAINT scan_directory_interval_ck CHECK (scan_interval_min BETWEEN 1 AND 527040),
+    CONSTRAINT scan_directory_min_age_ck CHECK (min_age_min >= 0),
+    CONSTRAINT scan_directory_mode_ck CHECK (mode IN ('off', 'report', 'register')),
+    CONSTRAINT scan_directory_time_zone_ck CHECK (
+        time_zone <> '' AND time_zone = btrim(time_zone)),
+    CONSTRAINT scan_directory_window_ck CHECK (
+        (window_start IS NULL AND window_end IS NULL)
+        OR (    window_start IS NOT NULL AND window_end IS NOT NULL
+            AND window_start <> window_end
+            AND window_start < time '24:00' AND window_end < time '24:00'
+            AND extract(second FROM window_start) = 0
+            AND extract(second FROM window_end) = 0)),
+    -- The session / artifact rule, then the three clauses that leave one
+    -- spelling per directory. Without them 'a/./b', 'a//b' and 'a/b/' would
+    -- be three more rows for 'a/b' that the nesting rule cannot recognise.
+    CONSTRAINT scan_directory_path_ck CHECK (
+            relative_path <> ''
+        AND relative_path = btrim(relative_path)
+        AND relative_path !~ '^([/\\]|[A-Za-z]:)'
+        AND relative_path !~ '\\'
+        AND relative_path !~ '(^|/)\.\.(/|$)'
+        AND relative_path !~ '(^|/)\.(/|$)'
+        AND relative_path !~ '//'
+        AND relative_path !~ '/$')
+);
+-- One directory, one row, among those that are searched. lower(): an SMB
+-- share does not distinguish 'Data' from 'data', and neither may the list.
+CREATE UNIQUE INDEX uq_scan_directory_path
+    ON lab.scan_directory (storage_root_id, lower(relative_path))
+    WHERE mode <> 'off';
+
+-- One row when a run of one directory starts.
+--   command     'run' (the scheduled, unattended search) or 'apply' (a
+--               reviewed plan written by a person).
+--   mode        the mode the run was made in; never 'off'.
+--   due_at      the scheduled time this run answers, as lab.fn_scan_status
+--               gave it. NULL for a run made by hand: such a run never moves
+--               the schedule. Only a 'run' answers a scheduled time, and a
+--               time that has not come yet cannot be answered -- which also
+--               keeps a faulty client from postponing a directory by writing
+--               a due time in the future.
+--   started_at  the database's clock, not the client's: the waiting time of
+--               lab.scan_directory.min_age_min is measured between runs.
+--   run_login   stamped by trg_scan_run_stamp_login, whatever the client
+--               sends.
+CREATE TABLE lab.scan_run (
+    scan_run_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    scan_directory_id integer NOT NULL REFERENCES lab.scan_directory(scan_directory_id),
+    command           text NOT NULL,
+    mode              text NOT NULL,
+    due_at            timestamptz,
+    started_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+    tool_version      text,
+    host              text,
+    run_login         text,
+    CONSTRAINT scan_run_command_ck CHECK (command IN ('run', 'apply')),
+    CONSTRAINT scan_run_mode_ck CHECK (mode IN ('report', 'register')),
+    CONSTRAINT scan_run_due_ck CHECK (
+        due_at IS NULL OR (command = 'run' AND due_at <= started_at))
+);
+
+-- One row when a run ends; at most one per run.
+--   outcome  'ok'           the directory was listed completely and
+--                           everything that could be done was done;
+--            'partial'      it stopped early (the window closed): the rest
+--                           is done at the next opening;
+--            'failed'       a folder could not be listed, or the run broke
+--                           off: nothing was concluded from what is absent;
+--            'unreachable'  the directory was missing or empty.
+-- The counts are of files and of groups (one session's files) in this run.
+CREATE TABLE lab.scan_run_result (
+    scan_run_id       bigint PRIMARY KEY REFERENCES lab.scan_run(scan_run_id),
+    finished_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    outcome           text NOT NULL,
+    files_listed      integer NOT NULL DEFAULT 0,
+    files_unchanged   integer NOT NULL DEFAULT 0,
+    files_pending     integer NOT NULL DEFAULT 0,
+    files_registered  integer NOT NULL DEFAULT 0,
+    files_known       integer NOT NULL DEFAULT 0,
+    files_held        integer NOT NULL DEFAULT 0,
+    files_ignored     integer NOT NULL DEFAULT 0,
+    files_cleared     integer NOT NULL DEFAULT 0,
+    groups_registered integer NOT NULL DEFAULT 0,
+    groups_waiting    integer NOT NULL DEFAULT 0,
+    groups_held       integer NOT NULL DEFAULT 0,
+    bytes_read        bigint NOT NULL DEFAULT 0,
+    message           text,
+    details           jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT scan_run_result_outcome_ck CHECK (
+        outcome IN ('ok', 'partial', 'failed', 'unreachable')),
+    CONSTRAINT scan_run_result_counts_ck CHECK (
+            files_listed >= 0 AND files_unchanged >= 0 AND files_pending >= 0
+        AND files_registered >= 0 AND files_known >= 0 AND files_held >= 0
+        AND files_ignored >= 0 AND files_cleared >= 0
+        AND groups_registered >= 0 AND groups_waiting >= 0 AND groups_held >= 0
+        AND bytes_read >= 0),
+    CONSTRAINT scan_run_result_details_object_ck CHECK (jsonb_typeof(details) = 'object')
+);
+
+-- The scan memory. A row is appended only when what the tool sees of a file
+-- differs from the latest row for its path, so a file that does not change
+-- has one row however often its directory is searched; the latest row per
+-- (storage root, path), in insertion order, is the file's state
+-- (lab.scan_file_latest).
+--   relative_path  spelled as on disk, under the artifact path rules and
+--                  normalised the same way, so that it compares equal to
+--                  lab.artifact.relative_path.
+--   size_bytes,    as listed. mtime_ns is the file system's modification
+--   mtime_ns       time in whole nanoseconds since 1970 (st_mtime_ns): a
+--                  whole number, never a float, because it is compared for
+--                  equality.
+--   group_key      the group (one session's files) the file belongs to.
+--   status         'pending'     seen, waiting to be seen unchanged;
+--                  'registered'  this tool registered it (artifact_id);
+--                  'known'       another client had registered these bytes
+--                                at this path, confirmed by reading them
+--                                (artifact_id);
+--                  'held'        left for a person (reason_code, reason);
+--                  'cleared'     a pending or held file is no longer there.
+-- The composite foreign key makes a 'registered' or 'known' row name an
+-- artifact at its own root and path: a memory row that named another file's
+-- artifact would let the tool skip a file that was never registered.
+--
+-- There is no subject column, for the reason lab.tag_assignment stores no
+-- entity_id: a stored copy of the subject would have to follow a rename.
+-- The subject of a registered file is its artifact's.
+CREATE TABLE lab.scan_file (
+    scan_file_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    scan_run_id     bigint NOT NULL REFERENCES lab.scan_run(scan_run_id),
+    storage_root_id smallint NOT NULL REFERENCES lab.storage_root(root_id),
+    relative_path   text NOT NULL,
+    size_bytes      bigint,
+    mtime_ns        bigint,
+    group_key       text,
+    status          text NOT NULL,
+    reason_code     text,
+    reason          text,
+    artifact_id     uuid,
+    CONSTRAINT scan_file_status_ck CHECK (
+        status IN ('pending', 'registered', 'known', 'held', 'cleared')),
+    CONSTRAINT scan_file_size_ck CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    -- What was listed is recorded for every file that is there.
+    CONSTRAINT scan_file_listing_ck CHECK (
+        status = 'cleared' OR (size_bytes IS NOT NULL AND mtime_ns IS NOT NULL)),
+    CONSTRAINT scan_file_artifact_ck CHECK (
+        (artifact_id IS NOT NULL) = (status IN ('registered', 'known'))),
+    -- A file held with no stated reason cannot be acted on.
+    CONSTRAINT scan_file_held_ck CHECK (
+        status <> 'held' OR (reason_code IS NOT NULL AND btrim(reason_code) <> '')),
+    CONSTRAINT scan_file_artifact_fk FOREIGN KEY (artifact_id, storage_root_id, relative_path)
+        REFERENCES lab.artifact(artifact_id, storage_root_id, relative_path),
+    -- See "Relative-path rules" above CREATE TABLE lab.session.
+    CONSTRAINT scan_file_path_ck CHECK (
+            relative_path <> ''
+        AND relative_path = btrim(relative_path)
+        AND relative_path !~ '^([/\\]|[A-Za-z]:)'
+        AND relative_path !~ '\\'
+        AND relative_path !~ '(^|/)\.\.(/|$)')
+);
+
+-- ---------------------------------------------------------------------------
 -- Audit logs
 -- ---------------------------------------------------------------------------
 -- Both are append-only (see the trigger loop below). Clients never write to
@@ -919,7 +1190,8 @@ CREATE TABLE lab.maintenance_log (
 );
 
 -- Prior versions of rows in the *mutable* tables (the reference tables,
--- project tables, subject, session and the tag vocabulary). Those tables are
+-- project tables, subject, session, the tag vocabulary and the list of
+-- directories to search). Those tables are
 -- deliberately editable in place, but an in-place edit with no record of the
 -- previous value or of who made it is the same provenance gap the event log
 -- exists to close. One row per UPDATE that changed something, or per DELETE.
@@ -1012,6 +1284,17 @@ CREATE INDEX ix_subject_form_form             ON lab.subject_form (form_name, fo
 CREATE INDEX ix_observation_event_subject_form ON lab.observation_event (subject_form_id);
 CREATE INDEX ix_observation_event_form        ON lab.observation_event (form_name, form_version);
 
+-- The scan memory is read as "the latest row for this path"
+-- (lab.scan_file_latest, once per file per search) and as "the rows of this
+-- run" or "of this group"; the runs as "the latest run of this directory"
+-- (lab.fn_scan_status).
+CREATE INDEX ix_scan_file_path
+    ON lab.scan_file (storage_root_id, relative_path, scan_file_id DESC);
+CREATE INDEX ix_scan_file_run   ON lab.scan_file (scan_run_id, group_key);
+CREATE INDEX ix_scan_file_group ON lab.scan_file (storage_root_id, group_key, scan_file_id DESC)
+    WHERE group_key IS NOT NULL;
+CREATE INDEX ix_scan_run_directory ON lab.scan_run (scan_directory_id, scan_run_id DESC);
+
 -- ---------------------------------------------------------------------------
 -- Immutability + validation triggers
 -- ---------------------------------------------------------------------------
@@ -1082,7 +1365,8 @@ BEGIN
 
     IF TG_TABLE_NAME IN ('artifact_verification', 'maintenance_log',
                          'row_history', 'schema_version', 'tag_assignment',
-                         'variable_value', 'retraction', 'artifact_disposition') THEN
+                         'variable_value', 'retraction', 'artifact_disposition',
+                         'scan_run', 'scan_run_result', 'scan_file') THEN
         RAISE EXCEPTION
           '% on %.% is not allowed: this table is an append-only log.',
           TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
@@ -1121,7 +1405,8 @@ BEGIN
         'artifact','event_input',
         'artifact_verification','maintenance_log','row_history','schema_version',
         'tag_assignment','variable_value','retraction','artifact_disposition',
-        'form_version'
+        'form_version',
+        'scan_run','scan_run_result','scan_file'
     ] LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_immutable_%1$s ON lab.%1$s;', t);
@@ -1268,6 +1553,14 @@ CREATE TRIGGER trg_artifact_normalize_path
 
 CREATE TRIGGER trg_project_artifact_normalize_path
     BEFORE INSERT OR UPDATE ON lab.project_artifact
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_path();
+
+CREATE TRIGGER trg_scan_directory_normalize_path
+    BEFORE INSERT OR UPDATE ON lab.scan_directory
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_path();
+
+CREATE TRIGGER trg_scan_file_normalize_path
+    BEFORE INSERT ON lab.scan_file
     FOR EACH ROW EXECUTE FUNCTION lab.fn_normalize_path();
 
 -- No two *active* artifacts may describe the same file. uq_artifact_file_original
@@ -1623,6 +1916,11 @@ CREATE TRIGGER trg_artifact_matches_event
 -- stamped but not defaulted here -- lab.fn_set_variable does that -- because
 -- a carried-forward value must keep the set_by it was carried with, NULL
 -- included.
+--
+-- Two tables that are not person-attributed logs are stamped here too:
+-- lab.scan_directory, a mutable table whose INSERT lab.row_history does not
+-- record (created_login, and created_by defaulted as above), and
+-- lab.scan_run (run_login; a run names no person).
 CREATE OR REPLACE FUNCTION lab.fn_stamp_login() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
@@ -1649,6 +1947,11 @@ BEGIN
     ELSIF TG_TABLE_NAME = 'form_version' THEN
         NEW.created_login := session_user;
         NEW.created_by := coalesce(NEW.created_by, lab.fn_current_person());
+    ELSIF TG_TABLE_NAME = 'scan_directory' THEN
+        NEW.created_login := session_user;
+        NEW.created_by := coalesce(NEW.created_by, lab.fn_current_person());
+    ELSIF TG_TABLE_NAME = 'scan_run' THEN
+        NEW.run_login := session_user;
     ELSE
         RAISE EXCEPTION 'lab.fn_stamp_login is not defined for table %', TG_TABLE_NAME;
     END IF;
@@ -1686,6 +1989,14 @@ CREATE TRIGGER trg_variable_value_stamp_login
 
 CREATE TRIGGER trg_form_version_stamp_login
     BEFORE INSERT ON lab.form_version
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_scan_directory_stamp_login
+    BEFORE INSERT ON lab.scan_directory
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
+
+CREATE TRIGGER trg_scan_run_stamp_login
+    BEFORE INSERT ON lab.scan_run
     FOR EACH ROW EXECUTE FUNCTION lab.fn_stamp_login();
 
 -- subject_id is the natural key every append-only table refers to, so only a
@@ -2151,6 +2462,146 @@ CREATE TRIGGER trg_artifact_disposition_policy
     BEFORE INSERT ON lab.artifact_disposition
     FOR EACH ROW EXECUTE FUNCTION lab.fn_artifact_disposition_policy();
 
+-- What a row of lab.scan_directory may say, beyond its CHECKs:
+--
+--   * Its time zone is a name this server knows (pg_timezone_names). Checked
+--     when the row is added and when the zone changes, not on every edit, so
+--     a zone a later tz database drops does not lock the row.
+--   * Among the directories that are not 'off', no two on one storage root
+--     are equal or nested: the files under the inner one would be searched,
+--     and registered, by two runs under two sets of rules. Paths are compared
+--     in lower case, because an SMB share does not distinguish 'Data' from
+--     'data', and with starts_with on a '/' boundary -- never LIKE, where the
+--     '_' of 'epsych_files' is a wildcard. A directory that is 'off' takes no
+--     part, which is how one is replaced. Writers are serialised per storage
+--     root, so two concurrent transactions cannot each add one half of an
+--     overlap; lab.fn_check_integrity reports one that exists all the same
+--     (scan_directory_overlap).
+--   * Once the directory has a run, its storage root, path, layout and time
+--     zone are frozen: the runs, and the files registered by them, were made
+--     under those. To change one, turn the directory 'off' and add another.
+--     The key and the created_* columns never change.
+--   * mode_changed_at is the database's: the time the row was added, then
+--     the time of each change of mode, whatever the client sends with it. An
+--     UPDATE that leaves mode alone may not touch it.
+--
+-- The freeze must hold against a run that starts while the row is being
+-- edited, so the edit takes the lock trg_scan_run_policy shares: a change of
+-- a frozen column and the first run of the directory happen one after the
+-- other, never at once. A client that has inserted its lab.scan_run row
+-- therefore reads the directory's row again and has the values its run is
+-- recorded under.
+--
+-- The trigger name sorts after trg_scan_directory_normalize_path, and BEFORE
+-- triggers fire in name order, so the comparison sees the normalised path.
+CREATE OR REPLACE FUNCTION lab.fn_scan_directory_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_self  integer;
+    v_mine  text;
+    v_other record;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.mode_changed_at := now();
+    ELSE
+        v_self := OLD.scan_directory_id;
+        IF NEW.mode IS DISTINCT FROM OLD.mode THEN
+            NEW.mode_changed_at := now();
+        ELSIF NEW.mode_changed_at IS DISTINCT FROM OLD.mode_changed_at THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('scan directory %s: mode_changed_at is kept by the database and '
+                                 'cannot be set', OLD.scan_directory_id),
+                HINT    = 'It changes when mode does.';
+        END IF;
+        IF NEW.scan_directory_id IS DISTINCT FROM OLD.scan_directory_id
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at
+           OR NEW.created_by IS DISTINCT FROM OLD.created_by
+           OR NEW.created_login IS DISTINCT FROM OLD.created_login THEN
+            RAISE EXCEPTION USING
+                MESSAGE = format('scan directory %s: scan_directory_id, created_at, created_by and '
+                                 'created_login never change', OLD.scan_directory_id);
+        END IF;
+        IF NEW.storage_root_id IS DISTINCT FROM OLD.storage_root_id
+           OR NEW.relative_path IS DISTINCT FROM OLD.relative_path
+           OR NEW.layout IS DISTINCT FROM OLD.layout
+           OR NEW.time_zone IS DISTINCT FROM OLD.time_zone THEN
+            PERFORM pg_advisory_xact_lock(hashtextextended(
+                concat_ws(':', 'lab.scan_run', OLD.scan_directory_id), 0));
+            IF EXISTS (SELECT 1 FROM lab.scan_run r
+                       WHERE r.scan_directory_id = OLD.scan_directory_id) THEN
+                RAISE EXCEPTION USING
+                    MESSAGE = format('scan directory %s has been searched: its storage root, path, '
+                                     'layout and time zone can no longer change',
+                                     OLD.scan_directory_id),
+                    HINT    = 'Turn it off (mode = ''off'') and add another directory.';
+            END IF;
+        END IF;
+    END IF;
+
+    IF NEW.time_zone IS NOT NULL
+       AND (TG_OP = 'INSERT' OR NEW.time_zone IS DISTINCT FROM OLD.time_zone)
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_timezone_names z
+                       WHERE z.name = NEW.time_zone) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'invalid_parameter_value',
+            MESSAGE = format('time zone %s is not a time zone name this server knows',
+                             NEW.time_zone),
+            HINT    = 'Use a name from pg_timezone_names, spelled as it is there, such as '
+                      'America/New_York.';
+    END IF;
+
+    IF NEW.mode <> 'off' THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended(
+            concat_ws(':', 'lab.scan_directory', NEW.storage_root_id), 0));
+        v_mine := lower(NEW.relative_path);
+        SELECT o.scan_directory_id, o.relative_path INTO v_other
+        FROM lab.scan_directory o
+        WHERE o.storage_root_id = NEW.storage_root_id
+          AND o.mode <> 'off'
+          AND o.scan_directory_id IS DISTINCT FROM v_self
+          AND (   lower(o.relative_path) = v_mine
+               OR starts_with(lower(o.relative_path), v_mine || '/')
+               OR starts_with(v_mine, lower(o.relative_path) || '/'))
+        ORDER BY o.scan_directory_id
+        LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'exclusion_violation',
+                MESSAGE = format('directory %s on storage root %s cannot be searched: scan '
+                                 'directory %s (%s) is the same directory, contains it or lies '
+                                 'inside it',
+                                 NEW.relative_path, NEW.storage_root_id,
+                                 v_other.scan_directory_id, v_other.relative_path),
+                HINT    = 'Among the directories that are not off, no two on one storage root '
+                          'may be equal or nested (compared without regard to case). Turn one '
+                          'of them off.';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_scan_directory_policy
+    BEFORE INSERT OR UPDATE ON lab.scan_directory
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_scan_directory_policy();
+
+-- The other half of the freeze in lab.fn_scan_directory_policy: a run takes,
+-- shared, the lock an edit of the directory's frozen columns takes
+-- exclusively. Shared, so two runs of one directory (a scheduled one and one
+-- made by hand) do not wait for each other.
+CREATE OR REPLACE FUNCTION lab.fn_scan_run_policy() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(
+        concat_ws(':', 'lab.scan_run', NEW.scan_directory_id), 0));
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_scan_run_policy
+    BEFORE INSERT ON lab.scan_run
+    FOR EACH ROW EXECUTE FUNCTION lab.fn_scan_run_policy();
+
 -- Edit history for the mutable tables (see lab.row_history). SECURITY DEFINER
 -- so that clients need no INSERT privilege on row_history and cannot write
 -- forged history rows; the trigger arguments name the table's primary-key
@@ -2195,7 +2646,9 @@ BEGIN
         ('tag',                '''tag'''),
         ('variable',           '''name'''),
         ('form',               '''name'''),
-        ('subject_form',       '''subject_form_id''')
+        ('subject_form',       '''subject_form_id'''),
+        ('scan_layout',        '''code'''),
+        ('scan_directory',     '''scan_directory_id''')
     ) AS v(tbl, pk_args) LOOP
         EXECUTE format(
           'DROP TRIGGER IF EXISTS trg_history_%1$s ON lab.%1$s;', r.tbl);
@@ -2464,6 +2917,51 @@ CREATE VIEW lab.entity_variables AS
                                  ELSE to_jsonb(vc.value_text) END) AS variables
     FROM lab.variable_current vc
     GROUP BY vc.entity_kind, vc.entity_id;
+
+-- The scan memory's current state: the latest row per (storage root, path).
+-- "Latest" is insertion order (scan_file_id), as for tags and variables; the
+-- runs of one directory follow one another, so it is also the order in which
+-- the file was looked at. The path is compared exactly, as in lab.artifact:
+-- two spellings that differ in case are two rows here (and the tool holds
+-- the second, path_case_conflict).
+CREATE VIEW lab.scan_file_latest AS
+    SELECT DISTINCT ON (f.storage_root_id, f.relative_path) f.*
+    FROM lab.scan_file f
+    ORDER BY f.storage_root_id, f.relative_path, f.scan_file_id DESC;
+
+-- The files waiting for a person: the latest rows that are 'held'.
+-- scan_directory_id is the directory of the run that wrote the row, which
+-- is the directory the file lies under: a run writes memory rows only for
+-- files under its own directory, also when it lists the directory it is
+-- paired with. held_at is when that run started.
+-- first_held_at is when the file was first held for this reason without
+-- interruption: the start of the run that wrote the earliest row since the
+-- file was last anything but held with this reason_code (a row is appended
+-- when the size or the modification time changes, so one hold can be several
+-- rows).
+CREATE VIEW lab.scan_held AS
+    SELECT l.scan_file_id, l.scan_run_id, r.scan_directory_id,
+           l.storage_root_id, sr.name AS storage_root, l.relative_path,
+           l.size_bytes, l.mtime_ns, l.group_key, l.reason_code, l.reason,
+           r.started_at AS held_at, h.first_held_at
+    FROM lab.scan_file_latest l
+    JOIN lab.scan_run r ON r.scan_run_id = l.scan_run_id
+    JOIN lab.storage_root sr ON sr.root_id = l.storage_root_id
+    CROSS JOIN LATERAL (
+        SELECT fr.started_at AS first_held_at
+        FROM lab.scan_file f
+        JOIN lab.scan_run fr ON fr.scan_run_id = f.scan_run_id
+        WHERE f.storage_root_id = l.storage_root_id
+          AND f.relative_path   = l.relative_path
+          AND f.scan_file_id > coalesce((
+                  SELECT max(b.scan_file_id) FROM lab.scan_file b
+                  WHERE b.storage_root_id = l.storage_root_id
+                    AND b.relative_path   = l.relative_path
+                    AND NOT (b.status = 'held' AND b.reason_code = l.reason_code)), 0)
+        ORDER BY f.scan_file_id
+        LIMIT 1
+    ) h
+    WHERE l.status = 'held';
 
 -- ---------------------------------------------------------------------------
 -- Correction chains and the recursive lineage function
@@ -4270,6 +4768,242 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Searching listed directories: the schedule
+-- ---------------------------------------------------------------------------
+-- When each directory of lab.scan_directory is to be searched next is
+-- defined here and nowhere else: the tool asks lab.fn_scan_due which
+-- directories to search, the app shows lab.scan_directory_status, and
+-- neither does arithmetic on times. p_now is the clock the question is asked
+-- at (the tests pass fixed instants); it is not an "as of": the runs counted
+-- are all the runs there are.
+--
+-- Every duration is built with make_interval(mins => ...), which has no day
+-- or month part, and the only use of a time zone is the directory's own, by
+-- name. So the answer depends on p_now and the rows alone, never on the
+-- session's TimeZone setting. It also means an interval of 1440 minutes is
+-- 24 hours, not "the same time tomorrow": across a daylight-saving change a
+-- daily search moves by an hour on the wall clock, and the window, which is
+-- wall-clock, is what keeps it at night.
+
+-- Whether the directory's window is open at p_now: the wall-clock time in
+-- the directory's time zone is in [window_start, window_end), which wraps
+-- midnight when start > end. No window is always open. NULL when there is no
+-- such directory. This is the window test alone -- it does not look at mode
+-- or at the schedule -- and it is cheap: the tool asks it again before each
+-- group it registers.
+--
+-- Daylight saving needs no special case. On the day the clocks go forward
+-- the skipped hour never appears on the wall clock, so a window that lies
+-- inside it does not open that day; on the day they go back the repeated
+-- hour appears twice and a window inside it is open twice, which is
+-- harmless.
+CREATE OR REPLACE FUNCTION lab.fn_scan_window_open(
+    p_scan_directory_id integer,
+    p_now               timestamptz DEFAULT now()
+) RETURNS boolean
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT CASE
+               WHEN d.window_start IS NULL THEN true
+               WHEN d.window_start < d.window_end THEN
+                   w.local_time >= d.window_start AND w.local_time < d.window_end
+               ELSE
+                   w.local_time >= d.window_start OR w.local_time < d.window_end
+           END
+    FROM lab.scan_directory d
+    CROSS JOIN LATERAL (
+        SELECT (coalesce(p_now, now()) AT TIME ZONE d.time_zone)::time AS local_time) w
+    WHERE d.scan_directory_id = p_scan_directory_id;
+$$;
+
+-- The schedule: one row per directory, with its settings (the window as
+-- 'HH24:MI' text, the interval and the minimum age as whole minutes), its
+-- storage root's name, its latest run, and what follows from them at p_now.
+--
+-- A *scheduled* run is one with a due_at; a run made by hand has none and
+-- never moves the schedule. due_at is taken from the latest scheduled run
+-- that has a result (latest by scan_run_id):
+--
+--   none yet       the directory's created_at;
+--   'ok'           that run's due_at plus the interval -- its due_at, not
+--                  the time it actually ran, so a daily search does not start
+--                  a little later every day. When that is more than one
+--                  interval before p_now (the scheduler was stopped, the
+--                  directory was 'off') it is p_now: one search is owed, not
+--                  one for every interval missed;
+--   'partial'      p_now: the rest is done at once, which with a window
+--                  means at its next opening;
+--   'failed',      that run's finished_at plus the interval or 60 minutes,
+--   'unreachable'  whichever is shorter.
+--
+-- is_due       mode <> 'off', p_now >= due_at and the window is open.
+-- is_overdue   mode <> 'off' and no scheduled search has ended 'ok' for more
+--              than one interval plus 26 hours after one was due: p_now >
+--              D + interval + 26 h, where D is the last 'ok' scheduled run's
+--              due_at plus the interval (created_at when there is none), or
+--              mode_changed_at when that is later.
+-- is_running   the latest run of any kind has no result and started less
+--              than 24 hours before p_now. Without a result after that, it
+--              was interrupted.
+-- n_pending,   files of the scan memory under this directory (same storage
+-- n_held       root, path below it, compared as trg_scan_directory_policy
+--              compares) whose latest row is 'pending' / 'held'.
+--
+-- Three points the rule above leaves open are settled on the side of
+-- searching, and of saying so:
+--
+--   * A run with no result does not count. While it is running, and after it
+--     was interrupted, the directory is as due as it was before: is_due does
+--     not look at is_running. A second process is kept out by the tool's
+--     advisory lock, and a search made twice registers nothing twice; a
+--     schedule that waited for a run that died would stop searching.
+--   * is_overdue is anchored on the last 'ok' search, not on due_at. due_at
+--     moves with every 'failed', 'unreachable' or 'partial' run and with
+--     p_now itself once it is far behind, so "p_now > due_at + interval +
+--     26 h" would never be true for a directory whose searches fail every
+--     hour, or whose scheduler has been stopped for a week -- the two cases
+--     the flag is for.
+--   * A directory turned on after being 'off' is due at once -- a search is
+--     owed -- but not overdue for the time it was off: the count for
+--     is_overdue starts again at mode_changed_at. The row does not say what
+--     the mode was before, so every change of mode restarts it; a change
+--     between 'report' and 'register' therefore puts an overdue alarm off,
+--     by one interval plus 26 hours at most.
+CREATE OR REPLACE FUNCTION lab.fn_scan_status(p_now timestamptz DEFAULT now())
+RETURNS TABLE (
+    scan_directory_id    integer,
+    storage_root_id      smallint,
+    storage_root         text,
+    relative_path        text,
+    layout               text,
+    rig                  text,
+    pair_with            integer,
+    time_zone            text,
+    scan_interval_min    integer,
+    window_start_text    text,
+    window_end_text      text,
+    min_age_min          integer,
+    mode                 text,
+    mode_changed_at      timestamptz,
+    notes                text,
+    created_at           timestamptz,
+    created_by           uuid,
+    created_login        text,
+    last_run_id          bigint,
+    last_run_command     text,
+    last_run_mode        text,
+    last_run_started_at  timestamptz,
+    last_run_outcome     text,
+    last_run_finished_at timestamptz,
+    last_ok_run_id       bigint,
+    last_ok_due_at       timestamptz,
+    last_ok_finished_at  timestamptz,
+    due_at               timestamptz,
+    window_open          boolean,
+    is_due               boolean,
+    is_overdue           boolean,
+    is_running           boolean,
+    n_pending            integer,
+    n_held               integer
+)
+LANGUAGE sql STABLE AS $$
+    WITH b AS (
+        SELECT d.*, sr.name AS root_name, c.t,
+               make_interval(mins => d.scan_interval_min) AS every,
+               lab.fn_scan_window_open(d.scan_directory_id, c.t) AS is_open,
+               lr.scan_run_id AS lr_id, lr.command AS lr_command, lr.mode AS lr_mode,
+               lr.started_at AS lr_started_at, lr.outcome AS lr_outcome,
+               lr.finished_at AS lr_finished_at,
+               ls.outcome AS ls_outcome, ls.due_at AS ls_due_at, ls.finished_at AS ls_finished_at,
+               lo.scan_run_id AS lo_id, lo.due_at AS lo_due_at, lo.finished_at AS lo_finished_at
+        FROM lab.scan_directory d
+        CROSS JOIN (SELECT coalesce(p_now, now()) AS t) c
+        JOIN lab.storage_root sr ON sr.root_id = d.storage_root_id
+        -- the latest run of any kind, with its result if it has one
+        LEFT JOIN LATERAL (
+            SELECT r.scan_run_id, r.command, r.mode, r.started_at, x.outcome, x.finished_at
+            FROM lab.scan_run r
+            LEFT JOIN lab.scan_run_result x ON x.scan_run_id = r.scan_run_id
+            WHERE r.scan_directory_id = d.scan_directory_id
+            ORDER BY r.scan_run_id DESC
+            LIMIT 1
+        ) lr ON true
+        -- the latest scheduled run that has a result
+        LEFT JOIN LATERAL (
+            SELECT r.due_at, x.outcome, x.finished_at
+            FROM lab.scan_run r
+            JOIN lab.scan_run_result x ON x.scan_run_id = r.scan_run_id
+            WHERE r.scan_directory_id = d.scan_directory_id AND r.due_at IS NOT NULL
+            ORDER BY r.scan_run_id DESC
+            LIMIT 1
+        ) ls ON true
+        -- the latest scheduled run that ended 'ok'
+        LEFT JOIN LATERAL (
+            SELECT r.scan_run_id, r.due_at, x.finished_at
+            FROM lab.scan_run r
+            JOIN lab.scan_run_result x ON x.scan_run_id = r.scan_run_id
+            WHERE r.scan_directory_id = d.scan_directory_id AND r.due_at IS NOT NULL
+              AND x.outcome = 'ok'
+            ORDER BY r.scan_run_id DESC
+            LIMIT 1
+        ) lo ON true
+    ), s AS (
+        SELECT b.*,
+               CASE
+                   WHEN b.ls_outcome IS NULL THEN b.created_at
+                   WHEN b.ls_outcome = 'ok' THEN
+                       CASE WHEN b.ls_due_at + b.every < b.t - b.every THEN b.t
+                            ELSE b.ls_due_at + b.every END
+                   WHEN b.ls_outcome = 'partial' THEN b.t
+                   ELSE b.ls_finished_at + least(b.every, make_interval(mins => 60))
+               END AS next_due,
+               greatest(coalesce(b.lo_due_at + b.every, b.created_at),
+                        b.mode_changed_at) AS ok_due
+        FROM b
+    ), n AS (
+        SELECT d.scan_directory_id,
+               count(*) FILTER (WHERE l.status = 'pending') AS n_pending,
+               count(*) FILTER (WHERE l.status = 'held')    AS n_held
+        FROM lab.scan_directory d
+        JOIN lab.scan_file_latest l
+          ON l.storage_root_id = d.storage_root_id
+         AND starts_with(lower(l.relative_path), lower(d.relative_path) || '/')
+        WHERE l.status IN ('pending', 'held')
+        GROUP BY d.scan_directory_id
+    )
+    SELECT s.scan_directory_id, s.storage_root_id, s.root_name, s.relative_path, s.layout,
+           s.rig, s.pair_with, s.time_zone, s.scan_interval_min,
+           to_char(s.window_start, 'HH24:MI'), to_char(s.window_end, 'HH24:MI'),
+           s.min_age_min, s.mode, s.mode_changed_at, s.notes, s.created_at, s.created_by,
+           s.created_login,
+           s.lr_id, s.lr_command, s.lr_mode, s.lr_started_at, s.lr_outcome, s.lr_finished_at,
+           s.lo_id, s.lo_due_at, s.lo_finished_at,
+           s.next_due,
+           s.is_open,
+           s.mode <> 'off' AND s.t >= s.next_due AND s.is_open,
+           s.mode <> 'off' AND s.t > s.ok_due + s.every + make_interval(mins => 26 * 60),
+           s.lr_id IS NOT NULL AND s.lr_outcome IS NULL
+               AND s.lr_started_at > s.t - make_interval(mins => 24 * 60),
+           coalesce(n.n_pending, 0)::integer, coalesce(n.n_held, 0)::integer
+    FROM s
+    LEFT JOIN n ON n.scan_directory_id = s.scan_directory_id
+    ORDER BY s.root_name, s.relative_path, s.scan_directory_id;
+$$;
+
+-- The schedule now. What the app's list of directories shows.
+CREATE VIEW lab.scan_directory_status AS
+    SELECT * FROM lab.fn_scan_status(now());
+
+-- The directories to search at p_now, the one longest due first. What the
+-- scheduled run of the tool reads.
+CREATE OR REPLACE FUNCTION lab.fn_scan_due(p_now timestamptz DEFAULT now())
+RETURNS SETOF lab.scan_directory_status
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM lab.fn_scan_status(p_now) s
+    WHERE s.is_due
+    ORDER BY s.due_at, s.scan_directory_id;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Integrity report
 -- ---------------------------------------------------------------------------
 -- Class-table inheritance has one hole no declarative constraint can close:
@@ -4475,7 +5209,26 @@ LANGUAGE sql STABLE AS $$
     FROM lab.observation_active oa
     CROSS JOIN LATERAL lab.fn_observation_problems(oa.form_name, oa.form_version,
                                                    oa.field_values, true) p
-    GROUP BY oa.event_id, oa.form_name, oa.form_version;
+    GROUP BY oa.event_id, oa.form_name, oa.form_version
+
+    UNION ALL
+    -- Two directories to search, neither 'off', that are the same directory
+    -- or one inside the other on one storage root: the files of the inner
+    -- one are searched by two runs. trg_scan_directory_policy refuses such a
+    -- row, but it is a trigger, not a constraint: this reports a pair that
+    -- got past it (rows loaded with triggers off, or two writers under a
+    -- snapshot isolation level). One row per pair, under the lower id.
+    SELECT 'warning', 'scan_directory_overlap', a.scan_directory_id::text,
+           format('directory %s on storage root %s and scan directory %s (%s) are equal or nested',
+                  a.relative_path, a.storage_root_id, b.scan_directory_id, b.relative_path)
+    FROM lab.scan_directory a
+    JOIN lab.scan_directory b
+      ON b.storage_root_id = a.storage_root_id
+     AND b.scan_directory_id > a.scan_directory_id
+     AND (   lower(b.relative_path) = lower(a.relative_path)
+          OR starts_with(lower(b.relative_path), lower(a.relative_path) || '/')
+          OR starts_with(lower(a.relative_path), lower(b.relative_path) || '/'))
+    WHERE a.mode <> 'off' AND b.mode <> 'off';
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -4515,6 +5268,11 @@ INSERT INTO lab.species (code, common_name) VALUES
     ('meriones_unguiculatus','Mongolian gerbil'),
     ('mus_musculus','House mouse'),
     ('rattus_norvegicus','Norway rat')
+ON CONFLICT (code) DO NOTHING;
+
+-- The layouts tools/import_nas_files.py implements (see lab.scan_layout).
+INSERT INTO lab.scan_layout (code, label) VALUES
+    ('epsych','EPsych behavior files'), ('intan','Intan RHX recording folders')
 ON CONFLICT (code) DO NOTHING;
 
 -- Starting tag vocabulary; every row is editable by lab members, within the
@@ -4569,6 +5327,11 @@ ON CONFLICT (version) DO NOTHING;
 -- after this file:
 --
 --     psql -v ON_ERROR_STOP=1 -d lab -f design_docs/grants.sql
+--
+-- It also keeps the list of directories to search (lab.scan_directory) and
+-- the scan logs out of lab_rw's hands: the administrator edits the list, and
+-- the one login the scheduled search runs as is granted INSERT on the logs
+-- by the deployment guide.
 --
 -- lab.fn_rename_subject is REVOKEd from PUBLIC above; grant EXECUTE on it only
 -- to the administrator role that is expected to run identity maintenance.

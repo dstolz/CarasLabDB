@@ -142,7 +142,7 @@ def test_schema_map_matches_the_catalog(seed):
 
 def test_tool_surface_is_read_only_and_takes_no_identifiers(seed):
     tools = asyncio.run(app.list_tools())
-    assert len(tools) == 32
+    assert len(tools) == 35
     for tool in tools:
         assert tool.name.startswith("get_") or tool.name in ("find_by_tags", "find_by_variable"), \
             tool.name
@@ -160,7 +160,7 @@ def test_every_list_tool_is_bounded_and_puts_the_flags_first(seed, seed5):
         "get_counts": {"question": "events_by_type"},
     }
     tools = [t.name for t in asyncio.run(app.list_tools()) if t.name != "get_event_detail"]
-    assert len(tools) == 31
+    assert len(tools) == 34
     for name in tools:
         args = required.get(name, {})
         res = call(name, limit=10**9, **args)
@@ -942,12 +942,12 @@ def test_integrity_docstring_lists_every_check(seed):
         source = conn.execute(
             "SELECT pg_get_functiondef('lab.fn_check_integrity()'::regprocedure)").fetchone()[0]
     checks = set(re.findall(r"SELECT '(error|warning)', '([a-z_]+)'", source))
-    assert len(checks) == 15
+    assert len(checks) == 16
     doc = {t.name: t.description for t in asyncio.run(app.list_tools())}["get_integrity_report"]
-    assert "The 15 checks" in doc
+    assert "The 16 checks" in doc
     for severity, name in checks:
         assert f"- {name} ({severity})" in doc, name
-    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 15
+    assert len(re.findall(r"^\s*- [a-z_]+ \((?:error|warning)\)", doc, re.M)) == 16
 
 
 def test_artifact_file_lookup(seed5):
@@ -1086,3 +1086,170 @@ def test_dispositions_say_where_a_file_is(seed):
     with pytest.raises(Exception, match="present_only"):
         call("get_artifacts", present_only=True, active_only=False)
 
+
+
+@pytest.fixture(scope="module")
+def seed_scan(seed):
+    """Two listed directories, a finished and an unfinished run, memory rows of every status."""
+    import psycopg
+
+    tag = uuid.uuid4().hex[:8]
+    ids = {"tag": tag}
+    with psycopg.connect(dbname=TEST_DB, autocommit=True) as conn:
+        q = conn.execute
+        root = ids["root"] = q("INSERT INTO lab.storage_root (name) VALUES (%s) RETURNING root_id",
+                               [f"nass-{tag}"]).fetchone()[0]
+        # The seed's registered file: a 'registered' memory row must name a real artifact.
+        art_root, art_path = q("SELECT storage_root_id, relative_path FROM lab.artifact "
+                               "WHERE artifact_id = %s", [seed["artifact"]]).fetchone()
+        ids["art_root"], ids["art_path"] = art_root, art_path
+
+        def directory(path, layout, mode, interval=60):
+            return q("INSERT INTO lab.scan_directory (storage_root_id, relative_path, layout, "
+                     "time_zone, scan_interval_min, window_start, window_end, mode) "
+                     "VALUES (%s, %s, %s, 'America/New_York', %s, '22:00', '06:00', %s) "
+                     "RETURNING scan_directory_id", [root, path, layout, interval, mode]
+                     ).fetchone()[0]
+
+        ids["dir_a"] = directory(f"rigA_{tag}", "epsych", "report")
+        ids["dir_b"] = directory(f"rigB_{tag}", "intan", "off", 120)
+
+        def run(directory_id, command, mode, result=None):
+            run_id = q("INSERT INTO lab.scan_run (scan_directory_id, command, mode, tool_version) "
+                       "VALUES (%s, %s, %s, 'test') RETURNING scan_run_id",
+                       [directory_id, command, mode]).fetchone()[0]
+            if result:
+                q("INSERT INTO lab.scan_run_result (scan_run_id, outcome, files_listed, "
+                  "files_held, message) VALUES (%s, %s, %s, %s, %s)", [run_id, *result])
+            return run_id
+
+        ids["run1"] = run(ids["dir_a"], "apply", "report", ("ok", 5, 1, "first"))
+        ids["run2"] = run(ids["dir_a"], "run", "report", ("failed", 0, 0, "second"))
+        ids["run3"] = run(ids["dir_a"], "run", "report")        # no result: unfinished
+
+        def memory(run_id, path, status, **extra):
+            ids[f"f_{status}_{path[-6:]}"] = q(
+                "INSERT INTO lab.scan_file (scan_run_id, storage_root_id, relative_path, "
+                "size_bytes, mtime_ns, group_key, status, reason_code, reason, artifact_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING scan_file_id",
+                [run_id, extra.get("root", root), path,
+                 None if status == "cleared" else 10, None if status == "cleared" else 1,
+                 extra.get("group"), status, extra.get("code"), extra.get("reason"),
+                 extra.get("artifact")]).fetchone()[0]
+
+        base = f"rigA_{tag}"
+        memory(ids["run1"], f"{base}/g1/a.dat", "pending", group="g1")
+        memory(ids["run2"], f"{base}/g1/a.dat", "held", group="g1", code="late",
+               reason="changed")          # the log has two rows for a.dat
+        memory(ids["run2"], f"{base}/g2/b_c.dat", "pending", group="g2")
+        memory(ids["run2"], f"{base}/g2/bXc.dat", "held", group="g2", code="odd")
+        memory(ids["run2"], f"{base}/g3/gone.dat", "cleared")
+        memory(ids["run2"], art_path, "registered", root=art_root, group="g4",
+               artifact=seed["artifact"])
+    return {k: str(v) for k, v in ids.items()}
+
+
+def test_scan_directories_filters_and_schedule(seed_scan):
+    s = seed_scan
+    rows = call("get_scan_directories", storage_root_id=int(s["root"]))["rows"]
+    assert [r["scan_directory_id"] for r in rows] == [int(s["dir_a"]), int(s["dir_b"])]
+    a = next(r for r in rows if r["scan_directory_id"] == int(s["dir_a"]))
+    assert a["mode"] == "report" and a["window_start_text"] == "22:00"
+    assert a["window_end_text"] == "06:00" and a["time_zone"] == "America/New_York"
+    assert a["last_run_id"] == int(s["run3"]) and a["last_run_outcome"] is None
+    assert a["is_running"] is True and a["is_due"] in (True, False)
+    assert a["n_pending"] == 1 and a["n_held"] == 2
+    one = call("get_scan_directories", scan_directory_id=int(s["dir_b"]))["rows"]
+    assert len(one) == 1 and one[0]["mode"] == "off" and one[0]["is_due"] is False
+    off = call("get_scan_directories", storage_root_id=int(s["root"]), mode="off")["rows"]
+    assert [r["scan_directory_id"] for r in off] == [int(s["dir_b"])]
+    due = call("get_scan_directories", due_only=True)["rows"]
+    assert all(r["is_due"] for r in due)
+    assert all(r["is_overdue"] for r in call("get_scan_directories", overdue_only=True)["rows"])
+    with pytest.raises(Exception, match="mode must be"):
+        call("get_scan_directories", mode="on")
+
+
+def test_scan_runs_join_their_result_newest_first(seed_scan):
+    s = seed_scan
+    res = call("get_scan_runs", scan_directory_id=int(s["dir_a"]))
+    assert [r["scan_run_id"] for r in res["rows"]] == [int(s["run3"]), int(s["run2"]), int(s["run1"])]
+    assert list(res)[:3] == ["row_count", "limit", "truncated"] and "next_cursor" in res
+    unfinished, failed, ok = res["rows"]
+    assert unfinished["outcome"] is None and unfinished["finished_at"] is None
+    assert failed["outcome"] == "failed" and failed["message"] == "second"
+    assert ok["files_listed"] == 5 and ok["files_held"] == 1 and ok["details"] == {}
+    assert call("get_scan_runs", scan_directory_id=int(s["dir_a"]), outcome="ok")["rows"][0][
+        "scan_run_id"] == int(s["run1"])
+    by_command = call("get_scan_runs", scan_directory_id=int(s["dir_a"]), command="apply")["rows"]
+    assert [r["scan_run_id"] for r in by_command] == [int(s["run1"])]
+    assert call("get_scan_runs", scan_directory_id=int(s["dir_b"]))["row_count"] == 0
+    future = call("get_scan_runs", scan_directory_id=int(s["dir_a"]),
+                  started_from="2999-01-01")
+    past = call("get_scan_runs", scan_directory_id=int(s["dir_a"]), started_before="2000-01-01")
+    assert future["row_count"] == past["row_count"] == 0
+    assert call("get_scan_runs", scan_directory_id=int(s["dir_a"]),
+                started_from="2000-01-01", started_before="2999-01-01")["row_count"] == 3
+    page = call("get_scan_runs", scan_directory_id=int(s["dir_a"]), limit=2)
+    assert page["truncated"] and page["row_count"] == 2
+    rest = call("get_scan_runs", scan_directory_id=int(s["dir_a"]), limit=2,
+                cursor=page["next_cursor"])
+    assert [r["scan_run_id"] for r in rest["rows"]] == [int(s["run1"])] and not rest["truncated"]
+    with pytest.raises(Exception, match="outcome must be"):
+        call("get_scan_runs", outcome="done")
+    with pytest.raises(Exception, match="command must be"):
+        call("get_scan_runs", command="scan")
+    with pytest.raises(Exception, match="cursor"):
+        call("get_scan_runs", cursor="abc")
+
+
+def test_scan_files_latest_versus_log_and_filters(seed_scan):
+    s = seed_scan
+    root, base = int(s["root"]), f"rigA_{s['tag']}"
+    latest = call("get_scan_files", storage_root_id=root)["rows"]
+    states = {r["relative_path"]: r["status"] for r in latest}
+    assert states == {f"{base}/g1/a.dat": "held", f"{base}/g2/b_c.dat": "pending",
+                      f"{base}/g2/bXc.dat": "held", f"{base}/g3/gone.dat": "cleared"}
+    log = call("get_scan_files", storage_root_id=root, latest_per_file=False)["rows"]
+    assert len(log) == 5 and [r["scan_file_id"] for r in log] == sorted(
+        (r["scan_file_id"] for r in log), reverse=True)
+    assert [r["status"] for r in call("get_scan_files", storage_root_id=root,
+                                      relative_path=f"{base}/g1/a.dat",
+                                      latest_per_file=False)["rows"]] == ["held", "pending"]
+    held = call("get_scan_files", storage_root_id=root, status="held")["rows"]
+    assert {r["relative_path"] for r in held} == {f"{base}/g1/a.dat", f"{base}/g2/bXc.dat"}
+    assert [r["reason_code"] for r in call("get_scan_files", storage_root_id=root,
+                                           reason_code="late")["rows"]] == ["late"]
+    assert call("get_scan_files", storage_root_id=root, group_key="g2")["row_count"] == 2
+    assert call("get_scan_files", storage_root_id=root, scan_run_id=int(s["run1"]),
+                latest_per_file=False)["row_count"] == 1
+    # Windows spelling and whitespace are normalised as for artifacts.
+    assert call("get_scan_files", storage_root_id=root,
+                relative_path=f" {base}\\g1\\a.dat ")["row_count"] == 1
+    # "_" and "%" in a prefix are literal: g2/b_c matches only that file.
+    assert [r["relative_path"] for r in call(
+        "get_scan_files", storage_root_id=root,
+        relative_path_prefix=f"{base}/g2/b_")["rows"]] == [f"{base}/g2/b_c.dat"]
+    assert call("get_scan_files", storage_root_id=root,
+                relative_path_prefix=f"{base}/g%")["row_count"] == 0
+    assert call("get_scan_files", storage_root_id=root,
+                relative_path_prefix=f"{base}/g")["row_count"] == 4
+    registered = call("get_scan_files", storage_root_id=int(s["art_root"]),
+                      relative_path=s["art_path"], status="registered")["rows"]
+    assert len(registered) == 1 and registered[0]["artifact_id"]
+    with pytest.raises(Exception, match="status must be"):
+        call("get_scan_files", status="done")
+    with pytest.raises(Exception, match="must not be empty"):
+        call("get_scan_files", relative_path_prefix="  ")
+
+
+def test_scan_files_page_and_limit(seed_scan):
+    s = seed_scan
+    root = int(s["root"])
+    page = call("get_scan_files", storage_root_id=root, limit=3)
+    assert page["row_count"] == 3 and page["truncated"] and page["next_cursor"]
+    rest = call("get_scan_files", storage_root_id=root, limit=3, cursor=page["next_cursor"])
+    assert rest["row_count"] == 1 and not rest["truncated"]
+    seen = {r["scan_file_id"] for r in page["rows"] + rest["rows"]}
+    assert len(seen) == 4
+    assert call("get_scan_files", limit=10**9)["limit"] == db.MAX_LIMIT

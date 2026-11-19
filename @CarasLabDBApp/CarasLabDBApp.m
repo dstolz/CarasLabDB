@@ -9,7 +9,9 @@ classdef CarasLabDBApp < handle
 %   that should never have been recorded (Ctrl+Delete); enter the day's
 %   weights and water for all animals at once (Ctrl+H); show the database's
 %   integrity report (Ctrl+I), from which a missing file is looked for by
-%   its checksum and its new place recorded; export any filtered table to the base
+%   its checksum and its new place recorded; list the NAS directories that
+%   are searched for new files, and how often (Ctrl+Shift+D; editable by the
+%   schema owner or a login granted it); export any filtered table to the base
 %   workspace; and run vetted read-only custom SQL with history recall.
 %   Window geometry, connection (minus password), the active view toggle,
 %   and SQL history persist between sessions.
@@ -66,6 +68,7 @@ classdef CarasLabDBApp < handle
         nRecorded = showFindFileDialog(obj, artifactIds, findings)
         showHusbandryEntry(obj)
         showIntegrityReport(obj)
+        showScanDirectoriesDialog(obj)
         runCustomSQL(obj)
     end
 
@@ -247,6 +250,7 @@ classdef CarasLabDBApp < handle
             %   Ctrl+D Edit/Supersede · Ctrl+T Tags, Ctrl+L Variables and
             %   Ctrl+Delete Retract for the selected row ·
             %   Ctrl+Shift+F File disposition of the selected artifact ·
+            %   Ctrl+Shift+D Scan directories (tested before Ctrl+D) ·
             %   Ctrl+H Daily husbandry · Ctrl+I Integrity report ·
             %   Enter Apply filters (browse tabs) ·
             %   Ctrl+Enter Run (Custom SQL tab) · Escape Clear filters ·
@@ -279,6 +283,8 @@ classdef CarasLabDBApp < handle
                 obj.onAddMenu("session");
             elseif key == "f" && ctrl && shift
                 obj.onFileDisposition();
+            elseif key == "d" && ctrl && shift
+                obj.onScanDirectories();
             elseif key == "e" && ctrl
                 obj.onExport();
             elseif key == "d" && ctrl
@@ -389,6 +395,11 @@ classdef CarasLabDBApp < handle
         function onIntegrity(obj, ~, ~)
             %ONINTEGRITY Show the database integrity report (Ctrl+I).
             obj.showIntegrityReport();
+        end
+
+        function onScanDirectories(obj, ~, ~)
+            %ONSCANDIRECTORIES The directories searched for new files (Ctrl+Shift+D).
+            obj.showScanDirectoriesDialog();
         end
 
         function [d, id] = pRequireSelection(obj, alertTitle, noTabMessage)

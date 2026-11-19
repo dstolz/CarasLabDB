@@ -7,6 +7,8 @@ The backups keep growing, so the tool has to be safe to run again: it writes onl
 
 It depends on the master-log migration (`plans/master-log-migration.md`): subjects must exist before their files can be registered. The importer never creates a subject.
 
+`plans/nas-auto-scan.md` builds on this plan: it moves the list of directories into the database, adds the unattended `run` and `check` commands, and changes some points here. Each is marked "Amended" below.
+
 ### What the profile found (read-only, 2026-11-17, RIG3 only)
 - **`S:/RIG3_Backup_2025/epsych_files/Data`**: 2,475 files, 14.6 GiB, layout `Data/<SUBJ>/<files>` with no deeper folders.
   - 60 subject folders `SUBJ-ID-<n>`, plus `TEST`, `TEST_SUBJECT`, `SUBJ-ID-TEST` and `videos`.
@@ -33,7 +35,7 @@ It depends on the master-log migration (`plans/master-log-migration.md`): subjec
 | Behavior-only sessions | Every epsych session gets a session row. A paired one joins its recording's session; an unpaired one gets a session whose path is the epsych file. |
 
 ## Part 1: Database changes
-**No schema change.** The existing tables hold everything, so the schema version, `grants.sql` and the MCP server are untouched.
+**No schema change for the data.** The existing tables hold every session, event and file. *Amended:* the list of directories, the run log and the scan memory are new tables (`plans/nas-auto-scan.md`, Part 1); the schema version stays 1.
 
 **New rows, entered once by a lab member** (`lab_rw` may insert them):
 - `lab.storage_root`: `nas-rig3`, described with the share path. `nas-rig1` and `nas-rig2` follow when those rigs are added.
@@ -42,25 +44,12 @@ It depends on the master-log migration (`plans/master-log-migration.md`): subjec
 
 ## Part 2: Interpretation and mapping
 
-**Directories are listed in a config file**, each with the root it belongs to, a layout and a rig name:
+**Directories are rows of `lab.scan_directory`** (*Amended:* not a config file; the administrator keeps the list, `plans/nas-auto-scan.md`), each with the root it belongs to, a layout, a rig name, the time zone of its file names and a minimum age:
 
-```toml
-lab_time_zone = "America/New_York"
-min_age_hours = 24
-
-[[directory]]
-root = "nas-rig3"
-path = "epsych_files/Data"
-layout = "epsych"
-rig = "RIG3"
-
-[[directory]]
-root = "nas-rig3"
-path = "intan_files/Data"
-layout = "intan"
-rig = "RIG3"
-pair_with = "epsych_files/Data"
-```
+| root | path | layout | rig | pair_with | time_zone | min_age_min |
+|---|---|---|---|---|---|---|
+| `nas-rig3` | `epsych_files/Data` | `epsych` | RIG3 | | `America/New_York` | 1440 |
+| `nas-rig3` | `intan_files/Data` | `intan` | RIG3 | `epsych_files/Data` | `America/New_York` | 1440 |
 
 A layout is one module that turns a directory tree into *groups* (one session and one event each, with its files). The first pass implements `epsych` and `intan`.
 
@@ -78,7 +67,7 @@ A layout is one module that turns a directory tree into *groups* (one session an
 
 - **Trial count**: the number of elements of `Data`, read from the MAT file's variable headers by a small standard-library reader (it decompresses only the start of each variable). A v7.3 file is held.
 - **Recording header**: sample rate, amplifier channel count and duration come from the `.rhd` headers and file sizes, a port of `@IntanReader/parseIntanHeader.m`.
-- **Subject**: the level-1 folder name, which must be an existing `lab.subject` row.
+- **Subject**: the level-1 folder name, which must be an existing `lab.subject` row. *Amended:* a folder that is not a subject is held (`unknown_subject`), not set aside as a test folder: a real subject may simply be missing from the table. An override row naming the folder with `skip` sets a test folder aside.
   - A name prefix that differs only in case is accepted and reported.
   - A different subject in the name holds the group until an override names the subject.
   - **Overrides** are a reviewed CSV (`root, relative_path, subject_id or skip, reason`). The reason is stored on the event.
@@ -92,7 +81,7 @@ A layout is one module that turns a directory tree into *groups* (one session an
 | | `recording` event in that session | `acquisition_system_code` `intan_rhx`, `modality` `ephys`, `sample_rate_hz`, `n_channels`, `duration_s`. |
 | Every file in the folder | `lab.artifact`, role `raw` | `format` = lower-case extension, attributes `{"kind":"raw","reader":"intan"}`, as `LabCapture.copiedSession` writes them. This includes `settings.xml` and `_manifest.json`. |
 | Paired epsych session | `behavior` event in the recording's session | `trials_completed` from the file. |
-| Unpaired epsych session | `lab.session` + `behavior` event | `label` = the file stem, `relative_path` = the epsych file, `started_at` from the name (NULL when only the date is known). |
+| Unpaired epsych session | `lab.session` + `behavior` event | `label` = the file stem, `relative_path` = the epsych file, `started_at` from the name (NULL when only the date is known). *Amended:* the stem is the base stem `<SUBJ>_<stamp>` and the path `<SUBJ>_<stamp>.mat`, whichever twin files exist, so a twin that appears later does not change the session. |
 | epsych `.mat` | `lab.artifact`, role `raw` | Attributes `{"kind":"epsych"}`. Files sharing a subject and timestamp are one session and one event. |
 | `.ts` video | `lab.artifact`, role `video`, on the same behavior event | A video with no `.mat` is held. |
 | `_conv.mp4` | `lab.artifact`, role `video` | Attributes `{"kind":"video_converted","converted_from":"<path>"}`. |
@@ -105,17 +94,17 @@ A layout is one module that turns a directory tree into *groups* (one session an
 **Provenance on every event**: `attributes.import` = `{tool, layout, root, path, source_value, override?}`, plus `captured_by_tool`, `code_version` and `occurred_at_source` in the form `LabCapture` uses. `recorded_by` is the person running the import.
 
 ## Part 3: The importer, `tools/import_nas_files.py`
-Python standard library plus psycopg, built like `tools/verify_artifacts.py`: `--root NAME=PATH` (repeatable, refuses an empty or unknown root), connection from the `PG*` environment as a member login in `lab_rw`.
+Python standard library plus psycopg, built like `tools/verify_artifacts.py`: `--root NAME=PATH` (repeatable, refuses an empty or unknown root), connection from the `PG*` environment. *Amended:* the login is `lab_scanner` (in `lab_rw`, with INSERT on the scan logs) or the owner, because `apply` also writes the scan memory.
 
-**Two commands**
-1. **`scan --config <file> --out <dir>`** reads the NAS and the database and writes nothing to either. It produces a plan file (JSON lines: every group, file, size, modification time and SHA-256) and a report (CSV and text).
+**Two commands** (`plans/nas-auto-scan.md` adds the unattended `run` and `check`)
+1. **`scan --directory <id> ... --out <dir>`** reads the NAS and the database and writes nothing to either. It produces a plan file (JSON lines: every group, file, size, modification time and SHA-256) and a report (CSV and text).
 2. **`apply <plan file>`** writes exactly the reviewed plan. Before each group it checks every file's size and modification time again; a group that changed is refused and reported.
 
 **Stages of a scan**
-1. **Walk** each listed directory. Symbolic links are not followed. A group whose newest file is younger than `min_age_hours` is skipped, so a session still being recorded or copied is never registered half-way.
+1. **Walk** each named directory. Symbolic links are not followed. *Amended:* a folder that cannot be listed fails the scan of its directory, and modification times no longer decide whether a group is complete: `apply` refuses a group whose sighting in the plan file is younger than the directory's `min_age_min`, so a session still being recorded or copied is never registered half-way.
 2. **Interpret** with the layout module: groups, subjects, times, pairing, held items.
 3. **Diff against the database**, so unchanged files are not read again:
-   - a file whose active artifact at the same root and path has the same size and `source_mtime` is unchanged;
+   - *Amended:* a file whose latest row in the scan memory (`lab.scan_file`) is `registered` or `known` with the same size and modification time, and whose artifact is active and present, is unchanged;
    - everything else is hashed (4 MiB chunks, a few worker threads).
 4. **Report** every insert, correction, held item and normalisation.
 

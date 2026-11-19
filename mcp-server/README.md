@@ -60,7 +60,12 @@ Read tools mirroring `@CarasLabDB`'s `get*` method surface:
   `size_bytes`), `subjects_by_project_species`, `sessions_per_subject`,
   `current_tags_by_tag`, `current_variables_by_variable`; optionally for one
   subject, project or entity kind.
-- **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`, 13
+- **NAS scan**: `get_scan_directories` (the directories the scheduled scan
+  searches, with `mode`, `due_at`, `is_due`, `is_overdue`, `is_running`,
+  `n_pending`, `n_held`), `get_scan_runs` (runs with their result; newest
+  first) and `get_scan_files` (the scan memory: each file's latest state, or
+  with `latest_per_file=False` the whole log).
+- **Health**: `get_integrity_report` (wraps `lab.fn_check_integrity`, 16
   checks; empty means healthy).
 
 Corrections and retractions: by default (`active_only=True`) every read uses
@@ -83,7 +88,8 @@ Every list tool takes `limit` (default 200, max 1000) and returns
 first — there is no unlimited mode, and `truncated: true` tells the caller
 the answer was cut off. The listings that grow without bound (`get_events`,
 `get_artifacts`, `get_subjects`, `get_sessions`, `get_entity_tags`,
-`get_variables`, `find_by_variable`, `get_artifact_verifications`) also
+`get_variables`, `find_by_variable`, `get_artifact_verifications`,
+`get_scan_runs`, `get_scan_files`) also
 return `next_cursor`: pass it back as `cursor` with the same arguments for
 the next page (keyset paging on the listing's stable order; `limit` still
 caps each page).

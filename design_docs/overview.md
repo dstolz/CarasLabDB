@@ -40,15 +40,15 @@ reading an analysis event rather than reverse-engineering a folder.
 
 | Component | Role |
 |---|---|
-| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag and variable definitions and their value logs, retractions, file dispositions |
+| PostgreSQL database | Append-only event log, artifact index, provenance graph, tag and variable definitions and their value logs, retractions, file dispositions, the list of NAS directories searched for new files with its run log |
 | NAS storage | Actual data, laid out as `subject/session/...` |
 | MATLAB class (`CarasLabDB`) | Programmatic push/pull between MATLAB and the database, including tagging (`addTag`, `setTag`, `findByTags`, ...), variables (`setVariable`, `getVariables`, ...), retraction (`retractEvent`, `retractArtifact`) and file dispositions (`addArtifactDisposition`) |
-| MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, file dispositions (Ctrl+Shift+F), a daily husbandry grid and the integrity report |
+| MATLAB GUI (`@CarasLabDBApp`, a `uifigure` app) | Interactive metadata entry and browsing for the lab, with a tag filter, per-row tag (Ctrl+T) and variable (Ctrl+L) editors, retraction, file dispositions (Ctrl+Shift+F), a daily husbandry grid, the integrity report and the list of NAS directories searched for new files (Ctrl+Shift+D) |
 | Web dashboard (`web/lab-dashboard.html`) | Standalone HTML/JS visualization of the data model, rendered from in-page synthetic data with no backend (charts load Chart.js from a CDN) |
 | Live dashboard (`web/live/`) | The same UI backed by the real database through a small `/api/data` server |
 | Forms (`web/forms/`) | A browser page for building data-entry templates and entering one session of one subject on them, under each member's own login, with a CSV file per subject per project kept up to date ([forms.md](forms.md)) |
 | MCP server (`mcp-server/`) | Read-only Model Context Protocol server giving an LLM agent typed `get*` query tools over the schema, including tag and variable lookups |
-| Tools (`tools/`) | Backup and restore of the database and its roles (`backup_lab.py`, `restore_lab.py`), and the scheduled check of the NAS files against their checksums (`verify_artifacts.py`) |
+| Tools (`tools/`) | Backup and restore of the database and its roles (`backup_lab.py`, `restore_lab.py`), the scheduled check of the NAS files against their checksums (`verify_artifacts.py`), and the scheduled search of listed NAS directories that registers the files it has not seen (`import_nas_files.py`, [NAS import](nas-import.md)) |
 
 MATLAB target: R2024b or newer, with the Database Toolbox. The class connects
 through the toolbox's **native `postgresql()`** interface, so no ODBC DSN and no
@@ -56,7 +56,8 @@ JDBC driver `.jar` need to be installed or configured. See
 [Database design](database-design.md) for the table-by-table model and
 [MCP server](mcp-server.md) for the agent-facing interface,
 [Tagging](tagging.md) for the tag system and [Variables](variables.md) for
-user-defined variables. The lab's production deployment is on a Windows 11
+user-defined variables, [NAS import](nas-import.md) for registering the files
+already on the NAS. The lab's production deployment is on a Windows 11
 server ([deployment guide](deployment-windows.md)).
 
 ## Data flow
@@ -112,6 +113,12 @@ flowchart LR
   `observation` event whose field values are variables on the event, plus a
   note that can be changed later; for each subject in each project the
   entries are also kept as one CSV file. See [Forms](forms.md).
+- **Directory search.** The files already on the NAS are registered by a
+  scheduled tool from a list of directories the administrator keeps in the
+  database. It reads only files it has not seen, registers what is new and
+  unambiguous, and holds everything else for a person; it never writes to
+  the NAS, never creates a subject, and an unattended run only adds. See
+  [NAS import](nas-import.md).
 - **Login and person.** Every lab member connects with their own database
   login. The database stamps that login on each row it stores and maps it to
   the member's `person` row (`lab.person.db_login`), so who entered what does

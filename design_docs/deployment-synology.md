@@ -369,6 +369,18 @@ needs `psycopg` and a mount of the data; run it weekly on a workstation or
 server that mounts the NAS shares, as a login in `lab_rw`, per
 [deployment-windows.md](deployment-windows.md) §4.2.
 
+**Searching the NAS for new files** (`tools/import_nas_files.py`, see
+[nas-import.md](nas-import.md)) has the same needs and goes the same way: run
+it on a workstation or server that mounts the NAS shares and can reach the
+database's port, as the login `lab_scanner`, every 15 minutes (`run`) with a
+daily `check`, per [deployment-windows.md](deployment-windows.md) §4.4. Create
+the login on this database like the others (`CREATE ROLE lab_scanner LOGIN
+PASSWORD '...' IN ROLE lab_rw;` and `GRANT INSERT ON lab.scan_run,
+lab.scan_run_result, lab.scan_file TO lab_scanner;`, through `docker exec`
+as in §2.4). Running it from the NAS's own Task Scheduler works only if the
+DSM Python 3 has `psycopg` (check over SSH); the data is then read from the
+local volume path, which is what `--root` takes.
+
 ---
 
 ## 6. Quick verification checklist

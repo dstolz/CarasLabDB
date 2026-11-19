@@ -70,4 +70,5 @@ function d = local_defaults()
     d.LastSql      = "SELECT * FROM lab.subject_current;";
     d.LastTagFilter = "";                % Tags field, e.g. "stage:raw -qc:fail"
     d.LowWeightPercent = 85;             % daily husbandry: flag a weight below this % of baseline
+    d.ScanDialogGeometry = [];           % scan directories dialog: [x y w h] or [] -> centered
 end

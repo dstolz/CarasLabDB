@@ -3,8 +3,9 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
 %
 %   The class also holds the app's other GUI tests that share this fixture:
 %   the browse filters and columns, the toolbar and shortcut list, the typed
-%   number rule (CarasLabDBApp.parseNumber), the variables editor, and the
-%   integrity report's file actions with the find-files dialog.
+%   number rule (CarasLabDBApp.parseNumber), the variables editor, the
+%   integrity report's file actions with the find-files dialog, and the
+%   scan directories dialog (Ctrl+Shift+D).
 %
 %   results = runtests("tests/matlab/TagGuiTests.m")
 %
@@ -1089,6 +1090,181 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
     end
 
     % =====================================================================
+    % Scan directories (the NAS directories searched for new files)
+    % =====================================================================
+    methods (Test)
+        function scanDirectoriesAreReadOnlyForAMember(tc)
+            % Ctrl+Shift+D opens the dialog (Ctrl+D stays Edit / Supersede),
+            % the toolbar has its button and Ctrl+? lists it. For a member
+            % of lab_rw every control that writes is disabled and the top
+            % line says the list is read-only for this login.
+            m = tc.mainParts();
+            tc.verifyNumElements(findall(m.Fig, "Type", "uibutton", "Text", "Scan directories…"), 1);
+            obs = tc.withWindow("Scan directories", ...
+                @() TagGuiTests.key(m.Fig, "d", {'control', 'shift'}, char(4)), ...
+                @(f, obs) local_look(tc, f, obs));
+
+            tc.verifySubstring(obs("notice"), "read-only for this login (" + LabScratchDb.RwRole + ")");
+            tc.verifyGreaterThan(obs("nWriters"), 10, "the form's controls were found");
+            tc.verifyEmpty(obs("enabled"), "no control that writes is enabled for a member");
+            for col = ["Root", "Path", "Layout", "Mode", "Every", "Hours", "Last run", "Next due", ...
+                    "Pending", "Held", "State"]
+                tc.verifyTrue(ismember(col, obs("columns")), "the list has a column " + col);
+            end
+            tc.verifySubstring(obs("help"), "Ctrl+S ");
+            tc.verifySubstring(obs("help"), "Ctrl+N ");
+            tc.verifyTrue(obs("escResumed"), "Esc closes the dialog");
+
+            setappdata(groot, "TagGuiTests_alerts", []);
+            TagGuiTests.key(m.Fig, "slash", {'control'}, '?');
+            a = TagGuiTests.alerts();
+            tc.assertNumElements(a, 1);
+            tc.verifySubstring(a.Message, "Ctrl+Shift+D ");
+            tc.verifySubstring(a.Message, "Ctrl+D ");
+            tc.dismissAlertDialog(m.Fig);
+
+            function local_look(tc, f, obs)
+                notice = findall(f, "Tag", "scan:notice");
+                obs("notice") = string(notice.Text);
+                panel = findall(f, "Tag", "scan:edit");
+                on = strings(1, 0);
+                n = 0;
+                for type = ["uieditfield", "uidropdown", "uibutton"]
+                    for h = reshape(findall(panel, "Type", type), 1, [])
+                        n = n + 1;
+                        if logical(h.Enable)
+                            on(end+1) = string(h.Tag); %#ok<AGROW>
+                        end
+                    end
+                end
+                obs("enabled") = on;
+                obs("nWriters") = n;
+                list = findall(f, "Tag", "scan:list");
+                obs("columns") = string(list.Data.Properties.VariableNames);
+                setappdata(groot, "TagGuiTests_alerts", []);
+                TagGuiTests.key(f, "slash", {'control'}, '?');
+                shown = TagGuiTests.alerts();
+                obs("help") = strjoin([strings(1, 0), shown.Message], newline);
+                tc.dismissAlert(f);
+                setappdata(groot, "TagGuiTests_alerts", []);
+                TagGuiTests.key(f, "escape", {});
+                obs("escResumed") = TagGuiTests.resumed(f);
+            end
+        end
+
+        function ownerAddsAndEditsAScanDirectory(tc)
+            % On the owner's connection the form adds a directory (Save),
+            % which is then listed and selected; an edit is saved with
+            % Ctrl+S; a window that is not HH:mm is refused under the form
+            % and writes nothing. The database holds the values typed, and
+            % row_history the one edit.
+            fx = tc.Fx;
+            adm = fx.Admin;
+            delete(tc.App);
+            tc.App = CarasLabDBApp(adm);
+            base = "scan/gui-" + fx.next();
+            dirPath = base + "/epsych";
+            tc.addTeardown(@() ScanDirectoryTests.switchOff(adm, base));
+            rootLabel = "mtest-root (" + string(fx.RootId) + ")";
+            btn = findall(tc.App.Fig, "Type", "uibutton", "Text", "Scan directories…");
+            tc.assertNumElements(btn, 1);
+            obs = tc.withWindow("Scan directories", @() tc.press(btn), ...
+                @(f, obs) local_steps(tc, f, obs));
+
+            tc.verifyFalse(contains(obs("notice"), "read-only"), "the owner may edit: " + obs("notice"));
+            tc.verifySubstring(obs("afterAdd"), "Added directory");
+            tc.verifyEqual(obs("selectedAfterAdd"), dirPath, "the new directory is listed and selected");
+            tc.verifyEqual(obs("formAfterAdd"), dirPath, "and loaded into the form");
+            tc.verifySubstring(obs("afterEdit"), "Saved directory");
+            tc.verifyEqual(obs("selectedAfterEdit"), dirPath, "saving keeps the selection");
+            tc.verifySubstring(obs("badMessage"), "HH:mm");
+            tc.verifySubstring(obs("badMessage"), "Nothing was written");
+            tc.verifyEqual(obs("historyAfterBad"), obs("historyAfterEdit"), "the invalid window wrote nothing");
+            tc.verifyTrue(obs("escResumed"), "Esc closes the dialog");
+
+            T = adm.getScanDirectories(StorageRootId=fx.RootId);
+            r = find(LabScratchDb.column(T, "relative_path") == dirPath);
+            tc.assertNumElements(r, 1, "one directory at " + dirPath);
+            row = T(r, :);
+            col = @(name) LabScratchDb.column(row, name);
+            tc.verifyEqual(col("layout"), "epsych");
+            tc.verifyEqual(col("mode"), "register");
+            tc.verifyEqual(double(row.scan_interval_min), 30, "30 minutes, as edited");
+            tc.verifyEqual(col("window_start_text"), "01:00");
+            tc.verifyEqual(col("window_end_text"), "05:00");
+            tc.verifyEqual(double(row.min_age_min), 1440, "24 hours, the form's default");
+            tc.verifyEqual(col("rig"), "rig G");
+            tc.verifyEqual(col("time_zone"), "America/New_York");
+            tc.verifyEqual(col("notes"), "edited");
+            tc.verifyEqual(fx.rowHistoryCount("scan_directory", "scan_directory_id", ...
+                string(double(row.scan_directory_id))), 1, "one edit after the insert");
+
+            function local_steps(tc, f, obs)
+                c = @(tag) findall(f, "Tag", tag);
+                list = c("scan:list");
+                message = c("scan:message");
+                notice = c("scan:notice");
+                pathBox = c("scan:path");
+                obs("notice") = string(notice.Text);
+                tc.pressOn(c("scan:new"));
+                tc.chooseIn(c("scan:root"), rootLabel);
+                tc.typeIn(c("scan:path"), dirPath);
+                tc.chooseIn(c("scan:layout"), "epsych (EPsych behavior files)");
+                tc.typeIn(c("scan:interval"), "6");
+                tc.chooseIn(c("scan:intervalUnit"), "hours");
+                tc.typeIn(c("scan:start"), "01:00");
+                tc.typeIn(c("scan:end"), "05:00");
+                tc.typeIn(c("scan:rig"), "rig G");
+                tc.typeIn(c("scan:tz"), "America/New_York");
+                tc.typeIn(c("scan:notes"), "added in the GUI test");
+                tc.pressOn(c("scan:save"));
+                obs("afterAdd") = string(message.Text);
+                obs("selectedAfterAdd") = local_selectedPath(list);
+                obs("formAfterAdd") = string(pathBox.Value);
+
+                tc.typeIn(c("scan:interval"), "30");
+                tc.chooseIn(c("scan:intervalUnit"), "minutes");
+                tc.chooseIn(c("scan:mode"), "register");
+                tc.typeIn(c("scan:notes"), "edited");
+                TagGuiTests.key(f, "s", {'control'}, char(19));
+                TagGuiTests.quiet(f);
+                obs("afterEdit") = string(message.Text);
+                obs("selectedAfterEdit") = local_selectedPath(list);
+                id = local_selectedId(list);
+                obs("historyAfterEdit") = tc.Fx.rowHistoryCount("scan_directory", ...
+                    "scan_directory_id", id);
+
+                tc.typeIn(c("scan:start"), "25:00");
+                tc.pressOn(c("scan:save"));
+                obs("badMessage") = string(message.Text);
+                obs("historyAfterBad") = tc.Fx.rowHistoryCount("scan_directory", ...
+                    "scan_directory_id", id);
+                tc.typeIn(c("scan:start"), "01:00");      % back as saved: nothing unsaved
+                setappdata(groot, "TagGuiTests_confirmAnswer", "Discard");
+                TagGuiTests.key(f, "escape", {});
+                setappdata(groot, "TagGuiTests_confirmAnswer", []);
+                obs("escResumed") = TagGuiTests.resumed(f);
+            end
+
+            function p = local_selectedPath(list)
+                p = "";
+                sel = list.Selection;
+                if ~isempty(sel) && istable(list.Data) && sel(1) <= height(list.Data)
+                    p = string(list.Data.Path(sel(1)));
+                end
+            end
+
+            function id = local_selectedId(list)
+                id = "";
+                sel = list.Selection;
+                if ~isempty(sel) && istable(list.Data) && sel(1) <= height(list.Data)
+                    id = string(list.Data.Id(sel(1)));
+                end
+            end
+        end
+    end
+
+    % =====================================================================
     % Helpers
     % =====================================================================
     methods (Access = private)
@@ -1264,6 +1440,7 @@ classdef (SharedTestFixtures = {LabScratchDb}) TagGuiTests < matlab.uitest.TestC
             TagGuiTests.closeEditors();
             TagGuiTests.closeWindows("Variables ");
             TagGuiTests.closeWindows("Find files");
+            TagGuiTests.closeWindows("Scan directories");
             setappdata(groot, "TagGuiTests_confirmAnswer", []);
             if ~isempty(tc.App) && isvalid(tc.App)
                 delete(tc.App);

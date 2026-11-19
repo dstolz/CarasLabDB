@@ -78,6 +78,20 @@ jobs:
           psql -X -q -v ON_ERROR_STOP=1 -d lab_verify -f design_docs/schema.sql
           PGDATABASE=lab_verify python tests/check_verify_artifacts.py
 
+      # No database: names, MAT 5.0 and .rhd headers, pairing, subjects, on a
+      # fixture tree built in a temporary folder.
+      - name: NAS importer, file interpretation
+        run: python tests/check_nas_import_parsing.py
+
+      # The unattended search (run) and its monitor (check), end to end on
+      # fixture trees. Creates throw-away roles and backdates rows, so it
+      # runs as the superuser on a database of its own with the grants.
+      - name: NAS importer, run and check end to end
+        run: |
+          createdb lab_nas
+          psql -X -q -v ON_ERROR_STOP=1 -d lab_nas -f design_docs/schema.sql -f design_docs/grants.sql
+          PGDATABASE=lab_nas python tests/check_import_nas_files.py
+
       # Creates two throw-away logins, so it runs as the superuser, on a
       # database of its own with the schema and the grants.
       - name: Forms server, end to end
