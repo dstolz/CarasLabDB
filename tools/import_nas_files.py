@@ -87,6 +87,12 @@ Options of ``run``
 --dry-run          write nothing to the database, the cache or a report; read
                    no file to its end; print what would be done.
 
+``scan`` takes ``--root``, ``--directory ID`` (required, repeatable), ``--out
+DIR`` (required), ``--overrides`` and ``--cache-file`` (read, never written).
+``apply PLANFILE`` takes ``--root``, ``--only GROUP_KEY``, ``--dry-run``,
+``--report-dir`` (a CSV and a text file per directory applied to) and
+``--log-file``.
+
 Connection settings come from the standard libpq environment variables
 (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD or the password file). The
 login must inherit ``lab_rw`` and hold INSERT on lab.scan_run,
@@ -98,7 +104,12 @@ renamed or deleted.
 Exit status of ``run``: 0 when every directory searched ended ``ok`` or
 ``partial``; 1 when any ended ``failed`` or ``unreachable``; 2 on a usage or
 connection error, which includes a login that may not write the scan logs
-(nothing was searched). Skipped directories do not change it.
+(nothing was searched). Skipped directories do not change it. Of ``check``:
+0 when there is nothing to report, 1 otherwise. Of ``scan``: 0 when a plan
+was written for every named directory, 1 when one could not be listed. Of
+``apply``: 0 when every group the plan acts on was applied, 1 when any was
+refused, 2 (nothing written) for a plan that cannot be trusted. Every
+command exits 2 on a usage or connection error; ``--help`` of each says so.
 """
 
 import argparse
@@ -441,6 +452,8 @@ def cmd_apply(args):
         applied += out["applied"]
         refused += out["refused"]
         notes += out["notes"]
+        if args.report_dir and out["run_id"] is not None:
+            print("report: %s" % reviewed.write_apply_report(args.report_dir, plan, out))
     db.close()
     verb = "would be applied" if args.dry_run else "applied"
     for key in applied:
@@ -450,8 +463,7 @@ def cmd_apply(args):
     for note in notes:
         print("NOTE  %s" % note)
     skipped = sum(1 for g in plan.groups if g["action"] in ("held", "wait"))
-    print("The files were not read again: each had the size and modification time the scan "
-          "recorded, and the verification rows carry the time of the scan's read.")
+    print(reviewed.NOT_READ)
     if skipped:
         print("%d group(s) are held or waiting in the plan and were not touched." % skipped)
     text = "apply%s %s: %d group(s) %s, %d refused" % (
@@ -486,7 +498,10 @@ def main(argv=None):
                     "the START of the earlier run (its listing ended at most a listing's "
                     "duration later). Give each storage root its .caraslabdb-root.json marker "
                     "(a JSON object with the root's name), so that one folder cannot be "
-                    "searched under two root names.")
+                    "searched under two root names.",
+        epilog="Exit status: 0 when every directory searched ended ok or partial (skipped "
+               "directories do not count); 1 when any ended failed or unreachable; 2 on a usage "
+               "or connection error, or a login that may not write the scan logs.")
     run.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     run.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
                      help="only this scan_directory_id; repeatable")
@@ -504,7 +519,13 @@ def main(argv=None):
                      help="write nothing; print what would be done")
     run.set_defaults(func=cmd_run)
 
-    check = sub.add_parser("check", help="exit 1 when a directory is overdue (searches nothing)")
+    check = sub.add_parser(
+        "check", help="exit 1 when a directory is overdue (searches nothing)",
+        description="Search nothing and write nothing: say whether the scheduled searches are "
+                    "being made, and how many files are pending and held.",
+        epilog="Exit status: 0 when no directory is overdue, none overlap, and (with --root) "
+               "every due directory's storage root was given; 1 otherwise; 2 on a usage or "
+               "connection error.")
     check.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     check.add_argument("--log-file", metavar="FILE",
                        help="append one line per run (OK or ERROR) to FILE")
@@ -514,7 +535,10 @@ def main(argv=None):
         "scan", help="write a plan for review; writes nothing to the NAS or the database",
         description="Read the named directories (in any mode) and the database, and write a "
                     "plan file (JSON lines), a CSV and a text report into --out. Nothing is "
-                    "written to the NAS, the database or the cache file.")
+                    "written to the NAS, the database or the cache file.",
+        epilog="Exit status: 0 when a plan was written for every named directory; 1 when a "
+               "named directory could not be listed completely (the plan says so and plans "
+               "nothing for it); 2 on a usage or connection error.")
     scan.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     scan.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
                       help="a scan_directory_id to scan; repeatable. Name a directory and the "
@@ -530,13 +554,22 @@ def main(argv=None):
         description="Carry out the plan a scan wrote. A group is refused, and nothing written "
                     "for it, unless its files have the size and modification time of the plan, "
                     "the plan's listing is at least the directory's min_age_min old, and the "
-                    "database is as the scan found it. The files are not read again.")
+                    "database is as the scan found it. The files are not read again.",
+        epilog="Exit status: 0 when every group the plan acts on (all, or those named with "
+               "--only) was applied; 1 when any was refused, also because another process "
+               "holds its directory's lock; 2, with nothing written, for a plan that was "
+               "edited or truncated, has another plan format, was made against another "
+               "database or names a storage root not given, and on a usage or connection "
+               "error. Groups the plan holds or lets wait are never applied and do not count.")
     apply.add_argument("plan", metavar="PLANFILE")
     apply.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     apply.add_argument("--only", action="append", default=[], metavar="GROUP_KEY",
                        help="apply only this group of the plan; repeatable")
     apply.add_argument("--dry-run", action="store_true",
                        help="make every check and write nothing")
+    apply.add_argument("--report-dir", metavar="DIR",
+                       help="write a CSV and a text report per directory applied to: what was "
+                            "applied, what was refused and why, the notes")
     apply.add_argument("--log-file", metavar="FILE",
                        help="append one line per run (OK or ERROR) to FILE")
     apply.set_defaults(func=cmd_apply)

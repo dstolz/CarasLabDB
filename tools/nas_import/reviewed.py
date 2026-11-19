@@ -34,9 +34,11 @@ JSON lines (UTF-8, ``\\n``, each line canonical JSON: sorted keys, no floats):
                       supersedes it (``event.supersedes`` -> ``event.id``,
                       ``changes`` lists old and new values), each active
                       artifact of the old event is superseded by a row of the
-                      new one (``supersede``: old and new id, root and path;
-                      this includes files other clients added to the event),
-                      tags are carried;
+                      new one (``supersede``: old and new id, the storage
+                      root's id and name, and the path; this includes files
+                      other clients added to the event on other roots). Tags,
+                      input edges and variables are carried at apply time
+                      (``carried`` says so);
     ``move_session``  a ``correct`` whose only change is the session: a
                       recording arrived for a behavior session registered on
                       its own. The session it leaves stays and gets a note;
@@ -104,6 +106,8 @@ from .report import COLUMNS
 FORMAT = "caraslabdb-nas-plan/1"
 ACTIONS = ("register", "add_files", "attach_copy", "correct", "move_session")
 ASIDE = "#superseded-by-"
+CARRIED = ("the tags of the event and of each superseded artifact, the event's input edges "
+           "and its variables are carried at apply time, as they are then")
 
 
 class PlanError(Exception):
@@ -284,7 +288,7 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     if own is not None and own.retracted:
         return _held_record(s, g, files + held_files() + unread(), "registered_but_withdrawn",
                             "its event %s was retracted" % own.event_id), None
-    digest = engine.digest_of(g, session_id) if session_id is not None else None
+    digest = ids.client_digest(g, session_id) if session_id is not None else None
     correcting = own is not None and own.digest != digest
     hosts = sorted({s.events[s.settled[f.path].event_id].event_id for f in g.files
                     if f.path in s.settled})
@@ -376,8 +380,9 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
             changes["import"] = [was, now]
         new_id = correction_event_id(own.event_id, digest)
         active = db.active_artifacts(own.event_id)
+        names = {root_id: name for name, root_id in db.storage_roots().items()}
         supersede = [{"old": a, "new": successor_artifact_id(a, new_id), "storage_root_id": r,
-                      "path": p} for a, r, p, _c in active]
+                      "root": names[r], "path": p} for a, r, p, _c in active]
         move = (g.kind == "behavior" and paired and set(changes) == {"session_id"}
                 and old["session_id"] is not None)
         note = None
@@ -391,11 +396,11 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
         event = block(new_id, g.subject_id, session["id"])
         event.update({"supersedes": own.event_id, "occurred_local": g.occurred_local,
                       "time_zone": g.time_zone, "detail": dict(g.detail),
-                      "attributes": engine.event_attributes(g, digest, version),
+                      "attributes": engine.event_attributes(g, session_id, version),
                       "drop_attributes": ["occurred_precision"]})
         return _group_record(s, g, "move_session" if move else "correct", files + held + written(),
                              expect=expect, event=event, session=session, supersede=supersede,
-                             changes=changes, session_note=note), read_us
+                             changes=changes, session_note=note, carried=CARRIED), read_us
 
     # No event of its own: another client's, a copy, or new.
     facts = db.event_facts([a.event_id for a in known.values()])
@@ -443,11 +448,11 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     if problem is not None:
         return _held_record(s, g, files + held + written(), problem[0], problem[1]), read_us
     expect["sessions"] = session.pop("expect")
-    values = engine.event_values(g, session["id"], digest, version, also)
+    values = engine.event_values(g, session["id"], version, also)
     event = block(values["event_id"], g.subject_id, session["id"])
     event.update({"event_type": g.kind, "occurred_local": g.occurred_local,
                   "time_zone": g.time_zone, "detail": values["detail"],
-                  "attributes": engine.event_attributes(g, digest, version, also)})
+                  "attributes": engine.event_attributes(g, session["id"], version, also)})
     return _group_record(s, g, "register", files + held + written(), expect=expect, event=event,
                          session=session), read_us
 
@@ -712,7 +717,8 @@ def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, 
     end, its result. Returns ``{"applied": [...], "refused": [(key, why)],
     "notes": [...], "run_id": ...}``.
     """
-    out = {"applied": [], "refused": [], "notes": [], "run_id": None, "directory": record}
+    out = {"applied": [], "refused": [], "notes": [], "run_id": None, "started": "",
+           "directory": record}
     groups = [g for g in plan.groups if g["directory"] == record["id"] and g["action"] in ACTIONS
               and (not only or g["key"] in only)]
     d = db.directory(record["id"])
@@ -723,8 +729,8 @@ def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, 
                           for g in groups]
         return out
     if not dry_run:
-        out["run_id"], _started, _text = db.insert_run(d.id, "apply", "register", None, version,
-                                                       host)
+        out["run_id"], _started, out["started"] = db.insert_run(d.id, "apply", "register", None,
+                                                                version, host)
         d = db.directory(record["id"])
     listed_us = plan.listed.get(record["id"])
     counters = dict.fromkeys(("files_registered", "files_known", "groups_registered"), 0)
@@ -844,7 +850,85 @@ def scan_report(records: list[dict]) -> tuple[str, str]:
             if g.get("session", {}).get("aside"):
                 text.append("      session %s is moved aside (%s)"
                             % (g["session"]["aside"]["id"], g["session"]["aside"]["path"]))
+            for item in g.get("supersede", []):
+                text.append("      supersedes artifact %s at %s:%s"
+                            % (item["old"], item["root"], item["path"]))
+            if g.get("carried"):
+                text.append("      " + g["carried"])
     return out.getvalue(), "\n".join(head + text).rstrip("\n") + "\n"
+
+
+def apply_report(plan: PlanFile, out: dict) -> tuple[str, str]:
+    """(CSV, text) of what ``apply`` did in one directory: applied, refused and why, notes.
+
+    The CSV has the columns of a run's report (``report.COLUMNS``): a
+    ``group`` row per group with action ``applied`` or ``refused`` (the
+    plan's action is the first word of ``detail``), a ``file`` row per file
+    written for an applied group (``registered`` or ``known``), and a
+    ``group`` row with action ``note`` per note.
+    """
+    record = out["directory"]
+    groups = {g["key"]: g for g in plan.groups}
+    table = io.StringIO(newline="")
+    writer = csv.DictWriter(table, COLUMNS, lineterminator="\n")
+    writer.writeheader()
+
+    def row(**values):
+        writer.writerow(dict.fromkeys(COLUMNS, "") | {"root": record["root"]} | values)
+
+    text = ["apply of plan %s (sha256 %s) to directory %d %s:%s: %d group(s) applied, %d refused"
+            % (os.path.basename(plan.path), plan.end["sha256"], record["id"], record["root"],
+               record["path"], len(out["applied"]), len(out["refused"])), ""]
+    if out["applied"]:
+        text.append("Applied (%d group(s))" % len(out["applied"]))
+    for key in out["applied"]:
+        g = groups[key]
+        event = g.get("event", {}).get("id", "")
+        written = [f for f in g["files"] if f["state"] in ("new", "replace", "known")]
+        row(what="group", action="applied", path=g["source_path"], group_key=key, event_id=event,
+            detail="%s: %d file(s)" % (g["action"], len(written)))
+        text.append("  %s: %s, %d file(s)" % (g["source_path"], g["action"], len(written)))
+        for name, change in sorted(g.get("changes", {}).items()):
+            text.append("      %s: %s -> %s" % (name, ids.canonical_json(change[0]),
+                                                 ids.canonical_json(change[1])))
+        for f in written:
+            row(what="file", action="known" if f["state"] == "known" else "registered",
+                path=f["path"], group_key=key, size_bytes=f["size"], mtime_ns=f["mtime_ns"],
+                artifact_id=f["artifact_id"], event_id=event,
+                detail="replaces artifact %s" % f["replaces"] if f["state"] == "replace" else "")
+    if out["refused"]:
+        text += ["", "Refused (%d group(s)); nothing was written for them"
+                 % len(out["refused"])]
+    for key, why in out["refused"]:
+        g = groups[key]
+        row(what="group", action="refused", path=g["source_path"], group_key=key,
+            detail="%s: %s" % (g["action"], why))
+        text.append("  %s (%s): %s" % (g["source_path"], g["action"], why))
+    if out["notes"]:
+        text += ["", "Notes"]
+    for note in out["notes"]:
+        key = note.split(": ", 1)[0]
+        row(what="group", action="note", group_key=key if key in groups else "", detail=note)
+        text.append("  " + note)
+    text += ["", NOT_READ]
+    return table.getvalue(), "\n".join(text) + "\n"
+
+
+NOT_READ = ("The files were not read again: each had the size and modification time the scan "
+            "recorded, and the verification rows carry the time of the scan's read.")
+
+
+def write_apply_report(report_dir: str, plan: PlanFile, out: dict) -> str:
+    """Write the CSV and the text report of one directory's apply; returns the text's path."""
+    os.makedirs(report_dir, exist_ok=True)
+    stem = os.path.join(report_dir, "%s_dir%d_run%d" % (out["started"], out["directory"]["id"],
+                                                        out["run_id"]))
+    table, text = apply_report(plan, out)
+    with open(stem + ".csv", "w", encoding="utf-8", newline="") as fh:
+        fh.write(table)
+    with open(stem + ".txt", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    return stem + ".txt"
 
 
 def file_digest(path: str) -> str:

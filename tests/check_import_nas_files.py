@@ -1999,9 +1999,14 @@ def apply_refuses_what_is_not_as_the_scan_found_it_and_leaves_it_untouched():
     key_two = [k for k, g in groups_of(plan).items() if g["source_path"].endswith("260308_101800")]
     code, out = apply(w, plan, "--only", "no-such-group")
     check(code == 2 and "no such group" in out, "--only with an unknown key: %d %s" % (code, out))
-    code, out = apply(w, plan)
+    code, out = apply(w, plan, "--report-dir", w.reports)
     check(code == 1 and out.count("REFUSED") == 1 and "is not as the scan saw it" in out
           and set(w.artifacts()) == set(two), "a touched file: %d %s" % (code, out))
+    texts = [open(os.path.join(w.reports, n), encoding="utf-8").read()
+             for n in os.listdir(w.reports) if n.endswith(".txt")]
+    check(len(texts) == 1 and "1 group(s) applied, 1 refused" in texts[0]
+          and "is not as the scan saw it" in texts[0] and "Refused (1 group(s))" in texts[0],
+          "the report of an apply with a refusal: %s" % texts)
     check(not q("SELECT 1 FROM lab.scan_file_latest WHERE storage_root_id = %s AND "
                 "relative_path = ANY(%s)", (w.root_id, list(one))),
           "the refused group got memory rows")
@@ -2038,6 +2043,120 @@ def apply_only_carries_out_the_groups_named():
           "the rest of the plan: %d %s" % (code, out))
     nothing_held_or_pending(w, d)
     w.off()
+
+
+@named
+def apply_skips_a_directory_another_process_is_searching():
+    from nas_import.database import LOCK_CLASS
+    w = World("applylock")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    recording(w, s, "260307_101800", blocks=SHORT)
+    code, out, plan = scan(w, d)
+    check(code == 0, "scan: %d %s" % (code, out))
+    counts = table_counts()
+    other = psycopg.connect(autocommit=True)          # the other process: it holds the lock
+    try:
+        other.execute("SELECT pg_advisory_lock(%s::integer, %s::integer)", (LOCK_CLASS, d))
+        code, out = apply(w, plan, "--report-dir", w.reports)
+    finally:
+        other.close()
+    check(code == 1 and "being searched by another process" in out and "0 group(s) applied" in out,
+          "apply against a held lock: %d %s" % (code, out))
+    check(table_counts() == counts and not os.path.isdir(w.reports),
+          "apply wrote something while the directory was locked")
+    code, out = apply(w, plan, "--report-dir", w.reports)
+    check(code == 0 and len(w.artifacts()) == 2, "apply once the lock is free: %d %s" % (code, out))
+    w.off()
+
+
+@named
+def a_correction_carries_input_edges_files_on_other_roots_and_takes_a_new_file():
+    w = World("carry")
+    local = World("elsewhere")
+    d = w.directory(I, "intan")
+    s, s2 = w.subject(1), w.subject(2)
+    rec = recording(w, s, "260709_095155", blocks=SHORT)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    w.ok(d, times=2)
+    arts = w.artifacts()
+    old_event = arts[next(iter(rec))]["event"]
+    # Another client added a file on another root to the event, and the event has an input.
+    their = q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+               "checksum, role, subject_id, session_id) VALUES (%s::uuid, %s, %s, %s, 'derived', "
+               "%s, %s::uuid) RETURNING artifact_id::text",
+               (old_event, local.root_id, "analysis/%s/sorted.npy" % TAG, sha(b"theirs"), s,
+                arts[next(iter(rec))]["session"]))
+    source = q1("INSERT INTO lab.event (event_type, subject_id, occurred_at) VALUES ('husbandry', "
+                "%s, now()) RETURNING event_id::text", (s,))
+    conn.execute("INSERT INTO lab.husbandry_event (event_id, measure) VALUES (%s::uuid, 'weight')",
+                 (source,))
+    consumed = q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, "
+                  "relative_path, checksum, role) VALUES (%s::uuid, %s, %s, %s, 'other') "
+                  "RETURNING artifact_id::text",
+                  (source, local.root_id, "inputs/%s/map.json" % TAG, sha(b"map")))
+    conn.execute("INSERT INTO lab.event_input (event_id, artifact_id, role) VALUES (%s::uuid, "
+                 "%s::uuid, 'probe map')", (old_event, consumed))
+    # A new file arrives in the folder, and an override names another subject.
+    added = w.write(folder + "/_manifest.json", b'{"with": "the correction"}')
+    over = os.path.join(TMP, "carry_%d.csv" % w.n)
+    P.write(over, ("root,relative_path,subject_id,reason\n%s,%s,%s,the other animal\n"
+                   % (w.name, folder, s2)).encode())
+    before = corrections()
+    code, out, plan = scan(w, d, extra=["--overrides", over])
+    (g,) = groups_of(plan).values()
+    listed = sorted((x["root"], x["path"]) for x in g["supersede"])
+    check(code == 0 and g["action"] == "correct"
+          and listed == sorted([(w.name, p) for p in rec]
+                               + [(local.name, "analysis/%s/sorted.npy" % TAG)])
+          and "carried at apply time" in g["carried"]
+          and [f["state"] for f in g["files"] if f["path"] == added] == ["new"],
+          "the planned correction: %s %s" % (g["action"], listed))
+    text = open(plan[:-6] + ".txt", encoding="utf-8").read()
+    check("supersedes artifact %s at %s:analysis/%s/sorted.npy" % (their, local.name, TAG) in text
+          and all("at %s:%s" % (w.name, p) in text for p in rec)
+          and "carried at apply time" in text, "the scan's text report: %s" % text)
+    code, out = apply(w, plan, "--report-dir", w.reports)
+    check(code == 0, "apply: %d %s" % (code, out))
+    new_event = q1("SELECT event_id::text FROM lab.event WHERE supersedes = %s::uuid", (old_event,))
+    session = q1("SELECT session_id::text FROM lab.event WHERE event_id = %s::uuid", (new_event,))
+    check(q("SELECT artifact_id::text, role FROM lab.event_input WHERE event_id = %s::uuid",
+            (new_event,)) == [(consumed, "probe map")], "the input edge was not carried")
+    active = {r[0]: r[1:] for r in q(
+        "SELECT a.relative_path, r.name, a.subject_id, a.session_id::text, a.supersedes::text, "
+        "a.role FROM lab.artifact_active a JOIN lab.storage_root r ON r.root_id = "
+        "a.storage_root_id WHERE a.produced_by_event_id = %s::uuid", (new_event,))}
+    check(set(active) == set(rec) | {added, "analysis/%s/sorted.npy" % TAG}
+          and {v[1:3] for v in active.values()} == {(s2, session)},
+          "the files of the corrected event: %s" % active)
+    check(active["analysis/%s/sorted.npy" % TAG] == (local.name, s2, session, their, "derived")
+          and active[added][3] is None and all(active[p][3] == arts[p]["id"] for p in rec),
+          "what each file supersedes: %s" % active)
+    now = corrections()
+    check(now == (before[0] + 1, before[1] + len(rec) + 1, before[2], before[3])
+          and q1("SELECT count(*) FROM lab.artifact_active WHERE produced_by_event_id = %s::uuid",
+                 (old_event,)) == 0, "one correction, every file followed: %s -> %s"
+          % (before, now))
+    # The report of the apply.
+    stem = [n[:-4] for n in os.listdir(w.reports) if n.endswith(".txt")
+            and "_run%d." % q1("SELECT max(scan_run_id) FROM lab.scan_run WHERE command = 'apply' "
+                              "AND scan_directory_id = %s", (d,)) in n]
+    check(len(stem) == 1, "no report of the apply in %s" % os.listdir(w.reports))
+    text = open(os.path.join(w.reports, stem[0] + ".txt"), encoding="utf-8").read()
+    rows = open(os.path.join(w.reports, stem[0] + ".csv"), encoding="utf-8").read()
+    check("1 group(s) applied, 0 refused" in text and "correct, 1 file(s)" in text
+          and "subject_id:" in text and "The files were not read again" in text,
+          "the text report of apply: %s" % text)
+    check(rows.startswith("what,action,root,path,") and "group,applied,%s,%s," % (w.name, folder)
+          in rows and "file,registered,%s,%s," % (w.name, added) in rows,
+          "the CSV of apply: %s" % rows)
+    w.ok(d, extra=["--overrides", over], times=2)
+    last = w.last(d)
+    check(last["files_held"] == 0 and last["groups_held"] == 0 and last["files_pending"] == 0
+          and statuses(w, list(rec) + [added]) == ["registered"],
+          "a run after the correction: %s" % last)
+    w.off()
+    local.off()
 
 
 def main():

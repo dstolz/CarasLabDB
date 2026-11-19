@@ -23,7 +23,7 @@ appends the ``lab.scan_run_result`` row.
 
 **An unattended run only adds.** It never supersedes, retracts or records a
 disposition. Whatever would need one of those is held with a reason code
-(:data:`RUN_REASON_CODES`) and left for a person.
+(``model.REASON_CODES``, the "database side" ones) and left for a person.
 
 **The stability rule** (:func:`stability`). A group may be registered by a run
 R only when every file listed in it now (registrable or held one by one)
@@ -77,7 +77,6 @@ import hashlib
 import os
 import stat as stat_module
 import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from . import content, ids, mat5, walk
@@ -90,35 +89,6 @@ from .model import TOOL_NAME, DirectorySpec, Group, GroupFile, Interpretation, L
 VERSION = "1.0"
 CHUNK = 4 * 1024 * 1024
 READ_MARK = "[read: sha256="
-
-# Reason codes of holds decided against the database (the interpretation's own
-# are model.REASON_CODES). Stored in lab.scan_file.reason_code: never rename.
-RUN_REASON_CODES: dict[str, str] = {
-    "would_correct": "the group's event is in the database with another digest: registering "
-                     "it would be a correction",
-    "content_changed": "other bytes at a registered path: registering them would record the "
-                       "registered file as replaced",
-    "late_recording": "a recording that arrives for a behavior session already registered in "
-                      "a session of its own",
-    "path_case_conflict": "a path that differs only in case from a registered or another "
-                          "listed path",
-    "registered_but_withdrawn": "the file's artifact, or the group's event, was retracted, or "
-                                "the file was recorded as moved, replaced or deleted",
-    "copy_ambiguous": "the group's files are, by path or by their bytes, files of more than "
-                      "one event already in the database",
-    "copy_event_mismatch": "the event the group's files already belong to is another "
-                           "subject's or of another type",
-    "duplicate_content": "the group's raw files hold the bytes this tool registered already "
-                         "under another name",
-    "session_conflict": "the session the group needs cannot be used: another session holds "
-                        "its label or path, or it belongs to another subject",
-    "local_time_nonexistent": "the wall-clock time of the name does not exist in the "
-                              "directory's time zone (the clocks went forward)",
-    "local_time_ambiguous": "the wall-clock time of the name occurs twice in the directory's "
-                            "time zone (the clocks went back)",
-    "paired_recording_held": "the recording it pairs with is held",
-}
-
 
 class Unreachable(Exception):
     """The directory is missing or empty: nothing is concluded, nothing else written."""
@@ -139,62 +109,19 @@ class FileChanged(Exception):
 
 @dataclass
 class ReadStats:
-    files_opened: int = 0           # files opened for their header
-    header_bytes: int = 0
+    """What a run read. ``header`` is what ``interpret(..., stats=)`` counts."""
+    header: dict = field(default_factory=dict)
     files_read: int = 0             # files read to their end
     read_bytes: int = 0
 
     @property
+    def files_opened(self) -> int:
+        """Files opened for their header."""
+        return self.header.get("files_opened", 0)
+
+    @property
     def bytes_read(self) -> int:
-        return self.header_bytes + self.read_bytes
-
-
-class _CountingFile:
-    """A binary file whose reads are counted."""
-
-    def __init__(self, fh, stats: ReadStats):
-        self._fh = fh
-        self._stats = stats
-
-    def read(self, n: int = -1):
-        data = self._fh.read(n)
-        self._stats.header_bytes += len(data)
-        return data
-
-    def __getattr__(self, name):
-        return getattr(self._fh, name)
-
-
-@contextmanager
-def count_header_reads(stats: ReadStats):
-    """Count the files the interpretation opens and the bytes it asks of them.
-
-    ``cache.HeaderReader`` opens files through the module attribute
-    ``content.open_listed`` (the seam its own test uses); it is replaced for
-    the duration by one that counts and restored afterwards.
-    """
-    real = content.open_listed
-
-    @contextmanager
-    def counting(root_path, listed):
-        stats.files_opened += 1
-        with real(root_path, listed) as fh:
-            yield _CountingFile(fh, stats)
-
-    content.open_listed = counting
-    try:
-        yield
-    finally:
-        content.open_listed = real
-
-
-def verify_mat(fh, size: int) -> None:
-    """The full structural pass of a ``.mat`` file about to be registered.
-
-    ``mat5.verify_file`` inflates every compressed variable to its end and
-    raises ``MatProblem`` on damage (a seam for tests).
-    """
-    mat5.verify_file(fh, size)
+        return self.header.get("bytes_read", 0) + self.read_bytes
 
 
 def us_text(us: int) -> str:
@@ -357,10 +284,9 @@ def sight(db: Database, directory: Directory, root_path: str, overrides=(),
     restricted = cache.restricted_to(keys) if cache is not None else None
     subjects = db.subjects()
     try:
-        with count_header_reads(stats):
-            interp = interpret(listings, {directory.root: root_path}, subjects,
-                               [o for o in overrides if o.root == directory.root],
-                               header_cache=restricted)
+        interp = interpret(listings, {directory.root: root_path}, subjects,
+                           [o for o in overrides if o.root == directory.root],
+                           header_cache=restricted, stats=stats.header)
     except ValueError as exc:            # a pairing the layouts do not define, a bad override
         raise ListingFailed(str(exc)) from exc
     if not interp.complete:
@@ -436,19 +362,6 @@ def case_conflicts(paths) -> set[str]:
             spellings.setdefault(ascii_fold(pre), set()).add(pre)
     bad = {s for v in spellings.values() if len(v) > 1 for s in v}
     return {p for p, mine in prefixes.items() if any(pre in bad for pre in mine)}
-
-
-def digest_of(group: Group, session_id: str) -> str:
-    """``ids.client_digest`` of GROUP in session SESSION_ID.
-
-    The session is the group's deterministic one except for a behavior
-    session paired with a recording whose event lies in another session (a
-    recording registered from a copy by another client): the behavior event
-    then goes where the recording's event is.
-    """
-    source = ids.digest_source(group)
-    source["session_id"] = session_id
-    return ids.sha256_text(ids.canonical_json(source))
 
 
 def registered_event(group: Group, s: Sighting) -> EventFact | None:
@@ -659,7 +572,9 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                 else:
                     wait = "its recording %s is not registered yet" % (
                         partner.source_path if partner is not None else g.pairing.partner_key)
-        digest = digest_of(g, session_id) if session_id is not None else None
+        # The session is the group's deterministic one, except for a behavior session
+        # paired with a recording whose event lies in another session.
+        digest = ids.client_digest(g, session_id) if session_id is not None else None
         would_correct = False
         if own is not None:
             if own.retracted:
@@ -797,7 +712,7 @@ def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats
             fh.seek(0)
             stats.read_bytes += f.size
             try:
-                verify_mat(fh, f.size)
+                mat5.verify_file(fh, f.size)      # every variable, to its end
             except content.ContentProblem as exc:
                 if exc.code in content.TRANSIENT:
                     raise OSError(exc.sentence) from exc
@@ -958,7 +873,7 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
             if db.session(gp.session_id) is None:
                 w.session = session_values(g, gp.session_id, root_id)
                 out.created_session = True
-            w.event = event_values(g, gp.session_id, gp.digest, version, also)
+            w.event = event_values(g, gp.session_id, version, also)
             out.created_event = True
         else:
             w.event_id, w.subject_id, w.session_id = host.event_id, host.subject_id, host.session_id
@@ -1020,20 +935,19 @@ def session_values(g: Group, session_id: str, root_id: int, subject_id: str | No
             "rig": g.rig}
 
 
-def event_attributes(g: Group, digest: str, version: str, also=()) -> dict:
-    """The attributes of G's event: ``ids.event_attributes`` with the digest of its session."""
-    attributes = ids.event_attributes(g, version)
-    attributes["client_digest"] = digest
+def event_attributes(g: Group, session_id: str, version: str, also=()) -> dict:
+    """``ids.event_attributes`` of G in session SESSION_ID, with the events ALSO holding its raw files."""
+    attributes = ids.event_attributes(g, version, session_id)
     if also:
         attributes["raw_files_also_in_events"] = sorted(also)
     return attributes
 
 
-def event_values(g: Group, session_id: str, digest: str, version: str, also=()) -> dict:
+def event_values(g: Group, session_id: str, version: str, also=()) -> dict:
     """The arguments of ``Database.insert_event`` for G's own, new event."""
     return {"event_id": ids.group_event_id(g), "event_type": g.kind, "subject_id": g.subject_id,
             "session_id": session_id, "occurred_local": g.occurred_local, "zone": g.time_zone,
-            "attributes": ids.canonical_json(event_attributes(g, digest, version, also)),
+            "attributes": ids.canonical_json(event_attributes(g, session_id, version, also)),
             "detail": dict(g.detail)}
 
 
