@@ -23,6 +23,10 @@ re-run would register everything twice):
 * ``import``: the ``attributes.import`` block (tool name, layout, root,
   path, source_value, override when there is one).
 
+The override's reason is in it (``import.override.reason``), so rewording a
+reviewed reason changes the digest and the unattended run holds the group
+as a correction: documented, not avoided.
+
 Not in it: the tool's version, the files (a file added to a registered
 folder is a new artifact, not a correction), sizes and times, the session's
 own columns other than its id, notes.

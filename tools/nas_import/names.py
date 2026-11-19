@@ -18,7 +18,16 @@ Month abbreviations are English, ``Jan`` .. ``Dec`` exactly.
 
 Validity of a date and time follows ``nameTime`` (findCopySessions lines
 546-559): two-digit years are 2000 + yy, month 1-12, a day that exists in
-that month, hour 0-23, minute and second 0-59.
+that month, hour 0-23, minute and second 0-59. A four-digit year (the
+``dd-Mon-yyyy`` form) must lie in 1990-2099.
+
+A subject id that itself contains ``_`` cannot be named this way (the name
+would not parse; such files are held ``unrecognised_name``): documented,
+not handled.
+
+Case: :func:`ascii_fold` is the one comparison "equal but for case" used
+everywhere (subjects, twins, names in one folder). It folds the ASCII
+letters A-Z only, so ``\u017f`` (long s) is not ``S``.
 
 Every parser returns None when the name does not have the form, and raises
 :class:`BadNameTime` when it has the form but an invalid date or time.
@@ -40,6 +49,15 @@ INTAN_FOLDER = re.compile(_SUBJ + r"_(?P<d>[0-9]{6})_(?P<t>[0-9]{6})\Z")
 
 _MONTHS_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 MONTHS = {m: i + 1 for i, m in enumerate(_MONTHS_EN)}
+
+
+YEAR_MIN, YEAR_MAX = 1990, 2099
+_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def ascii_fold(text: str) -> str:
+    """TEXT with the ASCII letters A-Z lowered and nothing else changed."""
+    return text.translate(_FOLD)
 
 
 class BadNameTime(ValueError):
@@ -103,6 +121,8 @@ def parse_epsych(name: str) -> EpsychName | None:
     if m:
         if m["mon"] not in MONTHS:
             raise BadNameTime("%s is not a month" % m["mon"])
+        if not YEAR_MIN <= int(m["year"]) <= YEAR_MAX:
+            raise BadNameTime("the year %s is outside %d-%d" % (m["year"], YEAR_MIN, YEAR_MAX))
         date = _check_date(int(m["year"]), MONTHS[m["mon"]], int(m["day"]))
         stamp = "%s-%s-%s" % (m["day"], m["mon"], m["year"])
         if m["ab"]:

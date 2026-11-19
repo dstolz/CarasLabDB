@@ -36,9 +36,19 @@ What the importer does with the result (``apply_pairing``):
   depend on the pairing) with a note;
 * the others keep their own session (unpaired) with a note.
 
-Groups take part when their status is ``ready`` or ``held`` (a held group
-still occupies its time, so it can make a set ambiguous or claim a file);
-the subject is the resolved one, or the subject folder while unresolved.
+Every recording folder in sight takes part, in any state but ``skipped``:
+``ready`` or ``held`` for any reason (a folder with no ``.rhd`` yet, an
+unreadable header, an unknown subject ...), so an ePsych session near such a
+folder is paired with it and then held (``paired_recording_held``) or found
+ambiguous, never registered alone. A recording skipped by an override no
+longer counts (a person decided); an ePsych session that would have been
+its candidate may then be ``ready`` alone, with a note
+(``pairing_skipped_recording``) naming the skipped folder. The subject is
+the resolved one, or the subject folder while unresolved.
+
+Wall-clock text, unzoned: across a daylight-saving change the comparison is
+off by the hour that changed (documented; it is how findCopySessions
+compares, and the lab does not record across 02:00).
 """
 
 from __future__ import annotations
@@ -49,7 +59,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
-from .model import DirectorySpec, Group, Hold, Note, Pairing
+from .model import DirectorySpec, Group, Hold, Note, Pairing, with_hold
 from .names import wall_seconds
 from .rhd import decimal_text
 
@@ -154,8 +164,8 @@ def _takes_part(g: Group) -> bool:
     return g.status in ("ready", "held")
 
 
-def _cands(result: PairResult, key: str) -> str:
-    return "; ".join("%s (%+d s)" % (k.rsplit(":", 1)[1].rsplit("/", 1)[1], dt)
+def _cands(result: PairResult, key: str, names: dict) -> str:
+    return "; ".join("%s (%+d s)" % (names[k], dt)
                      for k, dt in sorted(result.candidates.get(key, [])))
 
 
@@ -184,6 +194,9 @@ def apply_pairing(groups: Sequence[Group], specs: Sequence[DirectorySpec]) -> tu
     for (root, ep_dir), rec_dirs in targets.items():
         rec_groups = [g for g in groups if (g.root, g.directory) in rec_dirs
                       and g.kind == "recording" and _takes_part(g)]
+        skipped = [g for g in groups if (g.root, g.directory) in rec_dirs
+                   and g.kind == "recording" and g.status == "skipped"]
+        names = {g.key: g.source_path.rsplit("/", 1)[-1] for g in groups}
         ep_groups = [g for g in groups if g.root == root and g.directory == ep_dir
                      and g.kind == "behavior" and _takes_part(g)]
         for g in ep_groups:
@@ -208,19 +221,21 @@ def apply_pairing(groups: Sequence[Group], specs: Sequence[DirectorySpec]) -> tu
             rec_of = {v: k for k, v in result.pair_of.items()}
             r_by_key = {g.key: g for g in rs}
             for g in rs:
-                out[g.key] = _recording_outcome(g, result, r_by_key)
+                out[g.key] = _recording_outcome(g, result, names)
             for g in es:
-                out[g.key] = _session_outcome(g, result, rec_of, r_by_key, rs)
+                out[g.key] = _session_outcome(g, result, rec_of, r_by_key, rs, names,
+                                              [r for r in skipped if _pool_subject(r) == subject])
     return tuple(out[g.key] for g in groups)
 
 
-def _recording_outcome(g: Group, result: PairResult, r_by_key) -> Group:
+def _recording_outcome(g: Group, result: PairResult, names: dict) -> Group:
     if g.key in result.short:
         p = Pairing("short", note="recording of %s s, shorter than %d s; not paired"
                     % (decimal_text(g.duration) or str(g.duration), MIN_RECORDING_S))
         code = "pairing_short"
     elif g.key in result.ambiguous_recordings:
-        p = Pairing("ambiguous", note="ambiguous: candidate ePsych sessions " + _cands(result, g.key))
+        p = Pairing("ambiguous", note="ambiguous: candidate ePsych sessions "
+                    + _cands(result, g.key, names))
         code = "pairing_ambiguous"
     elif g.key in result.pair_of:
         e = result.pair_of[g.key]
@@ -233,12 +248,13 @@ def _recording_outcome(g: Group, result: PairResult, r_by_key) -> Group:
     return dataclasses.replace(g, pairing=p, notes=g.notes + (Note(code, p.note),))
 
 
-def _session_outcome(g: Group, result: PairResult, rec_of, r_by_key, rs) -> Group:
+def _session_outcome(g: Group, result: PairResult, rec_of, r_by_key, rs, names,
+                     skipped) -> Group:
     if g.key in result.ambiguous_sessions:
-        note = "ambiguous: candidate recordings " + _cands(result, g.key)
+        note = "ambiguous: candidate recordings " + _cands(result, g.key, names)
         g = dataclasses.replace(g, pairing=Pairing("ambiguous", note=note),
                                 notes=g.notes + (Note("pairing_ambiguous", note),))
-        return _hold(g, Hold("pairing_ambiguous", note))
+        return with_hold(g, Hold("pairing_ambiguous", note))
     if g.key in rec_of:
         r = r_by_key[rec_of[g.key]]
         dt = dict(result.candidates[g.key])[r.key]
@@ -246,7 +262,7 @@ def _session_outcome(g: Group, result: PairResult, rec_of, r_by_key, rs) -> Grou
         g = dataclasses.replace(g, pairing=Pairing("paired", r.key, dt, note),
                                 notes=g.notes + (Note("pairing_paired", note),))
         if r.status != "ready":
-            return _hold(g, Hold("paired_recording_held", "it pairs with %s, which is %s (%s)"
+            return with_hold(g, Hold("paired_recording_held", "it pairs with %s, which is %s (%s)"
                                  % (r.key, r.status, r.hold.reason_code if r.hold else "")))
         return dataclasses.replace(g, session_path=r.session_path, label=r.label)
     t = wall_seconds(g.start_local)
@@ -254,12 +270,10 @@ def _session_outcome(g: Group, result: PairResult, rec_of, r_by_key, rs) -> Grou
                      <= MAX_LAG_S for r in rs)
     note = ("no recording of at least %d s within the pairing window" % MIN_RECORDING_S
             if near_short else "no recording folder within the pairing window")
-    return dataclasses.replace(g, pairing=Pairing("unpaired", note=note),
-                               notes=g.notes + (Note("pairing_unpaired", note),))
-
-
-def _hold(g: Group, hold: Hold) -> Group:
-    if g.status == "held":
-        return dataclasses.replace(g, notes=g.notes + (Note(hold.reason_code,
-                                                            "also: " + hold.sentence),))
-    return dataclasses.replace(g, status="held", hold=hold)
+    notes = (Note("pairing_unpaired", note),)
+    near_skipped = sorted(names[r.key] for r in skipped
+                          if -MAX_LEAD_S <= t - wall_seconds(r.start_local) <= MAX_LAG_S)
+    if near_skipped:
+        notes += (Note("pairing_skipped_recording", "recording %s in the pairing window was "
+                       "skipped by an override" % ", ".join(near_skipped)),)
+    return dataclasses.replace(g, pairing=Pairing("unpaired", note=note), notes=g.notes + notes)

@@ -8,7 +8,8 @@ ever written, renamed or deleted.
 * Symbolic links (and, on Windows, junctions and other reparse points) are
   never followed; they are returned in ``Listing.links``.
 * Entries other than regular files and folders are in ``Listing.special``.
-* Ignored by name, anywhere in the tree (:data:`IGNORED_NAMES`,
+* Ignored by name, anywhere in the tree, compared without regard to the
+  case of ASCII letters (:data:`IGNORED_NAMES`,
   :data:`IGNORED_PREFIXES`) and the root marker :data:`MARKER_NAME`: returned
   in ``Listing.ignored``; an ignored folder is not interpreted, only its files
   are counted (for the reconciliation against an independent listing); one
@@ -30,8 +31,11 @@ import os
 import stat as stat_module
 
 from .model import DirectorySpec, IgnoredItem, ListedFile, Listing, UnreadableItem
+from .names import ascii_fold
 
-IGNORED_NAMES = frozenset({".DS_Store", "Thumbs.db", "@eaDir", "#recycle", "_gsdata_"})
+IGNORED_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini", "@eaDir", "#recycle",
+                           "_gsdata_"})
+_IGNORED_FOLDED = frozenset(ascii_fold(n) for n in IGNORED_NAMES)
 IGNORED_PREFIXES = ("~$",)
 MARKER_NAME = ".caraslabdb-root.json"
 
@@ -72,8 +76,8 @@ def check_relative_path(path: str) -> None:
 
 
 def is_ignored_name(name: str) -> bool:
-    """True for a name the walker ignores (the marker file excluded)."""
-    return name in IGNORED_NAMES or name.startswith(IGNORED_PREFIXES)
+    """True for a name the walker ignores (the marker file excluded); ASCII case ignored."""
+    return ascii_fold(name) in _IGNORED_FOLDED or name.startswith(IGNORED_PREFIXES)
 
 
 def _lstat(entry: os.DirEntry) -> os.stat_result:
@@ -110,7 +114,7 @@ def _check_components(root_path: str, rel: str) -> str:
             raise WalkError("cannot list %s: %s" % (current, exc)) from exc
         exact = [e for e in entries if e.name == part]
         if not exact:
-            folded = [e.name for e in entries if e.name.casefold() == part.casefold()]
+            folded = [e.name for e in entries if ascii_fold(e.name) == ascii_fold(part)]
             if folded:
                 raise SpellingMismatch("%r is spelled %r on disk under %s"
                                        % (part, folded[0], current))

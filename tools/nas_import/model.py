@@ -12,14 +12,14 @@ Categories of what a scan finds (each listed file ends up in exactly one):
 * a file of a :class:`Group` -- ``group.files`` (registrable) or
   ``group.held_files`` (held one by one, still part of the group);
 * a loose :class:`HeldItem` -- held, belongs to no group;
-* a :class:`ReportedItem` -- not registered by rule (test folders, empty
-  folders), nothing to decide;
+* a :class:`ReportedItem` -- not registered and nothing to decide: an empty
+  folder, or a file under a level-1 folder an override skips;
 * an :class:`IgnoredItem` -- ignored by name (``.DS_Store`` ...), counted.
 
 A group's ``status`` is one of ``ready`` (registrable, once the database side
 has seen it unchanged for the directory's minimum age), ``held`` (see
-``group.hold``), ``skipped`` (an override said ``skip``) or ``reported`` (in a
-folder that is not a subject's).
+``group.hold``) or ``skipped`` (an override said ``skip``). No group is
+``ready`` from an incomplete listing.
 
 Every held item and every group hold carries a stable snake_case
 ``reason_code`` from :data:`REASON_CODES` and a sentence for people.
@@ -27,6 +27,7 @@ Every held item and every group hold carries a stable snake_case
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from fractions import Fraction
 
@@ -71,6 +72,7 @@ REASON_CODES: dict[str, str] = {
     "recording_folder_without_rhd": "a recording-named folder holding no .rhd file",
     "rhd_in_subfolder": "an .rhd file in a subfolder of a recording folder",
     "intan_split_format": "an info.rhd file: a split-format recording, not read by this layout",
+    "rhd_unknown_version": "an .rhd file whose main version is not 1, 2 or 3",
     "rhd_bad_magic": "an .rhd file without the Intan magic number 0xC6912702",
     "rhd_truncated": "the .rhd file ends inside its header",
     "rhd_bad_header": "the .rhd header holds a value this reader cannot accept",
@@ -84,7 +86,10 @@ REASON_CODES: dict[str, str] = {
     "subject_folder_case_variant": "the subject folder matches a subject only when case is ignored",
     "override_unknown_subject": "the override names a subject that does not exist",
     "override_skip": "an override says to skip it",
-    "not_a_subject_folder": "in a folder that is not a known subject (a test folder)",
+    "unknown_subject": "in a level-1 folder that is not a known subject",
+    "not_a_subject_folder": "retired: no longer produced (see unknown_subject)",
+    "name_case_conflict": "another name in the same folder differs from it only in case",
+    "listing_incomplete": "part of the listing could not be read; nothing is registered",
     "empty_folder": "an empty folder",
     # pairing and whole-scan checks
     "pairing_ambiguous": "another candidate lies within the ambiguity margin",
@@ -103,7 +108,17 @@ NOTE_CODES: dict[str, str] = {
     "pairing_short": "the recording is shorter than the pairing minimum",
     "pairing_ambiguous": "the pairing is ambiguous",
     "pairing_date_only": "a date-only session is never paired",
+    "pairing_skipped_recording": "a recording in the pairing window was skipped by an override",
+    "epsych_no_plain_file": "the session has no file without a suffix",
 }
+
+
+def with_hold(g: "Group", hold: "Hold") -> "Group":
+    """G held for HOLD; a group already held (or skipped) keeps its state and notes this one."""
+    if g.status in ("held", "skipped") and g.hold is not None:
+        return dataclasses.replace(g, notes=g.notes + (Note(hold.reason_code,
+                                                            "also: " + hold.sentence),))
+    return dataclasses.replace(g, status="held", hold=hold)
 
 
 def check_reason(code: str) -> str:
@@ -134,7 +149,8 @@ class DirectorySpec:
     time_zone: str               # IANA zone of the wall-clock times in the names
     min_age_min: int
     rig: str | None = None
-    pair_with: str | None = None   # another directory's path on the same root
+    pair_with: str | None = None   # path of the directory this one pairs with (same root)
+    paired_by: str | None = None   # path of the directory whose pair_with names this one
 
 
 @dataclass(frozen=True)

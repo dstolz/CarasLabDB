@@ -70,8 +70,8 @@ def channel(native, custom, order, signal_type, enabled=True):
             + struct.pack("<6h", 0, 0, 0, 0, 0, 0) + struct.pack("<ff", 0.0, 0.0))
 
 
-def rhd_header(fs=128.0, n_amp=4, version=(3, 5), n_aux=0, n_dig=1, n_dout=0, n_temp=0,
-               n_supply=0, n_adc=0, disabled=0, magic=0xC6912702):
+def rhd_header(fs=1000.0, n_amp=4, version=(3, 5), n_aux=0, n_dig=1, n_dout=0, n_temp=0,
+               n_supply=0, n_adc=0, disabled=0, magic=0xC6912702, group_enabled=1):
     """An RHD2000 header laid out as writeRhdHeader.m writes it (one signal group)."""
     main, sec = version
     b = struct.pack("<Ihh", magic, main, sec)
@@ -101,7 +101,7 @@ def rhd_header(fs=128.0, n_amp=4, version=(3, 5), n_aux=0, n_dig=1, n_dout=0, n_
     for k in range(n_dout):
         recs.append(channel("DIGITAL-OUT-%02d" % k, "dout%d" % k, k, 5))
     b += struct.pack("<h", 1) + qstring("Port A") + qstring("A")
-    b += struct.pack("<hhh", 1, len(recs), n_amp)
+    b += struct.pack("<hhh", group_enabled, len(recs), n_amp)
     return b + b"".join(recs)
 
 
@@ -146,8 +146,11 @@ def check_rhd():
     check(h1.samples_per_block == 60 and h1.num_samples == 120, "version 1.0 block size")
     check(h1.bytes_per_block == block_bytes(60, 2), "version 1.0 bytes per block")
     # A float32 rate that is not whole: exact decimal text.
-    check(rhd.decimal_text(parse_rhd_bytes(rhd_header(fs=1000.5)).sample_rate) == "1000.5",
-          "a fractional sample rate")
+    expect_problem(lambda: parse_rhd_bytes(rhd_header(fs=1000.5)), "rhd_bad_header",
+                   "a rate RHX does not offer")
+    third = parse_rhd_bytes(rhd_header(fs=10000.0 / 3.0)).sample_rate
+    check(third == Fraction(10000, 3) and rhd.decimal_text(third) is None,
+          "3333.33 Hz is kept as the listed rate 10000/3")
     expect_problem(lambda: parse_rhd_bytes(rhd_file(2, extra=7)), "rhd_partial_block",
                    "a partial block")
     expect_problem(lambda: parse_rhd_bytes(rhd_file(1, magic=0x12345678)), "rhd_bad_magic",
@@ -161,11 +164,11 @@ def check_rhd():
     a = parse_rhd_bytes(rhd_file(3))
     b = parse_rhd_bytes(rhd_file(2))
     s = rhd.recording_summary([("b.rhd", b), ("a.rhd", a)])
-    check(s.total_samples == 640 and s.duration == Fraction(5), "summary duration %s" % s.duration)
+    check(s.total_samples == 640 and s.duration == Fraction(16, 25), "summary duration %s" % s.duration)
     c = parse_rhd_bytes(rhd_file(1, n_amp=8))
     expect_problem(lambda: rhd.recording_summary([("a.rhd", a), ("c.rhd", c)]),
                    "rhd_header_mismatch", "channel count mismatch")
-    d = parse_rhd_bytes(rhd_file(1, fs=256.0))
+    d = parse_rhd_bytes(rhd_file(1, fs=2000.0))
     expect_problem(lambda: rhd.recording_summary([("a.rhd", a), ("d.rhd", d)]),
                    "rhd_header_mismatch", "sample rate mismatch")
     e = parse_rhd_bytes(rhd_file(1, n_amp=0))
@@ -388,24 +391,24 @@ def build_tree(root):
     ep("SUBJ-ID-2000/subj-id-2000_260408T100000.mat", n5)        # same stamp, subject case differs
     ep("SUBJ-ID-2000/SUBJ-ID-2000_260408T100000.mat", n5)
 
-    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_101800.rhd", rhd_file(60))
-    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_101900.rhd", rhd_file(60))
-    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_102000.rhd", rhd_file(30))
+    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_101800.rhd", rhd_file(400))
+    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_101900.rhd", rhd_file(400))
+    rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/SUBJ-ID-1255_260307_102000.rhd", rhd_file(200))
     rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/settings.xml", b"<xml/>")
     rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/_manifest.json", b"{}")
     rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/empty.txt")
     rec("SUBJ-ID-1255/SUBJ-ID-1255_260307_101800/sub/notes.txt", b"nested")
-    rec("SUBJ-ID-1225/SUBJ-ID-1255_260709_095155/SUBJ-ID-1255_260709_095155.rhd", rhd_file(150))
+    rec("SUBJ-ID-1225/SUBJ-ID-1255_260709_095155/SUBJ-ID-1255_260709_095155.rhd", rhd_file(1000))
     rec("SUBJ-ID-1225/SUBJ-ID-1255_260709_095155/settings.xml", b"<xml subject='stale'/>")
-    rec("SUBJ-ID-1278/SUBj-ID-1278_261015_094835/a.rhd", rhd_file(150))
+    rec("SUBJ-ID-1278/SUBj-ID-1278_261015_094835/a.rhd", rhd_file(1000))
     rec("SUBJ-ID-1154/SUBJ-ID-1154_impedance_03182026.csv", b"ch,z\n")
     os.makedirs(os.path.join(i, "New folder"))
     rec("TEST_260619_144257/TEST_260619_144257.rhd", rhd_file(5))
     rec(".DS_Store", b"x")
     rec("@eaDir/thumb/a.jpg", b"x")
     rec("@eaDir/b.jpg", b"x")
-    rec("SUBJ-ID-2000/SUBJ-ID-2000_260402_100000/a.rhd", rhd_file(150))
-    rec("SUBJ-ID-2000/SUBJ-ID-2000_260403_100000/a.rhd", rhd_file(60))          # short
+    rec("SUBJ-ID-2000/SUBJ-ID-2000_260402_100000/a.rhd", rhd_file(1000))
+    rec("SUBJ-ID-2000/SUBJ-ID-2000_260403_100000/a.rhd", rhd_file(500))         # short
     rec("SUBJ-ID-2000/SUBJ-ID-2000_260404_100000/a.rhd", rhd_file(10, extra=5))  # partial block
     rec("SUBJ-ID-2000/SUBJ-ID-2000_260405_100000/a.rhd", rhd_file(10))
     rec("SUBJ-ID-2000/SUBJ-ID-2000_260405_100000/b.rhd", rhd_file(10, n_amp=8))  # mismatch
@@ -428,9 +431,14 @@ def build_tree(root):
         return False
 
 
-SPECS = [DirectorySpec(ROOT, E, "epsych", rig="RIG3", time_zone="America/New_York", min_age_min=1440),
+SPECS = [DirectorySpec(ROOT, E, "epsych", rig="RIG3", time_zone="America/New_York", min_age_min=1440,
+                       paired_by=I),
          DirectorySpec(ROOT, I, "intan", rig="RIG3", pair_with=E, time_zone="America/New_York",
                        min_age_min=1440)]
+
+
+# The ePsych directory on its own (no pairing configured), for single-listing checks.
+E_ALONE = dataclasses.replace(SPECS[0], paired_by=None)
 
 
 def scan(root, overrides=()):
@@ -495,15 +503,15 @@ def check_tree(root, symlinked):
     check(g.session_path == rec.session_path and g.label == rec.label, "joins the recording's session")
     check(ids.group_session_id(g) == ids.group_session_id(rec), "same session id")
     check(g.start_local == "2026-03-07 10:15:00" and g.precision == "second", "epsych start")
-    check(g.source_value == "SUBJ-ID-1255_260307T101500.mat", "source value %s" % g.source_value)
+    check(g.source_value == "SUBJ-ID-1255_260307T101500", "source value %s" % g.source_value)
     check(any(n.code == "epsych_suffix" for n in g.notes), "suffix noted")
 
     # The recording: every file, recursively, raw/intan; zero-byte file held inside it.
     check(rec.status == "ready" and rec.subject_id == "SUBJ-ID-1255", "recording ready")
     check(rec.detail == {"acquisition_system_code": "intan_rhx", "modality": "ephys",
-                         "sample_rate_hz": "128", "n_channels": 4, "duration_s": "150"},
+                         "sample_rate_hz": "1000", "n_channels": 4, "duration_s": "128"},
           "recording detail %s" % rec.detail)
-    check(rec.duration == Fraction(150) and rec.start_local == "2026-03-07 10:18:00", "duration/start")
+    check(rec.duration == Fraction(128) and rec.start_local == "2026-03-07 10:18:00", "duration/start")
     check(len(rec.files) == 6, "recording files %s" % [f.path for f in rec.files])
     check(all(f.role == "raw" and f.attributes["kind"] == "raw" and f.attributes["reader"] == "intan"
               for f in rec.files), "recording artifact attributes")
@@ -558,17 +566,18 @@ def check_tree(root, symlinked):
         check(attrs["occurred_precision"] == "day"
               and attrs["occurred_at_source"] == "ePsych file name (date only)", "date-only attrs")
 
-    # Test folders: reported, not registered, not held.
+    # Folders that are not known subjects: HELD (unknown_subject), never set aside silently.
     for path in ("%s/TEST/TEST_260101T101010.mat" % E, "%s/TEST_SUBJECT/whatever.mat" % E,
                  "%s/SUBJ-ID-TEST/SUBJ-ID-TEST_260101T101010.mat" % E,
                  "%s/videos/SUBJ-ID-1255_260101T101010.ts" % E,
                  "%s/TEST_260619_144257/TEST_260619_144257.rhd" % I):
         owner = [g for g in res.groups if path in g.all_paths()]
         if owner:
-            check(owner[0].status == "reported" and owner[0].hold.reason_code == "not_a_subject_folder",
-                  "%s in a test folder: %s" % (path, owner[0].status))
+            check(owner[0].status == "held" and owner[0].hold.reason_code == "unknown_subject",
+                  "%s in an unknown folder: %s %s" % (path, owner[0].status, owner[0].hold))
         else:
-            check(RP.get(path) == "not_a_subject_folder", "%s reported: %s" % (path, RP.get(path)))
+            check(H.get(path) == "unknown_subject", "%s held: %s" % (path, H.get(path)))
+    check(not [r for r in res.reported if not r.is_dir], "nothing reported without an override")
     check(RP.get("%s/New folder" % I) == "empty_folder", "New folder reported as empty")
 
     # Mislabelled folder: held; its ePsych partner held too.
@@ -612,8 +621,9 @@ def check_tree(root, symlinked):
         check(g.status == "held" and g.hold.reason_code == code,
               "%s: %s %s" % (folder, g.status, g.hold))
     pre2 = "%s/SUBJ-ID-2000/" % I
-    check(H[pre2 + "SUBJ-ID-2000_260407_100000/settings.xml"] == "recording_folder_without_rhd",
-          "folder without .rhd")
+    g = G[rk("SUBJ-ID-2000/SUBJ-ID-2000_260407_100000")]
+    check(g.status == "held" and g.hold.reason_code == "recording_folder_without_rhd",
+          "a recording folder without .rhd is a held group")
     check(H[pre2 + "notarecording/x.txt"] == "unrecognised_folder", "unrecognised folder")
     check(H[pre2 + "SUBJ-ID-2000_261332_100000/a.rhd"] == "invalid_name_time", "invalid folder date")
 
@@ -744,7 +754,7 @@ def check_ids_and_stability(root, first):
 
 
 def check_walker(root):
-    spec = SPECS[0]
+    spec = E_ALONE
     # Spelling, missing, unclean paths, outside the root.
     for bad_path, exc in (("epsych_files/data", walk.SpellingMismatch),
                           ("epsych_files/Nope", walk.DirectoryMissing)):
@@ -811,7 +821,7 @@ def check_walker(root):
 
 
 def check_changed_during_scan(root):
-    spec = SPECS[0]
+    spec = E_ALONE
     listing = walk.walk(root, spec)
     target = [f for f in listing.files if f.path.endswith("SUBJ-ID-1255_260306.mat")][0]
     with open(os.path.join(root, *target.path.split("/")), "ab") as fh:
@@ -955,13 +965,421 @@ def check_cache(tmp):
     check(grown.path in o.opened, "a cached transient problem was trusted")
 
 
+# --------------------------------------------------------------------------- review round 2
+def mini(tmp, name):
+    """An empty storage root with both listed directories."""
+    root = os.path.join(tmp, name)
+    os.makedirs(os.path.join(root, *E.split("/")))
+    os.makedirs(os.path.join(root, *I.split("/")))
+    return root
+
+
+def put(root, rel, data=b"x"):
+    write(os.path.join(root, *rel.split("/")), data)
+    return os.path.join(root, *rel.split("/"))
+
+
+def scan_root(root, overrides=(), specs=None, header_cache=None):
+    listings = [walk.walk(root, spec) for spec in (specs or SPECS)]
+    return interpret(listings, {ROOT: root}, KNOWN, overrides, header_cache=header_cache)
+
+
+def recording_folder(root, subject_folder, name, n_files=1, blocks=1000):
+    base = "%s/%s/%s" % (I, subject_folder, name)
+    put(root, base + "/settings.xml", b"<xml/>")
+    for k in range(n_files):
+        put(root, base + "/%s_%02d.rhd" % (name, k), rhd_file(blocks))
+    return base
+
+
+def identity(g):
+    return (ids.group_event_id(g), ids.group_session_id(g), g.label, g.source_value,
+            g.session_path, ids.client_digest(g) if g.status == "ready" else None)
+
+
+def check_d1_transient_members(tmp):
+    """D1: a member held for a transient reason holds the whole session."""
+    root = mini(tmp, "d1")
+    S = E + "/SUBJ-ID-1255/"
+    plain = put(root, S + "SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    put(root, S + "SUBJ-ID-1255_260709T094800_psych.mat", fixture("epsych_n1_z.mat"))
+    listings = [walk.walk(root, E_ALONE)]
+    os.utime(plain, ns=(1, 1))                       # touched between listing and reading
+    g = interpret(listings, {ROOT: root}, KNOWN).groups[0]
+    check(g.status == "held" and g.hold.reason_code == "changed_during_scan",
+          "a twin that changed during the scan must hold the session: %s %s" % (g.status, g.hold))
+    with CountingOpener(fail_paths=[S + "SUBJ-ID-1255_260709T094800_psych.mat"]):
+        g = interpret([walk.walk(root, E_ALONE)], {ROOT: root}, KNOWN).groups[0]
+    check(g.status == "held" and g.hold.reason_code == "unreadable_file" and g.detail == {},
+          "an unreadable twin (5 vs 1 trials) must hold the session, not register 5: %s %s"
+          % (g.status, g.detail))
+    g = interpret([walk.walk(root, E_ALONE)], {ROOT: root}, KNOWN).groups[0]
+    check(g.hold.reason_code == "epsych_trials_disagree", "next pass sees the disagreement")
+
+
+def check_d2_identity(tmp):
+    """D2: a session's ids, label, path and digest do not depend on which twins exist."""
+    S = E + "/SUBJ-ID-1255/"
+    stem = "SUBJ-ID-1255_260709T094800"
+    members = {"plain": S + stem + ".mat", "psych": S + stem + "_psych.mat",
+               "delay": S + stem + "_delay.mat", "video": S + stem + ".ts"}
+    want = None
+    orders = [("plain",), ("psych",), ("delay", "psych"), ("psych", "plain"), ("plain", "video"),
+              ("psych", "video"), ("plain", "psych", "delay", "video")]
+    for k, order in enumerate(orders):
+        root = mini(tmp, "d2_%d" % k)
+        for i, m in enumerate(order):
+            put(root, members[m], TS_GOOD if m == "video" else fixture("epsych_n5_z.mat"))
+            res = scan_root(root, specs=[E_ALONE])
+            mats = [g for g in res.groups]
+            if not any(x != "video" for x in order[:i + 1]):
+                continue
+            g = mats[0]
+            check(g.status == "ready", "%s: %s %s" % (order, g.status, g.hold))
+            got = identity(g)
+            if want is None:
+                want = got
+            check(got == want, "the session identity changed with %s: %s != %s"
+                  % (order[:i + 1], got, want))
+            has_plain = "plain" in order[:i + 1]
+            check(any(n.code == "epsych_no_plain_file" for n in g.notes) == (not has_plain),
+                  "epsych_no_plain_file note for %s" % (order[:i + 1],))
+    check(want[2] == stem and want[3] == stem and want[4] == S + stem + ".mat",
+          "label, source value and session path are the base stem: %s" % (want[2:5],))
+    # Date-only forms: the whole stem; _A and _B stay two sessions.
+    root = mini(tmp, "d2_dmy")
+    put(root, S + "SUBJ-ID-1255_07-Mar-2026_A.mat", fixture("epsych_n1_z.mat"))
+    put(root, S + "SUBJ-ID-1255_07-Mar-2026_B.mat", fixture("epsych_n1_z.mat"))
+    labels = sorted(g.label for g in scan_root(root, specs=[E_ALONE]).groups)
+    check(labels == ["SUBJ-ID-1255_07-Mar-2026_A", "SUBJ-ID-1255_07-Mar-2026_B"], "dmy labels")
+
+
+def check_d3_subject_folders(tmp):
+    """D3: unknown folders are held; only a folder override skips; unstorable components."""
+    root = mini(tmp, "d3")
+    put(root, E + "/SUBJ-ID-9999/SUBJ-ID-9999_260709T094800.mat", fixture("epsych_n1_z.mat"))
+    put(root, E + "/SUBJ-ID-9999/stray.txt", b"x")
+    put(root, E + "/TEST/TEST_260709T094800.mat", fixture("epsych_n1_z.mat"))
+    put(root, E + "/TEST/notes.txt", b"x")
+    put(root, E + "/SUBJ-ID-1255 /SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n1_z.mat"))
+    put(root, E + "/SUBJ-ID-1255/sub dir /x.mat", b"x")
+    recording_folder(root, "SUBJ-ID-1255 ", "SUBJ-ID-1255_260709_095155")
+    res = scan_root(root)
+    G, H = by_key(res), held_codes(res)
+    check(G[bk("SUBJ-ID-9999/SUBJ-ID-9999_260709T094800")].hold.reason_code == "unknown_subject",
+          "a subject missing from lab.subject is held")
+    check(H["%s/SUBJ-ID-9999/stray.txt" % E] == "unknown_subject", "loose file of an unknown folder")
+    check(G[bk("TEST/TEST_260709T094800")].hold.reason_code == "unknown_subject", "TEST held")
+    for path in ("%s/SUBJ-ID-1255 /SUBJ-ID-1255_260709T094800.mat" % E,
+                 "%s/SUBJ-ID-1255/sub dir /x.mat" % E,
+                 "%s/SUBJ-ID-1255 /SUBJ-ID-1255_260709_095155/settings.xml" % I):
+        check(H.get(path) == "path_not_storable", "%s: %s" % (path, H.get(path)))
+    check(not [g for g in res.groups if " " in g.key], "no group under an unstorable folder")
+    ov = subjects.parse_overrides("root,relative_path,subject_id,reason\n"
+                                  "nas-test,%s/TEST,skip,a test folder\n" % E)
+    res = scan_root(root, ov)
+    G = by_key(res)
+    t = G[bk("TEST/TEST_260709T094800")]
+    check(t.status == "skipped" and t.hold.reason_code == "override_skip", "folder skip: group")
+    check({r.path: r.reason_code for r in res.reported}.get("%s/TEST/notes.txt" % E)
+          == "override_skip", "folder skip: loose file reported")
+    check(G[bk("SUBJ-ID-9999/SUBJ-ID-9999_260709T094800")].status == "held",
+          "another unknown folder stays held")
+    check(not res.unused_overrides, "the folder override is used")
+    try:
+        scan_root(root, subjects.parse_overrides("root,relative_path,subject_id,reason\n"
+                                                 "nas-test,%s/TEST,SUBJ-ID-1255,x\n" % E))
+        fail("a folder-level override naming a subject was accepted")
+    except subjects.OverrideError:
+        pass
+
+
+def check_d4_odd_entries(tmp):
+    """D4: a link or odd name inside a group's folder holds the group and is in its signature."""
+    root = mini(tmp, "d4")
+    base = recording_folder(root, "SUBJ-ID-1255", "SUBJ-ID-1255_260709_095155", n_files=3)
+    key = rk("SUBJ-ID-1255/SUBJ-ID-1255_260709_095155")
+    full = by_key(scan_root(root))[key]
+    check(full.status == "ready" and full.duration == Fraction(384), "three files: %s" % full.duration)
+    third = os.path.join(root, *base.split("/"), "SUBJ-ID-1255_260709_095155_02.rhd")
+    away = os.path.join(tmp, "d4_elsewhere.rhd")
+    os.rename(third, away)
+    cases = []
+    try:
+        os.symlink(away, third)
+        cases.append(("link", "symbolic_link", third))
+    except (OSError, NotImplementedError):
+        pass
+    for label, code, path in cases:
+        g = by_key(scan_root(root))[key]
+        check(g.status == "held" and g.hold.reason_code == code and g.detail == {},
+              "%s .rhd: %s %s" % (label, g.status, g.hold))
+        check(any(h.path.endswith("_02.rhd") for h in g.held_files)
+              and ids.signature(g) != ids.signature(full), "%s .rhd in the signature" % label)
+        os.unlink(path)
+    os.rename(away, third + " ")                                  # trailing space
+    g = by_key(scan_root(root))[key]
+    check(g.status == "held" and g.hold.reason_code == "path_not_storable",
+          "an .rhd named with a trailing space: %s %s" % (g.status, g.hold))
+    os.rename(third + " ", os.path.join(os.fsencode(os.path.dirname(third)).decode(
+        "utf-8", "surrogateescape"), b"caf\xe9.rhd".decode("utf-8", "surrogateescape")))
+    g = by_key(scan_root(root))[key]
+    check(g.status == "held" and g.hold.reason_code == "path_not_storable", "a Latin-1 name")
+    # ePsych: a twin that is a link holds the session.
+    S = E + "/SUBJ-ID-1255/"
+    put(root, S + "SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    target = put(root, "elsewhere/x.mat", fixture("epsych_n5_z.mat"))
+    try:
+        os.symlink(target, os.path.join(root, *(S + "SUBJ-ID-1255_260709T094800_psych.mat").split("/")))
+    except (OSError, NotImplementedError):
+        return
+    g = by_key(scan_root(root, specs=[E_ALONE]))[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")]
+    check(g.status == "held" and g.hold.reason_code == "symbolic_link", "ePsych twin link")
+
+
+def check_r1_pair_specs(tmp):
+    root = mini(tmp, "r1")
+    for label, specs in (("ePsych alone", [SPECS[0]]), ("Intan alone", [SPECS[1]]),
+                         ("no paired_by", [E_ALONE, SPECS[1]]),
+                         ("wrong paired_by", [dataclasses.replace(SPECS[0], paired_by="x/y"),
+                                              SPECS[1]])):
+        try:
+            interpret([walk.walk(root, s) for s in specs], {ROOT: root}, KNOWN)
+            fail("%s was accepted" % label)
+        except ValueError:
+            pass
+    scan_root(root)                                              # both: accepted
+
+
+def check_r2_recordings_in_sight(tmp):
+    root = mini(tmp, "r2")
+    S = E + "/SUBJ-ID-1255/"
+    put(root, S + "SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    put(root, I + "/SUBJ-ID-1255/SUBJ-ID-1255_260709_095155/settings.xml", b"<xml/>")
+    res = scan_root(root)
+    e = by_key(res)[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")]
+    check(e.status == "held" and e.hold.reason_code == "paired_recording_held",
+          "an ePsych session near a folder without .rhd: %s %s" % (e.status, e.hold))
+    ov = subjects.parse_overrides("root,relative_path,subject_id,reason\nnas-test,%s/SUBJ-ID-1255/"
+                                  "SUBJ-ID-1255_260709_095155,skip,aborted\n" % I)
+    e = by_key(scan_root(root, ov))[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")]
+    check(e.status == "ready" and any(n.code == "pairing_skipped_recording" for n in e.notes),
+          "near a skipped recording: %s %s" % (e.status, [n.code for n in e.notes]))
+    # M3: a ':' in folder names does not break the notes.
+    root = mini(tmp, "r2b")
+    recording_folder(root, "S:1", "S:1_260709_095155")
+    put(root, E + "/S:1/S:1_260709T094800.mat", fixture("epsych_n1_z.mat"))
+    put(root, E + "/S:1/S:1_260709T094810.mat", fixture("epsych_n1_z.mat"))
+    listings = [walk.walk(root, spec) for spec in SPECS]
+    res = interpret(listings, {ROOT: root}, KNOWN | {"S:1"})
+    check(all(g.hold.reason_code == "pairing_ambiguous" for g in res.groups if g.kind == "behavior"),
+          "a ':' in a name")
+
+
+def check_m8_case_conflicts(tmp):
+    root = mini(tmp, "m8")
+    recording_folder(root, "SUBJ-ID-1255", "SUBJ-ID-1255_260709_095155")
+    recording_folder(root, "SUBJ-ID-1255", "SUBj-ID-1255_260709_095155")
+    put(root, I + "/SUBJ-ID-1255/SUBJ-ID-1278_260710_095155/a.rhd", rhd_file(10))
+    put(root, I + "/SUBJ-ID-1255/SUBJ-ID-1278_260710_095155/A.RHD", rhd_file(10))
+    res = scan_root(root)
+    for g in res.groups:
+        check(g.status == "held" and "name_case_conflict" in
+              [g.hold.reason_code] + [n.code for n in g.notes], "%s: %s" % (g.key, g.hold))
+
+
+def check_m13_incomplete(tmp):
+    root = mini(tmp, "m13")
+    put(root, E + "/SUBJ-ID-1255/SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    put(root, E + "/SUBJ-ID-1278/SUBJ-ID-1278_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    target = os.path.join(root, *E.split("/"), "SUBJ-ID-1278")
+    real = os.scandir
+
+    def failing(path="."):
+        if os.path.abspath(str(path)) == os.path.abspath(target):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path)
+    os.scandir = failing
+    try:
+        res = scan_root(root, specs=[E_ALONE])
+    finally:
+        os.scandir = real
+    check(not res.complete and all(g.status == "held" and g.hold.reason_code == "listing_incomplete"
+                                   for g in res.groups) and res.groups, "incomplete listing")
+
+
+def check_minor():
+    from nas_import.layouts import _common
+    check(_common.file_format("a/b/name.") is None and _common.file_format("a/x.TAR.GZ") == "gz"
+          and _common.file_format("a/.hidden") is None, "M11 file_format")
+    for name in (".ds_store", "THUMBS.DB", "desktop.ini", "Desktop.INI", "@EADIR", "~$x.docx"):
+        check(walk.is_ignored_name(name), "M12 %s ignored" % name)
+    check(not walk.is_ignored_name("data.mat"), "M12 ordinary name")
+    for bad in ("SUBJ-ID-1255_07-Mar-0026.mat", "SUBJ-ID-1255_07-Mar-2100.mat",
+                "SUBJ-ID-1255_07-Mar-1989.mat"):
+        try:
+            names.parse_epsych(bad)
+            fail("M6 %s accepted" % bad)
+        except names.BadNameTime:
+            pass
+    check(names.parse_epsych("SUBJ-ID-1255_07-Mar-1990.mat").date == "1990-03-07", "M6 1990")
+    check(names.ascii_fold("ſUBJ") != names.ascii_fold("SUBJ") and
+          names.ascii_fold("SUBj") == names.ascii_fold("subJ"), "M7 ASCII fold only")
+    g = dataclasses.replace(
+        Group(key="k", kind="behavior", layout="epsych", root=ROOT, directory=E, rig=None,
+              time_zone="America/New_York", source_path="p", source_value="v",
+              subject_folder="SUBJ-ID-1255", subject_in_name="ſUBJ-ID-1255", label="l",
+              session_path="p.mat", start_local=None, date="2026-01-01", precision="day",
+              duration=None, files=(), held_files=(), detail={}))
+    check(subjects.resolve_group(g, KNOWN, None).hold.reason_code == "subject_mismatch",
+          "M7 long s is not S")
+    try:
+        subjects.parse_overrides('root,relative_path,subject_id,reason\nnas-test,a/b,skip,"why\n')
+        fail("M2 unterminated quote accepted")
+    except subjects.OverrideError as exc:
+        check("line 2" in str(exc), "M2 names the line: %s" % exc)
+    try:
+        subjects.parse_overrides('root,relative_path,subject_id,reason\nnas-test,a/b,skip,"l1\nl2"\n'
+                                 'nas-test,c/d,skip\n')
+        fail("a short row after a multi-line one accepted")
+    except subjects.OverrideError as exc:
+        check("line 4" in str(exc), "the line of a row after a multi-line one: %s" % exc)
+    # R4, M4, M10, R5 on the .rhd reader.
+    for v in ((0, 9), (4, 0), (-1, 0)):
+        expect_problem(lambda: parse_rhd_bytes(rhd_file(1, version=v)), "rhd_unknown_version",
+                       "version %s" % (v,))
+    h = rhd_header()
+    big = h[:48] + struct.pack("<I", 800_000_000) + h[52:]
+    expect_problem(lambda: parse_rhd_bytes(big), "rhd_bad_header", "M4 a huge QString")
+    hd = parse_rhd_bytes(rhd_file(2, group_enabled=0))
+    check(hd.num_amplifier_channels == 4 and hd.num_data_blocks == 2,
+          "M10 channel records of a disabled group are read and counted")
+    for rate in rhd.RHX_RATES:
+        got = parse_rhd_bytes(rhd_header(fs=float(rate))).sample_rate
+        check(got == rate, "R5 rate %s read as %s" % (rate, got))
+    for bad in (0.0, -25000.0, float("nan"), float("inf"), 25000.5, 24999.0, 128.0):
+        expect_problem(lambda: parse_rhd_bytes(rhd_header(fs=bad)), "rhd_bad_header",
+                       "R5 rate %r" % bad)
+    check(parse_rhd_bytes(_groups_header(12)).num_amplifier_channels == 0, "12 groups read")
+    expect_problem(lambda: parse_rhd_bytes(_groups_header(13)), "rhd_bad_header", "13 groups")
+
+
+def _groups_header(n):
+    h = rhd_header(n_amp=0, n_dig=0)
+    cut = h.rfind(struct.pack("<h", 1) + qstring("Port A"))
+    return h[:cut] + struct.pack("<h", n) + (qstring("G") + qstring("G") + struct.pack("<hhh", 1, 0, 0)) * n
+
+
+def check_r7_hostile_cache(tmp):
+    root = mini(tmp, "r7")
+    recording_folder(root, "SUBJ-ID-1255", "SUBJ-ID-1255_260709_095155")
+    put(root, E + "/SUBJ-ID-1255/SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    put(root, E + "/SUBJ-ID-1255/SUBJ-ID-1255_260709T094800.ts", TS_GOOD)
+    listings = [walk.walk(root, spec) for spec in SPECS]
+    cold = interpret(listings, {ROOT: root}, KNOWN)
+    good = dict(cold.headers)
+    want = without_headers(cold)
+    n = 0
+    for key, e in good.items():
+        variants = [{"reader": e["reader"]}, {"reader": e["reader"], "problem": 5},
+                    {"reader": e["reader"], "problem": ["no_such_code", "x"]},
+                    {"reader": e["reader"], "problem": ["unreadable_file", "x"]},
+                    {"reader": e["reader"], "problem": ["mat_corrupt"]},
+                    {"reader": e["reader"], "problem": ["rhd_bad_magic" if "variables" in e
+                                                        else "mat_corrupt", "wrong reader"]},
+                    dict(e, extra=1)]
+        if "header" in e:
+            for rate in ("1/0", "0/1", "-5/1", "abc", "", "nan", "inf", "1e400", 25000, None,
+                         "25000/1/1", " 25000 ", "1000/1", "128/1"):
+                variants.append({"reader": e["reader"], "header": dict(e["header"], sample_rate=rate)})
+            for f in ("num_amplifier_channels", "num_data_blocks", "samples_per_block", "file_size"):
+                for v in (None, "64", 64.0, True, [], -1, 10 ** 30):
+                    variants.append({"reader": e["reader"], "header": dict(e["header"], **{f: v})})
+            variants.append({"reader": e["reader"], "header": dict(
+                e["header"], num_data_blocks=5, num_amplifier_channels=32)})
+        if "variables" in e:
+            for rows in (None, [5], [["Data", "struct"]], [["Data", "struct", "12", False]],
+                         [["Data", "struct", [1.0, 2.0], False]], [["Data", "struct", [True, 5], False]],
+                         [["Data", "struct", [10 ** 30, 5], False], ["Info", "struct", [1, 1], False]],
+                         [[5, "struct", [1, 2], False]], [["Data", ["struct"], [1, 2], False]],
+                         [{"a": 1}], [["Data", "struct", [1, 7], False], ["Info", "struct", [1, 1], False],
+                                      ["Data", "struct", [1, 9], False]]):
+                variants.append({"reader": e["reader"], "variables": rows})
+        if "packets" in e:
+            for v in (None, -1, "8", 8.0, True, [], 3, 10 ** 9):
+                variants.append({"reader": e["reader"], "packets": v})
+        for bad in variants:
+            c = dict(good)
+            c[key] = bad
+            try:
+                r = interpret(listings, {ROOT: root}, KNOWN, header_cache=c)
+            except Exception as exc:  # noqa: BLE001
+                fail("a hostile cache entry crashed the interpretation: %r -> %r" % (bad, exc))
+            check(without_headers(r) == want, "a hostile cache entry changed the result: %r" % (bad,))
+            n += 1
+    check(n > 60, "hostile entries tried: %d" % n)
+    path = os.path.join(tmp, "r7.json")
+    for text in ("[" * 100000, '{"format":"%s","entries":[[' % cache.FORMAT, "null", "\x00\x01",
+                 '{"format":"%s","entries":5}' % cache.FORMAT):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        check(len(cache.HeaderCache.load(path)) == 0, "a damaged cache file must load empty")
+
+
+def check_r8_mat_integrity(tmp):
+    with open(os.path.join(TESTDATA, "expected.json"), encoding="utf-8") as fh:
+        expected = json.load(fh)["files"]
+    for name, want in expected.items():
+        if isinstance(want, str):
+            continue
+        path = os.path.join(TESTDATA, name)
+        with open(path, "rb") as fh:
+            mat5.verify_file(fh, os.path.getsize(path))           # every valid fixture verifies
+    good_u = fixture("epsych_n3_u.mat")
+    # (a) an uncompressed Data whose dimensions claim more elements than its bytes can hold
+    dims_at = [i for i in range(140, 200) if good_u[i:i + 8] == struct.pack("<ii", 1, 3)][0]
+    big = good_u[:dims_at] + struct.pack("<ii", 1, 100000) + good_u[dims_at + 8:]
+    expect_problem(lambda: mat_bytes(big), "mat_corrupt", "R8a implausible numel")
+    # the cheap pass cannot see 1x3 -> 1x4 in a struct; verify_file counts the fields
+    four = good_u[:dims_at] + struct.pack("<ii", 1, 4) + good_u[dims_at + 8:]
+    check(mat5.epsych_trials(mat_bytes(four)) == 4, "the cheap pass is fooled by 1x4")
+    import io
+    expect_problem(lambda: mat5.verify_file(io.BytesIO(four), len(four)), "mat_corrupt",
+                   "R8b verify_file sees 1x4 fields of a 1x3 struct")
+    # (b) compressed: zero-filled stream tail, bytes after the stream, bit flips
+    good_z = fixture("epsych_n5_z.mat")
+    n = struct.unpack_from("<I", good_z, 132)[0]
+    for keep in (n // 2, n - 5, n - 1):
+        b = bytearray(good_z)
+        b[136 + keep:136 + n] = b"\x00" * (n - keep)
+        expect_problem(lambda: mat5.verify_file(io.BytesIO(bytes(b)), len(b)), "mat_corrupt",
+                       "zero-filled stream tail keep=%d" % keep)
+    import zlib
+    inflated = zlib.decompress(good_z[136:136 + n])
+    flips = 0
+    for pos in range(136, 136 + n):
+        for bit in range(8):
+            b = bytearray(good_z)
+            b[pos] ^= 1 << bit
+            try:
+                mat5.verify_file(io.BytesIO(bytes(b)), len(b))
+            except mat5.MatProblem:
+                flips += 1
+                continue
+            # Not caught: only a flip that changes nothing (a padding bit of the last
+            # deflate byte, which zlib ignores) may pass.
+            check(zlib.decompress(bytes(b[136:136 + n])) == inflated,
+                  "a bit flip at byte %d bit %d changed the data and passed verify_file" % (pos, bit))
+    check(flips >= 0.95 * 8 * n, "bit flips caught: %d of %d" % (flips, 8 * n))
+
+
 def main():
     check_rhd()
     check_mat()
     check_names()
     check_pairing_rule()
     check_ts()
-    check(isinstance(Group, type), "model import")
+    check_minor()
     tmp = tempfile.mkdtemp(prefix="nas_import_")
     try:
         root = os.path.join(tmp, "root")
@@ -972,6 +1390,16 @@ def main():
         check_ids_and_stability(root, first)
         check_changed_during_scan(root)
         check_cache(tmp)
+        check_d1_transient_members(tmp)
+        check_d2_identity(tmp)
+        check_d3_subject_folders(tmp)
+        check_d4_odd_entries(tmp)
+        check_r1_pair_specs(tmp)
+        check_r2_recordings_in_sight(tmp)
+        check_m8_case_conflicts(tmp)
+        check_m13_incomplete(tmp)
+        check_r7_hostile_cache(tmp)
+        check_r8_mat_integrity(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("check_nas_import_parsing: OK")

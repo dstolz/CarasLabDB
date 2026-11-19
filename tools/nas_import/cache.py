@@ -12,10 +12,15 @@ mtime differs from the cached key is simply another key (a miss).
 Entry: a JSON object with a ``reader`` tag and either the reader's result or
 a content problem that depends only on the bytes:
 
-* ``{"reader": "mat5/1", "variables": [[name, class, dims or null, compressed], ...]}``
-* ``{"reader": "rhd/1", "header": {... whole numbers ..., "sample_rate": "num/den"}}``
+* ``{"reader": "mat5/2", "variables": [[name, class, dims or null, compressed], ...]}``
+* ``{"reader": "rhd/2", "header": {... whole numbers ..., "sample_rate": "num/den"}}``
 * ``{"reader": "ts/1", "packets": n}``
 * ``{"reader": <tag>, "problem": [reason_code, sentence]}``
+
+An entry is used only if every value is one a fresh read of a file of the
+key's size could give (exact key set, the reader's own bounds and
+arithmetic, a problem code that reader can raise); anything else -- a
+hostile or damaged entry included -- is a miss and the file is read.
 
 No floats anywhere. Transient outcomes (``unreadable_file``,
 ``changed_during_scan``) are never entries. The tags are the module
@@ -44,6 +49,15 @@ FORMAT = "caraslabdb-nas-header-cache/1"
 
 Key = tuple  # (root: str, path: str, size: int, mtime_ns: int)
 
+def _ts_from_entry(entry: dict, size: int) -> int:
+    if set(entry) != {"reader", "packets"}:
+        raise ValueError("unexpected keys")
+    n = entry["packets"]
+    if type(n) is not int or n != min(content.TS_PACKETS_CHECKED, size // content.TS_PACKET) or n < 1:
+        raise ValueError("packets")
+    return n
+
+
 _KINDS = {
     "mat5": (lambda: mat5.READER, lambda fh, size: mat5.to_entry(mat5.read_variables(fh, size)),
              mat5.from_entry),
@@ -52,14 +66,17 @@ _KINDS = {
     "ts": (lambda: content.TS_READER,
            lambda fh, size: {"reader": content.TS_READER,
                              "packets": content.check_mpeg_ts(fh, size)},
-           lambda e: _whole(e["packets"])),
+           _ts_from_entry),
 }
 
-
-def _whole(v):
-    if type(v) is not int or v < 0:
-        raise ValueError("not a whole number")
-    return v
+# The problem codes each reader can raise from the bytes alone.
+_PROBLEMS = {
+    "mat5": frozenset({"mat_v73", "mat_not_mat5", "mat_truncated", "mat_corrupt",
+                       "mat_big_endian"}),
+    "rhd": frozenset({"rhd_bad_magic", "rhd_truncated", "rhd_bad_header", "rhd_partial_block",
+                      "rhd_unknown_version"}),
+    "ts": frozenset({"video_not_mpeg_ts"}),
+}
 
 
 def file_key(root: str, f: ListedFile) -> Key:
@@ -117,7 +134,7 @@ class HeaderCache(Mapping):
                     return cls()
                 out.put(tuple(row[:4]), row[4])
             return out
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:      # anything at all, RecursionError and MemoryError included
             return cls()
 
     def save(self, path: str) -> None:
@@ -170,11 +187,16 @@ class HeaderReader:
         tag = tag_fn()
         key = file_key(self.root, f)
         if self.cache is not None:
-            entry = self.cache.get(key)
+            try:
+                entry = self.cache.get(key)
+            except Exception:
+                entry = None
             if isinstance(entry, dict) and entry.get("reader") == tag:
                 try:
-                    return self._decode(entry, decode)
-                except (ValueError, KeyError, TypeError):
+                    return self._decode(entry, decode, kind, f.size)
+                except ContentProblem:
+                    raise
+                except Exception:
                     pass                                   # a malformed entry: read the file
         try:
             with content.open_listed(self.root_path, f) as fh:
@@ -185,13 +207,19 @@ class HeaderReader:
             entry = {"reader": tag, "problem": [exc.code, exc.sentence]}
         _check_no_float(entry)
         self.fresh[key] = entry
-        return self._decode(entry, decode)
+        return self._decode(entry, decode, kind, f.size)
 
     @staticmethod
-    def _decode(entry: dict, decode):
+    def _decode(entry: dict, decode, kind: str, size: int):
         if "problem" in entry:
-            code, sentence = entry["problem"]
-            if not isinstance(code, str) or not isinstance(sentence, str) or code in content.TRANSIENT:
+            if set(entry) != {"reader", "problem"}:
+                raise ValueError("unexpected keys")
+            problem = entry["problem"]
+            if not isinstance(problem, list) or len(problem) != 2:
+                raise ValueError("a malformed problem entry")
+            code, sentence = problem
+            if (not isinstance(code, str) or not isinstance(sentence, str)
+                    or code not in _PROBLEMS[kind] or len(sentence) > 4096):
                 raise ValueError("a malformed problem entry")
             raise ContentProblem(code, sentence)
-        return decode(entry)
+        return decode(entry, size)
