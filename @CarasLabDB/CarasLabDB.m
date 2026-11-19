@@ -94,13 +94,15 @@ classdef CarasLabDB < handle
 %       supersedeArtifact, artifactLineage, runReadOnlyQuery, updateSubject,
 %       updateSession, addTagNamespace, registerTag, addTag, removeTag,
 %       setTag, getEntityTags, findByTags, setVariable, getVariables,
-%       defineVariable, recordEvent, recordArtifactMove.
+%       defineVariable, recordEvent, recordArtifactMove, getScanDirectories,
+%       addScanDirectory, updateScanDirectory, getScanRuns, getScanFiles.
 %   Defined in this file: the add/get methods of the reference, project,
 %   subject and session tables; getEvents, getEventDetail, getArtifacts and
 %   the other readers; getTagNamespaces, getTags, updateTagNamespace,
 %   retireTag; unsetVariable, getVariableValues, getVariableDefinitions,
 %   updateVariableDefinition, retireVariable; retractEvent,
-%   retractArtifact, getRetractions; checkIntegrity; and the static helpers
+%   retractArtifact, getRetractions; checkIntegrity; getScanLayouts,
+%   canEditScanDirectories; and the static helpers
 %   sqlLiteral, jsonText, recordEventColumns, normalizeTag, parseTag,
 %   displayTag, normalizeVariableName.
 %
@@ -158,6 +160,21 @@ classdef CarasLabDB < handle
 %   and SHA-256 itself (static fileChecksum). recordArtifactMove records a
 %   file found at another path with the same bytes: the row of the new
 %   place, its check and the 'moved' disposition, in one transaction.
+%
+%   Searching listed directories for new files. The directories that
+%   tools/import_nas_files.py searches, and how often, are rows of
+%   lab.scan_directory, which only the schema owner (or a login the owner
+%   grants INSERT / UPDATE on it) may change; every member can read them:
+%       T  = db.getScanDirectories();          % with the schedule (lab.scan_directory_status)
+%       id = db.addScanDirectory(StorageRootId=1, RelativePath="rig1/epsych", ...
+%                Layout="epsych", TimeZone="America/New_York", ScanIntervalMin=60, ...
+%                WindowStart="01:00", WindowEnd="05:00");
+%       db.updateScanDirectory(id, Mode="register");
+%       db.updateScanDirectory(id, Clear="window");      % any time of day
+%       R  = db.getScanRuns(ScanDirectoryId=id);
+%       H  = db.getScanFiles(Status="held", StorageRootId=1, PathPrefix="rig1/epsych/");
+%       c  = db.canEditScanDirectories();     % c.Insert, c.Update
+%   Intervals travel as whole minutes and window times as "HH:mm" text.
 %
 %   Requires MATLAB R2024b or later and the Database Toolbox.
 %
@@ -218,6 +235,11 @@ classdef CarasLabDB < handle
         [artifactId, info] = addArtifactFromFile(obj, filePath, opts)
         out         = recordEvent(obj, eventType, opts)
         out         = recordArtifactMove(obj, artifactId, opts)
+        T           = getScanDirectories(obj, opts)
+        scanDirectoryId = addScanDirectory(obj, opts)
+        updateScanDirectory(obj, scanDirectoryId, opts)
+        T           = getScanRuns(obj, opts)
+        T           = getScanFiles(obj, opts)
     end
 
     methods (Static)
@@ -1562,6 +1584,63 @@ classdef CarasLabDB < handle
     end
 
     % ==================================================================
+    % Searching listed directories for new files (tools/import_nas_files.py).
+    % Reading and writing the list live in their own files:
+    % getScanDirectories, addScanDirectory, updateScanDirectory,
+    % getScanRuns, getScanFiles.
+    % ==================================================================
+    methods
+        function T = getScanLayouts(obj)
+            %GETSCANLAYOUTS The layouts a listed directory can have (lab.scan_layout).
+            %   T = db.getScanLayouts()   % columns code, label; ordered by code
+            %
+            %   A layout is a module of tools/import_nas_files.py, so the
+            %   list arrives with the tool; it is not edited from here.
+            %
+            %   See also ADDSCANDIRECTORY.
+            arguments
+                obj (1,1) CarasLabDB
+            end
+            T = obj.pSelectFrom(obj.pT("scan_layout"), struct(), OrderBy="code");
+        end
+
+        function c = canEditScanDirectories(obj)
+            %CANEDITSCANDIRECTORIES Whether this login may add / change listed directories.
+            %   c = db.canEditScanDirectories()
+            %
+            %   Returns a struct:
+            %       c.Insert  true when the login may add a directory
+            %                 (ADDSCANDIRECTORY): INSERT on lab.scan_directory
+            %       c.Update  true when it may change one (UPDATESCANDIRECTORY):
+            %                 UPDATE on lab.scan_directory
+            %       c.Login   the database role the answer is for
+            %   The two are asked separately, because the owner may grant
+            %   one without the other. design_docs/grants.sql withholds both
+            %   from lab_rw: the list is the schema owner's, or a login's the
+            %   owner grants it to (GRANT INSERT, UPDATE ON lab.scan_directory
+            %   TO jdoe). A member reads the list all the same.
+            %
+            %   The question is put for current_user, the role whose
+            %   privileges PostgreSQL checks when a statement runs. It counts
+            %   privileges held through membership in a role (INHERIT), as
+            %   the INSERT itself would; session_user would be the wrong role
+            %   after a SET ROLE.
+            %
+            %   See also ADDSCANDIRECTORY, UPDATESCANDIRECTORY.
+            arguments
+                obj (1,1) CarasLabDB
+            end
+            tbl = obj.sqlLiteral(obj.pT("scan_directory"));
+            R = obj.pSelect("SELECT has_table_privilege(current_user, " + tbl + ", 'INSERT') " + ...
+                "AS can_insert, has_table_privilege(current_user, " + tbl + ", 'UPDATE') " + ...
+                "AS can_update, current_user::text AS login;");
+            c = struct("Insert", logical(R.can_insert(1)), ...
+                "Update", logical(R.can_update(1)), ...
+                "Login", CarasLabDB.pColText(R.login(1)));
+        end
+    end
+
+    % ==================================================================
     % Private helpers used by both inline and external methods
     % ==================================================================
     methods (Access = private)
@@ -2707,6 +2786,43 @@ classdef CarasLabDB < handle
             if CarasLabDB.pIsProvided(value) && ~ismember(string(value), allowed)
                 error("CarasLabDB:invalidValue", "%s must be one of: %s (got '%s').", ...
                     name, strjoin(allowed, ", "), string(value));
+            end
+        end
+
+        function [ws, we] = pScanWindow(ws, we)
+            %PSCANWINDOW Check a directory's search window before anything is sent.
+            %   WS and WE are WindowStart / WindowEnd: both or neither
+            %   (string(missing) = not given), each a time of day written
+            %   HH:mm, 00:00 to 23:59, and not the same time. They are
+            %   returned trimmed, as the text the time columns are sent
+            %   (lab.scan_directory reads them back as the same 'HH24:MI'
+            %   text). Raises CarasLabDB:invalidWindow.
+            hasStart = CarasLabDB.pIsProvided(ws);
+            hasEnd = CarasLabDB.pIsProvided(we);
+            if hasStart ~= hasEnd
+                error("CarasLabDB:invalidWindow", ...
+                    "Give both WindowStart and WindowEnd, or neither: the window is " + ...
+                    "[start, end) in the directory's time zone.");
+            end
+            if ~hasStart
+                return
+            end
+            ws = strtrim(ws);
+            we = strtrim(we);
+            pattern = '^([01]\d|2[0-3]):[0-5]\d$';
+            names = ["WindowStart", "WindowEnd"];
+            values = [ws, we];
+            for i = 1:2
+                if isempty(regexp(char(values(i)), pattern, 'once'))
+                    error("CarasLabDB:invalidWindow", ...
+                        "%s must be a time of day written HH:mm, 00:00 to 23:59 (got '%s').", ...
+                        names(i), values(i));
+                end
+            end
+            if ws == we
+                error("CarasLabDB:invalidWindow", ...
+                    "WindowStart and WindowEnd are both %s, which leaves no time to search. " + ...
+                    "For any time of day give neither.", ws);
             end
         end
 
