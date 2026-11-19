@@ -92,28 +92,34 @@ Commands: `scan` and `apply` (the reviewed path of the importer plan, now readin
 2. Per directory: take an advisory lock (a second process skips it), check the root marker, append the `scan_run` row. A missing or empty directory is `unreachable`.
 3. **List** it completely with `os.scandir`: names and sizes only, no file is opened, symbolic links are not followed. A paired directory is listed in the same pass. **If any folder cannot be listed the run is `failed`: nothing is registered and nothing is concluded from what is absent.**
 4. **Decide what to read.** A file whose latest memory row is `registered` or `known` with the same size and `mtime_ns`, and whose artifact is still active and present, is not opened: its header comes from a local cache (`--cache-file`, an optimisation only; without it the first few kilobytes are read again). A held file with the same size, `mtime_ns` and reason is not read to its end again either.
-5. **Interpret** with the layout, as in the importer plan. **A directory and the one it is paired with are judged together**, whichever of the two is being searched:
+5. **Interpret** with the layout, as in the importer plan. **A directory and the one it is paired with are judged together**, whichever of the two is being searched and whatever the other's mode (a partner that is `off` or in `report` is still listed):
    - an ePsych session paired with a recording waits until that recording is registered, and is held while the recording is held;
    - an ePsych session with no recording is registered on its own only when no recording folder of that subject that could pair with it is in sight in any state;
    - a run writes memory rows, and registers, only for its own directory's files.
    
    A recording that reaches the NAS after its ePsych session was registered on its own is held as `late_recording`. Give the ePsych directory a minimum age longer than the longest delay between the two backups.
-6. **Wait for stability.** A group is registered only when two complete listings at least `min_age_min` apart, by the database clock, show the same files with the same sizes and `mtime_ns`; the first sighting writes `pending` rows. This replaces the modification-time rule: a backup tool that preserves timestamps would make a half-copied recording look old, and a rig clock that runs ahead would make a file look young for ever.
-7. **Register** (mode `register`): hash the group's files (4 MiB chunks), stat each again, and write the group in one transaction exactly as `apply` does (session, event, artifacts, `ok` verification rows) together with its memory rows. The window is asked again before each group; when it has closed the run ends `partial` and continues at the next opening. **Mode `report`** does steps 1 to 6, writes the same `pending`, `held` and `cleared` rows, and stops there: its report names the groups that are stable and would be registered.
+6. **Wait for stability.** A group is registered only when two complete listings at least `min_age_min` apart, by the database clock, show the same files with the same sizes and `mtime_ns`; the first sighting writes `pending` rows. The wait is counted from the start of the earlier run (its listing ended at most a listing's duration later). This replaces the modification-time rule: a backup tool that preserves timestamps would make a half-copied recording look old, and a rig clock that runs ahead would make a file look young for ever.
+7. **Register** (mode `register`): hash the group's files (4 MiB chunks), stat each again, check every `.mat` file to its end (`mat5.verify_file`: each variable inflated and its structure walked), and write the group in one transaction exactly as `apply` does (session, event, artifacts, `ok` verification rows) together with its memory rows. The window is asked again before each group; when it has closed the run ends `partial` and continues at the next opening. **Mode `report`** does steps 1 to 6, writes the same `pending`, `held` and `cleared` rows, and stops there: its report names the groups that are stable and would be registered.
 8. Append the `scan_run_result` row, write the report (CSV and text) when anything happened, one line to the log file.
 
-**An unattended run only adds.** These are held for a person, and done with `scan` / `apply`:
+**An unattended run only adds.** These are held for a person:
 
-| Seen | Held as |
-|---|---|
-| A group whose event exists with another digest (it would be a correction) | `would_correct` |
-| Other bytes at a registered path (it would record `replaced`) | `content_changed` |
-| A recording arriving for a behavior-only session already registered | `late_recording` |
-| A path that differs only in case from a registered one | `path_case_conflict` |
-| A file whose artifact was retracted or recorded as moved, replaced or deleted | `registered_but_withdrawn` |
-| Everything the importer plan holds (unknown subject, mislabelled folder, ambiguous pairing, orphan video, unreadable or unrecognised file) | its own code |
+| Seen | Held as | Resolved by |
+|---|---|---|
+| A group whose event exists with another digest (it would be a correction) | `would_correct` | `scan` / `apply` |
+| Other bytes at a registered path (it would record `replaced`) | `content_changed` | `scan` / `apply` |
+| A recording arriving for a behavior-only session already registered | `late_recording` | `scan` / `apply` |
+| A path that differs only in case from a registered one, or from another listed one | `path_case_conflict` | a rename on the NAS |
+| A file whose artifact was retracted or recorded as moved, replaced or deleted | `registered_but_withdrawn` | a person's decision in the database |
+| Bytes this tool already registered under another name | `duplicate_content` | a person: two names for the same bytes |
+| A folder of a subject that is not in `lab.subject` | `unknown_subject` | the subject row (it then registers by itself), or an override that skips the folder |
+| Everything else the importer plan holds (mislabelled folder, ambiguous pairing, orphan video, unreadable or unrecognised file) | its own code | see `design_docs/nas-import.md` |
 
-A file whose size or `mtime_ns` changed but whose bytes are the registered ones is read once and gets a new `known` row; no artifact is written. Registered files missing from a listing are reported only: recording a deletion stays a person's decision.
+`scan` holds the last five as well: they are never applied.
+
+A file whose size or `mtime_ns` changed but whose bytes are the registered ones is read once, after the same wait, and gets a new `known` row; no artifact is written. Registered files missing from a listing are reported only: recording a deletion stays a person's decision.
+
+Files another client registered from a copy (the last row of "What happens when the NAS changes" in the importer plan) are attached to that client's event. That rule is for other clients' events only.
 
 **`check`** searches nothing and exits 1 when a directory is overdue, when two listed directories overlap, or when a due directory's root was not given. It prints the number of held files. Schedule it and alert on it, as for `backup_lab.py --check`.
 

@@ -7,7 +7,7 @@ The backups keep growing, so the tool has to be safe to run again: it writes onl
 
 It depends on the master-log migration (`plans/master-log-migration.md`): subjects must exist before their files can be registered. The importer never creates a subject.
 
-`plans/nas-auto-scan.md` builds on this plan: it moves the list of directories into the database, adds the unattended `run` and `check` commands, and changes four points here. Each is marked "Amended" below.
+`plans/nas-auto-scan.md` builds on this plan: it moves the list of directories into the database, adds the unattended `run` and `check` commands, and changes some points here. Each is marked "Amended" below.
 
 ### What the profile found (read-only, 2026-11-17, RIG3 only)
 - **`S:/RIG3_Backup_2025/epsych_files/Data`**: 2,475 files, 14.6 GiB, layout `Data/<SUBJ>/<files>` with no deeper folders.
@@ -67,7 +67,7 @@ A layout is one module that turns a directory tree into *groups* (one session an
 
 - **Trial count**: the number of elements of `Data`, read from the MAT file's variable headers by a small standard-library reader (it decompresses only the start of each variable). A v7.3 file is held.
 - **Recording header**: sample rate, amplifier channel count and duration come from the `.rhd` headers and file sizes, a port of `@IntanReader/parseIntanHeader.m`.
-- **Subject**: the level-1 folder name, which must be an existing `lab.subject` row.
+- **Subject**: the level-1 folder name, which must be an existing `lab.subject` row. *Amended:* a folder that is not a subject is held (`unknown_subject`), not set aside as a test folder: a real subject may simply be missing from the table. An override row naming the folder with `skip` sets a test folder aside.
   - A name prefix that differs only in case is accepted and reported.
   - A different subject in the name holds the group until an override names the subject.
   - **Overrides** are a reviewed CSV (`root, relative_path, subject_id or skip, reason`). The reason is stored on the event.
@@ -81,7 +81,7 @@ A layout is one module that turns a directory tree into *groups* (one session an
 | | `recording` event in that session | `acquisition_system_code` `intan_rhx`, `modality` `ephys`, `sample_rate_hz`, `n_channels`, `duration_s`. |
 | Every file in the folder | `lab.artifact`, role `raw` | `format` = lower-case extension, attributes `{"kind":"raw","reader":"intan"}`, as `LabCapture.copiedSession` writes them. This includes `settings.xml` and `_manifest.json`. |
 | Paired epsych session | `behavior` event in the recording's session | `trials_completed` from the file. |
-| Unpaired epsych session | `lab.session` + `behavior` event | `label` = the file stem, `relative_path` = the epsych file, `started_at` from the name (NULL when only the date is known). |
+| Unpaired epsych session | `lab.session` + `behavior` event | `label` = the file stem, `relative_path` = the epsych file, `started_at` from the name (NULL when only the date is known). *Amended:* the stem is the base stem `<SUBJ>_<stamp>` and the path `<SUBJ>_<stamp>.mat`, whichever twin files exist, so a twin that appears later does not change the session. |
 | epsych `.mat` | `lab.artifact`, role `raw` | Attributes `{"kind":"epsych"}`. Files sharing a subject and timestamp are one session and one event. |
 | `.ts` video | `lab.artifact`, role `video`, on the same behavior event | A video with no `.mat` is held. |
 | `_conv.mp4` | `lab.artifact`, role `video` | Attributes `{"kind":"video_converted","converted_from":"<path>"}`. |
