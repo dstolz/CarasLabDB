@@ -93,6 +93,8 @@ ORDER_BY_DISPOSITION_LATEST = "artifact_id"
 ORDER_BY_SUBJECT = "subject_id"
 ORDER_BY_SESSION = "subject_id, label"
 ORDER_BY_VERIFICATION_LATEST = "artifact_id"
+ORDER_BY_SCAN_FILE = "scan_file_id DESC"
+ORDER_BY_SCAN_RUN = "scan_run_id DESC"
 
 # Every table or view `select_from` may read, with the ordering it gets when
 # the caller passes none. `table` and `order_by` are interpolated as raw SQL
@@ -137,6 +139,10 @@ DEFAULT_ORDER_BY = {
     "lab.retraction": ORDER_BY_RETRACTION,
     "lab.artifact_disposition": ORDER_BY_DISPOSITION,
     "lab.artifact_disposition_latest": ORDER_BY_DISPOSITION_LATEST,
+    "lab.scan_directory_status": "storage_root, relative_path, scan_directory_id",
+    "lab.scan_run": ORDER_BY_SCAN_RUN,
+    "lab.scan_file": ORDER_BY_SCAN_FILE,
+    "lab.scan_file_latest": ORDER_BY_SCAN_FILE,
 }
 DEFAULT_ORDER_BY.update({t: "event_id" for t in schema_map.EVENT_DETAIL_TABLE.values()})
 
@@ -159,6 +165,8 @@ PAGE_KEYS = {
     ORDER_BY_VERIFICATION_LATEST: (("artifact_id", False, "uuid"),),
     ORDER_BY_TAG_ASSIGNMENT: (("assignment_id", True, "bigint"),),
     ORDER_BY_DISPOSITION: (("disposition_id", True, "bigint"),),
+    ORDER_BY_SCAN_FILE: (("scan_file_id", True, "bigint"),),
+    ORDER_BY_SCAN_RUN: (("scan_run_id", True, "bigint"),),
     ORDER_BY_TAG_CURRENT: (("tag", False, "text"), ("assignment_id", False, "bigint")),
     ORDER_BY_SUBJECT: (("subject_id", False, "text"),),
     ORDER_BY_SESSION: (("subject_id", False, "text"), ("label", False, "text")),

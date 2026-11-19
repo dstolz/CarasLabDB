@@ -434,3 +434,21 @@ def test_count_questions_are_fixed_sql(question, active_only):
     assert sql.count("%s") == len(params)
     assert " ORDER BY " in sql and "LIMIT" not in sql
     assert all(p in (evil, active_only) for p in params)
+
+
+def test_scan_views_are_readable_and_their_orderings_pageable():
+    for table in ("lab.scan_directory_status", "lab.scan_run", "lab.scan_file",
+                  "lab.scan_file_latest"):
+        assert table in db.ALLOWED_TABLES
+    # newest first, and the runs listing (a join) pages on the same key as lab.scan_run
+    assert db.ORDER_BY_SCAN_FILE == "scan_file_id DESC"
+    assert db.DEFAULT_ORDER_BY["lab.scan_run"] == db.ORDER_BY_SCAN_RUN
+    assert db.ORDER_BY_SCAN_RUN in db.PAGE_KEYS and db.ORDER_BY_SCAN_FILE in db.PAGE_KEYS
+
+
+def test_scan_enumerations_are_checked_before_any_query():
+    from caraslabdb_mcp.tools import scans
+    assert scans._one_of(None, scans.SCAN_MODES, "mode") is None
+    assert scans._one_of("register", scans.SCAN_MODES, "mode") == "register"
+    with pytest.raises(ValueError, match="status must be one of 'pending'"):
+        scans._one_of("done", scans.SCAN_STATUSES, "status")
