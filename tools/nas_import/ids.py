@@ -75,16 +75,31 @@ def canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def text_bytes(text: str) -> bytes:
+    """The one place text becomes bytes for hashing: UTF-8, with lone surrogates
+    (names that are not valid UTF-8 on disk, surrogate-escaped by the walker)
+    encoded by ``surrogatepass``. Never fails, is the plain UTF-8 bytes for any
+    valid text, and distinct texts give distinct bytes."""
+    return text.encode("utf-8", "surrogatepass")
+
+
 def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text_bytes(text)).hexdigest()
+
+
+def _uuid5(name: str) -> str:
+    """uuid.uuid5(NAMESPACE, name), with the name's bytes from :func:`text_bytes`
+    (identical to uuid.uuid5 for valid text; it cannot fail on any other)."""
+    digest = hashlib.sha1(NAMESPACE.bytes + text_bytes(name)).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=5))
 
 
 def session_id(root: str, path: str) -> str:
-    return str(uuid.uuid5(NAMESPACE, "session:%s:%s" % (root, path)))
+    return _uuid5("session:%s:%s" % (root, path))
 
 
 def event_id(event_type: str, root: str, path: str) -> str:
-    return str(uuid.uuid5(NAMESPACE, "event:%s:%s:%s" % (event_type, root, path)))
+    return _uuid5("event:%s:%s:%s" % (event_type, root, path))
 
 
 def group_event_id(group: Group) -> str:
@@ -115,8 +130,12 @@ def import_block(group: Group) -> dict:
     return block
 
 
-def digest_source(group: Group) -> dict:
-    """The values ``client_digest`` is taken of (see the module docstring)."""
+def digest_source(group: Group, session_id: str | None = None) -> dict:
+    """The values ``client_digest`` is taken of (see the module docstring).
+
+    SESSION_ID, when given, is used in place of the group's own session id
+    (a behavior event placed in a session another client registered).
+    """
     if group.status != "ready" or group.subject_id is None:
         raise ValueError("group %s is not ready to register (%s)" % (group.key, group.status))
     return {
@@ -124,7 +143,7 @@ def digest_source(group: Group) -> dict:
         "event_type": group.kind,
         "event_id": group_event_id(group),
         "subject_id": group.subject_id,
-        "session_id": group_session_id(group),
+        "session_id": group_session_id(group) if session_id is None else str(session_id),
         "occurred_at_local": group.occurred_local,
         "time_zone": group.time_zone,
         "occurred_precision": group.precision,
@@ -133,9 +152,9 @@ def digest_source(group: Group) -> dict:
     }
 
 
-def client_digest(group: Group) -> str:
-    """SHA-256 hex of the canonical JSON of ``digest_source(group)``."""
-    return sha256_text(canonical_json(digest_source(group)))
+def client_digest(group: Group, session_id: str | None = None) -> str:
+    """SHA-256 hex of the canonical JSON of ``digest_source(group, session_id)``."""
+    return sha256_text(canonical_json(digest_source(group, session_id)))
 
 
 def signature(group: Group) -> str:
@@ -145,20 +164,21 @@ def signature(group: Group) -> str:
     return sha256_text(canonical_json(sorted(rows)))
 
 
-def event_attributes(group: Group, code_version: str) -> dict:
+def event_attributes(group: Group, code_version: str, session_id: str | None = None) -> dict:
     """The event's attributes: import block, LabCapture provenance, client_digest.
 
     ``captured_by_tool`` is the tool name, ``code_version`` the caller's
     version text (not in the digest), ``occurred_at_source`` says where the
     time came from, ``occurred_precision`` is ``day`` for a date-only session
-    (absent otherwise, as in the master-log import).
+    (absent otherwise, as in the master-log import). SESSION_ID as in
+    :func:`digest_source`.
     """
     attrs = {
         "import": import_block(group),
         "captured_by_tool": TOOL_NAME,
         "code_version": code_version,
         "occurred_at_source": OCCURRED_AT_SOURCE[(group.kind, group.precision)],
-        "client_digest": client_digest(group),
+        "client_digest": client_digest(group, session_id),
     }
     if group.precision == "day":
         attrs["occurred_precision"] = "day"

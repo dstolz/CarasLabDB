@@ -1,9 +1,15 @@
 """A cache of file header results, so registered files are not opened on every scan.
 
-Correctness must NEVER depend on this cache: it is an optimisation only. A
-missing, unreadable or malformed cache file loads as an empty cache, an
-entry that is malformed or carries an old reader tag is ignored, and every
-file not in the cache is read exactly as without one.
+An optimisation: a missing, unreadable or malformed cache file loads as an
+empty cache, an entry that is malformed or carries an old reader tag is
+ignored, and every file not in the cache is read exactly as without one.
+
+What it does assume: an entry is trusted for the key it was stored under --
+(root, path, size, mtime_ns) -- and for nothing else. A file whose bytes
+changed while its size and modification time did not would be answered from
+the cache; that is the same assumption under which registered files are not
+read again at all. The database side therefore passes only the entries of
+files whose registration is confirmed (``HeaderCache.restricted_to``).
 
 Key: ``(root, path, size, mtime_ns)`` -- the storage root's name, the path
 under it, and the size and ``st_mtime_ns`` as listed. A file whose size or
@@ -140,7 +146,7 @@ class HeaderCache(Mapping):
     def save(self, path: str) -> None:
         """Write the cache to PATH atomically (temp file in the same folder, fsync, os.replace)."""
         rows = [list(k) + [self._d[k]] for k in sorted(self._d)]
-        text = json.dumps({"format": FORMAT, "entries": rows}, ensure_ascii=False,
+        text = json.dumps({"format": FORMAT, "entries": rows}, ensure_ascii=True,
                           sort_keys=True, separators=(",", ":"))
         folder = os.path.dirname(os.path.abspath(path))
         fd, tmp = tempfile.mkstemp(prefix=".header-cache-", suffix=".tmp", dir=folder)
@@ -169,14 +175,48 @@ def _check_no_float(v) -> None:
             _check_no_float(x)
 
 
-class HeaderReader:
-    """Reads file headers for the layouts, through an optional read-only cache."""
+class _CountingFile:
+    """A read-only file wrapper that counts the bytes read through it."""
 
-    def __init__(self, root: str, root_path: str, cache: Mapping | None = None):
+    def __init__(self, fh, reader: "HeaderReader"):
+        self._fh = fh
+        self._reader = reader
+
+    def read(self, n: int = -1) -> bytes:
+        data = self._fh.read(n)
+        self._reader._count("bytes_read", len(data))
+        return data
+
+    def seek(self, *a):
+        return self._fh.seek(*a)
+
+    def tell(self):
+        return self._fh.tell()
+
+
+class HeaderReader:
+    """Reads file headers for the layouts, through an optional read-only cache.
+
+    STATS, when given, counts the reads: a dict gets the keys
+    ``files_opened`` and ``bytes_read`` (created at 0 when missing) increased;
+    any other object gets attributes of those names increased. A file is
+    counted when it was opened, whatever the reader then made of it.
+    """
+
+    def __init__(self, root: str, root_path: str, cache: Mapping | None = None, stats=None):
         self.root = root
         self.root_path = root_path
         self.cache = cache
+        self.stats = stats
         self.fresh: dict = {}
+
+    def _count(self, name: str, n: int) -> None:
+        if self.stats is None:
+            return
+        if isinstance(self.stats, dict):
+            self.stats[name] = self.stats.get(name, 0) + n
+        else:
+            setattr(self.stats, name, getattr(self.stats, name, 0) + n)
 
     def read(self, f: ListedFile, kind: str):
         """The decoded result of reader KIND (``mat5`` | ``rhd`` | ``ts``) for file F.
@@ -200,7 +240,8 @@ class HeaderReader:
                     pass                                   # a malformed entry: read the file
         try:
             with content.open_listed(self.root_path, f) as fh:
-                entry = read_fn(fh, f.size)
+                self._count("files_opened", 1)
+                entry = read_fn(_CountingFile(fh, self), f.size)
         except ContentProblem as exc:
             if exc.code in content.TRANSIENT:
                 raise

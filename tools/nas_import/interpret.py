@@ -23,7 +23,8 @@ Stages:
    everything under it ``path_not_storable``).
 2. Names in one folder that differ only in ASCII case: every group holding
    such an entry, or an entry under such a folder, is held
-   (``name_case_conflict``).
+   (``name_case_conflict``). No override releases it (an override cannot say
+   which spelling is meant): the remedy is to rename on the NAS.
 3. Subjects and overrides (:func:`.subjects.resolve_subjects`); loose items
    in an unknown level-1 folder are held ``unknown_subject``, those under a
    folder an override skips are reported.
@@ -148,7 +149,7 @@ def _account(listings, groups, held, reported) -> None:
 
 def interpret(listings: Sequence[Listing], root_paths: Mapping[str, str],
               known_subjects: Collection[str], overrides: Sequence[Override] = (),
-              header_cache: Mapping | None = None) -> Interpretation:
+              header_cache: Mapping | None = None, stats=None) -> Interpretation:
     """Interpret LISTINGS (see the module docstring).
 
     root_paths      storage root name -> its mount path on this computer
@@ -158,6 +159,8 @@ def interpret(listings: Sequence[Listing], root_paths: Mapping[str, str],
                     header entry (cache.py); a hit is used exactly as a fresh
                     read and the file is not opened. The fresh entries of this
                     pass are returned in ``Interpretation.headers``.
+    stats           optional dict or object counting header reads: ``files_opened``
+                    and ``bytes_read`` are increased (cache.HeaderReader)
     """
     _check_directories(listings)
     known = frozenset(known_subjects)
@@ -167,7 +170,7 @@ def interpret(listings: Sequence[Listing], root_paths: Mapping[str, str],
     fresh: dict = {}
     for listing in listings:
         spec = listing.spec
-        reader = HeaderReader(spec.root, root_paths[spec.root], header_cache)
+        reader = HeaderReader(spec.root, root_paths[spec.root], header_cache, stats)
         result = get_layout(spec.layout)(listing, reader)
         fresh.update(reader.fresh)
         conflicted = _case_conflicts(listing)

@@ -23,6 +23,11 @@ array (no MAT storage type is smaller), an 8-byte tag per cell, and an 8-byte
 tag per field per element of a struct array with fields. Sparse arrays,
 objects, function handles and opaque objects are not bounded.
 
+Stricter than scipy, in the safe direction: dimensions stored as
+``miUINT32`` (rather than ``miINT32``) or a variable name stored as
+``miUTF8`` (rather than ``miINT8``) are held ``mat_corrupt`` although scipy
+loads such files; no such file is known among the lab's.
+
 Classified, as :class:`MatProblem` (a ContentProblem) with a reason code:
 ``mat_v73`` (MATLAB 7.3, HDF5), ``mat_not_mat5`` (v4 or not a MAT file),
 ``mat_truncated`` (ends inside the header, a tag or an element),
@@ -46,6 +51,7 @@ number of elements of ``Data``, ``prod(size(Data))`` (see
 
 from __future__ import annotations
 
+import re
 import struct
 import zlib
 from dataclasses import dataclass
@@ -284,147 +290,337 @@ def read_variables(fh, size: int) -> tuple[MatVariable, ...]:
     return tuple(variables)
 
 
-def _inflate_whole(fh, nbytes: int, offset: int) -> None:
-    """Inflate one compressed element to its end; check it is exactly one miMATRIX."""
-    d = zlib.decompressobj()
-    remaining = nbytes
-    head = b""
-    total = 0
-    try:
-        while remaining > 0:
-            data = _read_exact(fh, min(CHUNK * 16, remaining), "a compressed variable")
-            remaining -= len(data)
-            while data:
-                if d.eof:
-                    raise MatProblem("mat_corrupt", "%d bytes follow the zlib stream of the "
-                                     "variable at byte %d" % (len(data) + remaining, offset))
-                out = d.decompress(data, INFLATE_CHUNK)
-                if len(head) < 8:
-                    head += out[:8 - len(head)]
-                total += len(out)
-                data = d.unconsumed_tail
-        if not d.eof:
-            out = d.flush()
-            total += len(out)
-            if len(head) < 8:
-                head += out[:8 - len(head)]
-        if not d.eof:
-            raise MatProblem("mat_truncated", "the zlib stream of the variable at byte %d does "
-                             "not end" % offset)
-        if d.unused_data:
-            raise MatProblem("mat_corrupt", "%d bytes follow the zlib stream of the variable at "
-                             "byte %d" % (len(d.unused_data), offset))
-    except zlib.error as exc:
-        raise MatProblem("mat_corrupt", "the variable at byte %d cannot be inflated: %s"
-                         % (offset, exc)) from exc
-    if len(head) < 8:
-        raise MatProblem("mat_corrupt", "the variable at byte %d inflates to %d bytes" % (offset, total))
-    dtype, inner = struct.unpack("<II", head)
-    if dtype != MI_MATRIX or 8 + inner != total:
-        raise MatProblem("mat_corrupt", "the variable at byte %d inflates to %d bytes, its matrix "
-                         "claims %d" % (offset, total, 8 + inner))
-
-
 _TYPE_BYTES = {1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 9: 8, 12: 8, 13: 8, 17: 2, 18: 4}
 _COMPLEX = 0x0800
-_SMALL_READ = 1 << 20
+MAX_DEPTH = 64                      # nested matrices deeper than this are mat_corrupt
+MI_UTF8 = 16
+_CHAR_TYPES = frozenset({2, 4, 16, 17, 18})   # miUINT8, miUINT16, miUTF8, miUTF16, miUTF32
+_FIELD_NAME = re.compile(rb"[A-Za-z][A-Za-z0-9_]*")
+_SMALL_READ = 65536                 # largest header sub-element read into memory
+_SKIP_BY_READING = 4096             # data shorter than this is read past, not sought past
 
 
-def _children(fh, start: int, end: int, what: str):
-    """(type, byte count, data offset) of each sub-element tiling [start, end)."""
-    out = []
-    pos = start
-    while pos < end:
-        if end - pos < 8:
-            raise MatProblem("mat_corrupt", "%s ends inside a sub-element tag" % what)
-        fh.seek(pos)
-        first, second = struct.unpack("<II", _read_exact(fh, 8, "a sub-element tag"))
-        if first >> 16:
-            n = first >> 16
-            if n > 4:
-                raise MatProblem("mat_corrupt", "%s has a small element of %d bytes" % (what, n))
-            out.append((first & 0xFFFF, n, pos + 4))
-            pos += 8
+class _Damage(Exception):
+    """Internal: the walk met bytes that cannot be a well-formed variable."""
+
+
+class _FileSource:
+    """The bytes [start, end) of the open file, read forward; seeks past long data."""
+
+    def __init__(self, fh, start: int, end: int):
+        self.fh = fh
+        self.pos = start
+        self.end = end
+        fh.seek(start)
+
+    def read(self, n: int) -> bytes:
+        if self.pos + n > self.end:
+            raise _Damage("a sub-element runs past the end of its variable")
+        data = self.fh.read(n)
+        if len(data) != n:
+            raise MatProblem("mat_truncated", "the file ends inside a variable")
+        self.pos += n
+        return data
+
+    def unread(self, data: bytes) -> None:
+        """Put back the last bytes read (a small element's data word)."""
+        self.pos -= len(data)
+        self.fh.seek(self.pos)
+
+    def skip(self, n: int) -> None:
+        if self.pos + n > self.end:
+            raise _Damage("a sub-element runs past the end of its variable")
+        if n <= _SKIP_BY_READING:
+            self.read(n)
         else:
-            out.append((first, second, pos + 8))
-            pos += 8 + ((second + 7) // 8) * 8
-    if pos != end:
-        raise MatProblem("mat_corrupt", "the sub-elements of %s overrun it" % what)
-    return out
+            self.pos += n
+            self.fh.seek(self.pos)
 
 
-def _data(fh, child, limit=_SMALL_READ) -> bytes:
-    dtype, n, at = child
+class _InflateSource:
+    """The inflated bytes of one compressed element, streamed in bounded memory."""
+
+    def __init__(self, fh, start: int, nbytes: int):
+        self.fh = fh
+        self.d = zlib.decompressobj()
+        self.remaining = nbytes
+        self.buf = bytearray()
+        self.off = 0                          # read position in buf
+        self.pos = 0                          # inflated bytes consumed
+        self.end = None                       # set once the inner tag is read
+        fh.seek(start)
+
+    def _avail(self) -> int:
+        return len(self.buf) - self.off
+
+    def _append(self, data: bytes) -> None:
+        if self.off:
+            del self.buf[:self.off]           # compact: at most one chunk is kept
+            self.off = 0
+        self.buf += data
+
+    def _more(self) -> bool:
+        try:
+            if self.d.unconsumed_tail:
+                self._append(self.d.decompress(self.d.unconsumed_tail, INFLATE_CHUNK))
+                return True
+            if self.remaining > 0 and not self.d.eof:
+                data = self.fh.read(min(CHUNK * 16, self.remaining))
+                if not data:
+                    raise MatProblem("mat_truncated", "the file ends inside a compressed variable")
+                self.remaining -= len(data)
+                self._append(self.d.decompress(data, INFLATE_CHUNK))
+                return True
+            if not self.d.eof:
+                out = self.d.flush(INFLATE_CHUNK)
+                if out:
+                    self._append(out)
+                    return True
+        except zlib.error as exc:
+            raise MatProblem("mat_corrupt", "a compressed variable cannot be inflated: %s"
+                             % exc) from exc
+        return False
+
+    def read(self, n: int) -> bytes:
+        if self.end is not None and self.pos + n > self.end:
+            raise _Damage("a sub-element runs past the end of its variable")
+        while self._avail() < n:
+            if not self._more():
+                raise _Damage("the inflated variable ends inside a sub-element")
+        data = bytes(self.buf[self.off:self.off + n])
+        self.off += n
+        self.pos += n
+        return data
+
+    def unread(self, data: bytes) -> None:
+        """Put back the last bytes read (a small element's data word)."""
+        self.off -= len(data)
+        self.pos -= len(data)
+
+    def skip(self, n: int) -> None:
+        if self.end is not None and self.pos + n > self.end:
+            raise _Damage("a sub-element runs past the end of its variable")
+        left = n
+        while left:
+            if not self._avail() and not self._more():
+                raise _Damage("the inflated variable ends inside a sub-element")
+            k = min(left, self._avail())
+            self.off += k
+            left -= k
+        self.pos += n
+
+    def finish(self) -> None:
+        """Nothing may follow the matrix: no inflated byte, no stream byte, no extra input."""
+        while True:
+            if self._avail():
+                raise _Damage("bytes follow the matrix inside the compressed variable")
+            if self.d.eof and not self.d.unconsumed_tail:
+                break
+            if not self._more():
+                raise MatProblem("mat_truncated", "the zlib stream of a variable does not end")
+        if self.d.unused_data or self.remaining:
+            raise _Damage("%d bytes follow the zlib stream of a variable"
+                          % (len(self.d.unused_data) + self.remaining))
+
+
+def _tag(src):
+    """(type, byte count, small) of the next sub-element; its data not yet read."""
+    first, second = struct.unpack("<II", src.read(8))
+    if first >> 16:
+        n = first >> 16
+        if n > 4:
+            raise _Damage("a small data element of %d bytes" % n)
+        src.unread(struct.pack("<I", second))  # the data sits in the tag's second word
+        return first & 0xFFFF, n, True
+    return first, second, False
+
+
+def _data(src, n: int, small: bool, limit: int = _SMALL_READ) -> bytes:
     if n > limit:
-        raise MatProblem("mat_corrupt", "a header sub-element of %d bytes" % n)
-    fh.seek(at)
-    return _read_exact(fh, n, "a sub-element")
+        raise _Damage("a header sub-element of %d bytes" % n)
+    data = src.read(n)
+    _pad(src, n, small)
+    return data
 
 
-def _check_body(fh, offset: int, nbytes: int) -> None:
-    """An uncompressed variable: its sub-elements tile it, and their number and
-    sizes agree with its class and dimensions (numeric data bytes = numel x the
-    storage type's size; numel x nfields fields of a struct; numel cells)."""
-    what = "the variable at byte %d" % offset
-    kids = _children(fh, offset + 8, offset + 8 + nbytes, what)
-    if len(kids) < 3:
-        raise MatProblem("mat_corrupt", "%s lacks its header sub-elements" % what)
-    if kids[0][0] != MI_UINT32 or kids[0][1] != 8:
-        raise MatProblem("mat_corrupt", "%s lacks its array flags" % what)
-    flags = struct.unpack("<II", _data(fh, kids[0]))[0]
+def _skip_data(src, n: int, small: bool) -> None:
+    src.skip(n)
+    _pad(src, n, small)
+
+
+def _pad(src, n: int, small: bool) -> None:
+    pad = (4 - n) if small else (-n) % 8
+    if pad:
+        src.skip(pad)
+
+
+def _matrix(src, n: int, depth: int) -> None:
+    """Walk one miMATRIX body of N bytes at the source's position (see verify_file)."""
+    if depth > MAX_DEPTH:
+        raise _Damage("matrices nested deeper than %d" % MAX_DEPTH)
+    if n == 0:
+        return                                # an empty element
+    end = src.pos + n
+    saved_end = src.end
+    src.end = end if saved_end is None else min(end, saved_end)
+    if end > (saved_end if saved_end is not None else end):
+        raise _Damage("a nested matrix runs past its parent")
+    t, k, small = _tag(src)
+    if t != MI_UINT32 or k != 8:
+        raise _Damage("a matrix without its array flags")
+    flags = struct.unpack("<II", _data(src, k, small))[0]
     code = flags & 0xFF
+    mclass = CLASSES.get(code)
+    if mclass is None:
+        raise _Damage("unknown array class %d" % code)
     if code == MX_OPAQUE:
+        _tile(src, end, None)                 # its layout is not verified, only its tiling
+        src.end = saved_end
         return
-    if kids[1][0] != MI_INT32 or kids[1][1] % 4 or kids[1][1] < 8:
-        raise MatProblem("mat_corrupt", "%s lacks valid dimensions" % what)
-    dims = struct.unpack("<%di" % (kids[1][1] // 4), _data(fh, kids[1]))
+    t, k, small = _tag(src)
+    if t != MI_INT32 or k % 4 or k < 8:
+        raise _Damage("a matrix without valid dimensions")
+    dims = struct.unpack("<%di" % (k // 4), _data(src, k, small))
+    if any(d < 0 for d in dims):
+        raise _Damage("negative dimensions")
     numel = 1
     for d in dims:
         numel *= d
-    rest = kids[3:]
-    mclass = CLASSES.get(code)
+    t, k, small = _tag(src)
+    if t != MI_INT8:
+        raise _Damage("a matrix without its name")
+    if not _data(src, k, small).isascii():
+        raise _Damage("a matrix name that is not ASCII")
+
     if mclass in NUMERIC:
-        want = 2 if flags & _COMPLEX else 1
-        if len(rest) != want and not (numel == 0 and not rest):
-            raise MatProblem("mat_corrupt", "%s (%s) has %d data parts, not %d"
-                             % (what, mclass, len(rest), want))
-        for dtype, n, _at in rest:
-            size = _TYPE_BYTES.get(dtype)
-            if size is not None and n != numel * size:
-                raise MatProblem("mat_corrupt", "%s holds %d bytes of data for %d elements"
-                                 % (what, n, numel))
-    elif mclass == "struct":
-        if len(rest) < 2:
-            raise MatProblem("mat_corrupt", "%s is a struct without field names" % what)
-        if rest[0][0] != MI_INT32 or rest[0][1] != 4:
-            raise MatProblem("mat_corrupt", "%s lacks its field-name length" % what)
-        flen = struct.unpack("<i", _data(fh, rest[0]))[0]
-        nfields = rest[1][1] // flen if flen > 0 else 0
-        if len(rest) - 2 != numel * nfields:
-            raise MatProblem("mat_corrupt", "%s holds %d fields for %d elements of %d fields"
-                             % (what, len(rest) - 2, numel, nfields))
-    elif mclass == "cell":
-        if len(rest) != numel:
-            raise MatProblem("mat_corrupt", "%s holds %d cells for %d elements"
-                             % (what, len(rest), numel))
+        parts = 2 if flags & _COMPLEX else 1
+        for i in range(parts):
+            if src.pos == end and numel == 0 and i == 0:
+                break
+            t, k, small = _tag(src)
+            if mclass == "char" and t not in _CHAR_TYPES:
+                raise _Damage("char data stored as type %d" % t)
+            size = _TYPE_BYTES.get(t)
+            if t == MI_UTF8:
+                _utf8_data(src, k, small, numel)
+                continue
+            if size is None:
+                raise _Damage("data of type %d" % t)
+            if k != numel * size:
+                raise _Damage("%d bytes of data for %d elements" % (k, numel))
+            _skip_data(src, k, small)
+    elif mclass in ("cell", "struct", "object"):
+        nfields = 1
+        if mclass == "object":
+            t, k, small = _tag(src)
+            if t != MI_INT8:
+                raise _Damage("an object without its class name")
+            _skip_data(src, k, small)
+        if mclass in ("struct", "object"):
+            t, k, small = _tag(src)
+            if t != MI_INT32 or k != 4:
+                raise _Damage("a struct without its field-name length")
+            flen = struct.unpack("<i", _data(src, k, small))[0]
+            t, k, small = _tag(src)
+            if t != MI_INT8 or flen < 0 or (flen and k % flen) or (k and not flen):
+                raise _Damage("malformed field names")
+            nfields = k // flen if flen else 0
+            names = _data(src, k, small)
+            for i in range(nfields):
+                field = names[i * flen:(i + 1) * flen]
+                name, _, pad = field.partition(b"\0")
+                if not _FIELD_NAME.fullmatch(name) or pad.strip(b"\0"):
+                    raise _Damage("a malformed field name %r" % field)
+        children = numel * nfields
+        if children * 8 > end - src.pos:
+            raise _Damage("%d elements cannot fit in %d bytes" % (children, end - src.pos))
+        for _i in range(children):
+            t, k, small = _tag(src)
+            if t != MI_MATRIX or small:
+                raise _Damage("a %s element that is not a matrix" % mclass)
+            _matrix(src, k, depth + 1)
+            src.end = end
+    elif mclass == "sparse":
+        if len(dims) != 2:
+            raise _Damage("a sparse array of %d dimensions" % len(dims))
+        t, k, small = _tag(src)                       # ir: row indices
+        if t != MI_INT32 or k % 4:
+            raise _Damage("a sparse array without its row indices")
+        _skip_data(src, k, small)
+        t, k, small = _tag(src)                       # jc: one more than the columns
+        if t != MI_INT32 or k != 4 * (dims[1] + 1):
+            raise _Damage("a sparse array whose column index does not fit its columns")
+        _skip_data(src, k, small)
+        _tile(src, end, 2)                            # pr [and pi]
+    else:                                     # function handle: tiling only
+        _tile(src, end, None)
+    if src.pos != end:
+        raise _Damage("%d bytes of a %s matrix are not accounted for" % (end - src.pos, mclass))
+    src.end = saved_end
+
+
+def _utf8_data(src, n: int, small: bool, numel: int) -> None:
+    """miUTF8 char data: N bytes holding exactly NUMEL UTF-16 code units of valid UTF-8."""
+    if n <= _SMALL_READ:
+        try:
+            text = _data(src, n, small).decode("utf-8")
+        except UnicodeDecodeError:
+            raise _Damage("char data that is not UTF-8") from None
+        if len(text.encode("utf-16-le")) // 2 != numel:
+            raise _Damage("char data of %d characters for %d elements" % (len(text), numel))
+        return
+    if not numel <= n <= 4 * numel:
+        raise _Damage("%d bytes of UTF-8 for %d characters" % (n, numel))
+    _skip_data(src, n, small)
+
+
+def _tile(src, end: int, most: int | None) -> None:
+    count = 0
+    while src.pos < end:
+        if end - src.pos < 8:
+            raise _Damage("a matrix ends inside a sub-element tag")
+        t, k, small = _tag(src)
+        _skip_data(src, k, small)
+        count += 1
+        if most is not None and count > most:
+            raise _Damage("more than %d sub-elements" % most)
 
 
 def verify_file(fh, size: int) -> None:
     """Full structural check of the MAT 5.0 file open as FH; MatProblem on damage.
 
-    Runs :func:`read_variables`, then inflates every compressed variable to
-    its end (constant memory; zlib checks the stream) and checks that the
-    sub-elements of every uncompressed variable tile it.
+    Runs :func:`read_variables`, then walks every variable to its end --
+    inflating a compressed one as a stream, in bounded memory -- through every
+    nested matrix (struct fields, cells, object fields) to depth
+    :data:`MAX_DEPTH`. At every level: sub-elements tile their matrix exactly,
+    a numeric or char array's data is numel x its storage type's size, a cell
+    or struct array holds exactly numel (x fields) matrices, each child is a
+    miMATRIX (an empty one allowed), and nothing follows a compressed
+    variable's matrix or its zlib stream. Data bytes are sought or read past,
+    never kept; time grows with the number of elements, not the bytes.
+    Opaque (MCOS) objects, sparse arrays and function handles are checked
+    for tiling only.
     """
     read_variables(fh, size)
     offset = 128
     while offset < size:
         fh.seek(offset)
         dtype, nbytes = struct.unpack("<II", _read_exact(fh, 8, "a variable's tag"))
-        if dtype == MI_COMPRESSED:
-            _inflate_whole(fh, nbytes, offset)
-        else:
-            _check_body(fh, offset, nbytes)
+        what = "the variable at byte %d" % offset
+        try:
+            if dtype == MI_COMPRESSED:
+                src = _InflateSource(fh, offset + 8, nbytes)
+                t, k = struct.unpack("<II", src.read(8))
+                if t != MI_MATRIX:
+                    raise _Damage("a compressed element that does not hold a matrix")
+                src.end = 8 + k
+                _matrix(src, k, 0)
+                src.end = None
+                src.finish()
+            else:
+                _matrix(_FileSource(fh, offset + 8, offset + 8 + nbytes), nbytes, 0)
+        except _Damage as exc:
+            raise MatProblem("mat_corrupt", "%s: %s" % (what, exc)) from None
         offset += 8 + nbytes
 
 

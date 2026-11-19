@@ -95,6 +95,25 @@ REASON_CODES: dict[str, str] = {
     "pairing_ambiguous": "another candidate lies within the ambiguity margin",
     "paired_recording_held": "the recording it pairs with is held or not registrable",
     "session_label_conflict": "two sessions of one subject would get the same label",
+    # raised by the database side (engine.py), never by this package's interpretation
+    "would_correct": "database side: the event exists with another digest; registering would "
+                     "be a correction",
+    "content_changed": "database side: other bytes at a registered path",
+    "late_recording": "database side: a recording arrived for a behavior-only session "
+                      "already registered",
+    "path_case_conflict": "database side: the path differs only in case from a registered one",
+    "registered_but_withdrawn": "database side: the file's artifact was retracted or recorded "
+                                "as moved, replaced or deleted",
+    "copy_ambiguous": "database side: the files are copies of raw artifacts of more than one "
+                      "event",
+    "copy_event_mismatch": "database side: the files are copies of an event that does not "
+                           "match this group",
+    "duplicate_content": "database side: the same bytes are already registered elsewhere",
+    "session_conflict": "database side: the session row exists with other values",
+    "local_time_nonexistent": "database side: the wall-clock time does not exist in the time "
+                              "zone (skipped by a daylight-saving change)",
+    "local_time_ambiguous": "database side: the wall-clock time occurs twice in the time zone "
+                            "(a daylight-saving change)",
 }
 
 # Codes of notes: things done or noticed that do not stop registration.

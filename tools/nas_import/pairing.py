@@ -43,8 +43,14 @@ folder is paired with it and then held (``paired_recording_held``) or found
 ambiguous, never registered alone. A recording skipped by an override no
 longer counts (a person decided); an ePsych session that would have been
 its candidate may then be ``ready`` alone, with a note
-(``pairing_skipped_recording``) naming the skipped folder. The subject is
-the resolved one, or the subject folder while unresolved.
+(``pairing_skipped_recording``) naming the skipped folder.
+
+Pools: a resolved group pairs within its subject. An unresolved group (held
+for ``subject_mismatch``, ``unknown_subject``, ``subject_folder_case_variant``
+or ``override_unknown_subject``) takes part in two pools -- the subject of its
+folder and the subject in its name -- so a mislabelled recording holds the
+ePsych sessions of both (``paired_recording_held``) until an override names
+its subject. Pools are compared without ASCII case.
 
 Wall-clock text, unzoned: across a daylight-saving change the comparison is
 off by the hour that changed (documented; it is how findCopySessions
@@ -60,7 +66,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 from .model import DirectorySpec, Group, Hold, Note, Pairing, with_hold
-from .names import wall_seconds
+from .names import ascii_fold, wall_seconds
 from .rhd import decimal_text
 
 MAX_LEAD_S = 600
@@ -156,8 +162,17 @@ def pair_subject(recordings: Sequence[Recording], sessions: Sequence[Session]) -
     return PairResult(pair_of, frozenset(amb_r), frozenset(amb_e), short, dict(cands_note))
 
 
-def _pool_subject(g: Group) -> str:
-    return g.subject_id if g.subject_id is not None else g.subject_folder
+def _pools(g: Group) -> set[str]:
+    """The subject pools a group takes part in, compared without ASCII case.
+
+    A resolved group: its subject. An unresolved one (a subject mismatch, an
+    unknown or misspelt folder, an override naming an unknown subject): BOTH
+    the subject of its folder and the subject in its name, so that it blocks
+    the sessions of either until an override settles it.
+    """
+    if g.subject_id is not None:
+        return {ascii_fold(g.subject_id)}
+    return {ascii_fold(g.subject_folder), ascii_fold(g.subject_in_name)}
 
 
 def _takes_part(g: Group) -> bool:
@@ -208,10 +223,12 @@ def apply_pairing(groups: Sequence[Group], specs: Sequence[DirectorySpec]) -> tu
         by_subject_r: dict[str, list[Group]] = defaultdict(list)
         by_subject_e: dict[str, list[Group]] = defaultdict(list)
         for g in rec_groups:
-            by_subject_r[_pool_subject(g)].append(g)
+            for pool in _pools(g):
+                by_subject_r[pool].append(g)
         for g in ep_groups:
             if g.precision == "second":
-                by_subject_e[_pool_subject(g)].append(g)
+                for pool in _pools(g):
+                    by_subject_e[pool].append(g)
         for subject in sorted(set(by_subject_r) | set(by_subject_e)):
             rs = sorted(by_subject_r[subject], key=lambda g: g.key)
             es = sorted(by_subject_e[subject], key=lambda g: g.key)
@@ -220,11 +237,11 @@ def apply_pairing(groups: Sequence[Group], specs: Sequence[DirectorySpec]) -> tu
                 [Session(g.key, wall_seconds(g.start_local)) for g in es])
             rec_of = {v: k for k, v in result.pair_of.items()}
             r_by_key = {g.key: g for g in rs}
-            for g in rs:
-                out[g.key] = _recording_outcome(g, result, names)
+            for g in rs:                      # a group in two pools gets both outcomes
+                out[g.key] = _recording_outcome(out[g.key], result, names)
             for g in es:
-                out[g.key] = _session_outcome(g, result, rec_of, r_by_key, rs, names,
-                                              [r for r in skipped if _pool_subject(r) == subject])
+                out[g.key] = _session_outcome(out[g.key], result, rec_of, r_by_key, rs, names,
+                                              [r for r in skipped if subject in _pools(r)])
     return tuple(out[g.key] for g in groups)
 
 

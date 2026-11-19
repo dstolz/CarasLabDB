@@ -17,5 +17,9 @@ Typical use (the database side supplies root paths, subjects, overrides)::
 Modules: :mod:`.model` (data classes, reason codes), :mod:`.walk`,
 :mod:`.content` (checked opening, MPEG-TS), :mod:`.mat5`, :mod:`.rhd`,
 :mod:`.names`, :mod:`.layouts`, :mod:`.subjects`, :mod:`.pairing`,
-:mod:`.ids`, :mod:`.interpret`.
+:mod:`.ids`, :mod:`.interpret`, :mod:`.cache` (header cache).
+
+The database side, on top of these: :mod:`.database` (the queries),
+:mod:`.engine` (scan, apply, run, check) and :mod:`.report` (the reports);
+``tools/import_nas_files.py`` is its command line.
 """

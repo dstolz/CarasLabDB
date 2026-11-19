@@ -31,6 +31,16 @@ Differences from the MATLAB, all towards refusing rather than guessing
   lines 498 and 527-538), a negative count, an odd QString byte length or
   one longer than :data:`QSTRING_MAX`, an unknown signal type are
   ``rhd_bad_header``.
+* In a main-version-3 file, a signal group's amplifier-channel count (the
+  third int16 of the group record; savefile.cpp:380) must equal the number
+  of its channel records of type 0, enabled or not (``rhd_bad_header``):
+  this catches a channel type changed by damage into another type of the
+  same block size, which no other header check sees. Its temperature-sensor
+  count must be 0, as RHX writes it (savemanager.cpp:107-111).
+* Not detectable from one header: a sample rate damaged into another RHX
+  rate (a recording of two or more files is then held
+  ``rhd_header_mismatch``), and a swap between board signal types of equal
+  block size.
 * The channel records of a signal group are read whether or not the group
   is enabled, and an enabled channel counts whatever its group says: the
   RHX writer writes every channel record (savefile.cpp 374-408) and RHX's
@@ -60,7 +70,7 @@ from .content import ContentProblem
 # Version of what this reader makes of a file's bytes, stored with every
 # cached result (cache.py). Raise it whenever the result for the same bytes
 # could change: older cache entries are then ignored and the files read again.
-READER = "rhd/2"
+READER = "rhd/3"
 
 MAGIC = 0xC6912702
 NULL_QSTRING = 0xFFFFFFFF
@@ -213,6 +223,7 @@ def read_header(fh, size: int) -> RhdHeader:
         if not 0 <= nchan <= MAX_GROUP_CHANNELS or not 0 <= namp <= MAX_GROUP_AMPLIFIERS:
             raise RhdProblem("rhd_bad_header", "a signal group of %d channels (%d amplifier)"
                              % (nchan, namp))
+        amp_records = 0
         for _c in range(nchan):
             r.qstring()                        # native name
             r.qstring()                        # custom name
@@ -226,11 +237,24 @@ def read_header(fh, size: int) -> RhdHeader:
             r.f32()                            # impedance phase
             if not 0 <= signal_type <= 5:
                 raise RhdProblem("rhd_bad_header", "unknown channel type %d" % signal_type)
+            if signal_type == 0:
+                amp_records += 1
             if channel_enabled:
                 counts[signal_type] += 1
+        # The RHX writer stores, per group, the number of its amplifier channel
+        # records, enabled or not (savefile.cpp:380, numChannels(AmplifierSignal)).
+        # Checked for main version 3 (RHX) only: the RHX source does not show how
+        # the older RHD2000 software (versions 1 and 2) filled it.
+        if main == 3 and namp != amp_records:
+            raise RhdProblem("rhd_bad_header", "a signal group says %d amplifier channels but "
+                             "holds %d amplifier channel records" % (namp, amp_records))
     n_amp, n_aux, n_supply, n_adc, n_din, n_dout = counts
     if num_temp < 0:
         raise RhdProblem("rhd_bad_header", "%d temperature sensor channels" % num_temp)
+    if main == 3 and num_temp != 0:
+        # RHX (main version 3) always writes 0 here for an .rhd file (savemanager.cpp:107-111).
+        raise RhdProblem("rhd_bad_header", "%d temperature sensor channels in a version-3 file "
+                         "(RHX writes 0)" % num_temp)
 
     bpb = block_bytes(spb, n_amp, n_aux, n_supply, n_adc, n_din, n_dout, num_temp)
 

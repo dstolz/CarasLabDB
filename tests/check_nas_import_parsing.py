@@ -101,7 +101,9 @@ def rhd_header(fs=1000.0, n_amp=4, version=(3, 5), n_aux=0, n_dig=1, n_dout=0, n
     for k in range(n_dout):
         recs.append(channel("DIGITAL-OUT-%02d" % k, "dout%d" % k, k, 5))
     b += struct.pack("<h", 1) + qstring("Port A") + qstring("A")
-    b += struct.pack("<hhh", group_enabled, len(recs), n_amp)
+    # The group's amplifier count: every type-0 record, enabled or not, as the RHX
+    # writer stores it (savefile.cpp:380); writeRhdHeader.m stores the enabled ones.
+    b += struct.pack("<hhh", group_enabled, len(recs), n_amp + disabled)
     return b + b"".join(recs)
 
 
@@ -126,11 +128,14 @@ def parse_rhd_bytes(data):
 
 
 def check_rhd():
-    # A realistic header: 25 kHz, version 3.5, 64 amplifier channels (+1 disabled),
-    # 3 aux, 2 digital in, 1 digital out, 1 temperature sensor, 2 supply, 1 ADC.
-    kw = dict(fs=25000.0, n_amp=64, version=(3, 5), n_aux=3, n_dig=2, n_dout=1, n_temp=1,
+    # A realistic header: 25 kHz, version 2.0 (temperature sensors: the older software),
+    # 64 amplifier channels (+1 disabled), 3 aux, 2 digital in, 1 digital out,
+    # 1 temperature sensor, 2 supply, 1 ADC.
+    kw = dict(fs=25000.0, n_amp=64, version=(2, 0), n_aux=3, n_dig=2, n_dout=1, n_temp=1,
               n_supply=2, n_adc=1, disabled=1)
     hdr_only = rhd_header(**kw)
+    expect_problem(lambda: parse_rhd_bytes(rhd_header(**dict(kw, version=(3, 5)))),
+                   "rhd_bad_header", "a temperature sensor in a version-3 header")
     bpb = (128 * 4 + 128 * 2 * 64 + 32 * 2 * 3 + 2 * 2 + 128 * 2 * 1 + 128 * 2 + 128 * 2 + 2 * 1)
     check(block_bytes(128, 64, 3, 2, 1, 2, 1, 1) == bpb, "test arithmetic of a block")
     h = parse_rhd_bytes(hdr_only + b"\0" * (bpb * 3))
@@ -1373,6 +1378,233 @@ def check_r8_mat_integrity(tmp):
     check(flips >= 0.95 * 8 * n, "bit flips caught: %d of %d" % (flips, 8 * n))
 
 
+# --------------------------------------------------------------------------- review round 3
+def check_n1_unencodable_names(tmp):
+    """N1: a group with a member whose name is not UTF-8 still has a signature."""
+    check(ids.sha256_text("caf\udce9") != ids.sha256_text("caf\udce8"), "surrogates hash apart")
+    check(ids.sha256_text("café") == __import__("hashlib").sha256("café".encode()).hexdigest(),
+          "valid text hashes as plain UTF-8")
+    check(ids.event_id("recording", ROOT, "a/b") == str(uuid.uuid5(ids.NAMESPACE,
+                                                                  "event:recording:%s:a/b" % ROOT)),
+          "ids are uuid5 for valid text")
+    ids.session_id(ROOT, "a/caf\udce9")                          # must not raise
+    ids.canonical_json({"p": "caf\udce9"})
+    if os.name == "nt":
+        return
+    sigs = []
+    for k, raw in enumerate((b"caf\xe9.rhd", b"caf\xe8.rhd")):
+        root = mini(tmp, "n1_%d" % k)
+        base = recording_folder(root, "SUBJ-ID-1255", "SUBJ-ID-1255_260709_095155")
+        folder = os.path.join(root, *base.split("/"))
+        with open(os.path.join(os.fsencode(folder), raw), "wb") as fh:
+            fh.write(b"x")
+        g = by_key(scan_root(root))[rk("SUBJ-ID-1255/SUBJ-ID-1255_260709_095155")]
+        check(g.status == "held" and g.hold.reason_code == "path_not_storable", "N1 held")
+        sig = ids.signature(g)
+        check(sig == ids.signature(by_key(scan_root(root))[g.key]), "N1 signature is deterministic")
+        sigs.append(sig)
+    check(sigs[0] != sigs[1], "N1 distinct names give distinct signatures")
+    hc = cache.HeaderCache({(ROOT, "a/caf\udce9.rhd", 1, 2): {"reader": "x"}})
+    path = os.path.join(tmp, "n1.json")
+    hc.save(path)
+    check(dict(cache.HeaderCache.load(path)) == dict(hc), "a surrogate key round-trips the cache file")
+
+
+def _mat_inner(data):
+    """The inflated miMATRIX of the first compressed variable of DATA, and its element bounds."""
+    import zlib
+    n = struct.unpack_from("<I", data, 132)[0]
+    return zlib.decompress(data[136:136 + n]), 128, 136 + n
+
+
+def _recompressed(data, inner):
+    import zlib
+    _, start, end = _mat_inner(data)
+    c = zlib.compress(inner)
+    return data[:start] + struct.pack("<II", 15, len(c)) + c + data[end:]
+
+
+def check_n2_nested_damage():
+    """N2: damage inside struct fields is found, uncompressed and (inflated) compressed."""
+    import io
+    good_u = fixture("epsych_n3_u.mat")
+    good_z = fixture("epsych_n5_z.mat")
+    flags = struct.pack("<II", 6, 8)
+    damaged = []
+    # a field name with a byte that is not ASCII
+    at = good_u.index(b"TrialID")
+    damaged.append(("field name, uncompressed", good_u[:at + 2] + b"\xf2" + good_u[at + 3:]))
+    # the first nested matrix (a field value) turned from double into char
+    first = good_u.index(flags, good_u.index(b"TrialID"))
+    damaged.append(("nested class, uncompressed",
+                    good_u[:first + 8] + b"\x04" + good_u[first + 9:]))
+    # a nested dimension changed
+    dims = good_u.index(struct.pack("<IIii", 5, 8, 1, 1), first)
+    damaged.append(("nested dims, uncompressed",
+                    good_u[:dims + 8] + struct.pack("<i", 3) + good_u[dims + 12:]))
+    inner, _s, _e = _mat_inner(good_z)
+    i_first = inner.index(flags, inner.index(b"TrialID"))
+    damaged.append(("nested class, compressed",
+                    _recompressed(good_z, inner[:i_first + 8] + b"\x04" + inner[i_first + 9:])))
+    i_dims = inner.index(struct.pack("<IIii", 5, 8, 1, 1), i_first)
+    damaged.append(("nested dims, compressed", _recompressed(
+        good_z, inner[:i_dims + 8] + struct.pack("<i", 7) + inner[i_dims + 12:])))
+    at = inner.index(b"TrialID")
+    damaged.append(("field name, compressed",
+                    _recompressed(good_z, inner[:at] + b"1rialID" + inner[at + 7:])))
+    check(_recompressed(good_z, inner) != good_z or True, "recompression helper")
+    mat5.verify_file(io.BytesIO(_recompressed(good_z, inner)), len(_recompressed(good_z, inner)))
+    for label, data in damaged:
+        mat_bytes(data)                                   # the header pass does not see it
+        expect_problem(lambda: mat5.verify_file(io.BytesIO(data), len(data)), "mat_corrupt",
+                       "N2 " + label)
+
+
+def check_n3_verify_cost(tmp):
+    """N3: verify_file seeks past data: constant memory, time by elements, not bytes."""
+    import time
+    import tracemalloc
+
+    def tag(t, payload):
+        return struct.pack("<II", t, len(payload)) + payload + b"\0" * ((-len(payload)) % 8)
+    head = b"MATLAB 5.0 MAT-file, Platform: test".ljust(116) + bytes(8) + struct.pack("<H", 0x0100) + b"IM"
+    info = tag(6, struct.pack("<II", 2, 0)) + tag(5, struct.pack("<ii", 1, 1)) + tag(1, b"Info") \
+        + tag(5, struct.pack("<i", 8)) + tag(1, b"")
+    info = struct.pack("<II", 14, len(info)) + info
+    path = os.path.join(tmp, "n3.mat")
+    n = 8 << 20                                           # 8 Mi doubles: a 64 MiB body
+    body = tag(6, struct.pack("<II", 6, 0)) + tag(5, struct.pack("<ii", 1, n)) + tag(1, b"Data")
+    with open(path, "wb") as fh:
+        fh.write(head + struct.pack("<II", 14, len(body) + 8 + 8 * n) + body
+                 + struct.pack("<II", 9, 8 * n))
+        fh.seek(8 * n, 1)
+        fh.write(info)
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    with open(path, "rb") as fh:
+        mat5.verify_file(fh, os.path.getsize(path))
+    dt, peak = time.perf_counter() - t0, tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    check(dt < 5 and peak < 4 << 20, "N3 64 MiB body: %.2f s, peak %d B" % (dt, peak))
+    # a struct array of 100000 elements, one field each, every value an empty matrix
+    m = 100000
+    body = tag(6, struct.pack("<II", 2, 0)) + tag(5, struct.pack("<ii", 1, m)) + tag(1, b"Data") \
+        + tag(5, struct.pack("<i", 8)) + tag(1, b"a".ljust(8, b"\0")) + struct.pack("<II", 14, 0) * m
+    data = head + struct.pack("<II", 14, len(body)) + body + info
+    with open(path, "wb") as fh:
+        fh.write(data)
+    tracemalloc.start()
+    with open(path, "rb") as fh:
+        mat5.verify_file(fh, len(data))
+        check(mat5.epsych_trials(mat5.read_variables(fh, len(data))) == m, "N3 struct read")
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    check(peak < 4 << 20, "N3 struct of 100000 elements: peak %d B" % peak)
+    bad = data[:-len(info) - 8] + struct.pack("<II", 1, 0) + info  # last element is no matrix
+    expect_problem(lambda: mat5.verify_file(__import__("io").BytesIO(bad), len(bad)), "mat_corrupt",
+                   "N3 a struct element that is not a matrix")
+
+
+def check_n4_unresolved_pools(tmp):
+    """N4: an unresolved recording blocks the ePsych sessions of its folder AND its name."""
+    root = mini(tmp, "n4")
+    recording_folder(root, "SUBJ-ID-1225", "SUBJ-ID-1255_260709_095155")
+    for subj in ("SUBJ-ID-1255", "SUBJ-ID-1225"):
+        put(root, "%s/%s/%s_260709T094800.mat" % (E, subj, subj), fixture("epsych_n5_z.mat"))
+    G = by_key(scan_root(root))
+    for subj in ("SUBJ-ID-1255", "SUBJ-ID-1225"):
+        e = G[bk("%s/%s_260709T094800" % (subj, subj))]
+        check(e.status == "held" and e.hold.reason_code == "paired_recording_held",
+              "N4 the %s session near a mislabelled recording: %s %s" % (subj, e.status, e.hold))
+    ov = subjects.parse_overrides("root,relative_path,subject_id,reason\nnas-test,%s/SUBJ-ID-1225/"
+                                  "SUBJ-ID-1255_260709_095155,SUBJ-ID-1225,folder is right\n" % I)
+    G = by_key(scan_root(root, ov))
+    check(G[bk("SUBJ-ID-1225/SUBJ-ID-1225_260709T094800")].status == "ready"
+          and G[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")].status == "ready"
+          and G[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")].pairing.status == "unpaired",
+          "N4 once the override names the subject, the other subject's session is free")
+    root = mini(tmp, "n4b")
+    recording_folder(root, "SUBJ-ID-9", "SUBJ-ID-1255_260709_095155")
+    put(root, "%s/SUBJ-ID-1255/SUBJ-ID-1255_260709T094800.mat" % E, fixture("epsych_n5_z.mat"))
+    e = by_key(scan_root(root))[bk("SUBJ-ID-1255/SUBJ-ID-1255_260709T094800")]
+    check(e.status == "held" and e.hold.reason_code == "paired_recording_held",
+          "N4 a recording under an unknown folder blocks the subject in its name")
+
+
+def check_g_group_amp_count():
+    """G: a v3 group's amplifier-count field must equal its type-0 records."""
+    h = rhd_header(n_amp=4, n_adc=1)
+    cut = h.rfind(qstring("A")) + len(qstring("A"))
+    for main, ok in ((3, False), (2, True), (1, True)):
+        hb = rhd_header(n_amp=4, n_adc=1, version=(main, 0))
+        c = hb.rfind(qstring("A")) + len(qstring("A"))
+        bad = hb[:c + 4] + struct.pack("<h", 3) + hb[c + 6:]
+        spb = 60 if main == 1 else 128
+        data = bad + b"\0" * block_bytes(spb, 4, n_adc=1, n_temp=0)
+        if ok:
+            check(parse_rhd_bytes(data).num_amplifier_channels == 4, "G not checked for v%d" % main)
+        else:
+            expect_problem(lambda: parse_rhd_bytes(data), "rhd_bad_header", "G v3 count mismatch")
+    # Every single-byte change of a v3 header with 4 amplifier and 1 ADC channels, the data
+    # blocks not zeros (as recorded data is not): none may be accepted with another
+    # amplifier-channel count or block count -- the changed type of a channel included.
+    # Not detectable from one header, and not asserted: a rate changed into another
+    # RHX rate (the sibling check of a recording catches it when it has two files) and a
+    # swap between board types of equal block size (an ADC and the only digital input).
+    nb = 3 * block_bytes(128, 4, n_adc=1)
+    full = h + (bytes(range(1, 256)) * (nb // 255 + 1))[:nb]
+    want = parse_rhd_bytes(full)
+    facts = lambda x: (x.num_amplifier_channels, x.num_data_blocks)  # noqa: E731
+    wrong = []
+    for pos in range(len(h)):
+        for v in {full[pos] ^ (1 << b) for b in range(8)} | {0, 0xFF, 3, 1}:
+            if v == full[pos]:
+                continue
+            b = bytearray(full)
+            b[pos] = v
+            try:
+                got = parse_rhd_bytes(bytes(b))
+            except rhd.RhdProblem:
+                continue
+            if facts(got) != facts(want):
+                wrong.append((pos, v, facts(got)))
+    check(not wrong, "G single-byte header changes accepted with other facts: %s" % wrong[:5])
+    del cut
+
+
+def check_e_hooks(tmp):
+    """E1 stats, E2 session id, E3 codes."""
+    root = mini(tmp, "e")
+    recording_folder(root, "SUBJ-ID-1255", "SUBJ-ID-1255_260709_095155", n_files=2)
+    put(root, E + "/SUBJ-ID-1255/SUBJ-ID-1255_260709T094800.mat", fixture("epsych_n5_z.mat"))
+    listings = [walk.walk(root, spec) for spec in SPECS]
+    stats = {}
+    with CountingOpener() as o:
+        cold = interpret(listings, {ROOT: root}, KNOWN, stats=stats)
+    check(stats.get("files_opened") == len(o.opened) == 3 and stats.get("bytes_read", 0) > 0,
+          "E1 stats %s" % stats)
+
+    class Stats:
+        pass
+    st = Stats()
+    interpret(listings, {ROOT: root}, KNOWN, header_cache=cold.headers, stats=st)
+    check(getattr(st, "files_opened", 0) == 0 and getattr(st, "bytes_read", 0) == 0,
+          "E1 a warm cache reads nothing")
+    beh = [g for g in cold.groups if g.kind == "behavior"][0]
+    other = "00000000-0000-5000-8000-000000000001"
+    src = ids.digest_source(beh, session_id=other)
+    check(src["session_id"] == other and ids.digest_source(beh)["session_id"] == ids.group_session_id(beh),
+          "E2 digest_source session id")
+    check(ids.client_digest(beh, session_id=other) != ids.client_digest(beh)
+          and ids.event_attributes(beh, "v", session_id=other)["client_digest"]
+          == ids.client_digest(beh, session_id=other), "E2 digest and attributes")
+    for code in ("would_correct", "content_changed", "late_recording", "path_case_conflict",
+                 "registered_but_withdrawn", "copy_ambiguous", "copy_event_mismatch",
+                 "duplicate_content", "session_conflict", "local_time_nonexistent",
+                 "local_time_ambiguous", "unknown_subject", "name_case_conflict"):
+        check(code in REASON_CODES, "E3 %s" % code)
+
+
 def main():
     check_rhd()
     check_mat()
@@ -1400,6 +1632,12 @@ def main():
         check_m13_incomplete(tmp)
         check_r7_hostile_cache(tmp)
         check_r8_mat_integrity(tmp)
+        check_n1_unencodable_names(tmp)
+        check_n2_nested_damage()
+        check_n3_verify_cost(tmp)
+        check_n4_unresolved_pools(tmp)
+        check_g_group_amp_count()
+        check_e_hooks(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("check_nas_import_parsing: OK")
