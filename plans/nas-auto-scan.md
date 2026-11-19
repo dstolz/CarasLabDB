@@ -17,7 +17,7 @@ Registration is permanent (`artifact` and `event` are append-only, and a file's 
 ### What this changes in `plans/nas-file-registration.md`
 | There | Now |
 |---|---|
-| "No schema change" (Part 1) | Five tables, three views, four functions and one integrity check (Part 1 here). Version stays 1: the database is not launched. |
+| "No schema change" (Part 1) | Five tables, three views, three read functions, two policy triggers and one integrity check (Part 1 here). Version stays 1: the database is not launched. |
 | Directories in a TOML config (Part 2) | Rows of `lab.scan_directory`. `lab_time_zone` and `min_age_hours` become columns of the directory. |
 | A group younger than `min_age_hours` by its files' modification times is skipped | A group is registered once two complete listings at least `min_age` apart show it unchanged (below). Modification times no longer decide it. |
 | Unchanged files found by size and `attributes.source_mtime` | Found by the scan memory (`lab.scan_file`), which names the artifact. `source_mtime` is still stored. |
@@ -39,15 +39,16 @@ Registration is permanent (`artifact` and `event` are append-only, and a file's 
 | `scan_interval_min` | minutes between searches, at least 1 |
 | `window_start`, `window_end` | allowed hours `[start, end)`, both or neither; wraps midnight when start > end |
 | `min_age_min` | how long a group must be seen unchanged before it is registered. Default 1440. |
-| `mode` | `off`, `report` (search and report, write nothing but the run log) or `register`. Default `report`. |
+| `mode` | `off`, `report` (search, remember what was seen and report what would be registered; registers nothing and reads no file to its end) or `register`. Default `report`. |
+| `mode_changed_at` | kept by the trigger, so a directory that was `off` is not called overdue for that time |
 | `notes`, `created_at`, `created_by`, `created_login` | `row_history` does not log an INSERT, so the creator is stamped on the row |
 
 Rules, in `trg_scan_directory_policy` (advisory lock per root; the name sorts after the path normalisation):
-- Among directories that are not `off`, no two on one root may be equal or nested, compared without regard to case (SMB ignores it). Not with `LIKE`: `_` is a wildcard.
+- Among directories that are not `off`, no two on one root may be equal or nested, compared without regard to case (SMB ignores it). Not with `LIKE`: `_` is a wildcard. Case is folded with `lower()`, which in a C-locale database folds ASCII letters only.
 - Root, path, layout, `time_zone` and the `created_*` columns are frozen once the directory has a run. To change them, turn the directory `off` and add another.
 - A directory with runs cannot be deleted (foreign key).
 
-**`lab.scan_run`** (append-only): written when a run of one directory starts. Directory, `command` (`run` or `apply`), `mode`, `due_at` (the scheduled time it answers; NULL for a run made by hand), `started_at` (database clock), tool version, host, `run_login` (stamped).
+**`lab.scan_run`** (append-only): written when a run of one directory starts. Directory, `command` (`run` or `apply`), `mode`, `due_at` (the scheduled time it answers, as the database gave it; NULL for a run made by hand, which never moves the schedule), `started_at` (database clock), tool version, host, `run_login` (stamped). A run locks its directory against a concurrent change of the frozen columns.
 
 **`lab.scan_run_result`** (append-only): written when it ends. `outcome` (`ok`, `partial`, `failed`, `unreachable`), counts of files and groups, bytes read, message. A run with no result is running or was interrupted.
 
@@ -67,8 +68,9 @@ Views `scan_file_latest` (latest row per root and path) and `scan_held`.
 **The schedule has one definition**: `lab.fn_scan_status(p_now)`, one row per directory; `scan_directory_status` is it at `now()`, `fn_scan_due(p_now)` its due rows, `fn_scan_window_open(id, p_now)` the window test alone. Times of day and durations are returned as text and whole numbers, so no client does interval arithmetic.
 - **Due** when `mode <> 'off'`, `p_now >= due_at` and the local time in `time_zone` is inside the window.
 - **`due_at`** is anchored, so a daily search does not start a little later each day: the directory's `created_at` if it never ran; else the last `ok` scheduled run's `due_at` plus the interval, moved up to `p_now` when more than one interval behind; at once after `partial`; `least(interval, 60 min)` after `failed` or `unreachable`.
-- **Overdue** when `p_now > due_at + interval + 26 h`.
-- Daylight saving: a window inside the skipped hour does not open that day; the repeated hour is harmless.
+- A run with no result does not move the schedule, so an interrupted run does not stall its directory.
+- **Overdue** when `p_now > D + interval + 26 h`, where D is the later of the time the last `ok` search was due plus the interval (the directory's `created_at` when there is none) and `mode_changed_at`. It is measured from the last search that succeeded, so repeated failures do not reset it.
+- Daylight saving: the interval is counted in minutes, so a daily search moves one hour on the wall clock at a change; with a window it then starts at the window's next opening. A window inside the skipped hour does not open that day; the repeated hour is harmless.
 
 **Integrity**: check 16, `scan_directory_overlap` (the nesting rule is a trigger, so it gets a check).
 
@@ -89,10 +91,15 @@ Commands: `scan` and `apply` (the reviewed path of the importer plan, now readin
 1. Read the due directories, earliest `due_at` first. A directory whose root was not given is skipped and counted.
 2. Per directory: take an advisory lock (a second process skips it), check the root marker, append the `scan_run` row. A missing or empty directory is `unreachable`.
 3. **List** it completely with `os.scandir`: names and sizes only, no file is opened, symbolic links are not followed. A paired directory is listed in the same pass. **If any folder cannot be listed the run is `failed`: nothing is registered and nothing is concluded from what is absent.**
-4. **Decide what to read.** A file whose latest memory row is `registered` or `known` with the same size and `mtime_ns`, and whose artifact is still active and present, is skipped unread. Everything else is a candidate.
-5. **Interpret** candidates with the layout, as in the importer plan.
+4. **Decide what to read.** A file whose latest memory row is `registered` or `known` with the same size and `mtime_ns`, and whose artifact is still active and present, is not opened: its header comes from a local cache (`--cache-file`, an optimisation only; without it the first few kilobytes are read again). A held file with the same size, `mtime_ns` and reason is not read to its end again either.
+5. **Interpret** with the layout, as in the importer plan. **A directory and the one it is paired with are judged together**, whichever of the two is being searched:
+   - an ePsych session paired with a recording waits until that recording is registered, and is held while the recording is held;
+   - an ePsych session with no recording is registered on its own only when no recording folder of that subject that could pair with it is in sight in any state;
+   - a run writes memory rows, and registers, only for its own directory's files.
+   
+   A recording that reaches the NAS after its ePsych session was registered on its own is held as `late_recording`. Give the ePsych directory a minimum age longer than the longest delay between the two backups.
 6. **Wait for stability.** A group is registered only when two complete listings at least `min_age_min` apart, by the database clock, show the same files with the same sizes and `mtime_ns`; the first sighting writes `pending` rows. This replaces the modification-time rule: a backup tool that preserves timestamps would make a half-copied recording look old, and a rig clock that runs ahead would make a file look young for ever.
-7. **Register** (mode `register`): hash the group's files (4 MiB chunks), stat each again, and write the group in one transaction exactly as `apply` does (session, event, artifacts, `ok` verification rows) together with its memory rows. The window is asked again before each group; when it has closed the run ends `partial` and continues at the next opening.
+7. **Register** (mode `register`): hash the group's files (4 MiB chunks), stat each again, and write the group in one transaction exactly as `apply` does (session, event, artifacts, `ok` verification rows) together with its memory rows. The window is asked again before each group; when it has closed the run ends `partial` and continues at the next opening. **Mode `report`** does steps 1 to 6, writes the same `pending`, `held` and `cleared` rows, and stops there: its report names the groups that are stable and would be registered.
 8. Append the `scan_run_result` row, write the report (CSV and text) when anything happened, one line to the log file.
 
 **An unattended run only adds.** These are held for a person, and done with `scan` / `apply`:
@@ -148,7 +155,8 @@ A file whose size or `mtime_ns` changed but whose bytes are the registered ones 
   - a folder that cannot be listed gives `failed` and no rows;
   - a touched file is read once, becomes `known`, and gets no artifact;
   - a changed file, a late recording and a case variant are held, and nothing is superseded;
-  - `report` mode writes run rows only;
+  - `report` mode writes sightings and registers nothing; switched to `register`, a group that was already stable is registered by the next run;
+  - an ePsych session waits for its recording, and is registered alone only when no recording could pair with it;
   - a member's INSERT into `scan_file` is refused.
 - `python -m pytest -q mcp-server/tests` passes with the three new tools.
 - MATLAB CI: a member sees disabled controls; the owner adds and edits a directory; `row_history` holds the edit.
