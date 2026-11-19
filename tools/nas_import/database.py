@@ -170,6 +170,16 @@ _DETAIL_SQL = {
 }
 
 
+# The detail columns a correction carries forward or sets, with their types.
+_DETAIL_CARRY = {
+    "recording": {"acquisition_system_code": "text", "probe_id": "uuid", "modality": "text",
+                  "sample_rate_hz": "numeric", "n_channels": "integer", "duration_s": "numeric",
+                  "stimulus_protocol": "text", "hardware_config": "jsonb"},
+    "behavior": {"task": "text", "paradigm": "text", "stage": "text",
+                 "trials_completed": "integer", "performance": "numeric", "reward": "text"},
+}
+
+
 def _chunks(items, n=5000):
     items = list(items)
     for k in range(0, len(items), n):
@@ -414,18 +424,29 @@ class Database:
             "AND starts_with(lower(relative_path), lower(%s)) ORDER BY 1",
             (root_id, directory_path + "/"))]
 
-    def raw_copies(self, checksums) -> dict[str, list[tuple[str, str]]]:
-        """checksum -> [(event_id, artifact_id)] of active ``raw`` artifacts of active events."""
-        out: dict[str, list[tuple[str, str]]] = {}
+    def raw_copies(self, checksums) -> dict[str, list[tuple[str, str, str]]]:
+        """checksum -> [(event_id, artifact_id, "root:path")] of active ``raw`` artifacts.
+
+        Only artifacts of active events (neither superseded nor retracted).
+        """
+        out: dict[str, list[tuple[str, str, str]]] = {}
         for chunk in _chunks(sorted(set(checksums))):
-            for c, e, a in self.all(
-                    "SELECT a.checksum, a.produced_by_event_id::text, a.artifact_id::text "
-                    "FROM lab.artifact_active a "
+            for c, e, a, where in self.all(
+                    "SELECT a.checksum, a.produced_by_event_id::text, a.artifact_id::text, "
+                    "sr.name || ':' || a.relative_path FROM lab.artifact_active a "
                     "JOIN lab.event_active e ON e.event_id = a.produced_by_event_id "
+                    "JOIN lab.storage_root sr ON sr.root_id = a.storage_root_id "
                     "WHERE a.role = 'raw' AND a.checksum_algo = 'sha256' AND a.checksum = ANY(%s) "
                     "ORDER BY 1, 2, 3", (chunk,)):
-                out.setdefault(c, []).append((e, a))
+                out.setdefault(c, []).append((e, a, where))
         return out
+
+    def written_by(self, event_id: str, tool: str) -> bool:
+        """Whether EVENT_ID was written by TOOL (its captured_by_tool or import block says so)."""
+        return bool(self.one(
+            "SELECT coalesce(attributes->>'captured_by_tool' = %s, false) "
+            "OR coalesce(attributes->'import'->>'tool' = %s, false) "
+            "FROM lab.event WHERE event_id = %s::uuid", (tool, tool, event_id))[0])
 
     def event_artifacts(self, event_id: str) -> dict[str, str]:
         """checksum -> artifact_id of the active artifacts of EVENT_ID (the first by id)."""
@@ -509,18 +530,155 @@ class Database:
 
     def insert_artifact(self, event_id: str, root_id: int, path: str, checksum: str, size: int,
                         role: str, file_format: str | None, subject_id: str | None,
-                        session_id: str | None, attributes: str) -> str:
-        """A new lab.artifact row and its ``ok`` verification; returns the artifact id."""
+                        session_id: str | None, attributes: str, artifact_id: str | None = None,
+                        verified_us: int | None = None) -> str:
+        """A new lab.artifact row and its ``ok`` verification; returns the artifact id.
+
+        ARTIFACT_ID None lets the database mint the id. VERIFIED_US is when
+        the bytes were read (microseconds since 1970); None means now.
+        """
         artifact_id = self.one(
-            "INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
-            "checksum, checksum_algo, size_bytes, role, format, subject_id, session_id, "
-            "attributes) VALUES (%s::uuid, %s, %s, %s, 'sha256', %s, %s, %s, %s, %s::uuid, "
-            "%s::jsonb) RETURNING artifact_id::text",
-            (event_id, root_id, path, checksum, size, role, file_format, subject_id, session_id,
-             attributes))[0]
-        self.insert_verification(artifact_id, checksum)
+            "INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, "
+            "relative_path, checksum, checksum_algo, size_bytes, role, format, subject_id, "
+            "session_id, attributes) VALUES (coalesce(%s::uuid, gen_random_uuid()), %s::uuid, "
+            "%s, %s, %s, 'sha256', %s, %s, %s, %s, %s::uuid, %s::jsonb) "
+            "RETURNING artifact_id::text",
+            (artifact_id, event_id, root_id, path, checksum, size, role, file_format, subject_id,
+             session_id, attributes))[0]
+        self.insert_verification(artifact_id, checksum, verified_us)
         return artifact_id
 
-    def insert_verification(self, artifact_id: str, checksum: str) -> None:
-        self.run("INSERT INTO lab.artifact_verification (artifact_id, status, observed_checksum) "
-                 "VALUES (%s::uuid, 'ok', %s)", (artifact_id, checksum))
+    def insert_verification(self, artifact_id: str, checksum: str,
+                            verified_us: int | None = None) -> None:
+        self.run("INSERT INTO lab.artifact_verification (artifact_id, status, observed_checksum, "
+                 "verified_at) VALUES (%s::uuid, 'ok', %s, coalesce(timestamptz 'epoch' + "
+                 "%s::bigint * interval '1 microsecond', now()))",
+                 (artifact_id, checksum, verified_us))
+
+    # ------------------------------------------------- the reviewed path only
+    def identity(self) -> dict:
+        """What says which database this is: its name, its oid and the cluster's identifier."""
+        name, oid, system = self.one(
+            "SELECT current_database()::text, (SELECT oid::bigint FROM pg_database "
+            "WHERE datname = current_database()), (SELECT system_identifier::text "
+            "FROM pg_control_system())")
+        return {"name": name, "oid": int(oid), "system_identifier": system}
+
+    def event_text(self, event_id: str, zone: str) -> dict | None:
+        """The event's columns and its detail row's as exact text (NULL is None).
+
+        ``occurred_local`` is occurred_at as wall-clock text in ZONE.
+        """
+        row = self.one(
+            "SELECT e.event_type, e.subject_id, e.session_id::text, "
+            "to_char(e.occurred_at AT TIME ZONE %s, 'YYYY-MM-DD HH24:MI:SS'), e.attributes "
+            "FROM lab.event e WHERE e.event_id = %s::uuid", (zone, event_id))
+        if row is None:
+            return None
+        out = {"event_type": row[0], "subject_id": row[1], "session_id": row[2],
+               "occurred_local": row[3], "attributes": row[4], "detail": {}}
+        if row[0] in _DETAIL_CARRY:
+            for key, value in self.all(
+                    "SELECT j.key, j.value FROM lab.%s_event d CROSS JOIN LATERAL "
+                    "jsonb_each_text(to_jsonb(d)) j WHERE d.event_id = %%s::uuid" % row[0],
+                    (event_id,)):
+                if key not in ("event_id", "event_type"):
+                    out["detail"][key] = value
+        return out
+
+    def active_artifacts(self, event_id: str) -> list[tuple[str, int, str, str]]:
+        """(artifact_id, storage_root_id, relative_path, checksum) of the event's active files."""
+        return self.all("SELECT artifact_id::text, storage_root_id, relative_path, checksum "
+                        "FROM lab.artifact_active WHERE produced_by_event_id = %s::uuid "
+                        "ORDER BY 1", (event_id,))
+
+    def supersede_event(self, old_id: str, new_id: str, subject_id: str, session_id: str,
+                        occurred_local: str, zone: str, attributes: str, drop: list[str],
+                        detail: dict) -> None:
+        """The correction of event OLD_ID: a new event and detail row that supersede it.
+
+        As ``@CarasLabDB/supersedeEvent.m``: every column is carried forward
+        except those given here. The carried values never leave the database
+        (INSERT ... SELECT), so none passes through a float. ATTRIBUTES (JSON
+        text) is laid over the old attributes after the keys in DROP are
+        removed; DETAIL gives the detail columns that change. The old event's
+        input edges are copied. recorded_by and recorded_login are the
+        database's to fill.
+        """
+        event_type = self.one("SELECT event_type FROM lab.event WHERE event_id = %s::uuid",
+                              (old_id,))[0]
+        self.run(
+            "INSERT INTO lab.event (event_id, event_type, subject_id, session_id, occurred_at, "
+            "notes, attributes, supersedes) "
+            "SELECT %s::uuid, e.event_type, %s::text, %s::uuid, %s::timestamp AT TIME ZONE %s, "
+            "e.notes, "
+            "(e.attributes - %s::text[]) || %s::jsonb, e.event_id "
+            "FROM lab.event e WHERE e.event_id = %s::uuid",
+            (new_id, subject_id, session_id, occurred_local, zone, drop, attributes, old_id))
+        columns = _DETAIL_CARRY[event_type]
+        unknown = sorted(set(detail) - set(columns))
+        if unknown:
+            raise DatabaseError("the %s detail has no column %s" % (event_type, ", ".join(unknown)))
+        values, params = [], [new_id]
+        for column, cast in columns.items():
+            if column in detail:
+                values.append("%s::" + cast)
+                params.append(detail[column])
+            else:
+                values.append("d." + column)
+        self.run("INSERT INTO lab.%s_event (event_id, %s) SELECT %%s::uuid, %s "
+                 "FROM lab.%s_event d WHERE d.event_id = %%s::uuid"
+                 % (event_type, ", ".join(columns), ", ".join(values), event_type),
+                 params + [old_id])
+        self.run("INSERT INTO lab.event_input (event_id, artifact_id, role) "
+                 "SELECT %s::uuid, artifact_id, role FROM lab.event_input "
+                 "WHERE event_id = %s::uuid", (new_id, old_id))
+
+    def supersede_artifact(self, old_id: str, new_id: str, event_id: str) -> None:
+        """A row for the same file, produced by EVENT_ID and filed under its subject and session.
+
+        As ``pArtifactSuccessor`` / ``pFollowEvent``: every column is carried
+        except the regenerated ones; where the event names a subject or a
+        session the row takes it, where it names none the row keeps its own.
+        """
+        self.run(
+            "INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, "
+            "relative_path, checksum, checksum_algo, size_bytes, role, format, subject_id, "
+            "session_id, supersedes, attributes) "
+            "SELECT %s::uuid, e.event_id, a.storage_root_id, a.relative_path, a.checksum, "
+            "a.checksum_algo, a.size_bytes, a.role, a.format, coalesce(e.subject_id, a.subject_id), "
+            "coalesce(e.session_id, a.session_id), a.artifact_id, a.attributes "
+            "FROM lab.artifact a, lab.event e WHERE a.artifact_id = %s::uuid "
+            "AND e.event_id = %s::uuid", (new_id, old_id, event_id))
+
+    def carry_tags(self, kind: str, old_id: str, new_id: str) -> list[str]:
+        """Copy the current tags of OLD_ID onto NEW_ID through lab.fn_tag.
+
+        As ``pCarryTags``: a retired tag cannot be assigned and is skipped;
+        the skipped tags are returned for the report.
+        """
+        retired = [r[0] for r in self.all(
+            "SELECT c.tag FROM lab.tag_current c JOIN lab.tag t ON t.tag = c.tag "
+            "WHERE c.entity_kind = %s AND c.entity_id = %s AND t.retired_at IS NOT NULL "
+            "ORDER BY 1", (kind, old_id))]
+        self.all("SELECT lab.fn_tag(%s::text, %s::text, x.tag, 'add', %s::text) FROM (SELECT c.tag "
+                 "FROM lab.tag_current c JOIN lab.tag t ON t.tag = c.tag "
+                 "WHERE c.entity_kind = %s AND c.entity_id = %s AND t.retired_at IS NULL "
+                 "ORDER BY c.tag) x", (kind, new_id, "carried forward from " + old_id, kind,
+                                       old_id))
+        return retired
+
+    def insert_disposition(self, artifact_id: str, successor_id: str, occurred_us: int,
+                           note: str, attributes: str) -> None:
+        """Record the file of ARTIFACT_ID as ``replaced`` by SUCCESSOR_ID."""
+        self.run("INSERT INTO lab.artifact_disposition (artifact_id, disposition, "
+                 "successor_artifact_id, occurred_at, note, attributes) VALUES (%s::uuid, "
+                 "'replaced', %s::uuid, timestamptz 'epoch' + %s::bigint * interval "
+                 "'1 microsecond', %s, %s::jsonb)",
+                 (artifact_id, successor_id, occurred_us, note, attributes))
+
+    def session_note(self, session_id: str, note: str, new_path: str | None = None) -> None:
+        """Append NOTE to the session's notes; with NEW_PATH also give it that path."""
+        self.run("UPDATE lab.session SET notes = concat_ws(chr(10), notes, %s::text), "
+                 "relative_path = coalesce(%s::text, relative_path) WHERE session_id = %s::uuid",
+                 (note, new_path, session_id))

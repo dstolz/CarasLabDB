@@ -23,15 +23,42 @@ Commands
            remembers what it saw in lab.scan_file, and -- in mode
            ``register`` -- registers every group of files that a complete
            listing at least ``min_age_min`` earlier showed exactly as this one
-           does (nas_import/engine.py states the rule). Mode ``report`` does
-           everything but read files to their end and register.
+           does (nas_import/engine.py states the rule). The wait is counted
+           from the START of the earlier run; its listing ended at most a
+           listing's duration later. Mode ``report`` does everything but
+           read files to their end and register.
 ``check``  Searches nothing and writes nothing. Exit 1 when a directory is
            overdue, when two listed directories overlap, or when a directory
            that is due lies on a storage root not given with ``--root`` (this
            third test is skipped, and said to be, when no ``--root`` is
            given). Prints the pending and held files of each directory.
            Schedule it and alert on it, as ``backup_lab.py --check``.
-``scan``, ``apply``  The reviewed path; not implemented yet.
+``scan``   The reviewed path, first half. Reads the named directories (in any
+           mode, each with the directory it is paired with) and the database
+           and writes NOTHING to the NAS, the database or the cache file.
+           Into ``--out`` it writes a plan (JSON lines; nas_import/reviewed.py
+           documents it), a CSV and a text report: per group what would be
+           done -- register, add files, correct an event, record a file as
+           replaced, move a behavior session into its recording's session,
+           attach a copy -- with the SHA-256 of every file that would be
+           written, and everything that stays held for a person. Exit 1 when
+           a named directory could not be listed completely (nothing is
+           planned for it).
+``apply``  The second half: writes exactly a plan that a person has read.
+           Refused outright (exit 2, nothing written): a plan that was edited
+           or truncated, of another plan format, made against another
+           database, or naming a storage root not given. A group is refused,
+           the others proceed, unless every file of it still has the size and
+           modification time of the plan, the plan's listing is at least the
+           directory's current ``min_age_min`` old, and the database is as the
+           scan found it. The files are not read again: the verification rows
+           carry the time of the scan's read. One transaction per group,
+           with its memory rows, so the next ``run`` finds nothing to do for
+           it. ``--only GROUP_KEY`` (repeatable) applies only those groups;
+           ``--dry-run`` makes every check and writes nothing. Exit 0 when
+           every group the plan acts on (all of them, or those named) was
+           applied; 1 when any was refused; groups the plan holds or lets
+           wait are never applied and do not count.
 
 Options of ``run``
 ------------------
@@ -41,6 +68,9 @@ Options of ``run``
                    the other, and a root whose ``.caraslabdb-root.json`` names
                    another root. A due directory whose root was not given is
                    skipped and counted.
+                   Give each root its ``.caraslabdb-root.json`` marker (a JSON
+                   object with the root's ``name``), so that one folder cannot
+                   be searched under two root names.
 --directory ID     only this scan_directory_id; repeatable.
 --now              search the named directories (or all that are not ``off``)
                    whether due or not. Such a run is made by hand: it records
@@ -79,8 +109,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from nas_import import engine, report, subjects, walk  # noqa: E402
-from nas_import.database import Database  # noqa: E402
+from nas_import import engine, report, reviewed, subjects, walk  # noqa: E402
+from nas_import.cache import HeaderCache  # noqa: E402
+from nas_import.database import ConnectionLost, Database  # noqa: E402
 
 PROG = "import_nas_files"
 
@@ -305,8 +336,135 @@ def cmd_check(args):
     return 0
 
 
-def cmd_not_yet(args):
-    raise Usage("%s is not implemented yet (the reviewed path follows); use run" % args.command)
+def cmd_scan(args):
+    if not args.root:
+        raise Usage("give at least one --root NAME=PATH")
+    if not args.directory:
+        raise Usage("scan: name the directories with --directory ID")
+    roots = parse_roots(args.root)
+    overrides, overrides_digest = (), None
+    if args.overrides:
+        try:
+            overrides = subjects.read_overrides(args.overrides)
+            overrides_digest = reviewed.file_digest(args.overrides)
+        except (subjects.OverrideError, OSError, UnicodeError) as exc:
+            raise Usage("--overrides %s: %s" % (args.overrides, exc)) from None
+    db = connect(roots)
+    every = {d.id: d for d in db.directories()}
+    for wanted in args.directory:
+        if wanted not in every:
+            raise Usage("no scan directory %d in lab.scan_directory" % wanted)
+        if every[wanted].root not in roots:
+            raise Usage("scan directory %s: its storage root was not given with --root"
+                        % every[wanted].name)
+    cache = HeaderCache.load(args.cache_file) if args.cache_file else None   # read, never written
+    stamp = engine.us_text(db.now_us()).replace("-", "").replace(":", "")
+    records = [{"type": "plan", "format": reviewed.FORMAT, "tool": PROG}]
+    planned = {}
+    try:
+        for d in reviewed.scan_order([every[i] for i in sorted(set(args.directory))]):
+            records += reviewed.scan_directory(db, d, roots[d.root], overrides, cache, planned)
+        text = reviewed.plan_text(records, engine.VERSION, db.identity(), overrides_digest)
+    except Exception as exc:
+        if db.lost(exc):
+            raise Usage("the database connection was lost: %s" % str(exc).strip()) from None
+        raise
+    db.close()
+    os.makedirs(args.out, exist_ok=True)
+    stem = os.path.join(args.out, "plan_%s" % stamp)
+    table, summary = reviewed.scan_report(records)
+    for suffix, content in ((".jsonl", text), (".csv", table), (".txt", summary)):
+        with open(stem + suffix, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+    print(summary)
+    print("plan: %s.jsonl" % stem)
+    failed = [r for r in records if r["type"] == "failed"]
+    for r in failed:
+        print("%s: ERROR: directory %d could not be scanned: %s" % (PROG, r["directory"],
+                                                                    r["reason"]), file=sys.stderr)
+    return 1 if failed else 0
+
+
+def cmd_apply(args):
+    try:
+        plan = reviewed.PlanFile(args.plan)
+    except reviewed.PlanError as exc:
+        raise Usage(str(exc)) from None
+    roots = parse_roots(args.root)
+    missing = sorted({r["root"] for r in plan.directories} - set(roots))
+    if missing:
+        raise Usage("the plan names storage root(s) %s, not given with --root"
+                    % ", ".join(missing))
+    keys = {g["key"]: g for g in plan.groups}
+    for key in args.only:
+        if key not in keys:
+            raise Usage("--only %s: the plan has no such group" % key)
+        if keys[key]["action"] not in reviewed.ACTIONS:
+            raise Usage("--only %s: the plan does not act on this group (%s)"
+                        % (key, keys[key]["action"]))
+    db = connect(roots)
+    here = db.identity()
+    if here != plan.end["database"]:
+        raise Usage("the plan was made against database %s; this is %s. Scan this database."
+                    % (plan.end["database"], here))
+    if not args.dry_run:
+        lacking = db.missing_log_privileges()
+        if lacking:
+            raise Usage("the login %s may not INSERT into %s: nothing was applied."
+                        % (db.login(), ", ".join(lacking)))
+    applied, refused, notes = [], [], []
+    dry_sessions = set()            # the sessions a dry run would have made so far
+    host = socket.gethostname()
+    for record in plan.directories:
+        mine = [g for g in plan.groups if g["directory"] == record["id"]
+                and g["action"] in reviewed.ACTIONS and (not args.only or g["key"] in args.only)]
+        if not mine:
+            continue
+        try:
+            if not db.lock(record["id"]):
+                refused += [(g["key"], "the directory is being searched by another process")
+                            for g in mine]
+                continue
+            try:
+                out = reviewed.apply_directory(db, plan, record, roots[record["root"]],
+                                               set(args.only), args.dry_run, engine.VERSION, host,
+                                               dry_sessions)
+            finally:
+                if not db.lost():
+                    db.unlock(record["id"])
+        except Exception as exc:
+            if isinstance(exc, ConnectionLost) or db.lost(exc):
+                raise Usage("the database connection was lost while the plan was applied: %s. "
+                            "Groups already applied stay applied; scan again for the rest."
+                            % str(exc).strip()) from None
+            raise
+        applied += out["applied"]
+        refused += out["refused"]
+        notes += out["notes"]
+    db.close()
+    verb = "would be applied" if args.dry_run else "applied"
+    for key in applied:
+        print("%s  %s (%s)" % (verb, key, keys[key]["action"]))
+    for key, why in refused:
+        print("REFUSED  %s (%s): %s" % (key, keys[key]["action"], why))
+    for note in notes:
+        print("NOTE  %s" % note)
+    skipped = sum(1 for g in plan.groups if g["action"] in ("held", "wait"))
+    print("The files were not read again: each had the size and modification time the scan "
+          "recorded, and the verification rows carry the time of the scan's read.")
+    if skipped:
+        print("%d group(s) are held or waiting in the plan and were not touched." % skipped)
+    text = "apply%s %s: %d group(s) %s, %d refused" % (
+        " (dry run)" if args.dry_run else "", os.path.basename(args.plan), len(applied), verb,
+        len(refused))
+    if refused:
+        text += ": " + "; ".join("%s: %s" % (k, why) for k, why in refused[:5])
+        print("%s: ERROR: %s" % (PROG, text), file=sys.stderr)
+        report.log_line(args.log_file, "ERROR %s" % text)
+        return 1
+    print("%s: OK: %s" % (PROG, text))
+    report.log_line(args.log_file, "OK %s" % text)
+    return 0
 
 
 def main(argv=None):
@@ -321,7 +479,14 @@ def main(argv=None):
     sub.required = True
     root_help = "where storage root NAME (lab.storage_root.name) is mounted; repeatable"
 
-    run = sub.add_parser("run", help="search the directories that are due (unattended)")
+    run = sub.add_parser(
+        "run", help="search the directories that are due (unattended)",
+        description="Search the directories that are due and register what a complete listing "
+                    "at least min_age_min earlier showed unchanged. The wait is counted from "
+                    "the START of the earlier run (its listing ended at most a listing's "
+                    "duration later). Give each storage root its .caraslabdb-root.json marker "
+                    "(a JSON object with the root's name), so that one folder cannot be "
+                    "searched under two root names.")
     run.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     run.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
                      help="only this scan_directory_id; repeatable")
@@ -345,13 +510,38 @@ def main(argv=None):
                        help="append one line per run (OK or ERROR) to FILE")
     check.set_defaults(func=cmd_check)
 
-    for name, text in (("scan", "write a plan file for review (not implemented yet)"),
-                       ("apply", "write a reviewed plan (not implemented yet)")):
-        sub.add_parser(name, help=text, add_help=False).set_defaults(func=cmd_not_yet)
+    scan = sub.add_parser(
+        "scan", help="write a plan for review; writes nothing to the NAS or the database",
+        description="Read the named directories (in any mode) and the database, and write a "
+                    "plan file (JSON lines), a CSV and a text report into --out. Nothing is "
+                    "written to the NAS, the database or the cache file.")
+    scan.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
+    scan.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
+                      help="a scan_directory_id to scan; repeatable. Name a directory and the "
+                           "one it is paired with together")
+    scan.add_argument("--out", required=True, metavar="DIR", help="where the plan is written")
+    scan.add_argument("--overrides", metavar="FILE", help="the reviewed overrides CSV")
+    scan.add_argument("--cache-file", metavar="FILE",
+                      help="file headers of registered files; read, never written by scan")
+    scan.set_defaults(func=cmd_scan)
 
-    args, extra = parser.parse_known_args(argv)
-    if extra and args.func is not cmd_not_yet:
-        parser.error("unrecognized arguments: %s" % " ".join(extra))
+    apply = sub.add_parser(
+        "apply", help="write exactly a reviewed plan",
+        description="Carry out the plan a scan wrote. A group is refused, and nothing written "
+                    "for it, unless its files have the size and modification time of the plan, "
+                    "the plan's listing is at least the directory's min_age_min old, and the "
+                    "database is as the scan found it. The files are not read again.")
+    apply.add_argument("plan", metavar="PLANFILE")
+    apply.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
+    apply.add_argument("--only", action="append", default=[], metavar="GROUP_KEY",
+                       help="apply only this group of the plan; repeatable")
+    apply.add_argument("--dry-run", action="store_true",
+                       help="make every check and write nothing")
+    apply.add_argument("--log-file", metavar="FILE",
+                       help="append one line per run (OK or ERROR) to FILE")
+    apply.set_defaults(func=cmd_apply)
+
+    args = parser.parse_args(argv)
     try:
         return args.func(args)
     except Usage as failure:

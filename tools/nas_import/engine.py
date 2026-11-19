@@ -47,6 +47,17 @@ it: the wait starts again for the whole group. The first sighting of a group
 never registers it (its rows are written by that run itself), also with
 ``min_age_min = 0``; the second can.
 
+The wait is counted from the START of the earlier run: its listing ended at
+most a listing's duration later, so the true interval between the two
+listings can be shorter than ``min_age_min`` by that duration. Choose
+``min_age_min`` with that in mind.
+
+**One folder, one root.** A storage root should carry its
+``.caraslabdb-root.json`` marker (naming the root): the tool then refuses the
+folder under any other root name. Without the marker nothing stops two
+invocations from searching one folder under two root names, and its files
+would be registered under both.
+
 **What is not read again.** A file whose latest row is ``registered`` or
 ``known`` with the size and ``mtime_ns`` listed now, and whose artifact's
 current version still describes that file and is in ``lab.artifact_present``,
@@ -97,6 +108,8 @@ RUN_REASON_CODES: dict[str, str] = {
                       "one event already in the database",
     "copy_event_mismatch": "the event the group's files already belong to is another "
                            "subject's or of another type",
+    "duplicate_content": "the group's raw files hold the bytes this tool registered already "
+                         "under another name",
     "session_conflict": "the session the group needs cannot be used: another session holds "
                         "its label or path, or it belongs to another subject",
     "local_time_nonexistent": "the wall-clock time of the name does not exist in the "
@@ -226,30 +239,38 @@ def _spec(d: Directory, pair_with: str | None, paired_by: str | None) -> Directo
 
 def pair_specs(directory: Directory, every: list[Directory]
                ) -> tuple[DirectorySpec, list[tuple[Directory, DirectorySpec]]]:
-    """The directory's spec and those of the directories judged with it.
+    """The directory's spec and that of the directory judged with it.
 
     The partner is the directory it names in ``pair_with``, or the directory
-    that names it. A partner whose mode is ``off`` is not listed (the
-    administrator withdrew it; an ``off`` row is also what a replaced
-    directory leaves behind). More than one directory naming the same one is
-    refused (:class:`ListingFailed`): the interpretation names one partner.
+    that names it: the one that is not ``off`` or, when there is none, the
+    most recent ``off`` one. A partner is listed and judged whatever its
+    mode -- a session that pairs with a recording visible on disk must not be
+    registered on its own because the recordings' directory is ``off`` or in
+    ``report`` mode; it waits. More than one directory that is not ``off``
+    naming the same one is refused (:class:`ListingFailed`): the
+    interpretation names one partner.
     """
-    on = {d.id: d for d in every if d.mode != "off" and d.root_id == directory.root_id}
-    on[directory.id] = directory
+    same_root = {d.id: d for d in every if d.root_id == directory.root_id}
+    same_root[directory.id] = directory
+    target = same_root.get(directory.pair_with) if directory.pair_with is not None else directory
+    if target is None:
+        return _spec(directory, None, None), []
+    namers = [d for d in same_root.values() if d.pair_with == target.id]
+    on = [d for d in namers if d.mode != "off" or d.id == directory.id]
     if directory.pair_with is not None:
-        target = on.get(directory.pair_with)
-        if target is None:
-            return _spec(directory, None, None), []
-        namers = [d for d in on.values() if d.pair_with == target.id]
-    else:
-        target = directory
-        namers = [d for d in on.values() if d.pair_with == directory.id]
-        if not namers:
-            return _spec(directory, None, None), []
-    if len(namers) > 1:
+        if len(on) > 1:
+            raise ListingFailed("directories %s all pair with %s; one directory may be paired "
+                                "with one other" % (", ".join(d.name for d in on), target.name))
+        namer = directory
+    elif len(on) > 1:
         raise ListingFailed("directories %s all pair with %s; one directory may be paired "
-                            "with one other" % (", ".join(d.name for d in namers), target.name))
-    namer = namers[0]
+                            "with one other" % (", ".join(d.name for d in on), target.name))
+    elif on:
+        namer = on[0]
+    elif namers:
+        namer = max(namers, key=lambda d: d.id)        # the most recent one that is off
+    else:
+        return _spec(directory, None, None), []
     specs = {namer.id: _spec(namer, target.path, None), target.id: _spec(target, None, namer.path)}
     partner = target if namer.id == directory.id else namer
     return specs[directory.id], [(partner, specs[partner.id])]
@@ -474,7 +495,7 @@ def _held(path: str, st: tuple[int, int], code: str, reason: str, key: str | Non
     return MemoryWrite(path, "held", st[0], st[1], key, code, reason)
 
 
-def _session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, paired: bool
+def session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, paired: bool
                   ) -> tuple[str, str] | None:
     if session_id is None:
         return ("session_conflict", "the recording it pairs with is registered under an event "
@@ -500,6 +521,20 @@ def _session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, p
     return None
 
 
+def time_hold(db: Database, s: Sighting, g: Group) -> tuple[str, str] | None:
+    """Why G's wall-clock time cannot be converted (a daylight-saving change), if so."""
+    key = (g.occurred_local, g.time_zone)
+    if key not in s.local_time:
+        s.local_time[key] = db.local_time_problem(*key)
+    problem = s.local_time[key]
+    if problem is None:
+        return None
+    return ("local_time_" + problem, "%s %s in %s (a daylight-saving change): the time is "
+            "not converted by guessing" % (g.occurred_local,
+                                           "does not exist" if problem == "nonexistent"
+                                           else "occurs twice", g.time_zone))
+
+
 def _new_event_hold(db: Database, s: Sighting, g: Group, session_id: str | None, paired: bool,
                     by_key: dict) -> tuple[str, str] | None:
     """Why a NEW event for G may not be written (decided without reading a file)."""
@@ -510,16 +545,7 @@ def _new_event_hold(db: Database, s: Sighting, g: Group, session_id: str | None,
             return ("late_recording", "the behavior session %s it pairs with is registered "
                     "already (event %s) in a session of its own: joining them is a correction"
                     % (partner.source_path, e.event_id))
-    key = (g.occurred_local, g.time_zone)
-    if key not in s.local_time:
-        s.local_time[key] = db.local_time_problem(*key)
-    problem = s.local_time[key]
-    if problem is not None:
-        return ("local_time_" + problem, "%s %s in %s (a daylight-saving change): the time is "
-                "not converted by guessing" % (g.occurred_local,
-                                               "does not exist" if problem == "nonexistent"
-                                               else "occurs twice", g.time_zone))
-    return _session_hold(db, s, g, session_id, paired)
+    return time_hold(db, s, g) or session_hold(db, s, g, session_id, paired)
 
 
 def plan(db: Database, s: Sighting, now_us: int) -> Plan:
@@ -648,7 +674,7 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                         % ", ".join(sorted(hosts)))
             elif len(hosts) == 1:
                 host = next(e for e in s.events.values() if e.event_id in hosts)
-                hold = _host_hold(g, host)
+                hold = host_hold(g, host)
             elif still:
                 hold = _new_event_hold(db, s, g, session_id, paired, by_key)
 
@@ -713,7 +739,7 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
     return Plan(targets, writes, sorted(plans, key=lambda p: p.group.key), missing, reported)
 
 
-def _host_hold(g: Group, host: EventFact) -> tuple[str, str] | None:
+def host_hold(g: Group, host: EventFact) -> tuple[str, str] | None:
     if host.retracted:
         return ("registered_but_withdrawn", "event %s, which its files belong to, was retracted"
                 % host.event_id)
@@ -890,7 +916,7 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
                 raw = [readings[f.path].checksum for f in g.files
                        if f.role == "raw" and f.path in readings]
                 copies = db.raw_copies(raw)
-                sets = [{e for e, _a in copies.get(c, [])} for c in raw]
+                sets = [{e for e, _a, _w in copies.get(c, [])} for c in raw]
                 common = set.intersection(*sets) if sets else set()
                 also = sorted(set().union(*sets)) if sets else []
                 if len(common) > 1:
@@ -898,16 +924,24 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
                                       "the files of each of events %s"
                                       % ", ".join(sorted(common))), True
                 elif len(common) == 1:
-                    host, copy, by_bytes = db.event_facts(common)[next(iter(common))], True, True
+                    one = next(iter(common))
+                    if db.written_by(one, TOOL_NAME):
+                        # The same bytes under two names on the NAS: a question for a person.
+                        where = sorted({w for c in raw for e, _a, w in copies[c] if e == one})
+                        hold, by_bytes = ("duplicate_content", "its raw files hold the bytes "
+                                          "this tool registered already as %s (event %s)"
+                                          % (", ".join(where[:3]), one)), True
+                    else:
+                        host, copy, by_bytes = db.event_facts(common)[one], True, True
             if host is not None:
-                hold = _host_hold(g, host)
+                hold = host_hold(g, host)
 
         rows_out: list[MemoryWrite] = []
         for path, (code, reason) in sorted(file_holds.items()):
             f = next(x for x in gp.open if x.path == path)
             rows_out.append(MemoryWrite(path, "held", f.size, f.mtime_ns, g.key, code, reason))
         if hold is None and host is None and not file_holds:
-            hold = _session_hold(db, s, g, gp.session_id, gp.paired)
+            hold = session_hold(db, s, g, gp.session_id, gp.paired)
         if hold is not None or (host is None and file_holds):
             for f in gp.open:
                 if f.path not in file_holds and hold is not None:
@@ -919,49 +953,141 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
             return GroupOutcome(g.key, "held", rows_out, code=code, reason=reason)
 
         out = GroupOutcome(g.key, "registered", rows_out)
+        w = GroupWrite(g.key, det, g.subject_id, gp.session_id)
         if host is None:
             if db.session(gp.session_id) is None:
-                db.insert_session(gp.session_id, g.subject_id, g.label, root_id, g.session_path,
-                                  g.start_local, g.time_zone,
-                                  g.detail.get("duration_s") if g.kind == "recording" else None,
-                                  g.rig)
+                w.session = session_values(g, gp.session_id, root_id)
                 out.created_session = True
-            attributes = ids.event_attributes(g, version)
-            attributes["client_digest"] = gp.digest
-            if also:
-                attributes["raw_files_also_in_events"] = also
-            db.insert_event(det, g.kind, g.subject_id, gp.session_id, g.occurred_local,
-                            g.time_zone, ids.canonical_json(attributes), g.detail)
-            host = EventFact(det, det, g.kind, g.subject_id, gp.session_id, gp.digest, False)
+            w.event = event_values(g, gp.session_id, gp.digest, version, also)
             out.created_event = True
-        elif copy:
-            out.copy_of = host.event_id
-        out.event_id, out.session_id = host.event_id, host.session_id
-        theirs = db.event_artifacts(host.event_id) if copy else {}
+        else:
+            w.event_id, w.subject_id, w.session_id = host.event_id, host.subject_id, host.session_id
+            if copy:
+                out.copy_of = host.event_id
+        out.event_id, out.session_id = w.event_id, w.session_id
+        theirs = db.event_artifacts(w.event_id) if copy else {}
         for f in new:
             c = readings[f.path].checksum
-            attributes = dict(f.attributes)
-            if copy:
-                # As labclient.Sync.sendCopy marks a copy, plus where it came from.
-                if c in theirs:
-                    attributes["copied_from"] = theirs[c]
-                attributes["copy_of_event"] = host.event_id
-                attributes["copy_recorded_as"] = det
-                attributes["import"] = ids.import_block(g)
-                attributes["captured_by_tool"] = TOOL_NAME
-                attributes["code_version"] = version
-            artifact_id = db.insert_artifact(host.event_id, root_id, f.path, c, f.size, f.role,
-                                             f.format, host.subject_id, host.session_id,
-                                             ids.canonical_json(attributes))
-            rows_out.append(MemoryWrite(f.path, "registered", f.size, f.mtime_ns, g.key,
-                                        artifact_id=artifact_id))
+            attributes = (copy_attributes(g, f.attributes, w.event_id, theirs.get(c), version)
+                          if copy else dict(f.attributes))
+            w.files.append(FileWrite(f.path, f.size, f.mtime_ns, c, "new", f.role, f.format,
+                                     attributes))
         for path, a in sorted(known.items()):
             f = next(x for x in gp.open if x.path == path)
-            db.insert_verification(a.current_id, readings[path].checksum)
-            rows_out.append(MemoryWrite(path, "known", f.size, f.mtime_ns, g.key,
-                                        artifact_id=a.current_id))
+            w.files.append(FileWrite(path, f.size, f.mtime_ns, readings[path].checksum, "known",
+                                     artifact_id=a.current_id))
+        rows_out += write_group(db, root_id, w)
         db.write_memory(run_id, root_id, rows_out)
         return out
+
+
+@dataclass
+class FileWrite:
+    """One file of a group as it is written: a new artifact, or a row that is there."""
+    path: str
+    size: int
+    mtime_ns: int
+    sha256: str
+    state: str                        # new | known | replace
+    role: str | None = None
+    format: str | None = None
+    attributes: dict | None = None
+    artifact_id: str | None = None    # new, replace: the id to give (None: the database's);
+    #                                   known: the row that registers these bytes
+    replaces: str | None = None       # replace: the row whose file these bytes took the place of
+
+
+@dataclass
+class GroupWrite:
+    """Everything decided about what to write for one group (see :func:`write_group`)."""
+    key: str
+    event_id: str                     # the event the files hang from
+    subject_id: str | None
+    session_id: str | None
+    session: dict | None = None       # Database.insert_session arguments, when it is new
+    event: dict | None = None         # Database.insert_event arguments, when it is new
+    files: list = field(default_factory=list)
+    read_us: int | None = None        # when the bytes were read; None: now
+
+
+def session_values(g: Group, session_id: str, root_id: int, subject_id: str | None = None
+                   ) -> dict:
+    """The arguments of ``Database.insert_session`` for G's session."""
+    return {"session_id": session_id, "subject_id": subject_id or g.subject_id, "label": g.label,
+            "root_id": root_id, "path": g.session_path, "start_local": g.start_local,
+            "zone": g.time_zone,
+            "duration": g.detail.get("duration_s") if g.kind == "recording" else None,
+            "rig": g.rig}
+
+
+def event_attributes(g: Group, digest: str, version: str, also=()) -> dict:
+    """The attributes of G's event: ``ids.event_attributes`` with the digest of its session."""
+    attributes = ids.event_attributes(g, version)
+    attributes["client_digest"] = digest
+    if also:
+        attributes["raw_files_also_in_events"] = sorted(also)
+    return attributes
+
+
+def event_values(g: Group, session_id: str, digest: str, version: str, also=()) -> dict:
+    """The arguments of ``Database.insert_event`` for G's own, new event."""
+    return {"event_id": ids.group_event_id(g), "event_type": g.kind, "subject_id": g.subject_id,
+            "session_id": session_id, "occurred_local": g.occurred_local, "zone": g.time_zone,
+            "attributes": ids.canonical_json(event_attributes(g, digest, version, also)),
+            "detail": dict(g.detail)}
+
+
+def copy_attributes(g: Group, attributes: dict, host_event: str, copied_from: str | None,
+                    version: str) -> dict:
+    """A file's attributes when it is added to an event that is not the group's own.
+
+    As ``labclient.Sync.sendCopy`` marks a copy (``copied_from`` when the
+    event has a file with the same bytes, ``copy_of_event``,
+    ``copy_recorded_as``), plus what the event of the group would have said
+    of where the file came from.
+    """
+    out = dict(attributes)
+    if copied_from is not None:
+        out["copied_from"] = copied_from
+    out["copy_of_event"] = host_event
+    out["copy_recorded_as"] = ids.group_event_id(g)
+    out["import"] = ids.import_block(g)
+    out["captured_by_tool"] = TOOL_NAME
+    out["code_version"] = version
+    return out
+
+
+def write_group(db: Database, root_id: int, w: GroupWrite) -> list[MemoryWrite]:
+    """Insert what W says, inside the caller's transaction; returns the files' memory rows.
+
+    The session and the event when they are new; one artifact with its
+    ``ok`` verification per ``new`` or ``replace`` file (a ``replace`` also
+    records the old file as ``replaced`` by it); an ``ok`` verification for
+    each ``known`` file. The caller appends the returned rows to the memory.
+    """
+    if w.session is not None:
+        db.insert_session(**w.session)
+    if w.event is not None:
+        db.insert_event(**w.event)
+    rows: list[MemoryWrite] = []
+    for f in w.files:
+        if f.state == "known":
+            db.insert_verification(f.artifact_id, f.sha256, w.read_us)
+            rows.append(MemoryWrite(f.path, "known", f.size, f.mtime_ns, w.key,
+                                    artifact_id=f.artifact_id))
+            continue
+        artifact_id = db.insert_artifact(w.event_id, root_id, f.path, f.sha256, f.size, f.role,
+                                         f.format, w.subject_id, w.session_id,
+                                         ids.canonical_json(f.attributes), f.artifact_id, w.read_us)
+        if f.state == "replace":
+            db.insert_disposition(
+                f.replaces, artifact_id, w.read_us,
+                "other bytes were found at this path; registered as artifact %s" % artifact_id,
+                ids.canonical_json({"recorded_by_tool": TOOL_NAME,
+                                    "source_mtime": ids.mtime_text(f.mtime_ns)}))
+        rows.append(MemoryWrite(f.path, "registered", f.size, f.mtime_ns, w.key,
+                                artifact_id=artifact_id))
+    return rows
 
 
 # --------------------------------------------------------------------------- one run
