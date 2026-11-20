@@ -1,7 +1,7 @@
 """The importer's engine: one search of one listed directory.
 
-Used by ``tools/import_nas_files.py run``; ``scan`` and ``apply`` are meant to
-reuse the same four steps:
+Used by ``tools/import_nas_files.py run``; ``scan`` and ``apply``
+(``reviewed.py``) are built on the same four steps:
 
 1. :func:`sight` -- list the directory and the directory it is paired with
    (``walk.walk``), load the scan memory and what the database knows of the

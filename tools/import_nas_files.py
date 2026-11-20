@@ -344,8 +344,8 @@ def cmd_check(args):
               % (name, r["mode"], r["n_pending"], r["n_held"],
                  "; last run " + r["last_run_outcome"] if r["last_run_outcome"] else ""))
         if r["is_overdue"]:
-            problems.append("directory %s is overdue: no search has succeeded for more than its "
-                            "interval plus 26 hours" % name)
+            problems.append("directory %s is overdue: no search has succeeded for more than one "
+                            "interval plus 26 hours after one was due" % name)
         if roots and r["is_due"] and r["storage_root"] not in roots:
             problems.append("directory %s is due, and its storage root %s was not given with "
                             "--root" % (name, r["storage_root"]))
@@ -418,8 +418,12 @@ def cmd_scan(args):
     stem = os.path.join(args.out, "plan_%s" % stamp)
     table, summary = reviewed.scan_report(records)
     for suffix, content in ((".jsonl", text), (".csv", table), (".txt", summary)):
-        with open(stem + suffix, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
+        try:            # "x": a plan of the same second is never overwritten
+            with open(stem + suffix, "x", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+        except FileExistsError:
+            raise Usage("%s exists already: nothing was overwritten; scan again"
+                        % (stem + suffix)) from None
     print(summary)
     print("plan: %s.jsonl" % stem)
     failed = [r for r in records if r["type"] == "failed"]
@@ -584,7 +588,8 @@ def main(argv=None):
                "nothing for it); 2 on a usage or connection error.")
     scan.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     scan.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
-                      help="a scan_directory_id to scan; repeatable. Name a directory and the "
+                      help="a scan_directory_id to scan; required, repeatable. Name a directory "
+                           "and the "
                            "one it is paired with together")
     scan.add_argument("--out", required=True, metavar="DIR", help="where the plan is written")
     scan.add_argument("--overrides", metavar="FILE", help="the reviewed overrides CSV")
