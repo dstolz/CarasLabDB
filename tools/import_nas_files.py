@@ -28,10 +28,14 @@ Commands
            listing's duration later. Mode ``report`` does everything but
            read files to their end and register.
 ``check``  Searches nothing and writes nothing. Exit 1 when a directory is
-           overdue, when two listed directories overlap, or when a directory
+           overdue, when two listed directories overlap, when more than one
+           directory that is not ``off`` pairs with the same one (none of them
+           can be searched), or when a directory
            that is due lies on a storage root not given with ``--root`` (this
            third test is skipped, and said to be, when no ``--root`` is
-           given). Prints the pending and held files of each directory.
+           given). Prints the pending and held files of each directory, and
+           how many groups wait for a recording whose directory is not in
+           ``register`` mode (said, not a problem).
            Schedule it and alert on it, as ``backup_lab.py --check``.
 ``scan``   The reviewed path, first half. Reads the named directories (in any
            mode, each with the directory it is paired with) and the database
@@ -47,12 +51,15 @@ Commands
 ``apply``  The second half: writes exactly a plan that a person has read.
            Refused outright (exit 2, nothing written): a plan that was edited
            or truncated, of another plan format, made against another
-           database, or naming a storage root not given. A group is refused,
-           the others proceed, unless every file of it still has the size and
-           modification time of the plan, the plan's listing is at least the
-           directory's current ``min_age_min`` old, and the database is as the
-           scan found it. The files are not read again: the verification rows
-           carry the time of the scan's read. One transaction per group,
+           database, or naming a storage root not given. The directory and
+           its partner are listed and interpreted again (headers only); an
+           incomplete listing refuses all of the directory's groups. A group
+           is refused, the others proceed, unless it is as the scan found it
+           (files, sizes, modification times, subject, session, time, detail,
+           pairing), the plan's listing is at least the directory's current
+           ``min_age_min`` old, and the database is as the scan found it. The
+           files are not read to their end again (``--reread`` does): the
+           verification rows carry the time of the scan's read. One transaction per group,
            with its memory rows, so the next ``run`` finds nothing to do for
            it. ``--only GROUP_KEY`` (repeatable) applies only those groups;
            ``--dry-run`` makes every check and writes nothing. Exit 0 when
@@ -90,8 +97,9 @@ Options of ``run``
 ``scan`` takes ``--root``, ``--directory ID`` (required, repeatable), ``--out
 DIR`` (required), ``--overrides`` and ``--cache-file`` (read, never written).
 ``apply PLANFILE`` takes ``--root``, ``--only GROUP_KEY``, ``--dry-run``,
-``--report-dir`` (a CSV and a text file per directory applied to) and
-``--log-file``.
+``--reread`` (read every file written again and require the plan's SHA-256),
+``--cache-file`` (read, never written), ``--report-dir`` (a CSV and a text
+file per directory applied to) and ``--log-file``.
 
 Connection settings come from the standard libpq environment variables
 (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD or the password file). The
@@ -102,7 +110,10 @@ design_docs/grants.sql), or be the schema's owner. Needs psycopg (v3):
 renamed or deleted.
 
 Exit status of ``run``: 0 when every directory searched ended ``ok`` or
-``partial``; 1 when any ended ``failed`` or ``unreachable``; 2 on a usage or
+``partial``; 1 when any ended ``failed`` or ``unreachable``, or a report could
+not be written to ``--report-dir`` (the run's rows stand, and the other
+directories are searched; a cache file that cannot be written is only a
+warning); 2 on a usage or
 connection error, which includes a login that may not write the scan logs
 (nothing was searched). Skipped directories do not change it. Of ``check``:
 0 when there is nothing to report, 1 otherwise. Of ``scan``: 0 when a plan
@@ -224,6 +235,7 @@ def cmd_run(args):
                                 dry_run=args.dry_run, ignore_window=args.now,
                                 host=socket.gethostname())
     results = []
+    unwritten = []                  # reports that could not be written
     skipped = {"locked": 0, "root not given": 0, "no longer due": 0}
     lost = None
     for directory_id, due_at in todo:
@@ -265,7 +277,12 @@ def cmd_run(args):
         else:
             print(report.summary(res))
             if res.happened and args.report_dir:
-                print("  report: %s" % report.write(args.report_dir, res)[1])
+                try:
+                    print("  report: %s" % report.write(args.report_dir, res)[1])
+                except OSError as exc:      # the run's rows stand; the next directory is searched
+                    unwritten.append("the report of directory %s could not be written to %s: %s"
+                                     % (directory.name, args.report_dir, exc))
+                    print("directory %s: %s" % (directory.name, unwritten[-1]), file=sys.stderr)
         if db.lost():
             if not db.reconnect():
                 lost = "the database connection was lost"
@@ -293,7 +310,11 @@ def cmd_run(args):
     for r in results:
         if r.outcome in ("failed", "unreachable"):
             text += "; %s %s: %s" % (r.directory.name, r.outcome, r.message)
-    if bad:
+        for warning in r.warnings:
+            text += "; %s: warning: %s" % (r.directory.name, warning)
+    for problem in unwritten:
+        text += "; " + problem
+    if bad or unwritten:
         print("%s: ERROR: %s" % (PROG, text), file=sys.stderr)
         report.log_line(args.log_file, "ERROR %s" % text)
         return 1
@@ -308,9 +329,12 @@ def cmd_check(args):
     try:
         rows = db.status()
         overlaps = db.overlaps()
+        every = db.directories()
+        waiting = db.waiting_for_recordings(engine.PAIRS_WITH + "recording:")
     except Exception as exc:
         raise Usage("cannot read the schedule: %s" % str(exc).strip()) from None
     db.close()
+    names = {d.id: d.name for d in every}
     problems = []
     for r in rows:
         if r["mode"] == "off":
@@ -320,13 +344,19 @@ def cmd_check(args):
               % (name, r["mode"], r["n_pending"], r["n_held"],
                  "; last run " + r["last_run_outcome"] if r["last_run_outcome"] else ""))
         if r["is_overdue"]:
-            problems.append("directory %s is overdue: no search has succeeded for more than its "
-                            "interval plus 26 hours" % name)
+            problems.append("directory %s is overdue: no search has succeeded for more than one "
+                            "interval plus 26 hours after one was due" % name)
         if roots and r["is_due"] and r["storage_root"] not in roots:
             problems.append("directory %s is due, and its storage root %s was not given with "
                             "--root" % (name, r["storage_root"]))
     for subject, detail in overlaps:
         problems.append("scan directories overlap (scan directory %s): %s" % (subject, detail))
+    problems += engine.pairing_problems(every)
+    for epsych, recordings, mode, n in waiting:     # said, not a problem: the exit stays
+        print("directory %s: %d group(s) wait for a recording of directory %s, which is %s: "
+              "they are not registered until it is in register mode (or by scan / apply)"
+              % (names[epsych], n, names[recordings], "off" if mode == "off" else
+                 "in %s mode" % mode))
     if not roots:
         print("no --root given: not checked whether the due directories' storage roots are "
               "mounted here")
@@ -371,6 +401,9 @@ def cmd_scan(args):
     cache = HeaderCache.load(args.cache_file) if args.cache_file else None   # read, never written
     stamp = engine.us_text(db.now_us()).replace("-", "").replace(":", "")
     records = [{"type": "plan", "format": reviewed.FORMAT, "tool": PROG}]
+    if args.overrides:
+        records.append({"type": "overrides", "rows": [
+            [o.root, o.path, o.subject_id, o.skip, o.reason, o.line] for o in overrides]})
     planned = {}
     try:
         for d in reviewed.scan_order([every[i] for i in sorted(set(args.directory))]):
@@ -385,8 +418,12 @@ def cmd_scan(args):
     stem = os.path.join(args.out, "plan_%s" % stamp)
     table, summary = reviewed.scan_report(records)
     for suffix, content in ((".jsonl", text), (".csv", table), (".txt", summary)):
-        with open(stem + suffix, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
+        try:            # "x": a plan of the same second is never overwritten
+            with open(stem + suffix, "x", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+        except FileExistsError:
+            raise Usage("%s exists already: nothing was overwritten; scan again"
+                        % (stem + suffix)) from None
     print(summary)
     print("plan: %s.jsonl" % stem)
     failed = [r for r in records if r["type"] == "failed"]
@@ -423,7 +460,8 @@ def cmd_apply(args):
         if lacking:
             raise Usage("the login %s may not INSERT into %s: nothing was applied."
                         % (db.login(), ", ".join(lacking)))
-    applied, refused, notes = [], [], []
+    cache = HeaderCache.load(args.cache_file) if args.cache_file else None   # read, never written
+    applied, refused, notes, unwritten = [], [], [], []
     dry_sessions = set()            # the sessions a dry run would have made so far
     host = socket.gethostname()
     for record in plan.directories:
@@ -439,7 +477,7 @@ def cmd_apply(args):
             try:
                 out = reviewed.apply_directory(db, plan, record, roots[record["root"]],
                                                set(args.only), args.dry_run, engine.VERSION, host,
-                                               dry_sessions)
+                                               dry_sessions, cache, args.reread)
             finally:
                 if not db.lost():
                     db.unlock(record["id"])
@@ -453,7 +491,12 @@ def cmd_apply(args):
         refused += out["refused"]
         notes += out["notes"]
         if args.report_dir and out["run_id"] is not None:
-            print("report: %s" % reviewed.write_apply_report(args.report_dir, plan, out))
+            try:
+                print("report: %s" % reviewed.write_apply_report(args.report_dir, plan, out))
+            except OSError as exc:          # what was applied stands
+                unwritten.append("the report of directory %d could not be written to %s: %s"
+                                 % (record["id"], args.report_dir, exc))
+                print(unwritten[-1], file=sys.stderr)
     db.close()
     verb = "would be applied" if args.dry_run else "applied"
     for key in applied:
@@ -463,14 +506,14 @@ def cmd_apply(args):
     for note in notes:
         print("NOTE  %s" % note)
     skipped = sum(1 for g in plan.groups if g["action"] in ("held", "wait"))
-    print(reviewed.NOT_READ)
+    print(reviewed.REREAD if args.reread else reviewed.NOT_READ)
     if skipped:
         print("%d group(s) are held or waiting in the plan and were not touched." % skipped)
     text = "apply%s %s: %d group(s) %s, %d refused" % (
         " (dry run)" if args.dry_run else "", os.path.basename(args.plan), len(applied), verb,
         len(refused))
-    if refused:
-        text += ": " + "; ".join("%s: %s" % (k, why) for k, why in refused[:5])
+    if refused or unwritten:
+        text += ": " + "; ".join(["%s: %s" % (k, why) for k, why in refused[:5]] + unwritten)
         print("%s: ERROR: %s" % (PROG, text), file=sys.stderr)
         report.log_line(args.log_file, "ERROR %s" % text)
         return 1
@@ -500,8 +543,10 @@ def main(argv=None):
                     "(a JSON object with the root's name), so that one folder cannot be "
                     "searched under two root names.",
         epilog="Exit status: 0 when every directory searched ended ok or partial (skipped "
-               "directories do not count); 1 when any ended failed or unreachable; 2 on a usage "
-               "or connection error, or a login that may not write the scan logs.")
+               "directories do not count; a cache file that cannot be written is a warning); 1 "
+               "when any ended failed or unreachable, or a report could not be written (the "
+               "run's rows stand and the other directories are searched); 2 on a usage or "
+               "connection error, or a login that may not write the scan logs.")
     run.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     run.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
                      help="only this scan_directory_id; repeatable")
@@ -523,9 +568,11 @@ def main(argv=None):
         "check", help="exit 1 when a directory is overdue (searches nothing)",
         description="Search nothing and write nothing: say whether the scheduled searches are "
                     "being made, and how many files are pending and held.",
-        epilog="Exit status: 0 when no directory is overdue, none overlap, and (with --root) "
+        epilog="Exit status: 0 when no directory is overdue, none overlap, no directory is "
+               "named by more than one that is not off as its pair_with, and (with --root) "
                "every due directory's storage root was given; 1 otherwise; 2 on a usage or "
-               "connection error.")
+               "connection error. Groups that wait for a recording whose directory is not in "
+               "register mode are counted and do not change it.")
     check.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     check.add_argument("--log-file", metavar="FILE",
                        help="append one line per run (OK or ERROR) to FILE")
@@ -541,7 +588,8 @@ def main(argv=None):
                "nothing for it); 2 on a usage or connection error.")
     scan.add_argument("--root", action="append", default=[], metavar="NAME=PATH", help=root_help)
     scan.add_argument("--directory", action="append", default=[], type=int, metavar="ID",
-                      help="a scan_directory_id to scan; repeatable. Name a directory and the "
+                      help="a scan_directory_id to scan; required, repeatable. Name a directory "
+                           "and the "
                            "one it is paired with together")
     scan.add_argument("--out", required=True, metavar="DIR", help="where the plan is written")
     scan.add_argument("--overrides", metavar="FILE", help="the reviewed overrides CSV")
@@ -551,10 +599,24 @@ def main(argv=None):
 
     apply = sub.add_parser(
         "apply", help="write exactly a reviewed plan",
-        description="Carry out the plan a scan wrote. A group is refused, and nothing written "
-                    "for it, unless its files have the size and modification time of the plan, "
-                    "the plan's listing is at least the directory's min_age_min old, and the "
-                    "database is as the scan found it. The files are not read again.",
+        description="Carry out the plan a scan wrote. The directory and its partner are listed "
+                    "completely again and interpreted again (file headers only; nothing is "
+                    "hashed), with the overrides the plan carries; a listing that cannot be made "
+                    "completely refuses every group of the directory. A group is refused, and "
+                    "nothing written for it, unless it is as the scan found it (the same files "
+                    "with the same sizes and modification times, the same subject, session, "
+                    "time, detail and pairing), the plan's listing is at least the directory's "
+                    "min_age_min old, and the database is as the scan found it. The files are "
+                    "not read to their end again unless --reread is given. "
+                    "What the plan's digest protects: its last line carries a SHA-256 over every "
+                    "line, so a plan that was edited by accident or truncated is refused. It is "
+                    "a plain SHA-256 with no key: whoever can write the plan can also compute a "
+                    "new digest, and apply then takes every value from the plan -- the SHA-256 of "
+                    "each file among them -- unless --reread reads the files again. Keep plans "
+                    "where only the people who review them can write. The plan names the "
+                    "database it was made against by its name, oid and the cluster's system "
+                    "identifier; these do not tell a physical clone of the cluster (a restored "
+                    "base backup, a promoted standby) from the original.",
         epilog="Exit status: 0 when every group the plan acts on (all, or those named with "
                "--only) was applied; 1 when any was refused, also because another process "
                "holds its directory's lock; 2, with nothing written, for a plan that was "
@@ -567,6 +629,13 @@ def main(argv=None):
                        help="apply only this group of the plan; repeatable")
     apply.add_argument("--dry-run", action="store_true",
                        help="make every check and write nothing")
+    apply.add_argument("--reread", action="store_true",
+                       help="read every file an action writes to its end again (and check each "
+                            ".mat file of an ePsych session structurally) and refuse the group "
+                            "unless it has the plan's SHA-256; off by default")
+    apply.add_argument("--cache-file", metavar="FILE",
+                       help="file headers of registered files, for the listing made again; read, "
+                            "never written by apply")
     apply.add_argument("--report-dir", metavar="DIR",
                        help="write a CSV and a text report per directory applied to: what was "
                             "applied, what was refused and why, the notes")

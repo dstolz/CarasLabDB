@@ -122,7 +122,7 @@ possible, we need a simple way to request the others:
 | `lab_ro` (group, no login) | Holds the read-only privilege set | Read only |
 | dashboard login, AI-tool login | Used by the live dashboard and by the read-only AI query tool | Members of `lab_ro` |
 | file-verification login | Used by the scheduled job that checks the data files against their checksums | Member of `lab_rw` |
-| NAS-search login | Used by the scheduled job that registers new files found on the NAS in the directories the lab lists (`nas-import.md`) | Member of `lab_rw`, plus insert on three of the schema's logs (granted by name) |
+| NAS-search login | Used by the scheduled job that registers new files found on the NAS in the directories the lab lists, and by `apply` of a reviewed plan (`nas-import.md`) | Member of `lab_rw`, plus insert on three of the schema's logs (granted by name) |
 | `postgres` superuser | Used only by the nightly backup (which includes the logins) and for restores | Superuser; not reachable from the network |
 
 Per-person logins are a requirement, not a preference: the database is to

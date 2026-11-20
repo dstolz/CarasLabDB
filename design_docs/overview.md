@@ -117,8 +117,9 @@ flowchart LR
   scheduled tool from a list of directories the administrator keeps in the
   database. It reads only files it has not seen, registers what is new and
   unambiguous, and holds everything else for a person; it never writes to
-  the NAS, never creates a subject, and an unattended run only adds. See
-  [NAS import](nas-import.md).
+  the NAS, never creates a subject, and an unattended run only adds. What
+  needs a correction is written only after a person has read a plan
+  (`scan`, then `apply`). See [NAS import](nas-import.md).
 - **Login and person.** Every lab member connects with their own database
   login. The database stamps that login on each row it stores and maps it to
   the member's `person` row (`lab.person.db_login`), so who entered what does

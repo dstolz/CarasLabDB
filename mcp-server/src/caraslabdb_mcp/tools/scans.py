@@ -204,11 +204,15 @@ def register(app):
         "registered" (the scan registered it; artifact_id names the row);
         "known" (another client had already registered these bytes at this
         path, confirmed by reading them; artifact_id names the row);
-        "held" (left for a person to decide; reason_code and reason say
-        why -- the scan never acts on a held file, and it stays held until
-        a person resolves it); "cleared" (a pending or held file is no
-        longer there). Anything else is an error. In "report" mode
-        directories only pending, held and cleared rows are written.
+        "held" (not registered; reason_code and reason say why -- the
+        unattended search never registers a held file. Some holds end by
+        themselves when their cause goes, e.g. the subject's row is added
+        or the recording is registered; the rest need a person); "cleared"
+        (a pending or held file is no longer there). Anything else is an
+        error. A directory in "report" mode registers nothing: its rows
+        are pending, held and cleared, and a registered or known row only
+        where a person corrected an artifact that was already registered
+        and the memory follows it.
 
         Columns: scan_file_id, scan_run_id (the run that wrote the row, see
         get_scan_runs), storage_root_id, relative_path, size_bytes,

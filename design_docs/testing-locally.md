@@ -14,9 +14,9 @@ automated tests (`tests/schema_test.sql`, `tests/roles_test.sql`,
 `tests/check_nas_import_parsing.py`, `tests/check_import_nas_files.py`,
 `mcp-server/tests/`), which CI (`.github/workflows/tests.yml`) runs on
 PostgreSQL 14, 15, 16 and 17. The MATLAB class and GUI have a
-`matlab.unittest` suite in `tests/matlab/` (§2.7) that runs locally only,
-because CI has no MATLAB; beyond it, "testing" them here means a disciplined
-manual walkthrough with explicit pass/fail checks.
+`matlab.unittest` suite in `tests/matlab/` (§2.7), which CI runs on Linux in
+MATLAB R2024b, R2025a and the latest release; beyond it, "testing" them here
+means a disciplined manual walkthrough with explicit pass/fail checks.
 
 Before the first real use of the MATLAB class and GUI, also work through [matlab-first-run-checklist.md](matlab-first-run-checklist.md): CI runs the MATLAB tests on Linux only, and most of the GUI is not covered by any automated test.
 
@@ -451,25 +451,39 @@ dropdb -U postgres lab_nas
 **Pass:** each check prints `ok` with its time, then `N checks, M assertions`
 and `check_import_nas_files: OK`. Words after the script name run only the
 checks whose name contains one of them
-(`python tests\check_import_nas_files.py first_sighting`). It covers: the
-first sighting registers nothing, the second after the minimum age does, and
-the third reads nothing; a change restarts the wait; an incomplete listing
-fails the run and writes no memory; an unmounted directory is `unreachable`;
-a touched file becomes `known`; every hold an unattended run must not
-resolve; pairing in either search order and a recording registered from a
-copy; daylight-saving times; `report` mode against `register` mode; two
-processes on one directory; the scanner login against a plain member;
-`check` exiting 1 when overdue, overlapping or a root is not given; every
-file accounted for; overrides; `--dry-run`; a lost connection, a window that
-closes and a file that changes while it is read; `scan` writes nothing and
-gives the same plan twice, and `apply` registers exactly that plan; an added
-file is one artifact, a changed file one artifact and one `replaced`
+(`python tests\check_import_nas_files.py first_sighting`). It covers `run`
+and `check`: the first sighting registers nothing, the second after the
+minimum age does, and the third reads nothing; a change restarts the wait,
+and so does a file found changed while it is read (at the next listing, not
+at the read) and one listing without a session's recording folder; an
+incomplete listing, of the directory or of its partner, fails the run and
+writes no memory; an unmounted directory is `unreachable`; a touched file
+becomes `known`; every hold an unattended run must not resolve; pairing in
+either search order, a partner that is `off`, two directories naming one
+partner, and a recording registered from a copy; a folder that is partly
+another client's copy (`copy_partial`); a retracted recording and the session
+paired with it; a group too large for one transaction; a file registered with
+md5 or blake3; daylight-saving times; `report` mode against `register` mode;
+two processes on one directory; the scanner login against a plain member;
+`check` exiting 1 when overdue, overlapping or a root is not given; every file
+accounted for; overrides; `--dry-run`; a lost connection, a window that
+closes and a file that changes while it is read; an unwritable cache (a
+warning) and an unwritable report folder (exit 1, nothing undone); and that
+every statement `run` and `scan` send is a `SELECT`, or, for `run`, an
+`INSERT` into nine tables. It covers `scan` and `apply`: `scan` writes
+nothing and gives the same plan twice; `apply` registers exactly that plan; an
+added file is one artifact, a changed file one artifact and one `replaced`
 disposition; a late recording and a subject override after registration are
-each one correction (tags and variables carried); `apply` refuses what is no
-longer as the scan found it, and `--only` applies the groups named. What it
-does **not** cover: a real NAS or a Windows share, any file written by the
-lab's software, and the Task Scheduler definitions. It never drives a clock
-option of the tool: a sighting is made old by inserting a backdated run.
+each one correction (tags and variables carried), and a withdrawn override
+gives the path back; `apply` lists again and refuses a group that grew or
+whose pairing changed, compares the storage root's name, reads every file
+again with `--reread`, refuses each change of the database since the scan,
+applies only the groups `--only` names, skips a directory another process is
+searching, and writes a report. What it does **not** cover: a real NAS or a
+Windows share, any file written by the lab's software (its MAT fixtures are
+written by scipy, its `.rhd` headers are built by the tests), and the Task
+Scheduler definitions. It never drives a clock option of the tool: a sighting
+is made old by inserting a backdated run.
 
 ---
 

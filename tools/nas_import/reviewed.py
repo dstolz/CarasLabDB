@@ -12,6 +12,9 @@ JSON lines (UTF-8, ``\\n``, each line canonical JSON: sorted keys, no floats):
 
 ``{"type": "plan", "format": FORMAT, "tool": ...}``
     the first line.
+``{"type": "overrides", "rows": [[root, path, subject_id, skip, reason, line], ...]}``
+    the overrides the scan was given (absent when none): ``apply`` interprets
+    the listing again with exactly these.
 ``{"type": "directory", "id", "root", "root_id", "path", "layout", "rig", "pair_with", "time_zone", "min_age_min", "mode", "partner"}``
     a directory's settings as read. Its lines follow it.
 ``{"type": "time", "directory", "listed_us", "listed"}``
@@ -45,12 +48,19 @@ JSON lines (UTF-8, ``\\n``, each line canonical JSON: sorted keys, no floats):
     ``none``          nothing to do;
     ``wait``, ``held`` not carried out: ``reason_code`` and ``reason`` say why.
 
+    ``basis`` is what the interpretation said of the group (:func:`group_basis`):
+    ``apply`` lists the directory and its partner completely again,
+    interprets again (headers only; nothing is hashed) and refuses a group
+    whose basis is not the same, naming the difference; an incomplete
+    listing refuses the whole directory.
+
     ``files`` lists every listed file of the group with its size and
     ``mtime_ns``; a file the action writes also has its ``sha256`` (it was
     read to its end by the scan, a ``.mat`` checked structurally) and a
     ``state``: ``new``, ``replace`` (other bytes at a registered path: a new
     artifact, and ``replaces`` is recorded as ``replaced`` by it), ``known``
-    (registered already with these bytes: a memory row and a verification),
+    (registered already with these bytes: a memory row and a verification;
+    ``observed`` is the MD5 when the artifact was registered with md5),
     ``registered`` (unchanged; nothing written) or ``held``. ``expect`` is
     what the scan found in the database for this group; ``apply`` compares.
 ``{"type": "time", "group", "read_us"}``
@@ -100,12 +110,12 @@ import uuid
 from . import engine, ids
 from .database import ConnectionLost, Database, Directory, MemoryWrite
 from .engine import FileWrite, GroupWrite, ListingFailed, Unreachable
-from .model import TOOL_NAME, Group
+from .model import TOOL_NAME, Group, GroupFile, Override
 from .report import COLUMNS
 
-FORMAT = "caraslabdb-nas-plan/1"
+FORMAT = "caraslabdb-nas-plan/2"
 ACTIONS = ("register", "add_files", "attach_copy", "correct", "move_session")
-ASIDE = "#superseded-by-"
+ASIDE = engine.ASIDE
 CARRIED = ("the tags of the event and of each superseded artifact, the event's input edges "
            "and its variables are carried at apply time, as they are then")
 
@@ -134,8 +144,7 @@ def successor_artifact_id(old_artifact: str, new_event: str) -> str:
     return _uuid("artifact-correction:%s:%s" % (old_artifact, new_event))
 
 
-def subject_session_id(root: str, path: str, subject: str) -> str:
-    return _uuid("session:%s:%s:subject:%s" % (root, path, subject))
+subject_session_id = engine.subject_session_id
 
 
 # --------------------------------------------------------------------------- scan
@@ -150,10 +159,67 @@ def _entry(f, state: str, **more) -> dict:
     return out
 
 
+def group_basis(g: Group) -> dict:
+    """What the interpretation says of G, without a time field: ``apply`` requires it again.
+
+    Every listed file with its size and ``mtime_ns`` (and the signature over
+    them), the files' roles and the holds of single files, the group's state,
+    subject, session path and label, rig, wall-clock time and zone, the
+    detail row, the import block (the override, if any) and the pairing.
+    """
+    files = sorted([[f.path, f.size, f.mtime_ns] for f in g.files]
+                   + [[h.path, h.size, h.mtime_ns] for h in g.held_files])
+    return {"signature": ids.signature(g), "files": files,
+            "roles": sorted([f.path, f.role, f.format] for f in g.files),
+            "held_files": sorted([h.path, h.reason_code] for h in g.held_files),
+            "status": g.status, "hold": g.hold.reason_code if g.hold is not None else None,
+            "kind": g.kind, "subject_id": g.subject_id, "source_path": g.source_path,
+            "session_path": g.session_path, "label": g.label, "rig": g.rig,
+            "occurred_local": g.occurred_local, "time_zone": g.time_zone,
+            "precision": g.precision, "detail": {k: str(v) for k, v in g.detail.items()},
+            "import": ids.import_block(g),
+            "pairing": (None if g.pairing is None
+                        else [g.pairing.status, g.pairing.partner_key, g.pairing.delta_s])}
+
+
+def _short(value) -> str:
+    text = ids.canonical_json(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def basis_difference(then: dict, now: dict) -> str | None:
+    """How the group NOW differs from what the plan recorded THEN; None when it does not."""
+    if then == now:
+        return None
+    parts = []
+    for key in sorted(set(then) | set(now)):
+        a, b = then.get(key), now.get(key)
+        if a == b:
+            continue
+        if key == "files":
+            was = {p: (size, mtime) for p, size, mtime in a or []}
+            is_ = {p: (size, mtime) for p, size, mtime in b or []}
+            said = []
+            for what, paths in (("added", sorted(set(is_) - set(was))),
+                                ("gone", sorted(set(was) - set(is_))),
+                                ("changed", sorted(p for p in was if p in is_
+                                                   and was[p] != is_[p]))):
+                if paths:
+                    said.append("%s %s" % (what, ", ".join(paths[:5])
+                                           + (" and %d more" % (len(paths) - 5)
+                                              if len(paths) > 5 else "")))
+            parts.append("files: " + "; ".join(said))
+        elif key == "signature":
+            continue                      # said by "files"
+        else:
+            parts.append("%s: %s -> %s" % (key, _short(a), _short(b)))
+    return "; ".join(parts) or "the signature differs"
+
+
 def _group_record(s, g: Group, action: str, files: list, **more) -> dict:
     rec = {"type": "group", "directory": s.directory.id, "key": g.key, "kind": g.kind,
            "action": action, "source_path": g.source_path, "subject_id": g.subject_id,
-           "files": sorted(files, key=lambda e: e["path"])}
+           "files": sorted(files, key=lambda e: e["path"]), "basis": group_basis(g)}
     rec.update({k: v for k, v in more.items() if v is not None})
     return rec
 
@@ -164,10 +230,19 @@ def _held_record(s, g: Group, files: list, code: str, reason: str, action: str =
 
 
 def _session_block(db: Database, s, g: Group, session_id, paired: bool, planned: dict,
-                   correcting: bool):
-    """(the plan's ``session`` block, a hold) for the session G's event goes into."""
+                   correcting: bool, own=None):
+    """(the plan's ``session`` block, a hold) for the session G's event goes into.
+
+    The block's ``expect`` (subject by session id) and ``expect_paths``
+    (path by session id) are what ``apply`` must find again. A non-paired
+    group's event goes into the session that holds the folder's path for
+    its subject. When the session of the path belongs to another subject, a
+    correction moves it aside (``aside``) and makes or gives back the path to
+    a session of the right subject: a new one (``create``), or one this tool
+    moved aside before (``restore``, the correction undone). Whatever else
+    stands in the way is held for a person.
+    """
     root_id = s.directory.root_id
-    expect: dict = {}
     if paired:
         row = db.session(session_id) if session_id is not None else None
         if row is None:
@@ -175,47 +250,87 @@ def _session_block(db: Database, s, g: Group, session_id, paired: bool, planned:
             if session_id is None or planned.get(partner) != session_id:
                 return None, ("session_conflict", "the session of its recording does not exist")
             return {"id": session_id, "create": None, "needs_group": partner,
-                    "expect": {session_id: None}}, None
+                    "expect": {session_id: None}, "expect_paths": {}}, None
         if row[0] != g.subject_id:
             return None, ("session_conflict", "session %s of its recording is subject %s's, "
                           "not %s's" % (session_id, row[0], g.subject_id))
-        return {"id": session_id, "create": None, "expect": {session_id: row[0]}}, None
-    row = db.session(session_id)
-    expect[session_id] = None if row is None else row[0]
-    aside = None
-    target = session_id
-    if row is not None and row[0] != g.subject_id:
-        if not correcting:
+        return {"id": session_id, "create": None, "expect": {session_id: row[0]},
+                "expect_paths": {session_id: row[3]}}, None
+    path = g.session_path
+    rows: dict = {}
+
+    def look(sid):
+        if sid not in rows:
+            rows[sid] = db.session(sid)
+        return rows[sid]
+
+    other_id = subject_session_id(g.root, path, g.subject_id)
+    mine = next((sid for sid in (session_id, other_id)
+                 if look(sid) is not None and look(sid)[0] == g.subject_id), None)
+    occupant = db.session_at(root_id, path)
+    if occupant is not None:
+        rows[occupant[0]] = (occupant[1], occupant[2], root_id, occupant[3])
+
+    def block(**values):
+        values["expect"] = {sid: None if r is None else r[0] for sid, r in rows.items()}
+        values["expect_paths"] = {sid: r[3] for sid, r in rows.items() if r is not None}
+        return values, None
+
+    if mine is not None and look(mine)[3] == path and (correcting or mine == session_id):
+        return block(id=mine, create=None)
+    aside = restore = None
+    if not correcting:
+        if mine is not None:
+            return None, ("session_conflict", "session %s of subject %s is at %s, not at %s: a "
+                          "person decides which session belongs at the path"
+                          % (mine, g.subject_id, look(mine)[3], path))
+        if look(session_id) is not None:
             return None, ("session_conflict", "session %s is subject %s's, not %s's"
-                          % (session_id, row[0], g.subject_id))
-        # A session belongs to one subject for good: a session of the right
-        # subject takes the path, and the old one is moved aside.
-        target = subject_session_id(g.root, g.session_path, g.subject_id)
-        other = db.session(target)
-        expect[target] = None if other is None else other[0]
-        if other is not None:
-            if other[0] != g.subject_id:
-                return None, ("session_conflict", "session %s is subject %s's" % (target, other[0]))
-            return {"id": target, "create": None, "expect": expect}, None
-        aside = {"id": session_id, "path": g.session_path + ASIDE + target,
-                 "note": "Superseded by session %s: the files at %s are subject %s's, not %s's. "
-                         "The path of this session was %s." % (target, g.session_path,
-                                                              g.subject_id, row[0],
-                                                              g.session_path)}
-        row = None
-    if row is not None:
-        return {"id": target, "create": None, "expect": expect}, None
-    for other, subject, label, path in db.session_clashes(target, g.subject_id, g.label,
-                                                          root_id, g.session_path):
+                          % (session_id, look(session_id)[0], g.subject_id))
+        target = session_id
+    else:
+        if occupant is not None:
+            occ_id, occ_subject, occ_label = occupant[0], occupant[1], occupant[2]
+            vacated = own is not None and own.session_id == occ_id
+            if (occ_subject == g.subject_id or not vacated
+                    or not engine.tool_session(g.root, occ_id, occ_subject, path)):
+                return None, ("session_conflict", "session %s (subject %s, label %s) holds the "
+                              "path %s and is not the session this correction moves event %s "
+                              "out of: a person decides which session belongs at the path"
+                              % (occ_id, occ_subject, occ_label, path,
+                                 own.event_id if own is not None else "-"))
+        if mine is not None:
+            was = look(mine)[3]
+            if not was.startswith(path + ASIDE):
+                return None, ("session_conflict", "session %s of subject %s is at %s, a path "
+                              "this tool did not give it: a person gives it back the path %s, "
+                              "or moves its events, before this correction"
+                              % (mine, g.subject_id, was, path))
+            target = mine
+            restore = {"id": mine, "path": path,
+                       "note": "Given back the path %s: the files there are subject %s's "
+                               "again. The path of this session was %s." % (path, g.subject_id,
+                                                                            was)}
+        else:
+            target = session_id if look(session_id) is None else other_id
+        if occupant is not None:
+            aside = {"id": occupant[0], "path": path + ASIDE + target,
+                     "note": "Superseded by session %s: the files at %s are subject %s's, not "
+                             "%s's. The path of this session was %s."
+                             % (target, path, g.subject_id, occupant[1], path)}
+    for other, subject, label, at, _root in db.session_clashes(target, g.subject_id, g.label,
+                                                               root_id, path):
         if aside is not None and other == aside["id"]:
             continue                 # it holds the path until it is moved aside
-        code = ("path_case_conflict" if path != g.session_path
-                and engine.ascii_fold(path) == engine.ascii_fold(g.session_path)
-                else "session_conflict")
+        if restore is not None and engine.ascii_fold(at) != engine.ascii_fold(path):
+            continue                 # a label of this subject: the session keeps its own label
+        code = ("path_case_conflict" if at != path
+                and engine.ascii_fold(at) == engine.ascii_fold(path) else "session_conflict")
         return None, (code, "session %s (subject %s, label %s, path %s) stands in the way"
-                      % (other, subject, label, path))
-    values = engine.session_values(g, target, root_id)
-    return {"id": target, "create": values, "aside": aside, "expect": expect}, None
+                      % (other, subject, label, at))
+    if restore is not None:
+        return block(id=target, create=None, restore=restore, aside=aside)
+    return block(id=target, create=engine.session_values(g, target, root_id), aside=aside)
 
 
 def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned: dict,
@@ -231,11 +346,13 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     listed = [_entry(f, "listed") for f in g.files]
     if g.status == "skipped":
         return _group_record(s, g, "none", files + listed, note="skipped by an override"), None
-    if g.status != "ready":
+    if g.status != "ready" or engine.too_large_hold(g) is not None:
         for e in listed:
             if e["path"] in s.settled:
                 e.update(state="registered", artifact_id=s.settled[e["path"]].current_id)
-        return _held_record(s, g, files + listed, g.hold.reason_code, g.hold.sentence), None
+        code, sentence = ((g.hold.reason_code, g.hold.sentence) if g.status != "ready"
+                          else engine.too_large_hold(g))
+        return _held_record(s, g, files + listed, code, sentence), None
 
     todo, file_holds = [], {}
     for f in g.files:
@@ -255,9 +372,13 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     at = db.artifacts_at(root_id, [f.path for f in todo])
     for f in list(todo):
         variants = sorted({r.path for r in at.get(f.path, []) if r.path != f.path})
+        odd = [r for r in at.get(f.path, []) if r.live and r.checksum_algo not in engine.COMPUTABLE]
         if variants:
             file_holds[f.path] = ("path_case_conflict", "registered as %s, which differs only "
                                   "in case" % variants[0])
+            todo.remove(f)
+        elif odd:
+            file_holds[f.path] = ("checksum_unsupported", engine.unsupported_sentence(odd[0]))
             todo.remove(f)
 
     def held_files():
@@ -278,6 +399,10 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
             session_id = rec.session_id
         elif partner is not None and partner.key in planned:
             session_id = planned[partner.key]
+        elif own is None and partner is not None and engine.withdrawn_event(partner, s):
+            return _held_record(s, g, files + held_files() + unread(), "paired_recording_held",
+                                engine.withdrawn_sentence(partner,
+                                                          engine.withdrawn_event(partner, s))), None
         else:
             return _held_record(
                 s, g, files + held_files() + unread(), None,
@@ -294,15 +419,17 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
                     if f.path in s.settled})
 
     # Read what an action would write.
-    readings = {}
+    readings, md5s = {}, {}
     try:
         for f in todo:
             verify = g.layout == "epsych" and f.role == "raw" and f.format == "mat"
-            reading, problem = engine.read_file(s.root_path, f, verify, s.stats)
+            more = ({"md5": True} if any(r.live and r.checksum_algo == "md5"
+                                         for r in at.get(f.path, [])) else {})
+            reading, problem = engine.read_file(s.root_path, f, verify, s.stats, **more)
             if problem is not None:
                 return _held_record(s, g, files + held_files() + unread(), problem[0],
                                     "%s: %s" % (f.path.rsplit("/", 1)[1], problem[1])), None
-            readings[f.path] = reading.checksum
+            readings[f.path], md5s[f.path] = reading.checksum, reading.md5
     except engine.FileChanged as exc:
         return _held_record(s, g, files + held_files() + unread(), "changed_during_scan",
                             "%s changed while it was read" % exc.path), None
@@ -318,10 +445,13 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
         rows = at.get(f.path, [])
         paths[f.path] = _fingerprint(rows)
         live = [r for r in rows if r.live]
-        same = [r for r in live if r.checksum_algo == "sha256" and r.checksum == c]
+        same = [r for r in live if (r.checksum_algo, r.checksum) in
+                (("sha256", c), ("md5", md5s[f.path]))]
         if same:
             known[f.path] = same[0]
-            files.append(_entry(f, "known", sha256=c, artifact_id=same[0].current_id))
+            files.append(_entry(f, "known", sha256=c, artifact_id=same[0].current_id,
+                                observed=md5s[f.path] if same[0].checksum_algo == "md5"
+                                else None))
         elif len(live) == 1:
             new.append((f, "replace", live[0].current_id))
         elif len(live) > 1:
@@ -362,7 +492,7 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     if own is not None:
         hold = engine.time_hold(db, s, g)
         session, problem = (None, hold) if hold else _session_block(
-            db, s, g, session_id, paired, planned, True)
+            db, s, g, session_id, paired, planned, True, own)
         if problem is not None:
             return _held_record(s, g, files + held + written(), problem[0], problem[1]), read_us
         old = db.event_text(own.event_id, g.time_zone)
@@ -393,6 +523,7 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
                             % (own.event_id, new_id, session["id"], partner.source_path)}
         expect["active"] = [a for a, _r, _p, _c in active]
         expect["sessions"] = session.pop("expect")
+        expect["session_paths"] = session.pop("expect_paths")
         event = block(new_id, g.subject_id, session["id"])
         event.update({"supersedes": own.event_id, "occurred_local": g.occurred_local,
                       "time_zone": g.time_zone, "detail": dict(g.detail),
@@ -419,8 +550,19 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
         sets = [{e for e, _a, _w in copies.get(c, [])} for c in raw]
         common = sorted(set.intersection(*sets)) if sets else []
         also = sorted(set().union(*sets)) if sets else []
-        expect["copies"] = {"checksums": raw, "common": common}
-        if len(common) > 1:
+        expect["copies"] = {"checksums": raw, "common": common,
+                            "events": {c: sorted(x) for c, x in zip(raw, sets)}}
+        partial = None if common else engine.partial_copy(db, g, {
+            f.path: {e for e, _a, _w in copies.get(readings[f.path], [])}
+            for f in g.files if f.role == "raw" and f.path in readings})
+        if partial is not None:
+            events = sorted(set().union(*sets))
+            if partial[0] == "copy_partial" and len(events) == 1:
+                # Every matching file is the one event's: the rest is added to it.
+                host = db.event_facts(events)[events[0]]
+            else:
+                hold = (partial[0], partial[1] + ": a person decides")
+        elif len(common) > 1:
             hold = ("copy_ambiguous", "its raw files are, by their SHA-256, the files of each "
                     "of events %s" % ", ".join(common))
         elif len(common) == 1 and db.written_by(common[0], TOOL_NAME):
@@ -436,11 +578,13 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     if host is not None:
         theirs = db.event_artifacts(host.event_id)
         expect["host"] = block(host.event_id, host.subject_id, host.session_id)
+        extra = sorted(f.path for f, _state, _r in new if readings[f.path] not in theirs)
         return _group_record(
             s, g, "attach_copy" if new or known else "none",
             files + held + written(lambda f: engine.copy_attributes(
                 g, f.attributes, host.event_id, theirs.get(readings[f.path]), version)),
-            expect=expect, event=block(host.event_id, host.subject_id, host.session_id)), read_us
+            expect=expect, event=block(host.event_id, host.subject_id, host.session_id),
+            copy_extra=extra or None), read_us
 
     hold = engine.time_hold(db, s, g)
     session, problem = (None, hold) if hold else _session_block(
@@ -448,6 +592,7 @@ def scan_group(db: Database, s, g: Group, by_key: dict, conflicts: set, planned:
     if problem is not None:
         return _held_record(s, g, files + held + written(), problem[0], problem[1]), read_us
     expect["sessions"] = session.pop("expect")
+    expect["session_paths"] = session.pop("expect_paths")
     values = engine.event_values(g, session["id"], version, also)
     event = block(values["event_id"], g.subject_id, session["id"])
     event.update({"event_type": g.kind, "occurred_local": g.occurred_local,
@@ -559,6 +704,14 @@ class PlanFile:
         self.read = {r["group"]: r["read_us"] for r in self.records
                      if r["type"] == "time" and "group" in r}
         self.groups = [r for r in self.records if r["type"] == "group"]
+        self.overrides = tuple(
+            Override(str(root), str(path), subject, bool(skip), str(reason), int(line))
+            for r in self.records if r["type"] == "overrides"
+            for root, path, subject, skip, reason, line in r["rows"])
+        if (self.end.get("overrides_sha256") is not None) != any(
+                r["type"] == "overrides" for r in self.records):
+            raise PlanError("the plan %s does not carry the overrides it was made with. Scan "
+                            "again." % path)
 
 
 # --------------------------------------------------------------------------- apply
@@ -622,6 +775,10 @@ def check_database(db: Database, d: Directory, rec: dict, dry_sessions=frozenset
         else:
             _check((None if row is None else row[0]) == subject,
                    "session %s is not as the scan found it" % session_id)
+    for session_id, path in expect.get("session_paths", {}).items():
+        row = db.session(session_id)
+        _check(row is not None and row[3] == path, "session %s is not at the path %s the scan "
+               "found it at" % (session_id, path))
     session = rec.get("session")
     if session is not None and session.get("create") is not None:
         v = session["create"]
@@ -634,13 +791,19 @@ def check_database(db: Database, d: Directory, rec: dict, dry_sessions=frozenset
         found = db.raw_copies(copies["checksums"])
         sets = [{e for e, _a, _w in found.get(c, [])} for c in copies["checksums"]]
         common = sorted(set.intersection(*sets)) if sets else []
-        _check(common == copies["common"], "the events that hold these raw bytes changed since "
-               "the scan")
+        events = {c: sorted(x) for c, x in zip(copies["checksums"], sets)}
+        _check(common == copies["common"] and events == copies["events"],
+               "the events that hold these raw bytes changed since the scan")
 
 
 def apply_group(db: Database, run_id: int | None, d: Directory, rec: dict, read_us: int | None,
-                dry_run: bool = False, dry_sessions: set | None = None) -> list[str]:
+                dry_run: bool = False, dry_sessions: set | None = None,
+                counted: dict | None = None) -> list[str]:
     """Carry out one planned group in ONE transaction; returns notes for the report.
+
+    COUNTED, when given, gets ``files_registered`` / ``files_known`` (the rows
+    ``engine.write_group`` wrote) and ``files_repointed`` (memory rows that
+    follow a superseded artifact to its successor) added.
 
     Raises :class:`Refused` (nothing written) when the database is not as the
     scan found it. With DRY_RUN the checks are made and nothing is written.
@@ -659,6 +822,9 @@ def apply_group(db: Database, run_id: int | None, d: Directory, rec: dict, read_
         if session.get("aside"):
             db.session_note(session["aside"]["id"], session["aside"]["note"],
                             session["aside"]["path"])
+        if session.get("restore"):
+            db.session_note(session["restore"]["id"], session["restore"]["note"],
+                            session["restore"]["path"])
         if session.get("create"):
             w.session = dict(session["create"])
         rows: list[MemoryWrite] = []
@@ -697,43 +863,97 @@ def apply_group(db: Database, run_id: int | None, d: Directory, rec: dict, read_
                                          f["attributes"], f["artifact_id"],
                                          successor.get(f.get("replaces"), f.get("replaces"))))
             elif f["state"] == "known":
-                w.files.append(FileWrite(f["path"], f["size"], f["mtime_ns"], f["sha256"], "known",
+                w.files.append(FileWrite(f["path"], f["size"], f["mtime_ns"],
+                                         f.get("observed", f["sha256"]), "known",
                                          artifact_id=successor.get(f["artifact_id"],
                                                                    f["artifact_id"])))
             elif f["state"] == "registered" and f["artifact_id"] in successor:
                 rows.append(MemoryWrite(f["path"], "registered", f["size"], f["mtime_ns"],
                                         rec["key"], artifact_id=successor[f["artifact_id"]]))
-        rows += engine.write_group(db, d.root_id, w)
-        db.write_memory(run_id, d.root_id, rows)
+        repointed = len(rows)
+        written = engine.write_group(db, d.root_id, w)
+        db.write_memory(run_id, d.root_id, rows + written)
+    if counted is not None:
+        for name, n in (("files_registered", sum(1 for r in written if r.status == "registered")),
+                        ("files_known", sum(1 for r in written if r.status == "known")),
+                        ("files_repointed", repointed)):
+            counted[name] = counted.get(name, 0) + n
     return notes
 
 
+def reread_files(root_path: str, record: dict, rec: dict) -> None:
+    """Read every file the group's action writes again; the plan's SHA-256 is required.
+
+    A ``.mat`` file of an ePsych session is checked structurally again
+    (``mat5.verify_file``). :class:`Refused` otherwise.
+    """
+    stats = engine.ReadStats()
+    for f in rec["files"]:
+        if f["state"] not in ("new", "replace", "known"):
+            continue
+        listed = GroupFile(f["path"], f["size"], f["mtime_ns"], f.get("role") or "",
+                           f.get("format"), {})
+        verify = (record["layout"] == "epsych" and f.get("role", "raw") == "raw"
+                  and f["path"].lower().endswith(".mat"))
+        try:
+            reading, problem = engine.read_file(root_path, listed, verify, stats)
+        except engine.FileChanged as exc:
+            raise Refused("%s changed while it was read again" % exc.path) from None
+        _check(problem is None, "%s: %s" % (f["path"], problem[1] if problem else ""))
+        _check(reading.checksum == f["sha256"],
+               "%s was read again: its SHA-256 is %s, the plan says %s"
+               % (f["path"], reading.checksum, f["sha256"]))
+
+
 def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, only: set,
-                    dry_run: bool, version: str, host: str, dry_sessions: set | None = None
-                    ) -> dict:
+                    dry_run: bool, version: str, host: str, dry_sessions: set | None = None,
+                    cache=None, reread: bool = False) -> dict:
     """Apply one directory's planned groups; the caller holds its lock.
 
-    Appends ``lab.scan_run`` (command ``apply``, no ``due_at``) and, at the
-    end, its result. Returns ``{"applied": [...], "refused": [(key, why)],
-    "notes": [...], "run_id": ...}``.
+    Lists the directory and its partner completely again and interprets
+    them again (headers only), with the plan's overrides: a group whose
+    basis differs from the plan's is refused, and a listing that cannot be
+    made completely refuses every group of the directory. With REREAD every
+    file an action writes is read to its end again and must have the plan's
+    SHA-256. Appends ``lab.scan_run`` (command ``apply``, no ``due_at``)
+    and, at the end, its result. Returns ``{"applied": [...], "refused":
+    [(key, why)], "notes": [...], "run_id": ...}``.
     """
     out = {"applied": [], "refused": [], "notes": [], "run_id": None, "started": "",
-           "directory": record}
+           "directory": record, "reread": reread}
     groups = [g for g in plan.groups if g["directory"] == record["id"] and g["action"] in ACTIONS
               and (not only or g["key"] in only)]
+
+    def refuse_all(why: str) -> dict:
+        out["refused"] = [(g["key"], why) for g in groups]
+        return out
+
     d = db.directory(record["id"])
+    if d is not None and d.root != record["root"]:
+        return refuse_all("the plan names storage root %s for directory %d; the database says "
+                          "its storage root %d is %s" % (record["root"], record["id"],
+                                                         d.root_id, d.root))
     same = d is not None and (d.root_id, d.path, d.layout, d.time_zone) == (
         record["root_id"], record["path"], record["layout"], record["time_zone"])
     if not same:
-        out["refused"] = [(g["key"], "the directory is no longer listed as the plan says")
-                          for g in groups]
-        return out
+        return refuse_all("the directory is no longer listed as the plan says")
+    try:
+        s = engine.sight(db, d, root_path, plan.overrides, cache)
+    except (Unreachable, ListingFailed) as exc:
+        return refuse_all("the directory cannot be listed and interpreted completely again: %s"
+                          % exc)
+    if [p.id for p in s.partners] != ([record["partner"]] if record["partner"] is not None
+                                      else []):
+        return refuse_all("the directory is paired with %s now; the plan says %s"
+                          % ([p.id for p in s.partners] or "none", record["partner"]))
+    now = {g.key: g for g in s.interp.groups}
     if not dry_run:
         out["run_id"], _started, out["started"] = db.insert_run(d.id, "apply", "register", None,
                                                                 version, host)
         d = db.directory(record["id"])
     listed_us = plan.listed.get(record["id"])
     counters = dict.fromkeys(("files_registered", "files_known", "groups_registered"), 0)
+    counted: dict = {}
     try:
         for rec in groups:
             try:
@@ -742,8 +962,18 @@ def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, 
                        "the plan's listing is %d min old; the directory's min_age_min is %d"
                        % (age_us // 60_000_000, d.min_age_min))
                 check_files(root_path, rec)
-                notes = apply_group(db, out["run_id"], d, rec, plan.read.get(rec["key"]), dry_run,
-                                    dry_sessions)
+                g = now.get(rec["key"])
+                _check(g is not None, "the group is no longer in the listing")
+                difference = basis_difference(rec["basis"], group_basis(g))
+                _check(difference is None, "the listing now differs from the scan's: %s"
+                       % difference)
+                read_us = plan.read.get(rec["key"])
+                if reread:
+                    reread_files(root_path, record, rec)
+                    read_us = db.now_us()
+                one: dict = {}
+                notes = apply_group(db, out["run_id"], d, rec, read_us, dry_run, dry_sessions,
+                                    one)
             except Refused as exc:
                 out["refused"].append((rec["key"], str(exc)))
                 continue
@@ -759,9 +989,11 @@ def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, 
             out["applied"].append(rec["key"])
             out["notes"] += ["%s: %s" % (rec["key"], n) for n in notes]
             counters["groups_registered"] += 1
-            counters["files_registered"] += sum(1 for f in rec["files"]
-                                                if f["state"] in ("new", "replace"))
-            counters["files_known"] += sum(1 for f in rec["files"] if f["state"] == "known")
+            for name, n in one.items():
+                if name in counters:
+                    counters[name] += n
+                else:
+                    counted[name] = counted.get(name, 0) + n
     finally:
         if out["run_id"] is not None and not db.lost():
             refused = len(out["refused"])
@@ -772,13 +1004,90 @@ def apply_directory(db: Database, plan: PlanFile, record: dict, root_path: str, 
                     "; %d refused" % refused if refused else ""),
                 {"plan": {"file": os.path.basename(plan.path), "sha256": plan.end["sha256"]},
                  "applied": out["applied"][:200],
-                 "refused": [{"group": k, "reason": why} for k, why in out["refused"][:200]]})
+                 "refused": [{"group": k, "reason": why} for k, why in out["refused"][:200]],
+                 "reread": reread, "files_repointed": counted.get("files_repointed", 0)})
     return out
 
 
 # --------------------------------------------------------------------------- the scan's report
+def what_is_written(g: dict) -> list[tuple[str, str, str, str, str]]:
+    """What ``apply`` writes for planned group G besides its files' artifacts, for a reviewer.
+
+    (what, action, path, id, sentence) rows: the event and its time, detail
+    and session; sessions made, moved aside, given back or given a note;
+    artifact rows superseded; files recorded as replaced; a copy's event.
+    """
+    out = []
+    event = g.get("event") or {}
+    session = g.get("session") or {}
+    if g["action"] in ("register", "correct", "move_session"):
+        detail = event.get("detail") or {}
+        said = ["subject %s" % event.get("subject_id"),
+                "occurred %s %s" % (event.get("occurred_local"), event.get("time_zone"))]
+        if "duration_s" in detail:
+            said.append("duration %s s" % detail["duration_s"])
+        if "trials_completed" in detail:
+            said.append("%s trial(s)" % detail["trials_completed"])
+        said += ["%s %s" % (k, v) for k, v in sorted(detail.items())
+                 if k not in ("duration_s", "trials_completed")]
+        verb = "a new %s event" % g["kind"] if g["action"] == "register" else (
+            "a %s event superseding %s" % (g["kind"], event.get("supersedes")))
+        out.append(("event", "new", g["source_path"], event.get("id", ""),
+                    "%s: %s" % (verb, "; ".join(said))))
+        create = session.get("create")
+        if create is not None:
+            out.append(("session", "new", create["path"], session["id"],
+                        "session %s of subject %s, label %s, at %s; starts %s %s%s; rig %s"
+                        % (session["id"], create["subject_id"], create["label"], create["path"],
+                           create["start_local"] or "(date only: no start)", create["zone"],
+                           "; duration %s s" % create["duration"] if create["duration"]
+                           else "", create["rig"])))
+        elif session.get("id"):
+            out.append(("session", "existing", "", session["id"],
+                        "into session %s%s" % (session["id"], ", which the recording's group "
+                                               "%s makes" % session["needs_group"]
+                                               if session.get("needs_group") else "")))
+    if g["action"] in ("add_files", "attach_copy"):
+        out.append(("event", "existing", g["source_path"], event.get("id", ""),
+                    "files added to %s event %s of subject %s, session %s"
+                    % ("another client's" if g["action"] == "attach_copy" else "its",
+                       event.get("id"), event.get("subject_id"), event.get("session_id"))))
+        if g.get("copy_extra"):
+            out.append(("event", "copy_extra", g["source_path"], event.get("id", ""),
+                        "files the other client's event does not hold, added to it: %s"
+                        % ", ".join(g["copy_extra"])))
+    for key, action in (("aside", "moved_aside"), ("restore", "given_back")):
+        if session.get(key):
+            item = session[key]
+            out.append(("session", action, item["path"], item["id"],
+                        "session %s gets the path %s and the note: %s"
+                        % (item["id"], item["path"], item["note"])))
+    if g.get("session_note"):
+        item = g["session_note"]
+        out.append(("session", "note", "", item["session_id"],
+                    "session %s gets the note: %s" % (item["session_id"], item["note"])))
+    for item in g.get("supersede", []):
+        out.append(("artifact", "superseded", "%s:%s" % (item["root"], item["path"]), item["old"],
+                    "artifact %s at %s:%s is superseded by %s" % (item["old"], item["root"],
+                                                                 item["path"], item["new"])))
+    for f in g["files"]:
+        if f["state"] == "replace":
+            out.append(("artifact", "replaced", f["path"], f["replaces"],
+                        "other bytes at %s: artifact %s is recorded as replaced by %s"
+                        % (f["path"], f["replaces"], f["artifact_id"])))
+    if g.get("carried"):
+        out.append(("event", "carried", "", event.get("id", ""), g["carried"]))
+    return out
+
+
 def scan_report(records: list[dict]) -> tuple[str, str]:
-    """(CSV, text) of a plan, for the person who reviews it."""
+    """(CSV, text) of a plan, for the person who reviews it.
+
+    Both show everything ``apply`` would write: per group its files with
+    their SHA-256, the event (subject, time and zone, duration, trial count,
+    detail), the session made or used, sessions moved aside, given back or
+    given a note, artifact rows superseded and files recorded as replaced.
+    """
     out = io.StringIO(newline="")
     writer = csv.DictWriter(out, COLUMNS, lineterminator="\n")
     writer.writeheader()
@@ -812,12 +1121,21 @@ def scan_report(records: list[dict]) -> tuple[str, str]:
                 "path": r["source_path"], "group_key": r["key"],
                 "reason_code": r.get("reason_code") or "", "detail": detail,
                 "event_id": event.get("id", "")})
+            if r["action"] in ACTIONS:
+                for what, action, path, the_id, sentence in what_is_written(r):
+                    writer.writerow(dict.fromkeys(COLUMNS, "") | {
+                        "what": what, "action": action, "root": roots[r["directory"]],
+                        "path": path, "group_key": r["key"], "detail": sentence,
+                        "artifact_id": the_id if what == "artifact" else "",
+                        "event_id": the_id if what == "event" else event.get("id", "")})
             for f in r["files"]:
+                said = f.get("sentence", "") or f.get("sha256", "")
+                if f["state"] == "replace":
+                    said = "sha256 %s; replaces artifact %s" % (f["sha256"], f["replaces"])
                 writer.writerow(dict.fromkeys(COLUMNS, "") | {
                     "what": "file", "action": f["state"], "root": roots[r["directory"]],
                     "path": f["path"], "group_key": r["key"], "reason_code": f.get("code", ""),
-                    "detail": f.get("sentence", "") or f.get("sha256", ""),
-                    "size_bytes": f["size"], "mtime_ns": f["mtime_ns"],
+                    "detail": said, "size_bytes": f["size"], "mtime_ns": f["mtime_ns"],
                     "artifact_id": f.get("artifact_id", ""), "event_id": event.get("id", "")})
     groups = [r for r in records if r["type"] == "group"]
     summary = ["%d %s" % (sum(1 for g in groups if g["action"] == a), a)
@@ -843,18 +1161,19 @@ def scan_report(records: list[dict]) -> tuple[str, str]:
             for k, v in sorted(g.get("changes", {}).items()):
                 text.append("      %s: %s -> %s" % (k, ids.canonical_json(v[0]),
                                                      ids.canonical_json(v[1])))
-            for f in g["files"]:
-                if f["state"] == "replace":
+            if action not in ACTIONS:
+                continue
+            for what, kind, _path, _id, sentence in what_is_written(g):
+                if (what, kind) == ("artifact", "superseded"):
+                    item = next(x for x in g["supersede"] if x["old"] == _id)
+                    text.append("      supersedes artifact %s at %s:%s"
+                                % (item["old"], item["root"], item["path"]))
+                elif (what, kind) == ("artifact", "replaced"):
+                    f = next(x for x in g["files"] if x.get("replaces") == _id)
                     text.append("      %s: other bytes; artifact %s is recorded as replaced"
                                 % (f["path"], f["replaces"]))
-            if g.get("session", {}).get("aside"):
-                text.append("      session %s is moved aside (%s)"
-                            % (g["session"]["aside"]["id"], g["session"]["aside"]["path"]))
-            for item in g.get("supersede", []):
-                text.append("      supersedes artifact %s at %s:%s"
-                            % (item["old"], item["root"], item["path"]))
-            if g.get("carried"):
-                text.append("      " + g["carried"])
+                else:
+                    text.append("      " + sentence)
     return out.getvalue(), "\n".join(head + text).rstrip("\n") + "\n"
 
 
@@ -910,12 +1229,14 @@ def apply_report(plan: PlanFile, out: dict) -> tuple[str, str]:
         key = note.split(": ", 1)[0]
         row(what="group", action="note", group_key=key if key in groups else "", detail=note)
         text.append("  " + note)
-    text += ["", NOT_READ]
+    text += ["", REREAD if out.get("reread") else NOT_READ]
     return table.getvalue(), "\n".join(text) + "\n"
 
 
 NOT_READ = ("The files were not read again: each had the size and modification time the scan "
             "recorded, and the verification rows carry the time of the scan's read.")
+REREAD = ("Every file written was read again (--reread) and had the plan's SHA-256; the "
+          "verification rows carry the time of that read.")
 
 
 def write_apply_report(report_dir: str, plan: PlanFile, out: dict) -> str:

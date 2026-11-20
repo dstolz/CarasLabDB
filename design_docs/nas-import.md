@@ -9,6 +9,7 @@ it has not seen, and registers what is new and unambiguous. Everything it is
 not sure of it holds, and reports, for a person to settle.
 
 - Tool: `tools/import_nas_files.py` and the package `tools/nas_import/`
+  (`run`, `check`, `scan`, `apply`; §10)
 - Data model: [database-design.md](database-design.md) §3.10
 - Deployment: [deployment-windows.md](deployment-windows.md) §4.4
 - Two readers: the **administrator** who keeps the list (§3, §4, §5) and the
@@ -28,17 +29,20 @@ It never:
 - creates a subject. A file in a folder that is not a known subject is held
   until the subject is added to the database;
 - guesses. A name it cannot read, a subject it cannot match, a pairing that
-  is ambiguous, a file that is damaged or that changed while it was read is
-  held with a reason;
+  is ambiguous, a file that is damaged is held with a reason; a file that
+  changed while it was read is not registered, and its wait starts again
+  (§6.3);
 - concludes anything from a folder it could not list. If any folder cannot
-  be listed the whole search of that directory fails, and nothing is
-  registered and nothing is marked missing;
+  be listed, in the directory or in the directory it is paired with, the
+  whole search of that directory fails, and nothing is registered and
+  nothing is marked missing;
 - deletes a row, or writes a `*_login` column (the database stamps those).
 
 **An unattended run only adds.** It never supersedes an event or artifact,
 never retracts one and never records a disposition. What would need one of
 those is held (`would_correct`, `content_changed`, `late_recording`,
-`registered_but_withdrawn`, §7) and left for a person.
+`registered_but_withdrawn`, §7) and left for a person, who reads a plan
+(`scan`) and has it written (`apply`, §10.3).
 
 A search that finds nothing new writes almost nothing: a file that does not
 change has one row in the scan memory however often its directory is
@@ -99,8 +103,8 @@ decide what the search does next. A member who could write `lab.scan_run`
 could postpone a directory's search as long as they liked, and one who could
 write `lab.scan_file` could make the search pass over a file as registered,
 or hide one that is held. Members read all five tables. A login in `lab_rw`
-without the grant is refused at start with exit 2 (except for `--dry-run`),
-and nothing is searched.
+without the grant is refused at start with exit 2 (`run` and `apply`, except
+for `--dry-run`), and nothing is searched.
 
 A `lab.person` row with `db_login = 'lab_scanner'` is optional. Without it
 `recorded_by` and `created_by` are NULL on what the tool registers, and
@@ -131,7 +135,8 @@ one (§12).
 
 Two tasks on a machine that mounts the NAS: `run` every 15 minutes, which
 searches only the directories that are due, and `check` once a day, which
-exits 1 when something is wrong. [deployment-windows.md](deployment-windows.md)
+exits 1 when something is wrong. `scan` and `apply` are run by hand (§10.3).
+[deployment-windows.md](deployment-windows.md)
 §4.4 has the task definitions; [deployment-linux.md](deployment-linux.md)
 §5 and [deployment-synology.md](deployment-synology.md) §5 the equivalents.
 
@@ -265,8 +270,10 @@ Outcomes of a run (`lab.scan_run_result.outcome`):
 A search lists the directory completely with the file system's directory
 listing: names, sizes and modification times (`st_mtime_ns`, a whole
 number). No file is opened for this. A directory it is paired with (§6.5) is
-listed in the same pass. A directory whose stored path is spelled on disk
-with other letter case fails the run.
+listed in the same pass, whatever its mode. A directory whose stored path is
+spelled on disk with other letter case fails the run. So does a partner
+directory that is missing, empty or not listed completely: the run is
+`failed`. (A missing or empty directory of its own is `unreachable`.)
 
 ### 6.2 What is opened
 
@@ -274,14 +281,30 @@ with other letter case fails the run.
 |---|---|
 | A file whose name a layout recognises, not yet registered | Its **start**: for a `.mat` file the beginning of each variable, for an `.rhd` its header, for a `.ts` its first packets. This is how the content check is made. |
 | A registered file whose size and modification time are as the memory says, whose artifact is still active and present | **Nothing**, when the cache holds its header (§11). Without a cache entry its start is read again, as for a new file. |
-| A file of a stable group, in `register` mode, not yet registered | **All of it**, once: SHA-256 in 4 MiB chunks. An ePsych `.mat` file is read a second time for a structural check (every compressed variable is inflated; a damaged file holds its group before any row is written). |
-| A file held after it was read to its end | Not read again while its size and modification time stay the same: the hold stands until a person acts. |
+| A file of a stable group, in `register` mode, not yet registered | **All of it**, once: SHA-256 in 4 MiB chunks (and the MD5 as well, when another client registered a file at that path with an MD5 checksum). Its size and modification time are checked before, during and after the read. An ePsych `.mat` file is read a second time for a structural check: every variable is walked to its end, nested matrices included, and a compressed one is inflated. A damaged file holds its group, and only held rows are written for it. |
+| A file held after it was read to its end | Not read again while it and every other unregistered file of its group keep their size and modification time: the hold stands until a person acts or a file of the group is added, changed or gone. |
 
 A registered file whose size or modification time changed is treated like a
 new one: it waits (§6.3) and is read once. If its bytes are the registered
 ones (a backup tool touched it) it gets a `known` row and an `ok` check on
 its existing artifact, and no artifact is written. Other bytes at the path
-are held `content_changed`.
+are held `content_changed`. A file another client registered with an MD5
+checksum is compared by its MD5; one registered with a BLAKE3 checksum cannot
+be compared, and is held `checksum_unsupported` before it is read.
+
+A file that is not what the listing said when it is read (its size or
+modification time differs before, during or after the read, or it is gone)
+is not registered, and neither is its group. Its memory row (none, when the
+file is gone) is `pending` with the reason code `changed_during_scan` and a
+sentence giving both states; this is not a hold. The group is looked at again
+at the next run (§6.3). A file that cannot be read at all (the operating
+system refuses it) is not a hold either: the group waits, and the run ends
+`failed` and names it.
+
+A registered file whose artifact a person corrected (a new row for the same
+file) is not read: its memory row follows the artifact to its current row,
+and the run's `details.files_repointed` counts those rows. They are the only
+`registered` or `known` rows a run in `report` mode can write.
 
 ### 6.3 The stability wait
 
@@ -297,7 +320,10 @@ or held one by one:
 1. has a latest memory row written by an **earlier** run;
 2. that row gives the same size, the same modification time, the same group
    and the same state the file would be given now, so that this run appends
-   no row for any file of the group; and
+   no row for any file of the group (for a pending file of an ePsych session
+   that is judged with a recordings directory, the state includes its
+   pairing: the recording it pairs with, or that it pairs with none and why;
+   §6.5); and
 3. no file that belonged to the group is gone without being recorded
    `cleared`;
 
@@ -313,6 +339,17 @@ second can. The wait is counted from the *start* of the earlier run, and its
 listing ended a little later, so the true interval between the two listings
 can be shorter than `min_age_min` by the length of a listing. Choose
 `min_age_min` with that in mind.
+
+A change of pairing counts as a change of the file. One listing in which an
+ePsych session's recording folder is missing therefore does not let the
+session be registered alone: its pending rows say that it pairs with no
+recording, which differs from the earlier rows, and the wait starts again.
+
+A file found changed while it is read (§6.2) is written as `pending` with the
+reason code `changed_during_scan`. No listing writes such a row, so it never
+equals what the next listing gives: that listing appends its own `pending`
+row, and the wait starts at the start of *that* run, never at the run that
+read the file.
 
 When a hold is lifted (§7), the files become `pending` at the next run and
 the wait starts again.
@@ -338,11 +375,29 @@ What makes a run safe to repeat:
 - A file registered already with the same bytes at the same path is reused
   (`known`); `uq_artifact_file_original` makes a second registration
   impossible.
-- A group with no event of its own whose raw files are, by checksum, the raw
-  files of exactly one active event (registered by another client, for
-  example from a local copy) is a copy: its files are added to that event,
-  with attributes naming it (`copy_of_event`), and no event or session is
-  made.
+- **The copy rule.** A group with no event of its own whose raw files are,
+  every one of them by checksum, raw files of exactly one active event that
+  another client registered (for example from a local copy) is a copy: its
+  files are added to that event, with attributes naming it (`copy_of_event`),
+  and no event or session is made. This is decided after the files are read,
+  so a session of another client that has the folder's label does not hold
+  the group before it is read. What is not a copy is held:
+  - `copy_ambiguous`: the files are those of more than one event;
+  - `copy_event_mismatch`: the event is another subject's or of another type;
+  - `duplicate_content`: the event is one this tool registered (the same
+    bytes under two names on the NAS);
+  - `copy_partial`: some of the raw files, a data file (`.mat` or `.rhd`)
+    among them, are raw files of another client's event and some are not, or
+    no one event holds them all. An unattended run never adds part of a
+    recording to another event and never makes a second event for it. (A
+    file that two recordings made with the same settings share, such as an
+    Intan `settings.xml`, is not a data file and decides nothing; the event
+    then names the events that hold its bytes in
+    `attributes.raw_files_also_in_events`.)
+
+  A group some of whose files are registered already, all under one event,
+  has its other files added to that event; a retracted event holds it
+  (`registered_but_withdrawn`).
 - A lock per directory (a PostgreSQL advisory lock) keeps a second process
   out of a directory being searched: it skips it. The lock only saves work;
   the ids, the unique index and the transaction are what prevent a double
@@ -351,7 +406,8 @@ What makes a run safe to repeat:
 A registered event carries `attributes.import` (tool, layout, root, path, the
 name the time was read from, and the override if one applied),
 `captured_by_tool` (`import_nas_files`), `code_version`,
-`occurred_at_source` and `client_digest`. Find them with
+`occurred_at_source` and `client_digest`; a date-only session also has
+`occurred_precision` (`day`). Find them with
 `WHERE attributes->>'captured_by_tool' = 'import_nas_files'`.
 
 ### 6.5 Pairs are judged together
@@ -372,9 +428,17 @@ pairing is the rule of `findCopySessions.m` in ephys_analysis:
   `pairing_ambiguous`.
 - A recording shorter than 2 minutes takes no part. A session known by its
   date only (§12) is never paired.
-- A paired ePsych session joins the recording's session. It is registered
-  after its recording is, and is held (`paired_recording_held`) while the
-  recording is held.
+- A paired ePsych session joins the recording's session (when the recording
+  was registered from a copy by another client, the session of that
+  client's event). It is registered after its recording is, and is held
+  (`paired_recording_held`) while the recording is held, or when the event it
+  was registered under was retracted. Until the recording is registered it
+  waits.
+- A recording whose subject is not settled (`subject_mismatch`,
+  `unknown_subject`, `subject_folder_case_variant`,
+  `override_unknown_subject`) takes part under the subject of its folder and
+  the subject in its name, so it holds the ePsych sessions of both
+  (`paired_recording_held`) until an override names its subject.
 - A session with no recording is registered on its own, with a session whose
   path is the ePsych file, only when no recording folder of that subject
   that could pair with it is in sight in any state. A folder that is held
@@ -386,10 +450,13 @@ pairing is the rule of `findCopySessions.m` in ephys_analysis:
   the ePsych directory a `min_age_min` longer than the longest delay between
   the two backups.
 
-A partner directory is judged whatever its mode, so a session that pairs
-with a recording on disk waits while the recordings' directory is `off` or
-in `report` mode. More than one directory that is not `off` may not name the
-same directory in `pair_with`: the search of either fails.
+A partner directory is listed and judged whatever its mode, so a session
+that pairs with a recording on disk waits while the recordings' directory is
+`off` or in `report` mode. `check` says how many groups wait so (§10.2); they
+are registered once that directory is in `register` mode, or by `scan` and
+`apply`. More than one directory that is not `off` may not name the same
+directory in `pair_with`: the search of each of them fails, and `check` exits
+1.
 
 ### 6.6 Subjects and times
 
@@ -414,7 +481,11 @@ never registered while the reason stands. Most holds are decided anew at
 every run and end by themselves when their cause is gone (a subject added, a
 file renamed, the other file arriving); the files then become `pending` and
 wait again (§6.3). The exceptions are holds decided after a file was read to
-its end, which stand until the file changes or a person acts (§6.2).
+its end (their reason ends in `[read: sha256=...]`), which stand until a
+file of the group is added, changed or gone, or a person acts (§6.2). The
+last column says what resolves a hold, and, where it names `scan`, what the
+reviewed path does with it (§10.3). Every other hold is held by `scan` as
+well: a plan never acts on it.
 
 | Code | Why | What resolves it |
 |---|---|---|
@@ -422,8 +493,8 @@ its end, which stand until the file changes or a person acts (§6.2).
 | `symbolic_link` | A symbolic link, junction or reparse point. Never followed. | Replace it by the real file or folder on the NAS. |
 | `not_a_regular_file` | Neither a regular file nor a folder (device, FIFO, socket). | Remove it on the NAS. |
 | `path_not_storable` | The path is not UTF-8, holds a backslash or a control character, or has white space at the end of a name. | Rename it on the NAS. |
-| `unreadable_file` | The file could not be opened or read. Never remembered: tried again at the next run. | Fix the permission or the lock; nothing else is needed. |
-| `changed_during_scan` | Its size or modification time changed between the listing and reading it. | Wait; it is looked at again at the next run. |
+| `unreadable_file` | The file could not be opened or read. Not kept in the header cache: tried again at every run. | Fix the permission or the lock; nothing else is needed. |
+| `changed_during_scan` | Its size or modification time changed between the listing and reading its start, or (as a `pending` row, not a hold) between the listing and reading it to its end (§6.2). | Wait; it is looked at again at the next run, and the wait starts again (§6.3). |
 | `zero_byte` | The file holds zero bytes. Held alone; the rest of its group is registered. | The file is written; it is then added to its event. |
 | `not_in_subject_folder` | A file directly in the listed directory. | Move it into a subject folder. |
 | `unexpected_depth` | A file deeper than the layout allows. | Move it. |
@@ -435,7 +506,7 @@ its end, which stand until the file changes or a person acts (§6.2).
 | `mat_v73` | A MATLAB v7.3 (HDF5) file; only MAT 5.0 is read. | Save it as v7 or earlier, or leave it held. |
 | `mat_not_mat5` | Not a MAT 5.0 file (a v4 file, or not a MAT file). | As above. |
 | `mat_truncated` | The file ends inside its header or a variable. | Copy it again. |
-| `mat_corrupt` | The structure cannot be read. Includes damage found by the structural check made when the group is registered. | Copy it again. |
+| `mat_corrupt` | The structure cannot be read. Includes damage found by the structural check made when the group is registered (any variable, nested matrices included). | Copy it again. |
 | `mat_big_endian` | A big-endian MAT file, which is not read. | None in the tool. |
 | `mat_not_epsych` | It lacks the variables `Data` and `Info` of an ePsych session. | Rename or move it. |
 | `mat_data_size_unknown` | The size of `Data` cannot be read from its header. | None in the tool. |
@@ -454,7 +525,7 @@ its end, which stand until the file changes or a person acts (§6.2).
 | `rhd_in_subfolder` | An `.rhd` in a subfolder of a recording folder. | Move it. |
 | `intan_split_format` | An `info.rhd`: a split-format recording, which this layout does not read. | None in the tool. |
 | `rhd_unknown_version` | The main version of an `.rhd` is not 1, 2 or 3. | None in the tool. |
-| `rhd_bad_magic`, `rhd_truncated`, `rhd_bad_header`, `rhd_partial_block` | An `.rhd` that is not one, ends inside its header, holds a value the reader will not accept, or is not a whole number of data blocks. Holds the whole recording. | Copy the recording again. |
+| `rhd_bad_magic`, `rhd_truncated`, `rhd_bad_header`, `rhd_partial_block` | An `.rhd` that is not one, ends inside its header, holds a value the reader will not accept (a sample rate RHX does not offer; in a version 3 file, a signal group whose amplifier-channel count differs from its channel records), or is not a whole number of data blocks. Holds the whole recording. | Copy the recording again. |
 | `rhd_header_mismatch` | The `.rhd` files of one recording disagree on sample rate or channel count. | A person looks at the recording. |
 | `rhd_no_amplifier_channels` | The header has no enabled amplifier channel. | None in the tool. |
 | `rhd_duration_inexact` | The duration has no exact decimal value. At 30 kS/s and 15 kS/s most recordings have none (§13). | None in the tool. |
@@ -465,26 +536,31 @@ its end, which stand until the file changes or a person acts (§6.2).
 | `override_unknown_subject` | An override names a subject that does not exist. | Add the subject, or correct the override. |
 | **Pairing** | | |
 | `pairing_ambiguous` | Another candidate lies within 30 seconds (§6.5). | Skip one of the recordings with an override, or fix the names. |
-| `paired_recording_held` | The recording it pairs with is held. | Resolve the recording. |
+| `paired_recording_held` | The recording it pairs with is held or not registrable, or was registered under an event that was retracted. | Resolve the recording. For a retracted one, a person decides whether the recording is registered again (`scan` and `apply`) or the session is registered on its own. |
 | `session_label_conflict` | Two sessions of one subject would get the same label. | A person looks at the two. |
 | **Against the database** | | |
 | `would_correct` | The group's event is in the database with another digest: registering would be a correction. | `scan` plans the correction and `apply` writes it, after a person has read the plan (§10.3). |
-| `content_changed` | Other bytes at a registered path: registering them would record the registered file as replaced. Raw data should not change. | `scan` plans a new artifact with the old one recorded `replaced`; `apply` writes it. |
-| `late_recording` | A recording arrived for an ePsych session already registered in a session of its own. Joining them is a correction. | `scan` plans the ePsych event corrected into the recording's session (`move_session`); `apply` writes it. |
-| `path_case_conflict` | The path differs only in case from a registered one or from another listed path. `scan` holds it too. | Rename on the NAS. |
-| `registered_but_withdrawn` | The file's artifact, or the group's event, was retracted, or the file was recorded as moved, replaced or deleted. A file's first row can never be entered twice. `scan` holds it too. | A person decides in the database (a `restored` disposition, or superseding a retracted row). |
-| `copy_ambiguous` | The group's files are files of more than one event already in the database. `scan` holds it too. | A person looks at the events named in the reason. |
-| `copy_event_mismatch` | The event the files already belong to is another subject's or of another type. `scan` holds it too. | As above. |
-| `duplicate_content` | The group's raw files hold the bytes this tool registered already under another name. `scan` holds it too. | A person looks at the paths named in the reason. |
-| `session_conflict` | The session the group needs cannot be used: another session holds its label or path, or belongs to another subject. `scan` holds it too. | As above. |
-| `local_time_nonexistent`, `local_time_ambiguous` | The name's wall-clock time does not exist in the zone, or occurs twice (§6.6). `scan` holds it too. | A person decides the time. |
+| `content_changed` | Other bytes at a registered path: registering them would record the registered file as replaced. Raw data should not change. | `scan` plans a new artifact with the old one recorded `replaced`; `apply` writes it. Several registered files at the path: `scan` holds it too. |
+| `late_recording` | A recording arrived for an ePsych session already registered in a session of its own. Joining them is a correction. The ePsych session is itself held `would_correct` meanwhile. | `scan` plans the ePsych event corrected into the recording's session (`move_session`) and the recording as new; `apply` writes both. |
+| `path_case_conflict` | The path differs only in case from a registered one, from another listed path, or from the path of a session. | Rename on the NAS. |
+| `registered_but_withdrawn` | The file's artifact, or the group's event, was retracted, or the file was recorded as moved, replaced or deleted. A file's first row can never be entered twice. | A person decides in the database (a `restored` disposition, or superseding a retracted row). |
+| `copy_ambiguous` | The group's files are files of more than one event already in the database (§6.4). | A person looks at the events named in the reason. |
+| `copy_event_mismatch` | The event the files already belong to is another subject's or of another type. | As above. |
+| `copy_partial` | Some, not all, of the raw files (a data file among them) are raw files of another client's event, or no one event holds them all (§6.4). | `scan` plans `attach_copy`, adding the rest to that event, when every matching file is in one event of the same type and subject; otherwise a person decides. |
+| `duplicate_content` | The group's raw files, or some of them, hold bytes this tool registered already under another name. | A person looks at the paths named in the reason. |
+| `session_conflict` | The session the group needs cannot be used: another session holds its label or path, or belongs to another subject, or (a paired session) the session of its recording does not exist or has none. For a session of another client with the folder's label this is decided after the files are read, and only when they are not a copy of that session's files. | A person relabels or moves the other session, then `scan` and `apply`. |
+| `local_time_nonexistent`, `local_time_ambiguous` | The name's wall-clock time does not exist in the zone, or occurs twice (§6.6). | A person decides the time. |
+| `group_too_large` | The group has more than 2000 files (`engine.MAX_GROUP_FILES`). One transaction takes an advisory lock per file, and more would fail with "out of shared memory" at PostgreSQL's default `max_locks_per_transaction` of 64 with `max_connections` 100. It is held before anything is read. | A person registers it in parts, or raises `max_locks_per_transaction`. |
+| `checksum_unsupported` | A file is registered at this path with a checksum algorithm this tool cannot compute (BLAKE3; it compares SHA-256 and MD5). | A person compares the file. |
 
 Not held, only reported: an empty folder (`empty_folder`), the files under a
 folder an override skips (`override_skip`), names ignored on purpose
 (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `@eaDir`, `#recycle`, `_gsdata_`,
 names that start with `~$`, in any letter case, and the root marker) and
 registered files that are not in the listing (`missing`: recording a deletion
-is a person's decision, `lab.artifact_disposition`).
+is a person's decision, `lab.artifact_disposition`). The code
+`not_a_subject_folder` is retired: nothing produces it any more
+(`unknown_subject` took its place).
 
 Every listed file ends in exactly one place: a group's files, a held file, a
 reported file or an ignored one. After a search the counts add up to the
@@ -494,7 +570,9 @@ files on disk, which can be checked against an independent listing
 ## 8. Overrides
 
 An overrides file is a reviewed CSV that tells the tool what a person
-decided about a subject. It is given to `run` with `--overrides FILE`. Rows:
+decided about a subject. It is given to `run` and to `scan` with
+`--overrides FILE`; the plan that `scan` writes carries the rows it was made
+with, and `apply` interprets the tree again with exactly those. Rows:
 
 | Column | Meaning |
 |---|---|
@@ -522,6 +600,11 @@ nas-rig3,epsych_files/Data/TEST,skip,test subject
   already registered makes the run hold it as `would_correct`.
 - An override cannot resolve `name_case_conflict`: it cannot say which
   spelling is meant.
+- Adding, changing or withdrawing an override after its group was registered
+  changes the group's digest, so it is a correction: `scan` plans it and
+  `apply` writes it. A correction to another subject moves the old session
+  aside; when the override is withdrawn, the path goes back to the subject's
+  own session (§10.3).
 
 Overrides stay a file, not part of the database. A scheduled run reads the
 file at every start, so keep it where the service account can read it and
@@ -557,6 +640,27 @@ the listing). The CSV has one row per line of that, with these columns:
 | `size_bytes`, `mtime_ns` | As listed. |
 | `artifact_id`, `event_id` | Of a registered or known file; the event a file was registered under. |
 | `until` | For a waiting group: from when it may be registered (UTC). |
+
+`apply --report-dir DIR` writes the same two files, with the same columns,
+for each directory it applied to (not for `--dry-run`): a `group` row per
+group with `action` `applied` or `refused` (the plan's action and, for a
+refusal, the reason are in `detail`), a `file` row (`registered` or `known`)
+for each file written, and a `group` row with `action` `note` for each note
+(a tag that could not be carried). The text ends with a line saying whether
+the files were read again (§10.3). A report that cannot be written does not
+undo anything: what was applied stands, and `apply` exits 1.
+
+The result row of every run (`lab.scan_run_result`) holds the counts as
+columns and the rest in `details`: `totals` (the files now, by state),
+`files_opened` and `files_read` (files opened for their start, files read to
+their end), `files_repointed`, and lists with `count`, `digest` and the first
+50 entries (`missing`, `would_correct`, `would_register`, `held_groups`).
+The counts are those of `database.RESULT_COUNTERS`, which says what each one
+counts: `files_registered` is files newly registered (one artifact row and one
+`ok` verification each), `files_known` files read and found registered
+already, `files_pending`, `files_held` and `files_cleared` the rows written,
+and `groups_registered` the groups written (a new event, files added to an
+event, a copy attached, or, for `apply`, a correction).
 
 ### 9.2 The dialog
 
@@ -633,11 +737,20 @@ read the same views.
 python tools/import_nas_files.py COMMAND [options]
 ```
 
+| Command | What it is | Writes to the database |
+|---|---|---|
+| `run` | The unattended search of the directories that are due (§10.1). | Yes: the scan logs, and what it registers. |
+| `check` | The monitor (§10.2). | No. |
+| `scan` | The reviewed path, first half: reads, and writes a plan to a folder (§10.3). | No. |
+| `apply` | The reviewed path, second half: writes exactly a plan (§10.3). | Yes. |
+
 The connection comes from the libpq environment (`PGHOST`, `PGPORT`,
 `PGDATABASE`, `PGUSER`, `PGPASSWORD` or the password file). It needs
 Python 3 and `psycopg` v3 (`pip install "psycopg[binary]"`). The login of
-`run` inherits `lab_rw` and has `INSERT` on the three scan logs
-(`lab_scanner`), or is the schema's owner. `check` only reads.
+`run` and `apply` inherits `lab_rw` and has `INSERT` on the three scan logs
+(`lab_scanner`), or is the schema's owner; both refuse to start without
+(exit 2, except with `--dry-run`). `check` and `scan` only read. Every
+command exits 2 on a usage or connection error, and `--help` of each says so.
 
 ### 10.1 `run`
 
@@ -652,9 +765,9 @@ the result row, writes the report.
 | `--directory ID` | Only this `scan_directory_id`; repeatable. |
 | `--now` | Search the named directories (or all that are not `off`) whether due or not. A run made by hand: it records no `due_at`, never moves the schedule and does not ask whether the window is open. Naming an `off` directory is refused. |
 | `--overrides FILE` | The overrides CSV (§8). |
-| `--cache-file FILE` | The header cache (§11). |
+| `--cache-file FILE` | The header cache (§11). A cache that cannot be written is a warning in the run's line, not an error. |
 | `--report-dir DIR` | Where the reports go (§9.1). Created if missing. |
-| `--log-file FILE` | Append one line per process run, `OK` or `ERROR`. The folder of this file, and that of `--cache-file`, must exist. |
+| `--log-file FILE` | Append one line per process run, `OK` or `ERROR`. The folder of this file must exist. |
 | `--dry-run` | Write nothing to the database, the cache or a report; read no file to its end; print the text report of what would be done. |
 
 Exit status:
@@ -662,7 +775,7 @@ Exit status:
 | Code | Meaning |
 |---|---|
 | 0 | Every directory searched ended `ok` or `partial`. Directories skipped (locked by another process, root not given, no longer due) do not change it. |
-| 1 | Some directory ended `failed` or `unreachable`. |
+| 1 | Some directory ended `failed` or `unreachable`, or a report could not be written to `--report-dir` (the run's rows stand and the other directories are still searched). |
 | 2 | A usage or connection error, including a login that may not write the scan logs, and a lost connection that could not be restored. Nothing, or not everything, was searched. |
 
 When the connection drops the tool reconnects once and takes its lock again,
@@ -676,12 +789,15 @@ python tools/import_nas_files.py check [--root NAME=PATH ...] [--log-file FILE]
 
 It searches nothing and writes nothing. It prints each directory that is not
 `off` with its pending and held files and its last outcome, and exits 1 when
-a directory is overdue (§5), when two listed directories overlap, or when a
-directory that is due lies on a storage root not given with `--root`. The
-third test is skipped, and says so, when no `--root` is given. Held files do
-not make it fail: read them (§9). Schedule it and alert on it, as for
-`backup_lab.py --check`. Exit 0 means none of this; 2 is a usage or
-connection error.
+a directory is overdue (§5), when two listed directories overlap, when more
+than one directory that is not `off` names the same directory in `pair_with`
+(none of them can be searched, §6.5), or when a directory that is due lies on
+a storage root not given with `--root`. The last test is skipped, and says
+so, when no `--root` is given. Held files do not make it fail: read them
+(§9). It also says how many groups wait for a recording whose directory is
+not in `register` mode (§6.5); that does not change the exit status.
+Schedule it and alert on it, as for `backup_lab.py --check`. Exit 0 means
+none of this; 2 is a usage or connection error.
 
 ### 10.3 `scan` and `apply`
 
@@ -692,24 +808,37 @@ a tree. A person reads a plan, and `apply` writes exactly that plan.
 python tools/import_nas_files.py scan --root NAME=PATH ... --directory ID ... --out DIR
                                       [--overrides FILE] [--cache-file FILE]
 python tools/import_nas_files.py apply PLANFILE --root NAME=PATH ...
-                                      [--only GROUP_KEY ...] [--dry-run] [--log-file FILE]
+                                      [--only GROUP_KEY ...] [--dry-run] [--reread]
+                                      [--cache-file FILE] [--report-dir DIR]
+                                      [--log-file FILE]
 ```
 
 **`scan`** reads the named directories (in any mode; name a directory and the
 one it is paired with together, so that a pair is judged together) and the
 database. It writes **nothing** to the NAS, the database or the cache file
 (`--cache-file` is read, never written), and it makes no `lab.scan_run` row.
-It reads to their end the files an action would write (SHA-256; an ePsych
-`.mat` is also checked structurally). It does not wait: whether the files
-are old enough is decided by `apply`. `--directory` (at least one), `--root`
-and `--out` are required. Into `--out` it writes, named for the database's
-clock in UTC (`plan_<yyyyMMddTHHmmssZ>`):
+It reads to their end the files an action would write (SHA-256, and the MD5
+where another client registered one; an ePsych `.mat` is also checked
+structurally). It does not wait: whether the files are old enough is decided
+by `apply`. `--directory` (at least one), `--root` and `--out` are required.
+Directories that name a partner (the recordings) are read before the others.
+Into `--out` it writes, named for the database's clock in UTC
+(`plan_<yyyyMMddTHHmmssZ>`):
 
-- `.jsonl`, the plan: one JSON line per directory, held file and group, and
-  an end line holding a SHA-256 of every line before it, so that an edited or
-  truncated plan is refused;
+- `.jsonl`, the plan, in the format `caraslabdb-nas-plan/2`: one JSON line
+  per record (the plan's head, the overrides it was given, each directory
+  with the time of its complete listing, each held file, each group and the
+  time its files were read), and an end line (below);
 - `.csv` and `.txt`, the report to read, with the columns of §9.1. For a group
   `action` is what the plan does with it; for a file it is the file's state.
+  For every group the plan acts on they also show what `apply` will write:
+  the event (subject, time and zone, duration, trial count, detail), the
+  session made or used (its label, path, start with its zone, duration and
+  rig), sessions moved aside, given back their path or given a note, the
+  artifact rows that a correction supersedes (each with its root and path),
+  files recorded as replaced, a copy's extra files, and that tags, input
+  edges and variables are carried when the plan is applied. The CSV carries
+  these as rows with `what` `event`, `session` and `artifact`.
 
 A group's action:
 
@@ -717,8 +846,8 @@ A group's action:
 |---|---|
 | `register` | A new session (unless it exists), the event and its detail row, one artifact per new file. |
 | `add_files` | New files on the group's event, which is there with the same digest. |
-| `attach_copy` | The group's files are added to an event another client registered; no event or session is made. |
-| `correct` | The event is there with another digest. A new event supersedes it (the report lists each changed value, old and new), the event's inputs are carried, each active artifact of the old event is superseded by a row of the new one, tags are copied, and the database carries variables. |
+| `attach_copy` | The group's files are added to an event another client registered; no event or session is made. Also the rest of a group some of whose data files are already in one event of the same type and subject (`copy_partial`, §6.4); the report lists those files as the copy's extras. |
+| `correct` | The event is there with another digest. A new event supersedes it (the report lists each changed value, old and new), the event's inputs are carried, each active artifact of the old event is superseded by a row of the new one (every file of the event, including files other clients put on other roots, each named with its root and path), tags are copied (a retired tag is skipped and noted), and the database carries variables. |
 | `move_session` | A `correct` whose only change is the session: a recording arrived for an ePsych session registered on its own. The session it leaves stays and gets a note. |
 | `none` | Nothing to do. |
 | `wait`, `held` | Not carried out; the reason code and the sentence say why. `wait`: a paired session whose recording is neither registered nor in this plan, so scan both directories together. |
@@ -729,39 +858,92 @@ it), `known` (registered already with these bytes: a memory row and an `ok`
 check), `registered` (unchanged, nothing written) or `held`. A correction to
 another subject cannot reuse the session: the old session is moved aside
 (its path gets the suffix `#superseded-by-<new session id>` and a note) and a
-session of the new subject takes the path.
+session of the new subject takes the path. When the override is withdrawn
+later, the subject's own session is given its path back, with a note.
 
 **`apply`** carries out the groups whose action writes something, each in
-one transaction, and refuses a group, writing nothing for it, unless:
+one transaction, and refuses a group, writing nothing for it, unless all of
+this holds. A plan that is not usable at all is refused with exit 2 and
+nothing is written (the first bullet).
 
-- the plan is as it was written (its digest matches), has the format this
-  version reads, and was made against this database;
-- every listed file of the group has the size and modification time the plan
-  recorded. **The files are not read again**; the verification rows carry
-  the time of the scan's read;
-- the plan's listing of the directory is at least the directory's
-  `min_age_min` old;
-- the database is as the scan found it: the event, the artifacts at the
-  group's paths, the sessions and the active artifacts of the event being
-  corrected.
+- The plan is as it was written (the digest on its last line matches its
+  lines, and the line count), has the format `caraslabdb-nas-plan/2`, carries
+  the overrides it was made with, names only storage roots given with
+  `--root`, and was made against this database (its name, oid and the
+  cluster's system identifier). `--only` names a group of the plan that
+  acts. The login may write the scan logs (not for `--dry-run`).
+- The directory is as the plan says: its storage root has the name the plan
+  gives (not only the same id), and its path, layout and time zone are the
+  same; nobody else is searching it (a directory another process holds is
+  refused with all its groups); it is paired with the directory the plan
+  says.
+- The directory and its partner are listed completely again, and
+  interpreted again with the plan's overrides (file headers only; nothing is
+  hashed). A listing that cannot be made completely refuses every group of
+  the directory.
+- The plan's listing of the directory is at least the directory's
+  `min_age_min` old (the database's clock, the directory's value now).
+- Every listed file of the group has the size and modification time the plan
+  recorded, and the group is as the scan found it: the same files with the
+  same sizes and times, none added, none gone, and the same subject, session,
+  label, rig, time and zone, detail, override and pairing. A recording that
+  grew, or whose partner arrived, after the scan is refused, with the
+  difference named.
+- The database is as the scan found it: the event (current, same digest, not
+  retracted), the event a copy is added to, the artifacts at the group's
+  paths, each registered file still current and present, the active artifacts
+  of an event being corrected, the sessions involved and their paths, a
+  session about to be made not blocked, and the events that hold the raw
+  bytes of a copy. A paired session is applied after its recording (the plan
+  lists the recordings first): its session must exist by then, or the group
+  is refused.
+- With `--reread`: each file the action writes is read to its end again, a
+  `.mat` of an ePsych session is checked structurally again, and the SHA-256
+  is the plan's. Without it the files are **not read again**: `apply` takes
+  every SHA-256 from the plan, and the verification rows carry the time of
+  the scan's read.
+- The database accepts the group's transaction. A refusal by the database
+  is reported as the group's reason.
 
-A refused group is reported and the others go on. `--only GROUP_KEY`
-applies one group (repeatable). `--dry-run` makes every check and writes
-nothing. A paired ePsych session is applied after its recording, which the
-plan lists first. A run is recorded in `lab.scan_run` with command `apply`
-and no `due_at`, so it never moves the schedule, and its result is `ok`, or
-`failed` when a group was refused. Run it as the scanner login or the owner.
+A refused group is reported and the others go on. `--only GROUP_KEY` applies
+one group (repeatable). `--dry-run` makes every check and writes nothing (no
+run row, no report). `--report-dir DIR` writes the report of §9.1. `--cache-file`
+is read, never written. `apply` works on a directory in any mode and does not
+ask whether its window is open. A run is recorded in `lab.scan_run` with
+command `apply`, mode `register` and no `due_at`, so it never moves the
+schedule; its result is `ok`, or `failed` when a group was refused, and its
+details name the plan (file and SHA-256), the groups applied and refused and
+whether the files were read again. Applying a plan again refuses the groups
+already applied: the database is no longer as the scan found it. Run it as
+the scanner login or the owner.
 
-Exit status of `scan`: 0; 1 when a directory could not be listed
-completely (it is not planned); 2 on a usage or connection error. Of
-`apply`: 0; 1 when a group was refused; 2 on a usage or connection error,
-including a plan that cannot be used and a login that may not write the scan
-logs.
+**What the plan's digest protects.** The last line of a plan holds a SHA-256
+over every line before it, so that a plan edited by accident or truncated is
+refused. It is a plain SHA-256 with no key: whoever can write the plan can
+also compute a new digest, and `apply` then takes every value from the plan,
+the SHA-256 of each file among them, unless `--reread` reads the files again.
+Keep plans where only the people who review them can write. The plan names
+the database by its name, oid and the cluster's system identifier. These do
+not tell a physical clone of the cluster (a restored base backup, a promoted
+standby) from the original: do not apply a plan to a clone of the database it
+was made against unless that is what you mean.
+
+Exit status of `scan`: 0 when a plan was written for every named directory; 1
+when a directory could not be listed completely (it is in the plan as
+failed, and nothing is planned for it); 2 on a usage or connection error. Of
+`apply`: 0 when every group the plan acts on (all, or those named with
+`--only`) was applied; 1 when any was refused, also because another process
+holds its directory, or a report could not be written; 2, with nothing
+written, for a plan that was edited or truncated, has another format, was made
+against another database or names a storage root not given, and on a usage or
+connection error, including a login that may not write the scan logs. Groups
+the plan holds or lets wait are never applied and do not count.
 
 ## 11. The header cache
 
 `--cache-file` names a JSON file in which `run` keeps the header results of
-registered files, so that they are not opened again every time. It is an
+registered files, so that they are not opened again every time. `scan` and
+`apply` read it for the listings they make and never write it. It is an
 optimisation only:
 
 - A missing, unreadable or malformed cache loads as empty, and every file
@@ -773,7 +955,9 @@ optimisation only:
   read again at all.
 - Only the entries of files whose registration is confirmed are used or
   kept. An entry that is damaged, hostile, or written by an older reader is a
-  miss. The file is replaced atomically, so its folder must exist.
+  miss. The file is replaced atomically, so its folder must exist; a cache
+  that cannot be written is a warning in the run's line and changes nothing
+  else.
 - Nothing in it decides what is registered: no hash and no database row
   comes from it.
 
@@ -866,16 +1050,43 @@ own tests (`tests/check_nas_import_parsing.py`).
 
 ## 13. Limits and what is not verified
 
-- **No file from the lab's NAS has been read by this code.** The `.rhd`
-  header reader is a port of `parseIntanHeader.m`, checked against the Intan
-  RHX writer's source and its own reader, and tested against headers built
-  in the tests from that format. The MAT reader is tested against
-  files written by scipy. Neither has met a real recorded file. The first use
-  on real data follows the staging procedure below.
-- **Windows and SMB.** The tool runs on Linux in CI. Reading a UNC path, the
-  treatment of reparse points, and the way a share reports sizes and
+**What has not been checked**
+
+- **No file from the lab's NAS has been read by this code.** Neither reader
+  has met a real recording or a real ePsych file from the lab's rigs.
+- **What the checks used.** The repository's MAT 5.0 fixtures
+  (`tests/testdata/nas_import`) are written by scipy, and the tests of the
+  `.rhd` reader use synthetic headers built in the tests. Separately, an
+  independent review checked the `.rhd` reader against files built from the
+  Intan RHX writer's source, and the MAT reader against scipy's own test
+  corpus and 21 MATLAB-written files in the lab's `ephys_analysis`
+  repository. The scripts of that review are not in this repository, so
+  nothing here re-runs it. The `.rhd` reader is a port of
+  `parseIntanHeader.m` (its docstring names the RHX source files it follows);
+  the MAT reader is stricter than scipy in a few ways its docstring lists.
+- **Windows and SMB.** CI runs the tool on Linux only. Reading a UNC path,
+  the treatment of reparse points, and the way a share reports sizes and
   modification times on Windows have not been exercised there. The
   scheduled-task definitions are not verified either.
+- **PostgreSQL.** The schema, the grants and the tool's end-to-end check run
+  in CI on PostgreSQL 14, 15, 16 and 17, and on nothing else.
+- **`apply` on a real tree.** The reviewed path is checked end to end on
+  fixture trees in CI (`tests/check_import_nas_files.py` drives `run`,
+  `check`, `scan` and `apply`); it has not been used on the lab's data.
+
+**Limits of the design**
+
+- **The plan's digest is not a key** (§10.3): it catches an accident, not a
+  person who can write the plan. And the database's identity (name, oid,
+  system identifier) does not tell a physical clone of the cluster from the
+  original.
+- **`apply` does not read the files again** unless `--reread` is given: it
+  takes each SHA-256 from the plan and the file's size and modification
+  time from the file system. A file whose bytes changed while both stayed
+  the same is registered with the plan's checksum.
+- **A group of more than 2000 files is held** (`group_too_large`, §7).
+- **Checksums.** A file another client registered with MD5 is compared by
+  MD5; one registered with BLAKE3 is held (`checksum_unsupported`).
 - **Recordings at 30 kS/s or 15 kS/s are held** (`rhd_duration_inexact`):
   the duration has no finite decimal for most block counts, `duration_s` is
   a numeric column, and the tool never rounds. The usual 25 kS/s is exact.
