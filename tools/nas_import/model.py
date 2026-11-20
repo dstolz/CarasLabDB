@@ -114,6 +114,12 @@ REASON_CODES: dict[str, str] = {
                               "zone (skipped by a daylight-saving change)",
     "local_time_ambiguous": "database side: the wall-clock time occurs twice in the time zone "
                             "(a daylight-saving change)",
+    "group_too_large": "database side: the group has more files than one transaction may "
+                       "register at the default lock settings",
+    "copy_partial": "database side: some but not all of the raw files are raw files of another "
+                    "client's event",
+    "checksum_unsupported": "database side: the file is registered at this path with a checksum "
+                            "algorithm this tool cannot compute",
 }
 
 # Codes of notes: things done or noticed that do not stop registration.

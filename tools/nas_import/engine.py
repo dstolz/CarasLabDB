@@ -38,13 +38,18 @@ and ``W + min_age_min <= started_at(R)``, where W is the latest
 ``scan_run.started_at`` among the runs that wrote those rows and the runs
 that wrote a ``cleared`` row for a file of the group. Both times are the
 database's clock. A memory row is appended whenever what is seen of a file
-differs from its latest row, and only by a run whose listing was complete, so
-"the latest row equals what is listed now" means: a complete listing made at
-W showed exactly these files with these sizes and modification times, and no
-complete listing since showed anything else. A file added, changed or gone
-appends a row (``pending`` / ``cleared``) and so moves W to the run that saw
-it: the wait starts again for the whole group. The first sighting of a group
-never registers it (its rows are written by that run itself), also with
+differs from its latest row, and only by a run whose listing was complete.
+The rows a listing writes are the only ones a plan can find equal to what is
+listed: a row that records what a READ found (a file that changed while it
+was read: ``pending`` with reason code ``changed_during_scan``, which no
+listing writes) always differs from the next listing's, so that listing
+appends its own row and W becomes the start of that run. Hence "the latest
+row equals what is listed now" means: a complete listing made at W showed
+exactly these files with these sizes and modification times, and no complete
+listing since showed anything else. A file added, changed or gone appends a
+row (``pending`` / ``cleared``) and so moves W to the run that saw it: the
+wait starts again for the whole group. The first sighting of a group never
+registers it (its rows are written by that run itself), also with
 ``min_age_min = 0``; the second can.
 
 The wait is counted from the START of the earlier run: its listing ended at
@@ -63,8 +68,11 @@ would be registered under both.
 current version still describes that file and is in ``lab.artifact_present``,
 is not opened (its header comes from the cache, restricted to exactly those
 files). A file held after it was read to its end -- the reason then ends with
-``[read: sha256=...]`` -- is not read again while its size and ``mtime_ns``
-stay the same: the hold stands until a person acts (``scan`` / ``apply``).
+``[read: sha256=...]`` -- is not read again while it and every other
+unregistered file of its group keep their size and ``mtime_ns``: the hold
+stands until a person acts (``scan`` / ``apply``) or a file of the group is
+replaced, added or gone, which ends it (the group is read again after its
+wait).
 Holds decided without reading (``would_correct``, ``late_recording``,
 ``path_case_conflict``, the session and time checks) are decided anew at
 every run and end by themselves when their cause is gone.
@@ -77,18 +85,49 @@ import hashlib
 import os
 import stat as stat_module
 import traceback
+import uuid
 from dataclasses import dataclass, field
 
 from . import content, ids, mat5, walk
 from .names import ascii_fold
 from .cache import HeaderCache
-from .database import (ArtifactFact, Database, Directory, EventFact, MemoryRow, MemoryWrite)
+from .database import (RESULT_COUNTERS, ArtifactFact, Database, Directory, EventFact, MemoryRow,
+                       MemoryWrite)
 from .interpret import interpret
 from .model import TOOL_NAME, DirectorySpec, Group, GroupFile, Interpretation, Listing
 
 VERSION = "1.0"
 CHUNK = 4 * 1024 * 1024
 READ_MARK = "[read: sha256="
+CHANGED_CODE = "changed_during_scan"     # a pending row written by a read, not by a listing
+
+ASIDE = "#superseded-by-"             # a session moved aside: <path>#superseded-by-<session>
+
+
+def subject_session_id(root: str, path: str, subject: str) -> str:
+    """The id of the session of SUBJECT at PATH that a correction to that subject makes."""
+    return str(uuid.uuid5(ids.NAMESPACE, "session:%s:%s:subject:%s" % (root, path, subject)))
+
+
+def tool_session(root: str, session_id: str, subject: str, path: str) -> bool:
+    """Whether SESSION_ID is an id this tool gives a session at PATH (or moved aside from it)."""
+    base = path.split(ASIDE, 1)[0]
+    return session_id in (ids.session_id(root, base), subject_session_id(root, base, subject))
+
+
+# The most files one group may have. A group is written in ONE transaction, and
+# every artifact row takes a transaction-level advisory lock (the one active row
+# per file of trg_artifact_unique_active; a replaced file in ``apply`` takes a
+# second, for its disposition). Those locks live in the shared lock table, which
+# holds max_locks_per_transaction x (max_connections + max_prepared_transactions)
+# entries: 64 x 100 = 6400 at PostgreSQL's defaults, shared by every connection.
+# 2000 files take at most 4000 advisory locks, and the rest of the transaction
+# (the relations and indexes it writes, a few dozen) stays well under 100: about
+# 4100 entries, which leaves some 2300 for every other connection. A larger group
+# would fail with "out of shared memory" after all of it was read; it is held
+# before anything is read instead (``group_too_large``).
+MAX_GROUP_FILES = 2000
+
 
 class Unreachable(Exception):
     """The directory is missing or empty: nothing is concluded, nothing else written."""
@@ -164,6 +203,24 @@ def _spec(d: Directory, pair_with: str | None, paired_by: str | None) -> Directo
     return DirectorySpec(**kw)
 
 
+def two_partners(namers: list[Directory], target: Directory) -> str:
+    """Why directories NAMERS (not ``off``), which all pair with TARGET, cannot be searched."""
+    return ("directories %s all pair with %s; one directory may be paired with one other "
+            "only, so none of them is searched (every run fails) until all but one of them are "
+            "off or name another directory" % (", ".join(d.name for d in namers), target.name))
+
+
+def pairing_problems(every: list[Directory]) -> list[str]:
+    """The sentences of :func:`two_partners` for every directory more than one names."""
+    by_id = {d.id: d for d in every}
+    out = []
+    for target in every:
+        namers = [d for d in every if d.pair_with == target.id and d.mode != "off"]
+        if len(namers) > 1:
+            out.append(two_partners(namers, by_id[target.id]))
+    return out
+
+
 def pair_specs(directory: Directory, every: list[Directory]
                ) -> tuple[DirectorySpec, list[tuple[Directory, DirectorySpec]]]:
     """The directory's spec and that of the directory judged with it.
@@ -184,14 +241,10 @@ def pair_specs(directory: Directory, every: list[Directory]
         return _spec(directory, None, None), []
     namers = [d for d in same_root.values() if d.pair_with == target.id]
     on = [d for d in namers if d.mode != "off" or d.id == directory.id]
+    if len(on) > 1:
+        raise ListingFailed(two_partners(on, target))
     if directory.pair_with is not None:
-        if len(on) > 1:
-            raise ListingFailed("directories %s all pair with %s; one directory may be paired "
-                                "with one other" % (", ".join(d.name for d in on), target.name))
         namer = directory
-    elif len(on) > 1:
-        raise ListingFailed("directories %s all pair with %s; one directory may be paired "
-                            "with one other" % (", ".join(d.name for d in on), target.name))
     elif on:
         namer = on[0]
     elif namers:
@@ -320,6 +373,7 @@ class GroupPlan:
     digest: str | None = None
     would_correct: bool = False
     paired: bool = False
+    md5: frozenset = frozenset()             # files whose MD5 is computed as well
 
 
 @dataclass
@@ -334,12 +388,39 @@ class Plan:
         return [g for g in self.groups if g.state == "register"]
 
 
+PAIRS_WITH = "pairs with "            # the reason of a pending row of a paired ePsych session
+
+
+def pairing_token(g: Group) -> str | None:
+    """The pairing state a pending row of G records (its ``reason``), or None.
+
+    For an ePsych session judged with a recordings' directory: the recording
+    it pairs with (``pairs with recording:<root>:<folder>``; whether that
+    recording is registered yet is not in it -- the session waits for that by
+    rule), or that it pairs with none in sight and why (``pairs with no
+    recording (unpaired)``, ``(short)``, ``(date_only)``). A change of it
+    appends rows like a changed file, so the wait starts again: one listing
+    in which the recording is missing does not register the session alone.
+    """
+    if g.kind != "behavior" or g.pairing is None:
+        return None
+    if g.pairing.status == "paired":
+        return PAIRS_WITH + g.pairing.partner_key
+    return PAIRS_WITH + "no recording (%s)" % g.pairing.status
+
+
 def differs(m: MemoryRow | None, w: MemoryWrite) -> bool:
-    """Whether W says something the latest row M does not (so a row is appended)."""
+    """Whether W says something the latest row M does not (so a row is appended).
+
+    The ``reason`` counts for pending rows only: there it is the pairing
+    state (:func:`pairing_token`) or what a read found.
+    """
     if m is None:
         return True
-    return ((m.status, m.size, m.mtime_ns, m.reason_code, m.group_key, m.artifact_id)
-            != (w.status, w.size, w.mtime_ns, w.reason_code, w.group_key, w.artifact_id))
+    return ((m.status, m.size, m.mtime_ns, m.reason_code, m.group_key, m.artifact_id,
+             m.reason if m.status == "pending" else None)
+            != (w.status, w.size, w.mtime_ns, w.reason_code, w.group_key, w.artifact_id,
+                w.reason if w.status == "pending" else None))
 
 
 def case_conflicts(paths) -> set[str]:
@@ -379,6 +460,33 @@ def registered_event(group: Group, s: Sighting) -> EventFact | None:
     return next(iter(found.values())) if len(found) == 1 else None
 
 
+def withdrawn_event(group: Group, s: Sighting) -> EventFact | None:
+    """The retracted event GROUP was registered under (its own, current version), if so.
+
+    Also the one event its settled files hang from when that event is
+    retracted (a copy attached to an event that was then retracted).
+    """
+    own = s.events.get(ids.group_event_id(group))
+    if own is not None:
+        return own if own.retracted else None
+    found = {}
+    for f in group.files:
+        a = s.settled.get(f.path)
+        e = s.events.get(a.event_id) if a is not None else None
+        if e is None:
+            return None
+        found[e.event_id] = e
+    gone = [e for e in found.values() if e.retracted]
+    return gone[0] if len(found) == 1 and gone else None
+
+
+def withdrawn_sentence(partner: Group, e: EventFact) -> str:
+    return ("its recording %s is registered under event %s, which was retracted "
+            "(registered_but_withdrawn): a person decides whether the recording is registered "
+            "again (scan / apply) or this session is registered on its own"
+            % (partner.source_path, e.event_id))
+
+
 def _memory_held(group: Group, s: Sighting) -> MemoryRow | None:
     for f in group.files:
         m = s.memory.get(f.path)
@@ -404,12 +512,29 @@ def stability(group: Group, targets: dict, s: Sighting, vanished: dict, cleared:
     return w + min_age_us <= now_us, w + min_age_us
 
 
+def too_large_hold(g: Group) -> tuple[str, str] | None:
+    """``group_too_large`` when G has more than MAX_GROUP_FILES files (decided before reading)."""
+    if len(g.files) <= MAX_GROUP_FILES:
+        return None
+    return ("group_too_large", "%d files, more than the %d one transaction may register at "
+            "the default lock settings (max_locks_per_transaction 64, max_connections 100): a "
+            "person registers it in parts or raises max_locks_per_transaction"
+            % (len(g.files), MAX_GROUP_FILES))
+
+
 def _held(path: str, st: tuple[int, int], code: str, reason: str, key: str | None) -> MemoryWrite:
     return MemoryWrite(path, "held", st[0], st[1], key, code, reason)
 
 
-def session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, paired: bool
-                  ) -> tuple[str, str] | None:
+def session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, paired: bool,
+                 before_read: bool = False) -> tuple[str, str] | None:
+    """Why G's event may not go into session SESSION_ID (made if it is not there), if so.
+
+    BEFORE_READ: decided before the group's files are read. A clash with a
+    session this tool did not write (another client's, whose label can be the
+    folder's name) is then left for after the read: its files may be a copy
+    of that client's event, and the copy rule decides (``register_group``).
+    """
     if session_id is None:
         return ("session_conflict", "the recording it pairs with is registered under an event "
                 "that has no session")
@@ -421,8 +546,10 @@ def session_hold(db: Database, s: Sighting, g: Group, session_id: str | None, pa
         return None
     if paired:
         return ("session_conflict", "the session %s of its recording does not exist" % session_id)
-    for other, subject, label, path in db.session_clashes(session_id, g.subject_id, g.label,
-                                                          s.directory.root_id, g.session_path):
+    for other, subject, label, path, root in db.session_clashes(
+            session_id, g.subject_id, g.label, s.directory.root_id, g.session_path):
+        if before_read and not tool_session(root, other, subject, path):
+            continue
         if path != g.session_path and ascii_fold(path) == ascii_fold(g.session_path):
             return ("path_case_conflict", "session %s has the path %s, which differs from %s "
                     "only in case" % (other, path, g.session_path))
@@ -458,7 +585,7 @@ def _new_event_hold(db: Database, s: Sighting, g: Group, session_id: str | None,
             return ("late_recording", "the behavior session %s it pairs with is registered "
                     "already (event %s) in a session of its own: joining them is a correction"
                     % (partner.source_path, e.event_id))
-    return time_hold(db, s, g) or session_hold(db, s, g, session_id, paired)
+    return time_hold(db, s, g) or session_hold(db, s, g, session_id, paired, before_read=True)
 
 
 def plan(db: Database, s: Sighting, now_us: int) -> Plan:
@@ -485,6 +612,8 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
     # Files of ready groups that are neither settled nor held one by one.
     pending: list[tuple[Group, list[GroupFile], dict[str, tuple[str, str]]]] = []
     plans: list[GroupPlan] = []
+    gone_keys = {m.group_key for path, m in s.memory.items()
+                 if s.own(path) and path not in s.stat_of and m.status in ("pending", "held")}
     for g in s.groups():
         if g.status in ("reported", "skipped"):
             for path in g.all_paths():
@@ -500,8 +629,22 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                                         g.hold.sentence, g.key)
             plans.append(GroupPlan(g, "held", g.hold.reason_code, g.hold.sentence))
             continue
+        too_large = too_large_hold(g)
+        if too_large is not None:
+            for f in g.files:
+                if f.path not in s.settled:
+                    targets[f.path] = _held(f.path, (f.size, f.mtime_ns), *too_large, g.key)
+            plans.append(GroupPlan(g, "held", *too_large))
+            continue
         todo: list[GroupFile] = []
         file_holds: dict[str, tuple[str, str]] = {}
+        # A hold decided by reading (READ_MARK) stands while every unregistered file of the
+        # group is as it was then: a file replaced, added or gone ends it, and the group is
+        # read again after its wait.
+        unchanged = g.key not in gone_keys and all(
+            s.memory.get(f.path) is not None and s.memory[f.path].group_key == g.key
+            and (s.memory[f.path].size, s.memory[f.path].mtime_ns) == (f.size, f.mtime_ns)
+            for f in g.files if f.path not in s.settled)
         for f in g.files:
             m = s.memory.get(f.path)
             st = (f.size, f.mtime_ns)
@@ -515,7 +658,7 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                                       "retracted, or the file was recorded as moved, replaced "
                                       "or deleted" % m.artifact_id)
             elif (m is not None and m.status == "held" and (m.size, m.mtime_ns) == st
-                    and READ_MARK in (m.reason or "") and m.group_key == g.key):
+                    and READ_MARK in (m.reason or "") and m.group_key == g.key and unchanged):
                 file_holds[f.path] = (m.reason_code, m.reason)       # read once; the hold stands
             elif f.path in conflicts:
                 file_holds[f.path] = ("path_case_conflict", "another listed path differs from "
@@ -550,6 +693,9 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                 file_holds[f.path] = ("registered_but_withdrawn", "the file registered at this "
                                       "path (artifact %s) was retracted or recorded as moved, "
                                       "replaced or deleted" % rows[0].artifact_id)
+            elif any(r.live and r.checksum_algo not in COMPUTABLE for r in rows):
+                r = next(r for r in rows if r.live and r.checksum_algo not in COMPUTABLE)
+                file_holds[f.path] = ("checksum_unsupported", unsupported_sentence(r))
             else:
                 still.append(f)
         own = s.events.get(ids.group_event_id(g))
@@ -566,7 +712,10 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                 session_id = rec.session_id
             elif own is None:
                 blocked = _memory_held(partner, s) if partner is not None else None
-                if blocked is not None:
+                gone = withdrawn_event(partner, s) if partner is not None else None
+                if gone is not None:
+                    hold = ("paired_recording_held", withdrawn_sentence(partner, gone))
+                elif blocked is not None:
                     hold = ("paired_recording_held", "its recording %s is held (%s)"
                             % (partner.source_path, blocked.reason_code))
                 else:
@@ -602,11 +751,12 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
             # Held as a group: every file not yet registered carries the reason.
             for f in still:
                 targets[f.path] = _held(f.path, (f.size, f.mtime_ns), hold[0], hold[1], g.key)
-            if still or would_correct or file_holds:
+            if still or would_correct or file_holds or (own is not None and own.retracted):
                 gp.state, gp.code, gp.reason = "held", hold[0], hold[1]
         else:
             for f in still:
-                targets[f.path] = MemoryWrite(f.path, "pending", f.size, f.mtime_ns, g.key)
+                targets[f.path] = MemoryWrite(f.path, "pending", f.size, f.mtime_ns, g.key,
+                                              reason=pairing_token(g))
             if not still:
                 if file_holds:
                     gp.state, gp.code, gp.reason = "held", first_file_hold[0], first_file_hold[1]
@@ -620,6 +770,8 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
                 stable, gp.until_us = stability(g, targets, s, vanished, cleared, now_us)
                 if stable:
                     gp.state, gp.open = "register", tuple(still)
+                    gp.md5 = frozenset(f.path for f in still if any(
+                        r.live and r.checksum_algo == "md5" for r in at.get(f.path, [])))
                 else:
                     gp.state = "waiting"
                     gp.reason = "not yet seen unchanged for %d min" % d.min_age_min
@@ -654,6 +806,40 @@ def plan(db: Database, s: Sighting, now_us: int) -> Plan:
     return Plan(targets, writes, sorted(plans, key=lambda p: p.group.key), missing, reported)
 
 
+# The raw files that carry a session's data, by layout: a match of one of these
+# with another event's raw file means the recording itself is registered there.
+# Other raw files (an Intan settings.xml) can be byte for byte the same in two
+# recordings made with the same settings, and match nothing by themselves.
+DATA_FORMATS = {"intan": ("rhd",), "epsych": ("mat",)}
+
+
+def partial_copy(db: Database, g: Group, events_of: dict[str, set]) -> tuple[str, str] | None:
+    """(code, sentence) when some, not all, of G's raw files are raw files of other events.
+
+    EVENTS_OF: raw file path -> the active events holding its bytes as a raw
+    file. Counts only when a data file (:data:`DATA_FORMATS`) is among the
+    matching ones. ``copy_partial`` when the events are other clients',
+    ``duplicate_content`` when this tool wrote one of them.
+    """
+    matched = {p: e for p, e in events_of.items() if e}
+    formats = DATA_FORMATS.get(g.layout, ())
+    if not matched or not any(f.format in formats for f in g.files if f.path in matched):
+        return None
+    events = sorted(set().union(*matched.values()))
+    unmatched = sorted(p for p in events_of if p not in matched)
+
+    def names(paths):
+        return ", ".join(p.rsplit("/", 1)[1] for p in sorted(paths))
+    said = "%s %s raw file(s) of event(s) %s" % (
+        names(matched), "is a" if len(matched) == 1 else "are", ", ".join(events))
+    said += ("; %s %s not" % (names(unmatched), "is" if len(unmatched) == 1 else "are")
+             if unmatched else "; no one event holds them all")
+    if any(db.written_by(e, TOOL_NAME) for e in events):
+        return ("duplicate_content", "part of its raw files hold bytes this tool registered "
+                "already: " + said)
+    return ("copy_partial", "part of its raw files are another client's: " + said)
+
+
 def host_hold(g: Group, host: EventFact) -> tuple[str, str] | None:
     if host.retracted:
         return ("registered_but_withdrawn", "event %s, which its files belong to, was retracted"
@@ -668,9 +854,18 @@ def host_hold(g: Group, host: EventFact) -> tuple[str, str] | None:
 # --------------------------------------------------------------------------- reading
 @dataclass(frozen=True)
 class Reading:
-    checksum: str
+    checksum: str                 # SHA-256
     size: int
     mtime_ns: int
+    md5: str | None = None        # when asked for: a file registered with md5 at the path
+
+
+COMPUTABLE = ("sha256", "md5")     # the checksum algorithms this tool can compare a file with
+
+
+def unsupported_sentence(r: ArtifactFact) -> str:
+    return ("artifact %s registers this path with a %s checksum, which this tool cannot "
+            "compute: a person compares the file" % (r.artifact_id, r.checksum_algo))
 
 
 def _lstat(path: str) -> tuple[int, int] | None:
@@ -683,7 +878,7 @@ def _lstat(path: str) -> tuple[int, int] | None:
     return int(st.st_size), int(st.st_mtime_ns)
 
 
-def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats
+def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats, md5: bool = False
               ) -> tuple[Reading, tuple[str, str] | None]:
     """Read F to its end: its SHA-256, and a structural problem of a ``.mat`` file if any.
 
@@ -698,6 +893,7 @@ def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats
         raise FileChanged(f.path, seen)
     problem = None
     h = hashlib.sha256()
+    h5 = hashlib.md5(usedforsecurity=False) if md5 else None
     with open(path, "rb") as fh:
         st = os.fstat(fh.fileno())
         if (int(st.st_size), int(st.st_mtime_ns)) != want or not stat_module.S_ISREG(st.st_mode):
@@ -707,6 +903,8 @@ def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats
             if not block:
                 break
             h.update(block)
+            if h5 is not None:
+                h5.update(block)
             stats.read_bytes += len(block)
         if verify:
             fh.seek(0)
@@ -721,7 +919,8 @@ def read_file(root_path: str, f: GroupFile, verify: bool, stats: ReadStats
     seen = _lstat(path)
     if seen != want:
         raise FileChanged(f.path, seen)
-    return Reading(h.hexdigest(), f.size, f.mtime_ns), problem
+    return Reading(h.hexdigest(), f.size, f.mtime_ns,
+                   h5.hexdigest() if h5 is not None else None), problem
 
 
 def read_group(s: Sighting, gp: GroupPlan) -> tuple[dict[str, Reading], dict[str, tuple[str, str]]]:
@@ -730,7 +929,8 @@ def read_group(s: Sighting, gp: GroupPlan) -> tuple[dict[str, Reading], dict[str
     problems: dict[str, tuple[str, str]] = {}
     for f in gp.open:
         verify = gp.group.layout == "epsych" and f.role == "raw" and f.format == "mat"
-        readings[f.path], problem = read_file(s.root_path, f, verify, s.stats)
+        more = {"md5": True} if f.path in gp.md5 else {}
+        readings[f.path], problem = read_file(s.root_path, f, verify, s.stats, **more)
         if problem is not None:
             problems[f.path] = problem
     return readings, problems
@@ -782,14 +982,21 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
         known: dict[str, ArtifactFact] = {}
         new: list[GroupFile] = []
         for f in gp.open:
-            c = readings[f.path].checksum
+            c, c5 = readings[f.path].checksum, readings[f.path].md5
             rows = at.get(f.path, [])
-            same = [r for r in rows if r.live and r.checksum_algo == "sha256" and r.checksum == c]
+            same = [r for r in rows if r.live and (r.checksum_algo, r.checksum) in
+                    (("sha256", c), ("md5", c5))]
             if any(r.path != f.path for r in rows):
                 file_holds[f.path] = ("path_case_conflict", "registered under a path that "
                                       "differs only in case")
             elif same:
                 known[f.path] = same[0]
+            elif any(r.live and r.checksum_algo not in COMPUTABLE for r in rows):
+                file_holds[f.path] = ("checksum_unsupported", unsupported_sentence(
+                    next(r for r in rows if r.live and r.checksum_algo not in COMPUTABLE)))
+            elif c5 is None and any(r.live and r.checksum_algo == "md5" for r in rows):
+                file_holds[f.path] = (CHANGED_CODE, "registered with an md5 checksum while the "
+                                      "group was read: compared at the next run")
             elif rows and any(r.live for r in rows):
                 file_holds[f.path] = ("content_changed", _mark(
                     "artifact %s registers other bytes at this path" %
@@ -828,13 +1035,20 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
             elif file_holds:
                 pass                       # nothing of a new group is written beside a held file
             else:
-                raw = [readings[f.path].checksum for f in g.files
-                       if f.role == "raw" and f.path in readings]
+                by_path = {f.path: readings[f.path].checksum for f in g.files
+                           if f.role == "raw" and f.path in readings}
+                raw = list(by_path.values())
                 copies = db.raw_copies(raw)
                 sets = [{e for e, _a, _w in copies.get(c, [])} for c in raw]
                 common = set.intersection(*sets) if sets else set()
                 also = sorted(set().union(*sets)) if sets else []
-                if len(common) > 1:
+                partial = partial_copy(db, g, {p: {e for e, _a, _w in copies.get(c, [])}
+                                               for p, c in by_path.items()})
+                if not common and partial is not None:
+                    hold, by_bytes = (partial[0], partial[1] + ": an unattended run never "
+                                      "adds part of a recording to another event, nor makes a "
+                                      "second event for it"), True
+                elif len(common) > 1:
                     hold, by_bytes = ("copy_ambiguous", "its raw files are, by their SHA-256, "
                                       "the files of each of events %s"
                                       % ", ".join(sorted(common))), True
@@ -857,6 +1071,13 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
             rows_out.append(MemoryWrite(path, "held", f.size, f.mtime_ns, g.key, code, reason))
         if hold is None and host is None and not file_holds:
             hold = session_hold(db, s, g, gp.session_id, gp.paired)
+            if hold is not None and session_hold(db, s, g, gp.session_id, gp.paired,
+                                                 before_read=True) is None:
+                # Decided by what was read (it is not a copy): the hold stands while the
+                # files stay as they are, and they are not read again at every run.
+                hold = (hold[0], hold[1] + "; it is not a copy of that session's files. A "
+                        "person relabels or moves that session, then scans and applies")
+                by_bytes = True
         if hold is not None or (host is None and file_holds):
             for f in gp.open:
                 if f.path not in file_holds and hold is not None:
@@ -889,7 +1110,8 @@ def register_group(db: Database, run_id: int, s: Sighting, gp: GroupPlan,
                                      attributes))
         for path, a in sorted(known.items()):
             f = next(x for x in gp.open if x.path == path)
-            w.files.append(FileWrite(path, f.size, f.mtime_ns, readings[path].checksum, "known",
+            seen = readings[path].md5 if a.checksum_algo == "md5" else readings[path].checksum
+            w.files.append(FileWrite(path, f.size, f.mtime_ns, seen, "known",
                                      artifact_id=a.current_id))
         rows_out += write_group(db, root_id, w)
         db.write_memory(run_id, root_id, rows_out)
@@ -902,7 +1124,8 @@ class FileWrite:
     path: str
     size: int
     mtime_ns: int
-    sha256: str
+    sha256: str                       # new, replace: the SHA-256; known: the checksum in the
+    #                                   artifact's algorithm (the verification observes it)
     state: str                        # new | known | replace
     role: str | None = None
     format: str | None = None
@@ -1029,6 +1252,7 @@ class DirectoryResult:
     lines: list[dict] = field(default_factory=list)      # the report's rows
     happened: bool = False
     result_written: bool = False
+    warnings: list[str] = field(default_factory=list)     # nothing failed because of them
 
 
 def _line(what: str, action: str, path: str = "", key: str | None = None, code: str | None = None,
@@ -1069,10 +1293,7 @@ def run_directory(db: Database, directory: Directory, root_path: str, due_at: st
     """
     res = DirectoryResult(directory, directory.mode)
     stats = ReadStats()
-    counters = dict.fromkeys(("files_listed", "files_unchanged", "files_pending",
-                              "files_registered", "files_known", "files_held", "files_ignored",
-                              "files_cleared", "groups_registered", "groups_waiting",
-                              "groups_held", "bytes_read"), 0)
+    counters = dict.fromkeys(RESULT_COUNTERS, 0)
     res.counters = counters
     errors: list[str] = []
     try:
@@ -1092,7 +1313,11 @@ def run_directory(db: Database, directory: Directory, root_path: str, due_at: st
         p = plan(db, s, now_us)
         _run_planned(db, s, p, res, options, counters, errors)
         if options.cache_path and not options.dry_run:
-            _save_cache(options.cache_path, s)
+            try:
+                _save_cache(options.cache_path, s)
+            except OSError as exc:      # an optimisation only: the run's rows stand
+                res.warnings.append("the cache file %s could not be written: %s"
+                                    % (options.cache_path, exc))
     except Unreachable as exc:
         res.outcome, res.message = "unreachable", str(exc)
     except ListingFailed as exc:
@@ -1111,6 +1336,8 @@ def run_directory(db: Database, directory: Directory, root_path: str, due_at: st
     counters["bytes_read"] = stats.bytes_read
     res.details.update({"files_opened": stats.files_opened, "files_read": stats.files_read,
                         "mode": res.mode})
+    if res.warnings:
+        res.details["warnings"] = res.warnings[:50]
     if errors:
         res.details["errors"] = errors[:50]
         if res.outcome in ("ok", "partial"):
@@ -1136,6 +1363,7 @@ def _run_planned(db: Database, s: Sighting, p: Plan, res: DirectoryResult, optio
         if t is not None and not differs(m, t):
             final[path] = m.status
     written = list(p.writes)
+    group_rows: list[MemoryWrite] = []          # the rows the groups' transactions wrote
     if not options.dry_run:
         with db.transaction():
             db.write_memory(res.run_id, d.root_id, p.writes)
@@ -1158,11 +1386,17 @@ def _run_planned(db: Database, s: Sighting, p: Plan, res: DirectoryResult, optio
             try:
                 readings, problems = read_group(s, gp)
             except FileChanged as exc:
-                # Not what the listing said: not registered now, and the wait starts again.
+                # Not what the listing said: not registered now. The row records what the
+                # read found, under CHANGED_CODE, which no listing writes: it never equals
+                # what the next listing gives, so the wait starts again at the next run
+                # whose listing shows the file so -- never at this run's start.
                 rows = []
                 if exc.seen is not None:
                     f = next(x for x in gp.open if x.path == exc.path)
-                    rows = [MemoryWrite(f.path, "pending", exc.seen[0], exc.seen[1], g.key)]
+                    rows = [MemoryWrite(f.path, "pending", exc.seen[0], exc.seen[1], g.key,
+                                        CHANGED_CODE, "changed while it was read: listed with "
+                                        "%d bytes, mtime_ns %d; read with %d bytes, mtime_ns %d"
+                                        % (f.size, f.mtime_ns, exc.seen[0], exc.seen[1]))]
                     db.write_memory(res.run_id, d.root_id, rows)
                 written += rows
                 res.lines += [_row_line(w) for w in rows]
@@ -1187,6 +1421,7 @@ def _run_planned(db: Database, s: Sighting, p: Plan, res: DirectoryResult, optio
             gp.state, gp.reason = "waiting", "a database error; tried again at the next run"
             continue
         written += out.rows
+        group_rows += out.rows
         for w in out.rows:
             final[w.path] = w.status
             res.lines.append(_row_line(w, out.event_id))
@@ -1227,8 +1462,9 @@ def _run_planned(db: Database, s: Sighting, p: Plan, res: DirectoryResult, optio
     counters["files_pending"] = _count(written, "pending")
     counters["files_held"] = _count(written, "held")
     counters["files_cleared"] = _count(written, "cleared")
-    counters["files_registered"] = _count(written, "registered")
-    counters["files_known"] = _count(written, "known")
+    counters["files_registered"] = _count(group_rows, "registered")
+    counters["files_known"] = _count(group_rows, "known")
+    res.details["files_repointed"] = _count(p.writes, "registered") + _count(p.writes, "known")
     touched = {w.path for w in written}
     counters["files_unchanged"] = sum(1 for path in s.stat_of
                                       if path not in touched and final[path] != "reported")
@@ -1243,6 +1479,8 @@ def _run_planned(db: Database, s: Sighting, p: Plan, res: DirectoryResult, optio
         "would_correct": _summary_list([gp.group.key for gp in p.groups if gp.would_correct]),
         "would_register": _summary_list([gp.group.key for gp in p.groups
                                          if gp.state == "register" and not stopped]),
+        "held_groups": _summary_list(["%s %s" % (gp.group.key, gp.code) for gp in p.groups
+                                      if gp.state == "held"]),
         "partners": [x.id for x in s.partners],
         "unused_overrides": ["line %d: %s:%s" % (o.line, o.root, o.path)
                              for o in s.interp.unused_overrides
@@ -1283,7 +1521,7 @@ def _finish(db: Database, res: DirectoryResult, options: RunOptions) -> None:
         res.happened = previous is None or (previous[0], previous[1]) != (res.outcome, res.message)
     elif not res.happened:
         before = previous[2] if previous is not None else {}
-        for name in ("missing", "would_correct", "would_register"):
+        for name in ("missing", "would_correct", "would_register", "held_groups"):
             now = res.details.get(name, {})
             then = before.get(name, {"count": 0, "digest": ids.sha256_text("")})
             if (now.get("count"), now.get("digest")) != (then.get("count"), then.get("digest")):

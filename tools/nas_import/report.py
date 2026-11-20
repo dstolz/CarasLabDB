@@ -74,6 +74,8 @@ def summary(res) -> str:
                 c.get("groups_waiting", 0), c.get("groups_held", 0), c.get("bytes_read", 0)))
     if res.message:
         text += "; " + res.message
+    for warning in getattr(res, "warnings", ()):
+        text += "; warning: " + warning
     return text
 
 

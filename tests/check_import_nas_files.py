@@ -43,7 +43,7 @@ sys.path.insert(0, TOOLS)
 
 import check_nas_import_parsing as P  # noqa: E402  (the fixture builders)
 import psycopg  # noqa: E402
-from nas_import import reviewed, rhd as rhd_module  # noqa: E402
+from nas_import import engine, ids, reviewed, rhd as rhd_module  # noqa: E402
 
 ZONE = "America/New_York"
 PREFIX = "nasimp-"
@@ -82,10 +82,38 @@ def q1(sql, params=()):
 
 
 # --------------------------------------------------------------------------- the tool
+AUDIT = os.path.join(TMP, "statements.tsv")
+
+# Every statement a run or a scan sends, one line each: "<command>\t<statement>".
+AUDIT_PATCH = (
+    "import os, psycopg\n"
+    "_audit = open(os.environ['NASIMP_AUDIT'], 'a', encoding='utf-8')\n"
+    "_execute, _executemany = psycopg.Cursor.execute, psycopg.Cursor.executemany\n"
+    "def _note(query):\n"
+    "    _audit.write(os.environ['NASIMP_COMMAND'] + '\\t' + ' '.join(str(query).split()) "
+    "+ '\\n')\n"
+    "    _audit.flush()\n"
+    "def _audited_execute(self, query, *a, **k):\n"
+    "    _note(query)\n"
+    "    return _execute(self, query, *a, **k)\n"
+    "def _audited_executemany(self, query, *a, **k):\n"
+    "    _note(query)\n"
+    "    return _executemany(self, query, *a, **k)\n"
+    "psycopg.Cursor.execute = _audited_execute\n"
+    "psycopg.Cursor.executemany = _audited_executemany\n")
+
+
 def tool(*args, env=None, patch=None):
-    """Run the tool; (exit status, stdout + stderr). PATCH is Python run before main()."""
+    """Run the tool; (exit status, stdout + stderr). PATCH is Python run before main().
+
+    The statements of ``run`` and ``scan`` are written to AUDIT (see
+    :func:`audit_statements`).
+    """
     full = dict(os.environ)
     full.update(env or {})
+    if args and args[0] in ("run", "scan") and "--help" not in args:
+        full.update(NASIMP_AUDIT=AUDIT, NASIMP_COMMAND=str(args[0]))
+        patch = AUDIT_PATCH + (patch or "")
     if patch is None:
         cmd = [sys.executable, TOOL, *args]
     else:
@@ -245,8 +273,39 @@ def corrections():
             q1("SELECT count(*) FROM lab.artifact_disposition"))
 
 
+def counters_agree(w):
+    """Every run and apply of W's directories counted what it wrote (database.RESULT_COUNTERS).
+
+    pending / held / cleared: the rows of that status the run appended; files_registered:
+    the artifact rows it made (their first memory row is this run's, and they supersede
+    nothing); files_registered + files_known + details.files_repointed: its registered and
+    known rows.
+    """
+    runs = q("SELECT r.scan_run_id, r.command, x.files_pending, x.files_held, x.files_cleared, "
+             "x.files_registered, x.files_known, x.details FROM lab.scan_run r "
+             "JOIN lab.scan_run_result x USING (scan_run_id) WHERE r.scan_directory_id = ANY(%s) "
+             "AND r.tool_version IS NOT NULL ORDER BY 1", (w.dirs,))
+    for run_id, command, pending, held, cleared, registered, known, details in runs:
+        rows = dict(q("SELECT status, count(*) FROM lab.scan_file WHERE scan_run_id = %s "
+                      "GROUP BY 1", (run_id,)))
+        new = q1("SELECT count(DISTINCT f.artifact_id) FROM lab.scan_file f JOIN lab.artifact a "
+                 "USING (artifact_id) WHERE f.scan_run_id = %s AND f.status = 'registered' "
+                 "AND a.supersedes IS NULL AND NOT EXISTS (SELECT 1 FROM lab.scan_file o "
+                 "WHERE o.artifact_id = f.artifact_id AND o.scan_run_id < f.scan_run_id)",
+                 (run_id,))
+        check((rows.get("pending", 0), rows.get("held", 0), rows.get("cleared", 0))
+              == (pending or 0, held or 0, cleared or 0)
+              and (registered or 0) == new
+              and rows.get("registered", 0) + rows.get("known", 0)
+              == (registered or 0) + (known or 0) + (details or {}).get("files_repointed", 0),
+              "the counters of %s %d do not count its rows: counters %s, rows %s, new artifacts "
+              "%d" % (command, run_id, (pending, held, cleared, registered, known,
+                                        (details or {}).get("files_repointed")), rows, new))
+
+
 def steady(world, *dirs):
     """Running everything again changes nothing but the run log."""
+    counters_agree(world)
     before = table_counts(skip=("scan_run", "scan_run_result"))
     rows = q1("SELECT max(scan_file_id) FROM lab.scan_file")
     for d in dirs:
@@ -768,6 +827,46 @@ def shape(w, subject):
     return arts, memory, len(events), len(sessions)
 
 
+@named
+def a_recording_missing_from_one_listing_does_not_release_its_session():
+    w = World("absent")
+    e, i = w.pair(min_age=60)
+    s = w.subject()
+    recording(w, s, "260301_120000", blocks=SHORT)      # another day's: never an empty listing
+    rec = recording(w, s, "260307_101800")
+    beh = session(w, s, "260307T101500")
+    mat_file = next(iter(beh))
+    folder = w.abs(next(iter(rec)).rsplit("/", 1)[0])
+    w.ok(e)                                   # the first sighting: it waits for its recording
+    check(w.memory()[mat_file]["reason"].startswith("pairs with recording:"),
+          "the pairing state is not remembered: %s" % w.memory()[mat_file])
+    backdate(e, 61)
+    away = os.path.join(TMP, "away_%d" % w.n)
+    shutil.move(folder, away)
+    w.ok(e)                                   # one listing without the recording
+    mem = w.memory()[mat_file]
+    check(not set(beh) & set(w.artifacts()) and mem["status"] == "pending"
+          and mem["reason"] == "pairs with no recording (unpaired)",
+          "registered alone after one listing without its recording: %s" % mem)
+    shutil.move(away, folder)
+    backdate(e, 61)
+    w.ok(e)
+    check(not set(beh) & set(w.artifacts())
+          and w.memory()[mat_file]["reason"].startswith("pairs with recording:"),
+          "after the recording came back: %s" % w.memory()[mat_file])
+    w.ok(i)
+    backdate(i, 61)
+    w.ok(i)
+    check(set(rec) <= set(w.artifacts()), "the recording was not registered")
+    backdate(e, 61)
+    w.ok(e)
+    arts = w.artifacts()
+    check(set(beh) <= set(arts)
+          and {arts[p]["session"] for p in beh} == {arts[p]["session"] for p in rec},
+          "the session did not join its recording: %s" % sorted(arts))
+    w.off()
+
+
 def pair_tree(w):
     s = w.subject()
     return s, {
@@ -830,14 +929,14 @@ def other_client(w, root_id, subject, files, label, role="raw"):
                   "VALUES ('recording', %s, %s::uuid, now()) RETURNING event_id::text",
                   (subject, session_id))
     conn.execute("INSERT INTO lab.recording_event (event_id) VALUES (%s::uuid)", (event_id,))
-    ids = {}
+    made = {}
     for rel, data in files.items():
-        ids[rel] = q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, "
+        made[rel] = q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, "
                       "relative_path, checksum, size_bytes, role) VALUES (%s::uuid, %s, %s, %s, "
                       "%s, %s) RETURNING artifact_id::text",
                       (event_id, root_id, "copies/%s/%s" % (label, rel.rsplit("/", 1)[1]),
                        sha(data), len(data), role))
-    return event_id, session_id, ids
+    return event_id, session_id, made
 
 
 @named
@@ -937,6 +1036,99 @@ def a_recording_registered_from_a_copy_gets_its_nas_files_and_no_second_event():
 
 
 @named
+def a_folder_partly_another_clients_copy_is_held_by_run_and_attached_by_apply():
+    w = World("partial")
+    d = w.directory(I, "intan")
+    local = World("local")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    ev = other_client(w, local.root_id, s, rec, "copy-partial-" + TAG)[0]
+    extra = w.write(folder + "/_manifest.json", ('{"written": "on the NAS, later", "tag": "%s"}'
+                                                 % TAG).encode())
+    # A recording whose settings.xml alone has the bytes of another event's: not a copy.
+    fresh = recording(w, s, "260308_101800", blocks=SHORT)
+    shared = next(p for p in fresh if p.endswith("settings.xml"))
+    ev2 = other_client(w, local.root_id, s, {shared: fresh[shared]}, "copy-settings-" + TAG)[0]
+    w.ok(d, times=3)
+    mem, arts = w.memory(), w.artifacts()
+    reason = mem[extra]["reason"]
+    check(codes(w, list(rec) + [extra]) == ["copy_partial"] and ev in reason
+          and "a.rhd, settings.xml are raw file(s) of event(s) %s" % ev in reason
+          and "_manifest.json is not" in reason and not (set(rec) | {extra}) & set(arts)
+          and w.last(d)["details"]["files_read"] == 0, "a partial copy: %s" % mem[extra])
+    check(set(fresh) <= set(arts) and len({arts[p]["event"] for p in fresh}) == 1
+          and w.events()[arts[shared]["event"]]["attributes"]["raw_files_also_in_events"]
+          == [ev2], "a recording sharing its settings.xml only: %s"
+          % {p: arts.get(p, {}).get("event") for p in fresh})
+    code, out, plan = scan(w, d)
+    planned = {g["source_path"].rsplit("_", 2)[1]: g for g in groups_of(plan).values()}
+    g = planned["260307"]
+    check(code == 0 and g["action"] == "attach_copy" and g["event"]["id"] == ev
+          and g["copy_extra"] == [extra], "the scan of a partial copy: %s %s"
+          % (g["action"], g.get("copy_extra")))
+    code, out = apply(w, plan)
+    arts = w.artifacts()
+    check(code == 0 and {arts[p]["event"] for p in list(rec) + [extra]} == {ev}
+          and "copied_from" not in arts[extra]["attributes"]
+          and all("copied_from" in arts[p]["attributes"] for p in rec),
+          "apply of a partial copy: %d %s" % (code, out))
+    w.ok(d, times=2)
+    check(w.last(d)["groups_held"] == 0 and statuses(w, list(rec) + [extra]) == ["registered"],
+          "a run after apply: %s" % w.last(d))
+    w.off()
+    local.off()
+
+
+@named
+def a_copy_whose_session_has_the_folders_label_is_attached_by_run_and_scan_alike():
+    w = World("copylabel")
+    d = w.directory(I, "intan")
+    local = World("local")
+    s = w.subject()
+    one = recording(w, s, "260307_101800", blocks=SHORT)
+    two = recording(w, s, "260308_101800", blocks=SHORT)
+    # labclient labels its session with the dataset's name: here the NAS folder's.
+    ev, sess, _ids = other_client(w, local.root_id, s, one, "%s_260307_101800" % s)
+    ev2 = other_client(w, local.root_id, s, two, "%s_260308_101800" % s)[0]
+    code, out, plan = scan(w, d)
+    planned = {g["source_path"].rsplit("_", 2)[1]: g for g in groups_of(plan).values()}
+    check(code == 0 and planned["260307"]["action"] == "attach_copy"
+          and planned["260307"]["event"]["id"] == ev, "the scan: %s"
+          % {k: (g["action"], g.get("reason_code")) for k, g in planned.items()})
+    # The other copy holds a file more than the NAS folder: still a copy (each NAS file is in it).
+    data = rhd("not in the copy", SHORT)
+    conn.execute("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+                 "checksum, size_bytes, role) VALUES (%s::uuid, %s, %s, %s, %s, 'raw')",
+                 (ev2, local.root_id, "copies/x%s/b.rhd" % TAG, sha(data), len(data)))
+    w.ok(d, times=3)
+    arts = w.artifacts()
+    check({arts[p]["event"] for p in one} == {ev} and statuses(w, one) == ["registered"]
+          and q1("SELECT count(*) FROM lab.session WHERE storage_root_id = %s", (w.root_id,)) == 0,
+          "a copy labelled as its folder: %s" % {p: w.memory()[p] for p in one})
+    check({arts[p]["event"] for p in two if p in arts} == {ev2}, "the second copy")
+    # A group that is not a copy and meets a session of another client with its label is
+    # read, then held; it is not read again while its files stay as they are.
+    three = recording(w, s, "260309_101800", blocks=SHORT)
+    conn.execute("INSERT INTO lab.session (subject_id, label, storage_root_id, relative_path) "
+                 "VALUES (%s, %s, %s, %s)", (s, "%s_260309_101800" % s, local.root_id,
+                                             "copies/three-" + TAG))
+    w.ok(d, times=2)
+    check(codes(w, three) == ["session_conflict"] and w.last(d)["details"]["files_read"] == 2
+          and not set(three) & set(w.artifacts()), "not a copy: %s %s"
+          % (codes(w, three), w.last(d)))
+    w.ok(d)
+    check(codes(w, three) == ["session_conflict"] and w.last(d)["details"]["files_read"] == 0,
+          "the held group was read again: %s" % w.last(d))
+    code, out, plan = scan(w, d)
+    planned = {g["source_path"].rsplit("_", 2)[1]: g for g in groups_of(plan).values()}
+    check(planned["260309"]["reason_code"] == "session_conflict", "the scan of it: %s"
+          % planned["260309"])
+    w.off()
+    local.off()
+
+
+@named
 def the_session_of_a_copied_recording_joins_the_session_of_that_recording():
     w = World("copypair")
     e, i = w.pair()
@@ -962,6 +1154,62 @@ def the_session_of_a_copied_recording_joins_the_session_of_that_recording():
     steady(w, e, i)
     w.off()
     local.off()
+
+
+@named
+def a_retracted_recording_holds_its_group_and_the_session_paired_with_it():
+    w = World("retracted")
+    e, i = w.pair()
+    s = w.subject()
+    rec = recording(w, s, "260307_101800")
+    beh = session(w, s, "260307T101500")
+    w.ok(i, times=2)
+    ev = w.artifacts()[next(iter(rec))]["event"]
+    conn.execute("SELECT lab.fn_retract('event', %s::uuid, 'entered in error (test)')", (ev,))
+    w.ok(e, i, times=3)
+    mem = w.memory()
+    check(statuses(w, beh) == ["held"] and codes(w, beh) == ["paired_recording_held"]
+          and all(ev in mem[p]["reason"] and "retracted" in mem[p]["reason"] for p in beh)
+          and not set(beh) & set(w.artifacts()), "the session of a retracted recording: %s"
+          % {p: mem.get(p) for p in beh})
+    last = w.last(i)
+    check(last["groups_held"] == 1 and statuses(w, rec) == ["registered"]
+          and last["details"]["files_read"] == 0, "the retracted recording's run: %s" % last)
+    text = open(os.path.join(w.reports, sorted(n for n in os.listdir(w.reports)
+                                              if n.endswith(".txt") and "_dir%d_" % i in n)[-1]),
+                encoding="utf-8").read()
+    check("registered_but_withdrawn" in text and ev in text, "the report: %s" % text)
+    code, out, plan = scan(w, e, i)
+    planned = {g["kind"]: g for g in groups_of(plan).values()}
+    check((planned["recording"]["action"], planned["recording"]["reason_code"])
+          == ("held", "registered_but_withdrawn")
+          and (planned["behavior"]["action"], planned["behavior"]["reason_code"])
+          == ("held", "paired_recording_held") and ev in planned["behavior"]["reason"],
+          "the scan: %s" % {k: (g["action"], g.get("reason_code")) for k, g in planned.items()})
+    w.off()
+
+
+@named
+def a_group_too_large_for_one_transaction_is_held_before_it_is_read():
+    w = World("large")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    for k in range(engine.MAX_GROUP_FILES - 1):          # one file more than the limit
+        rec[w.write("%s/part%05d.txt" % (folder, k), b"%d" % k)] = None
+    small = recording(w, s, "260308_101800", blocks=SHORT)
+    w.ok(d, times=2)
+    last = w.last(d)
+    check(codes(w, rec) == ["group_too_large"] and set(w.artifacts()) == set(small)
+          and last["details"]["files_read"] == len(small) and last["groups_held"] == 1,
+          "a group too large: %s %s" % (codes(w, rec), last))
+    check(str(engine.MAX_GROUP_FILES) in w.memory()[next(iter(rec))]["reason"], "the reason")
+    code, out, plan = scan(w, d)
+    planned = {g["source_path"].rsplit("_", 2)[1]: g for g in groups_of(plan).values()}
+    check((planned["260307"]["action"], planned["260307"]["reason_code"])
+          == ("held", "group_too_large"), "the scan: %s" % planned["260307"]["action"])
+    w.off()
 
 
 @named
@@ -1286,6 +1534,134 @@ def an_override_names_the_subject_of_a_mislabelled_folder():
 
 
 @named
+def a_sessions_end_is_exact_to_the_microsecond_and_never_a_float():
+    from nas_import import database
+    check([database.duration_us(x) for x in ("1.0000005", "1.0000004", "0.0000015", "128")]
+          == [1_000_001, 1_000_000, 2, 128_000_000], "duration_us rounds a half upwards")
+    w = World("exact")
+    s = w.subject()
+    db = database.Database("check_import_nas_files")
+    db.connect()
+    try:
+        for k, (text, want) in enumerate((("1.0000005", "1.000001"), ("1.0000004", "1.000000"),
+                                          ("86399.999999", "86399.999999"),
+                                          ("123456789.123457", "123456789.123457"),
+                                          ("9007199254.740993", "9007199254.740993"))):
+            db.insert_session(str(uuid.uuid4()), s, "exact-%d" % k, w.root_id, "exact/%d" % k,
+                              "2026-03-07 10:18:00", ZONE, text, None)
+            got = q1("SELECT (extract(epoch FROM ended_at) - extract(epoch FROM started_at))::text "
+                     "FROM lab.session WHERE storage_root_id = %s AND label = %s",
+                     (w.root_id, "exact-%d" % k))
+            check(got == want, "ended_at - started_at for %s s: %s, expected %s" % (text, got, want))
+    finally:
+        db.close()
+    w.off()
+
+
+@named
+def every_function_the_tool_calls_is_qualified():
+    evil = "nasimp_evil_" + TAG
+    conn.execute('CREATE SCHEMA "%s"' % evil)
+    try:
+        conn.execute('CREATE FUNCTION "%s".lower(text) RETURNS text LANGUAGE sql IMMUTABLE '
+                     "AS $$ SELECT ''::text $$" % evil)
+        conn.execute('CREATE FUNCTION "%s".starts_with(text, text) RETURNS boolean LANGUAGE sql '
+                     "IMMUTABLE AS $$ SELECT true $$" % evil)
+        env = {"PGOPTIONS": "-c search_path=%s,pg_catalog,public" % evil}
+        w = World("qualified")
+        other = World("qualified-other")
+        d = w.directory(I, "intan")
+        s = w.subject()
+        one = recording(w, s, "260307_101800", blocks=SHORT)
+        P.write(other.abs("x/y.txt"), b"elsewhere")
+        husbandry_artifact(other, w.root_id, "unrelated/" + TAG, b"unrelated")
+        w.ok(d, env=env, times=2)
+        two = recording(w, s, "260308_101800", blocks=SHORT)
+        w.ok(d, env=env, times=2)
+        check(set(w.artifacts()) == set(one) | set(two) | {"unrelated/" + TAG}
+              and statuses(w, list(one) + list(two)) == ["registered"],
+              "with another lower() first on the search path: %s"
+              % {p: w.memory().get(p) for p in two})
+        code, out, plan = scan(w, d, env=env)
+        check(code == 0 and {x for x, _n in actions_of(plan)} == {"none"},
+              "the scan with another lower() first: %s" % actions_of(plan))
+        w.off()
+        other.off()
+    finally:
+        conn.execute('DROP SCHEMA "%s" CASCADE' % evil)
+
+
+@named
+def an_unwritable_cache_is_a_warning_and_an_unwritable_report_dir_stops_nothing():
+    w = World("io")
+    d1 = w.directory(I, "intan")
+    d2 = w.directory(E, "epsych")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    beh = session(w, s, "260309T090000")
+    blocker = os.path.join(TMP, "blocker_%d" % w.n)
+    P.write(blocker, b"a file where a folder is expected")
+    log = os.path.join(TMP, "io_%d.log" % w.n)
+    args = ["run", "--root", w.root_arg(), "--now", "--directory", str(d1), "--directory",
+            str(d2), "--cache-file", os.path.join(blocker, "cache.json"), "--log-file", log]
+    code, out = tool(*args, "--report-dir", os.path.join(blocker, "reports"))
+    check(code == 1 and w.last(d1)["outcome"] == "ok" and w.last(d2)["outcome"] == "ok"
+          and statuses(w, list(rec) + list(beh)) == ["pending"]
+          and out.count("could not be written to %s" % os.path.join(blocker, "reports")) >= 2
+          and "Traceback" not in out, "an unwritable report folder: %d %s" % (code, out))
+    lines = open(log, encoding="utf-8").read().splitlines()
+    check(len(lines) == 1 and " ERROR run:" in lines[0] and "could not be written" in lines[0],
+          "the log line: %s" % lines)
+    code, out = tool(*args)
+    last = w.last(d1)
+    check(code == 0 and last["outcome"] == "ok" and set(w.artifacts()) == set(rec) | set(beh)
+          and "warning: the cache file" in out
+          and "could not be written" in last["details"]["warnings"][0],
+          "an unwritable cache file: %d %s %s" % (code, out, last))
+    w.off()
+
+
+@named
+def a_file_registered_with_md5_is_compared_by_md5_and_one_with_blake3_is_held():
+    w = World("algo")
+    d = w.directory(I, "intan")
+    local = World("local")
+    s = w.subject()
+    one = recording(w, s, "260307_101800", blocks=SHORT)
+    two = recording(w, s, "260308_101800", blocks=SHORT)
+    xml1 = next(p for p in one if p.endswith("settings.xml"))
+    xml2 = next(p for p in two if p.endswith("settings.xml"))
+    ev, sess, _made = other_client(w, local.root_id, s, {}, "algo-" + TAG)
+    md5 = hashlib.md5(one[xml1]).hexdigest()
+    by_md5 = q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+                "checksum, checksum_algo, size_bytes, role, subject_id, session_id) VALUES "
+                "(%s::uuid, %s, %s, %s, 'md5', %s, 'raw', %s, %s::uuid) "
+                "RETURNING artifact_id::text", (ev, w.root_id, xml1, md5, len(one[xml1]), s, sess))
+    ev2, sess2, _made = other_client(w, local.root_id, s, {}, "algo-two-" + TAG)
+    q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+       "checksum, checksum_algo, size_bytes, role, subject_id, session_id) VALUES "
+       "(%s::uuid, %s, %s, %s, 'blake3', %s, 'raw', %s, %s::uuid) RETURNING artifact_id::text",
+       (ev2, w.root_id, xml2, "ab" * 32, len(two[xml2]), s, sess2))
+    w.ok(d, times=3)
+    mem, arts = w.memory(), w.artifacts()
+    check(mem[xml1]["status"] == "known" and mem[xml1]["artifact"] == by_md5
+          and q1("SELECT observed_checksum FROM lab.artifact_verification WHERE artifact_id = "
+                 "%s::uuid", (by_md5,)) == md5
+          and {arts[p]["event"] for p in one} == {ev},
+          "a file registered with md5: %s %s" % (mem[xml1], {p: arts[p]["event"] for p in one}))
+    check(mem[xml2]["status"] == "held" and mem[xml2]["code"] == "checksum_unsupported"
+          and "blake3" in mem[xml2]["reason"] and "content_changed" not in str(codes(w, two))
+          and not (set(two) - {xml2}) & set(arts), "a file registered with blake3: %s" % mem[xml2])
+    code, out, plan = scan(w, d)
+    planned = {g["source_path"].rsplit("_", 2)[1]: g for g in groups_of(plan).values()}
+    check(planned["260307"]["action"] == "none"
+          and planned["260308"]["reason_code"] == "checksum_unsupported", "the scan: %s"
+          % {k: (g["action"], g.get("reason_code")) for k, g in planned.items()})
+    w.off()
+    local.off()
+
+
+@named
 def a_dry_run_writes_nothing():
     w = World("dry")
     d = w.directory(I, "intan")
@@ -1324,9 +1700,25 @@ def a_lost_connection_leaves_no_group_half_written():
            "                      \"current_database() AND pid <> pg_backend_pid()\")\n"
            "    return out\n"
            "engine.read_group = cut")
-    code, out = w.run(d, patch=cut)
+    # After the reconnection the new connection must hold the directory's lock again.
+    held = os.path.join(TMP, "locks_%d.txt" % w.n)
+    locks = ("real_reconnect = database.Database.reconnect\n"
+             "def reconnect(self):\n"
+             "    ok = real_reconnect(self)\n"
+             "    if ok:\n"
+             "        n = self.one(\"SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \"\n"
+             "                     \"AND pid = pg_backend_pid() AND classid = %%s::bigint::oid \"\n"
+             "                     \"AND objid = %%s::bigint::oid AND objsubid = 2\",\n"
+             "                     (database.LOCK_CLASS, %d))[0]\n"
+             "        with open(%r, 'a') as fh:\n"
+             "            fh.write('%%d\\n' %% n)\n"
+             "    return ok\n"
+             "database.Database.reconnect = reconnect\n" % (d, held))
+    code, out = w.run(d, patch=cut + "\n" + locks)
     last = w.last(d)
     arts = w.artifacts()
+    check(open(held).read().split() == ["1"], "the lock was not taken again after the "
+          "reconnection: %s" % open(held).read())
     check(code == 1 and last["outcome"] == "failed" and "could not be registered" in last["message"],
           "a lost connection: exit %d, %s, %s" % (code, last, out))
     check(set(arts) == set(two) and len(w.events()) == 1
@@ -1336,6 +1728,162 @@ def a_lost_connection_leaves_no_group_half_written():
     w.ok(d)
     check(set(w.artifacts()) == set(one) | set(two), "the interrupted group was not registered "
           "by the next run")
+    w.off()
+
+
+def raise_after(method, condition="True"):
+    """A patch: Database.METHOD does its work, then (when CONDITION) a database error."""
+    return ("import psycopg\nreal_%s = database.Database.%s\n"
+            "def injected(self, *a, **k):\n"
+            "    out = real_%s(self, *a, **k)\n"
+            "    rows = a[2] if len(a) > 2 else ()\n"
+            "    if %s:\n"
+            "        raise psycopg.Error('injected after %s')\n"
+            "    return out\n"
+            "database.Database.%s = injected" % (method, method, method, condition, method,
+                                                 method))
+
+
+@named
+def a_group_is_written_whole_or_not_at_all():
+    w = World("atomic")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    w.ok(d)
+    for patch in (raise_after("insert_session"),         # the group's first write
+                  raise_after("write_memory",            # its last: the memory rows
+                              "any(r.status == 'registered' for r in rows)")):
+        code, out = w.run(d, patch=patch)
+        check(code == 1 and "injected after" in out and w.last(d)["outcome"] == "failed",
+              "an injected failure: %d %s" % (code, out))
+        check(not w.artifacts() and not w.events() and statuses(w, rec) == ["pending"]
+              and q1("SELECT count(*) FROM lab.session WHERE storage_root_id = %s",
+                     (w.root_id,)) == 0
+              and q1("SELECT count(*) FROM lab.artifact_verification v JOIN lab.artifact a "
+                     "USING (artifact_id) WHERE a.storage_root_id = %s", (w.root_id,)) == 0,
+              "a group was written in part: %s" % sorted(w.artifacts()))
+    w.ok(d)
+    check(set(w.artifacts()) == set(rec), "not registered after the failures")
+    w.off()
+
+
+# Before the read: the file is a link to its own bytes (moved aside), which only the
+# lstat before opening sees; opening it puts the file back.
+LINK_BEFORE_OPEN = (
+    "import os, builtins\nreal_read_file = engine.read_file\n"
+    "def read_file(root_path, f, verify, stats, **kw):\n"
+    "    if f.path.endswith('.rhd'):\n"
+    "        p = content.absolute_path(root_path, f.path)\n"
+    "        os.rename(p, p + '.away')\n"
+    "        os.symlink(os.path.basename(p) + '.away', p)\n"
+    "    return real_read_file(root_path, f, verify, stats, **kw)\n"
+    "def opener(path, *a, **k):\n"
+    "    if os.path.islink(path):\n"
+    "        os.remove(path)\n"
+    "        os.rename(path + '.away', path)\n"
+    "    return builtins.open(path, *a, **k)\n"
+    "engine.read_file = read_file\n"
+    "engine.open = opener\n")
+
+# While the file is read (after the stat of the open file): its mtime moves 3 s.
+TOUCH_WHILE_READ = (
+    "import os, builtins\n"
+    "class Touching:\n"
+    "    def __init__(self, fh, path):\n"
+    "        self.fh, self.path, self.done = fh, path, False\n"
+    "    def read(self, n=-1):\n"
+    "        if not self.done:\n"
+    "            self.done = True\n"
+    "            st = os.stat(self.path)\n"
+    "            os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns + 3_000_000_000))\n"
+    "        return self.fh.read(n)\n"
+    "    def __getattr__(self, name):\n"
+    "        return getattr(self.fh, name)\n"
+    "    def __enter__(self):\n"
+    "        return self\n"
+    "    def __exit__(self, *exc):\n"
+    "        self.fh.close()\n"
+    "def opener(path, *a, **k):\n"
+    "    fh = builtins.open(path, *a, **k)\n"
+    "    return Touching(fh, path) if path.endswith('.rhd') else fh\n"
+    "engine.open = opener\n")
+
+
+@named
+def a_file_that_is_not_what_the_listing_said_before_or_after_it_is_read_is_not_registered():
+    w = World("stats")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    rel = next(p for p in rec if p.endswith(".rhd"))
+    w.ok(d)
+    code, out = w.run(d, patch=LINK_BEFORE_OPEN)
+    if os.path.islink(w.abs(rel)):          # put the file back as it was
+        os.remove(w.abs(rel))
+        os.rename(w.abs(rel) + ".away", w.abs(rel))
+    check(code == 0 and not w.artifacts() and w.last(d)["groups_waiting"] == 1,
+          "a file that was a link when it was stat'ed: %d %s" % (code, out))
+    listed = w.memory()[rel]["mtime_ns"]
+    code, out = w.run(d, patch=TOUCH_WHILE_READ)
+    mem = w.memory()[rel]
+    check(code == 0 and not w.artifacts() and mem["code"] == "changed_during_scan"
+          and mem["mtime_ns"] == listed + 3_000_000_000,
+          "a file that changed while it was read: %d %s %s" % (code, mem, out))
+    w.ok(d, times=2)
+    check(set(w.artifacts()) == set(rec), "not registered afterwards")
+    w.off()
+
+
+@named
+def an_empty_or_incomplete_partner_listing_fails_the_run():
+    w = World("partnerlisting")
+    e, i = w.pair()
+    s = w.subject()
+    beh = session(w, s, "260307T101500")
+    code, out = w.run(e)
+    last = w.last(e)
+    check(code == 1 and last["outcome"] == "failed" and "is empty" in last["message"]
+          and not w.memory(), "an empty partner: %d %s %s" % (code, last, out))
+    rec = recording(w, s, "260307_101800")
+    code, out = w.run(e, patch=unlistable_patch(w.abs(next(iter(rec)).rsplit("/", 1)[0])))
+    last = w.last(e)
+    check(code == 1 and last["outcome"] == "failed"
+          and "could not be listed completely" in last["message"] and not w.memory(),
+          "an incomplete partner: %d %s %s" % (code, last, out))
+    w.ok(e)
+    check(statuses(w, beh) == ["pending"], "the session after the failures")
+    w.off()
+
+
+@named
+def what_the_database_says_is_checked_again_inside_the_groups_transaction():
+    w = World("recheck")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    w.ok(d)
+    # Between the plan and the group's transaction another writer registers the group's
+    # event, with another digest.
+    other = ("import psycopg\nfrom nas_import import ids\nreal_read_group = engine.read_group\n"
+             "def read_group(s, gp):\n"
+             "    out = real_read_group(s, gp)\n"
+             "    g = gp.group\n"
+             "    with psycopg.connect(autocommit=True) as c:\n"
+             "        sid = c.execute(\"INSERT INTO lab.session (subject_id, label, \"\n"
+             "            \"storage_root_id, relative_path) VALUES (%%s, 'meanwhile', %%s, \"\n"
+             "            \"'meanwhile/%s') RETURNING session_id\", (g.subject_id, %d)).fetchone()[0]\n"
+             "        c.execute(\"INSERT INTO lab.event (event_id, event_type, subject_id, \"\n"
+             "            \"session_id, occurred_at, attributes) VALUES (%%s, 'recording', %%s, \"\n"
+             "            \"%%s, now(), '{\\\"client_digest\\\": \\\"another\\\"}')\",\n"
+             "            (ids.group_event_id(g), g.subject_id, sid))\n"
+             "        c.execute(\"INSERT INTO lab.recording_event (event_id) VALUES (%%s)\",\n"
+             "                  (ids.group_event_id(g),))\n"
+             "    return out\n"
+             "engine.read_group = read_group" % (TAG, w.root_id))
+    code, out = w.run(d, patch=other)
+    check(code == 0 and codes(w, rec) == ["would_correct"] and not w.artifacts(),
+          "an event registered meanwhile: %d %s %s" % (code, codes(w, rec), out))
     w.off()
 
 
@@ -1391,7 +1939,24 @@ def a_damaged_mat_file_holds_its_group_before_any_row_is_written():
     w.ok(d)                                   # read once: the hold stands, nothing is read again
     check(w.last(d)["details"]["files_read"] == 0 and codes(w, bad) == ["mat_corrupt"],
           "a file held after it was read was read again")
+    # The damaged file is replaced: the hold of every file of the session ends.
+    os.remove(w.abs(damaged))
+    w.write(damaged, mat(damaged + " again"))
+    w.ok(d, times=2)
+    check(set(bad) <= set(w.artifacts()) and statuses(w, bad) == ["registered"],
+          "the session whose damaged file was replaced: %s" % {p: w.memory()[p] for p in bad})
     w.off()
+
+
+# Touches every .rhd file just before it is read to its end (7 s later mtime).
+TOUCH_BEFORE_READ = ("import os\nreal = engine.read_file\n"
+                     "def read_file(root_path, f, verify, stats, **kw):\n"
+                     "    if f.path.endswith('.rhd'):\n"
+                     "        p = content.absolute_path(root_path, f.path)\n"
+                     "        st = os.stat(p)\n"
+                     "        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 7_000_000_000))\n"
+                     "    return real(root_path, f, verify, stats, **kw)\n"
+                     "engine.read_file = read_file")
 
 
 @named
@@ -1401,23 +1966,45 @@ def a_file_that_changes_while_it_is_read_is_not_registered_and_waits_again():
     s = w.subject()
     rec = recording(w, s, "260307_101800", blocks=SHORT)
     w.ok(d)
-    touch = ("import os\nreal = engine.read_file\n"
-             "def read_file(root_path, f, verify, stats):\n"
-             "    if f.path.endswith('.rhd'):\n"
-             "        p = content.absolute_path(root_path, f.path)\n"
-             "        st = os.stat(p)\n"
-             "        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 7_000_000_000))\n"
-             "    return real(root_path, f, verify, stats)\n"
-             "engine.read_file = read_file")
     rel = next(p for p in rec if p.endswith(".rhd"))
     listed = w.memory()[rel]["mtime_ns"]
-    code, out = w.run(d, patch=touch)
+    code, out = w.run(d, patch=TOUCH_BEFORE_READ)
     mem = w.memory()[rel]
     check(code == 0 and not w.artifacts() and mem["status"] == "pending"
           and mem["mtime_ns"] == listed + 7_000_000_000 and w.last(d)["files_pending"] == 1,
           "a file changed while read: %d %s %s" % (code, mem, out))
+    # The next listing is the first to show the file so (the row above is the read's):
+    # it writes its own row, and the run after it registers.
+    w.ok(d)
+    check(not w.artifacts() and w.memory()[rel]["code"] is None, "registered by the run whose "
+          "listing first showed the changed file")
     w.ok(d)
     check(set(w.artifacts()) == set(rec), "not registered once it was seen unchanged")
+    w.off()
+
+
+@named
+def a_change_found_by_a_read_restarts_the_wait_at_the_next_listing_not_at_the_read():
+    w = World("readchange")
+    d = w.directory(I, "intan", min_age=60)
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    rel = next(p for p in rec if p.endswith(".rhd"))
+    w.ok(d)                                   # the first sighting
+    backdate(d, 61)
+    code, out = w.run(d, patch=TOUCH_BEFORE_READ)
+    mem = w.memory()[rel]
+    check(code == 0 and not w.artifacts() and mem["status"] == "pending"
+          and mem["code"] == "changed_during_scan" and "read with" in mem["reason"],
+          "the row of a file found changed by a read: %s %s" % (mem, out))
+    backdate(d, 61)              # that run started 61 minutes ago; no listing has shown the state
+    w.ok(d)
+    mem = w.memory()[rel]
+    check(not w.artifacts() and mem["status"] == "pending" and mem["code"] is None,
+          "registered on the strength of a row a read wrote: %s" % mem)
+    backdate(d, 61)              # now a listing 61 minutes ago showed it
+    w.ok(d)
+    check(set(w.artifacts()) == set(rec), "not registered once a listing showed it unchanged")
     w.off()
 
 
@@ -1494,6 +2081,9 @@ def a_corrected_artifact_row_is_followed_and_a_group_held_later_keeps_its_regist
     check(mem["status"] == "registered" and mem["artifact"] == newer
           and w.last(d)["details"]["files_read"] == 0 and q1("SELECT count(*) FROM lab.artifact")
           == n, "a corrected artifact row: %s" % mem)
+    check(w.last(d)["files_registered"] == 0 and w.last(d)["groups_registered"] == 0
+          and w.last(d)["details"]["files_repointed"] == 1,
+          "a row that follows a correction counted as registered: %s" % w.last(d))
     steady(w, d)
     # The folder gets a file that makes the whole recording unreadable as one: the group
     # is held, and what is registered stays registered.
@@ -1522,6 +2112,9 @@ def a_partner_that_is_off_is_still_judged_and_two_partners_are_refused():
     last = w.last(e)
     check(code == 1 and last["outcome"] == "failed" and "all pair with" in last["message"]
           and not w.memory(), "two partners: %d %s" % (code, out))
+    code, out = tool("check")
+    check(code == 1 and "PROBLEM directories" in out and "all pair with %d " % e in out
+          and "none of them is searched" in out, "check with two partners: %d %s" % (code, out))
     conn.execute("UPDATE lab.scan_directory SET mode = 'off' WHERE scan_directory_id = %s",
                  (second,))
     # The recordings' directory is off: its recording is on disk all the same, and the
@@ -1534,6 +2127,9 @@ def a_partner_that_is_off_is_still_judged_and_two_partners_are_refused():
     first = sorted(n for n in os.listdir(w.reports) if n.endswith(".txt") and "_dir%d_" % e in n)
     text = open(os.path.join(w.reports, first[-1]), encoding="utf-8").read()
     check("is not registered yet" in text, "the report does not say why it waits: %s" % text)
+    code, out = tool("check")
+    check("directory %d %s:%s: 1 group(s) wait for a recording of directory %d %s:%s, which is off"
+          % (e, w.name, E, i, w.name, I) in out, "check does not say who waits: %s" % out)
     # ... nor in report mode.
     conn.execute("UPDATE lab.scan_directory SET mode = 'report' WHERE scan_directory_id = %s", (i,))
     w.ok(i, e, times=2)
@@ -1611,6 +2207,7 @@ def nothing_held_or_pending(w, *dirs):
           "a run after apply wrote memory rows")
     left = {p: m["code"] for p, m in w.memory().items() if m["status"] in ("held", "pending")}
     check(not left, "held or pending after apply: %s" % left)
+    counters_agree(w)
 
 
 @named
@@ -1632,6 +2229,17 @@ def scan_writes_nothing_its_plan_is_deterministic_and_apply_registers_exactly_it
           "the ePsych directory scanned alone: %s" % actions_of(alone))
     code, out, first = scan(w, e, i, extra=["--cache-file", cache])
     check(code == 0, "scan: %d %s" % (code, out))
+    text = open(first[:-6] + ".txt", encoding="utf-8").read()
+    rows = open(first[:-6] + ".csv", encoding="utf-8").read()
+    folder = "%s/%s/%s_260307_101800" % (I, s, s)
+    for needle in ("subject %s" % s, "label %s_260307_101800, at %s" % (s, folder),
+                   "starts 2026-03-07 10:18:00 %s; duration %s s" % (ZONE, seconds(LONG)),
+                   "occurred 2026-03-07 10:15:00 %s; 5 trial(s)" % ZONE,
+                   "occurred 2026-03-09 09:00:00 %s" % ZONE):
+        check(needle in text and needle in rows, "the scan's reports lack %r:\n%s\n%s"
+              % (needle, text, rows))
+    check("session,new,%s,%s," % (w.name, folder) in rows and "event,new," in rows,
+          "the scan's CSV: %s" % rows)
     code, out, second = scan(w, i, e)
     check(code == 0, "second scan: %d %s" % (code, out))
     check(table_counts() == counts, "scan wrote to the database")
@@ -1814,6 +2422,13 @@ def a_late_recording_is_one_correction_into_its_session_with_tags_and_variables_
                      ("move_session", "%s_260310T090000" % s)]),
           "planned %s: %s" % (actions_of(plan), out))
     move = [g for g in groups_of(plan).values() if g["action"] == "move_session"][0]
+    text = open(plan[:-6] + ".txt", encoding="utf-8").read()
+    rows = open(plan[:-6] + ".csv", encoding="utf-8").read()
+    note = move["session_note"]["note"]
+    check(("session %s gets the note: %s" % (old_session, note)) in text
+          and "session,note,%s,," % w.name in rows and note in rows
+          and all("supersedes artifact %s" % arts[p]["id"] in text for p in beh),
+          "the scan's reports do not show the note or the rows superseded: %s" % text)
     check(set(move["changes"]) == {"session_id"} and move["changes"]["session_id"][0]
           == old_session and move["event"]["supersedes"] == old_event,
           "the planned correction: %s" % move["changes"])
@@ -1931,6 +2546,62 @@ def a_subject_override_after_registration_is_one_correction_moving_event_and_art
     code, out, again = scan(w, d, extra=["--overrides", over])
     check({x for x, _n in actions_of(again)} == {"none"}, "a second scan plans %s"
           % actions_of(again))
+    counters_agree(w)
+    w.off()
+
+
+@named
+def an_override_withdrawn_after_its_correction_gives_the_path_back_to_the_subjects_session():
+    w = World("withdrawn")
+    d = w.directory(I, "intan")
+    s, s2 = w.subject(1), w.subject(2)
+    rec = recording(w, s, "260709_095155", blocks=SHORT)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    w.ok(d, times=2)
+    first = w.artifacts()[next(iter(rec))]["session"]
+    over = os.path.join(TMP, "withdrawn_%d.csv" % w.n)
+    P.write(over, ("root,relative_path,subject_id,reason\n%s,%s,%s,the other animal\n"
+                   % (w.name, folder, s2)).encode())
+    problems = integrity()
+
+    def where():
+        """(event subject, its session's subject, its session's path) of the active event."""
+        return q("SELECT e.subject_id, s.subject_id, s.relative_path FROM lab.event_active e "
+                 "JOIN lab.session s USING (session_id) WHERE s.storage_root_id = %s "
+                 "OR s.relative_path LIKE %s", (w.root_id, folder + "%"))
+
+    sessions = {}
+    for k, (extra, subject) in enumerate(((["--overrides", over], s2), ([], s),
+                                          (["--overrides", over], s2))):
+        code, out, plan = scan(w, d, extra=extra)
+        (g,) = groups_of(plan).values()
+        check(code == 0 and g["action"] == "correct", "scan %d: %s %s" % (k, g["action"], out))
+        code, out = apply(w, plan)
+        check(code == 0, "apply %d: %d %s" % (k, code, out))
+        check(where() == [(subject, subject, folder)],
+              "after apply %d the event is not in its subject's session at the folder's path: %s"
+              % (k, where()))
+        sessions[k] = q1("SELECT session_id::text FROM lab.event_active e WHERE e.event_id IN "
+                         "(SELECT produced_by_event_id FROM lab.artifact_active WHERE "
+                         "storage_root_id = %s)", (w.root_id,))
+        w.ok(d, extra=extra, times=2)
+        last = w.last(d)
+        check(last["groups_held"] == 0 and last["details"]["would_correct"]["count"] == 0
+              and statuses(w, rec) == ["registered"], "a run after apply %d: %s" % (k, last))
+        check(integrity() == problems, "the integrity report changed: %s"
+              % sorted(set(integrity()) ^ set(problems)))
+    # The first session got the path back, then the second one did: no third session.
+    check(sessions[1] == first and sessions[2] == sessions[0]
+          and q1("SELECT count(*) FROM lab.session WHERE storage_root_id = %s", (w.root_id,)) == 2,
+          "sessions %s, first %s" % (sessions, first))
+    paths = dict(q("SELECT session_id::text, relative_path FROM lab.session "
+                   "WHERE storage_root_id = %s", (w.root_id,)))
+    check(paths == {sessions[2]: folder, first: folder + "#superseded-by-" + sessions[2]},
+          "the sessions' paths: %s" % paths)
+    notes = q1("SELECT notes FROM lab.session WHERE session_id = %s::uuid", (first,))
+    check(notes and "Given back the path" in notes and "Superseded by session" in notes,
+          "the notes of the session that got its path back: %s" % notes)
+    counters_agree(w)
     w.off()
 
 
@@ -2023,6 +2694,235 @@ def apply_refuses_what_is_not_as_the_scan_found_it_and_leaves_it_untouched():
     check(code == 1 and "is in the database now" in out
           and table_counts(skip=("scan_run", "scan_run_result")) == n,
           "the database changed since the scan: %d %s" % (code, out))
+    w.off()
+
+
+def unlistable_patch(folder):
+    """A wrapper patch under which FOLDER (absolute) cannot be listed."""
+    return ("real = walk._sorted_entries\n"
+            "def unlistable(path):\n"
+            "    if path == %r:\n"
+            "        raise PermissionError(13, 'Permission denied', path)\n"
+            "    return real(path)\n"
+            "walk._sorted_entries = unlistable" % folder)
+
+
+@named
+def apply_lists_again_and_refuses_a_group_that_grew_or_whose_pairing_changed():
+    # D1: a recording folder that grew after the scan.
+    w = World("grown")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800")
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    code, out, plan = scan(w, d)
+    check(code == 0 and actions_of(plan)[0][0] == "register", "scan: %d %s" % (code, out))
+    more = {w.write(folder + "/%s.rhd" % n, rhd(folder + n)): None for n in ("b", "c")}
+    code, out = apply(w, plan)
+    check(code == 1 and "REFUSED" in out and "the listing now differs from the scan's" in out
+          and "added %s/b.rhd, %s/c.rhd" % (folder, folder) in out and "detail" in out
+          and not w.artifacts() and not w.events(), "a group that grew: %d %s" % (code, out))
+    code, out, plan = scan(w, d)
+    code, out = apply(w, plan)
+    check(code == 0 and set(w.artifacts()) == set(rec) | set(more), "apply again: %d %s"
+          % (code, out))
+    (ev,) = w.events()
+    check(q1("SELECT duration_s::text FROM lab.recording_event WHERE event_id = %s", (ev,))
+          == seconds(3 * LONG), "the duration of the whole recording")
+    w.off()
+    # D2: a behavior session planned alone whose recording appears before apply.
+    w = World("lateapply")
+    e, i = w.pair()
+    s = w.subject()
+    other = recording(w, s, "260301_120000", blocks=SHORT)
+    beh = session(w, s, "260307T101500")
+    code, out, plan = scan(w, e, i)
+    check(code == 0 and sorted(a for a, _n in actions_of(plan)) == ["register", "register"],
+          "scan: %s" % actions_of(plan))
+    rec = recording(w, s, "260307_101800")
+    code, out = apply(w, plan)
+    check(code == 1 and out.count("REFUSED") == 1 and "pairing" in out and "session_path" in out
+          and set(w.artifacts()) == set(other), "a recording that arrived: %d %s" % (code, out))
+    w.ok(i, times=2)
+    w.ok(e, times=2)
+    arts = w.artifacts()
+    check({arts[p]["session"] for p in beh} == {arts[p]["session"] for p in rec},
+          "the session did not join its recording: %s" % sorted(arts))
+    w.off()
+    # A listing that cannot be made completely at apply refuses the whole directory.
+    w = World("applyunlisted")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    one = recording(w, s, "260307_101800", blocks=SHORT)
+    two = recording(w, s, "260308_101800", blocks=SHORT)
+    code, out, plan = scan(w, d)
+    counts = table_counts()
+    code, out = tool("apply", plan, "--root", w.root_arg(),
+                     patch=unlistable_patch(w.abs(next(iter(two)).rsplit("/", 1)[0])))
+    check(code == 1 and out.count("REFUSED") == 2
+          and "cannot be listed and interpreted completely again" in out
+          and table_counts() == counts, "an incomplete listing at apply: %d %s" % (code, out))
+    code, out = apply(w, plan)
+    check(code == 0 and set(w.artifacts()) == set(one) | set(two), "apply: %d %s" % (code, out))
+    w.off()
+
+
+def forge(plan, change, name):
+    """A copy of PLAN whose records CHANGE edits, with a digest computed anew (a forgery)."""
+    records = plan_of(plan)
+    end = records.pop()
+    change(records)
+    path = os.path.join(TMP, "forged_%s.jsonl" % name)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(reviewed.plan_text(records, end["version"], end["database"],
+                                    end["overrides_sha256"]))
+    return path
+
+
+@named
+def apply_compares_the_root_name_and_with_reread_reads_every_file_again():
+    w = World("reread")
+    d = w.directory(I, "intan")
+    s = w.subject()
+    rec = recording(w, s, "260307_101800", blocks=SHORT)
+    other = World("othername")
+    code, out, plan = scan(w, d)
+    counts = table_counts()
+    # The plan's root name is compared with the name of its root id in the database.
+
+    def rename(records):
+        for r in records:
+            if r["type"] == "directory":
+                r["root"] = other.name
+    code, out = tool("apply", forge(plan, rename, "root_%d" % w.n), "--root",
+                     "%s=%s" % (other.name, w.path))
+    check(code == 1 and "the plan names storage root %s" % other.name in out
+          and table_counts() == counts, "another root's name: %d %s" % (code, out))
+
+    # A forged SHA-256 is carried out without --reread; with it, refused.
+    def zeros(records):
+        for r in records:
+            for f in r.get("files", []):
+                if f.get("state") == "new" and f["path"].endswith(".rhd"):
+                    f["sha256"] = "0" * 64
+    forged = forge(plan, zeros, "zeros_%d" % w.n)
+    code, out = apply(w, forged, "--reread")
+    check(code == 1 and "was read again: its SHA-256 is %s" % sha(rec[next(
+        p for p in rec if p.endswith(".rhd"))]) in out
+          and table_counts(skip=("scan_run", "scan_run_result"))
+          == {k: v for k, v in counts.items() if k not in ("scan_run", "scan_run_result")},
+          "a forged SHA-256 with --reread: %d %s" % (code, out))
+    code, out = apply(w, plan, "--reread")
+    check(code == 0 and "was read again (--reread)" in out and set(w.artifacts()) == set(rec),
+          "apply --reread: %d %s" % (code, out))
+    check(q1("SELECT count(*) FROM lab.artifact_verification v JOIN lab.artifact a "
+             "USING (artifact_id) WHERE a.storage_root_id = %s AND v.status = 'ok'",
+             (w.root_id,)) == len(rec), "the verification rows of a re-read")
+    code, out = tool("apply", "--help")
+    check(code == 0 and "plain SHA-256 with no key" in out and "physical clone" in out
+          and "--reread" in out, "apply --help: %s" % out)
+    w.off()
+
+
+def husbandry_artifact(w, root_id, rel, data, event=None):
+    """An artifact at REL on ROOT_ID produced by EVENT (else a new husbandry event)."""
+    s = w.subject()
+    if event is None:
+        event = q1("INSERT INTO lab.event (event_type, subject_id, occurred_at) VALUES "
+                   "('husbandry', %s, now()) RETURNING event_id::text", (s,))
+        conn.execute("INSERT INTO lab.husbandry_event (event_id, measure) VALUES (%s::uuid, "
+                     "'weight')", (event,))
+    return q1("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+              "checksum, role) VALUES (%s::uuid, %s, %s, %s, 'other') RETURNING artifact_id::text",
+              (event, root_id, rel, sha(data)))
+
+
+@named
+def apply_refuses_each_change_of_the_database_since_the_scan():
+    def refused(w, plan, needle, what):
+        before = table_counts(skip=("scan_run", "scan_run_result"))
+        code, out = apply(w, plan)
+        check(code == 1 and "REFUSED" in out and needle in out
+              and table_counts(skip=("scan_run", "scan_run_result")) == before,
+              "%s: %d %s" % (what, code, out))
+
+    def world(name):
+        w = World(name)
+        d = w.directory(I, "intan")
+        s = w.subject()
+        return w, d, s, recording(w, s, "260307_101800", blocks=SHORT)
+
+    # An artifact registered at a planned path.
+    w, d, s, rec = world("rpaths")
+    code, out, plan = scan(w, d)
+    husbandry_artifact(w, w.root_id, next(iter(rec)), b"something else")
+    refused(w, plan, "the artifacts registered at", "an artifact at a planned path")
+    w.off()
+    # The session the plan makes exists now, another subject's.
+    w, d, s, rec = world("rsessions")
+    code, out, plan = scan(w, d)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    conn.execute("INSERT INTO lab.session (session_id, subject_id, label, storage_root_id, "
+                 "relative_path) VALUES (%s::uuid, %s, 'elsewhere', %s, %s)",
+                 (ids.session_id(w.name, folder),
+                  w.subject(2), w.root_id, "elsewhere/" + TAG))
+    refused(w, plan, "is not as the scan found it", "the planned session exists")
+    w.off()
+    # The raw bytes became another client's event's.
+    w, d, s, rec = world("rcopies")
+    local = World("local")
+    code, out, plan = scan(w, d)
+    other_client(w, local.root_id, s, rec, "copy-later-" + TAG)
+    refused(w, plan, "the events that hold these raw bytes changed", "a copy registered meanwhile")
+    w.off()
+    local.off()
+    # A registered file of the group was retracted.
+    w, d, s, rec = world("rsettled")
+    w.ok(d, times=2)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    w.write(folder + "/_manifest.json", ('{"tag": "%s"}' % TAG).encode())
+    code, out, plan = scan(w, d)
+    check(actions_of(plan)[0][0] == "add_files", "the plan: %s" % actions_of(plan))
+    conn.execute("SELECT lab.fn_retract('artifact', %s::uuid, 'test')",
+                 (w.artifacts()[next(iter(rec))]["id"],))
+    refused(w, plan, "is no longer current and present", "a registered file retracted")
+    w.off()
+    # The event a correction supersedes got another file.
+    w, d, s, rec = world("ractive")
+    local = World("local")
+    w.ok(d, times=2)
+    folder = next(iter(rec)).rsplit("/", 1)[0]
+    over = os.path.join(TMP, "ractive_%d.csv" % w.n)
+    P.write(over, ("root,relative_path,subject_id,reason\n%s,%s,%s,the other animal\n"
+                   % (w.name, folder, w.subject(2))).encode())
+    code, out, plan = scan(w, d, extra=["--overrides", over])
+    check(actions_of(plan)[0][0] == "correct", "the plan: %s" % actions_of(plan))
+    husbandry_artifact(w, local.root_id, "analysis/%s/more.npy" % TAG, b"more",
+                       w.artifacts()[next(iter(rec))]["event"])
+    refused(w, plan, "the active artifacts of event", "a file added to the corrected event")
+    w.off()
+    local.off()
+    # The other client's event a file at the NAS path belongs to was retracted.
+    w, d, s, rec = world("rhost")
+    local = World("local")
+    ev, sess, _made = other_client(w, local.root_id, s, {}, "rhost-" + TAG)
+    xml = next(p for p in rec if p.endswith("settings.xml"))
+    conn.execute("INSERT INTO lab.artifact (produced_by_event_id, storage_root_id, relative_path, "
+                 "checksum, size_bytes, role, subject_id, session_id) VALUES (%s::uuid, %s, %s, "
+                 "%s, %s, 'raw', %s, %s::uuid)",
+                 (ev, w.root_id, xml, sha(rec[xml]), len(rec[xml]), s, sess))
+    code, out, plan = scan(w, d)
+    check(actions_of(plan)[0][0] == "attach_copy", "the plan: %s" % actions_of(plan))
+    conn.execute("SELECT lab.fn_retract('event', %s::uuid, 'test')", (ev,))
+    refused(w, plan, "event %s is not as the scan found it" % ev, "the host event retracted")
+    w.off()
+    local.off()
+    # The directory's row changed (its zone; it has no run, so it may).
+    w, d, s, rec = world("rdirectory")
+    code, out, plan = scan(w, d)
+    conn.execute("UPDATE lab.scan_directory SET time_zone = 'Europe/Berlin' "
+                 "WHERE scan_directory_id = %s", (d,))
+    refused(w, plan, "the directory is no longer listed as the plan says", "the zone changed")
     w.off()
 
 
@@ -2159,6 +3059,37 @@ def a_correction_carries_input_edges_files_on_other_roots_and_takes_a_new_file()
     local.off()
 
 
+RUN_TABLES = ("scan_run", "scan_run_result", "scan_file", "session", "event", "recording_event",
+              "behavior_event", "artifact", "artifact_verification")
+READ_FUNCTIONS = ("lab.fn_artifact_current", "lab.fn_event_current", "lab.fn_scan_due",
+                  "lab.fn_scan_window_open", "lab.fn_current_person", "lab.fn_check_integrity")
+
+
+def audit_statements():
+    """Every statement of every run sent in this check: a SELECT, or an INSERT into one of
+    the nine tables an unattended run writes (never with a supersedes column); every
+    statement of a scan: a SELECT. A SELECT calls no lab function but those that read."""
+    with open(AUDIT, encoding="utf-8") as fh:
+        lines = [line.rstrip("\n").split("\t", 1) for line in fh]
+    seen = {"run": 0, "scan": 0}
+    bad = []
+    for command, sql in lines:
+        seen[command] += 1
+        head = sql.split(None, 1)[0].upper()
+        if head == "INSERT":
+            m = re.match(r"INSERT INTO lab\.(\w+) ", sql)
+            if not (command == "run" and m is not None and m.group(1) in RUN_TABLES
+                    and "supersedes" not in sql.split("VALUES")[0].split("SELECT")[0]):
+                bad.append((command, sql))
+        elif head != "SELECT":
+            bad.append((command, sql))
+        if any(name not in READ_FUNCTIONS for name in re.findall(r"lab\.fn_\w+", sql)):
+            bad.append((command, sql))
+    check(not bad, "statements a run or a scan may not send: %s" % bad[:5])
+    check(seen["run"] > 1000 and seen["scan"] > 100, "too few statements audited: %s" % seen)
+    return seen
+
+
 def main():
     leftovers = q1("WITH u AS (UPDATE lab.scan_directory d SET mode = 'off' FROM lab.storage_root r "
                    "WHERE r.root_id = d.storage_root_id AND r.name LIKE %s AND d.mode <> 'off' "
@@ -2175,6 +3106,12 @@ def main():
             fn()
             ran += 1
             print("ok  %-70s %5.1f s" % (fn.__name__, time.time() - started))
+        if not only and os.path.exists(AUDIT):
+            seen = audit_statements()
+            ran += 1
+            print("ok  %-70s (%d run, %d scan statements)"
+                  % ("every_run_statement_is_a_select_or_an_insert_into_nine_tables",
+                     seen["run"], seen["scan"]))
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     conn.close()

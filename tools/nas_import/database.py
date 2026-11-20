@@ -31,14 +31,36 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 
 LOCK_CLASS = 0x4E415349          # "NASI"; first key of the two-integer advisory lock
 
 SCAN_LOGS = ("lab.scan_run", "lab.scan_run_result", "lab.scan_file")
 
-RESULT_COUNTERS = ("files_listed", "files_unchanged", "files_pending", "files_registered",
-                   "files_known", "files_held", "files_ignored", "files_cleared",
-                   "groups_registered", "groups_waiting", "groups_held", "bytes_read")
+# The counters of lab.scan_run_result, and what each counts: the one definition.
+# ``engine.run_directory`` and ``reviewed.apply_directory`` count by it. A memory
+# row that only follows a person's correction of an artifact to its current row
+# (``registered`` / ``known`` again, nothing read) is in none of them: the
+# result's details say how many as ``files_repointed``.
+RESULT_COUNTERS = {
+    "files_listed": "files, links and special entries in the directory's own listing",
+    "files_unchanged": "listed files for which no memory row was written",
+    "files_pending": "pending rows written: files seen new or changed, or found changed by a "
+                     "read",
+    "files_registered": "files newly registered: one new artifact row each, with its ok "
+                        "verification",
+    "files_known": "files read to their end and found registered already with the same bytes: "
+                   "a known row and an ok verification, no artifact",
+    "files_held": "held rows written",
+    "files_ignored": "files under entries ignored by name",
+    "files_cleared": "cleared rows written",
+    "groups_registered": "groups written: a new event, files added to an event, a copy attached "
+                         "or (apply) a correction",
+    "groups_waiting": "groups not registered yet: waiting for their minimum age or their "
+                      "recording, or stable in report mode",
+    "groups_held": "groups held for a person",
+    "bytes_read": "bytes read, of headers and of files read to their end",
+}
 
 
 class DatabaseError(Exception):
@@ -180,6 +202,31 @@ _DETAIL_CARRY = {
 }
 
 
+def duration_us(text: str) -> int:
+    """Exact decimal seconds as whole microseconds.
+
+    Sub-microsecond digits are rounded to the nearest microsecond, a half
+    upwards (durations are not negative), by integer arithmetic.
+    """
+    value = Fraction(text) * 1_000_000
+    return (value.numerator * 2 + value.denominator) // (value.denominator * 2)
+
+
+def interval_text(us: int) -> str:
+    """Whole microseconds as interval text of whole numbers, which PostgreSQL reads exactly.
+
+    Hours, minutes, seconds and microseconds, each a whole number: the
+    interval input of every supported PostgreSQL version adds these as
+    integers (``n * interval '1 microsecond'`` would multiply as a float).
+    """
+    sign = "-" if us < 0 else ""
+    hours, rest = divmod(abs(int(us)), 3_600_000_000)
+    minutes, rest = divmod(rest, 60_000_000)
+    seconds, micro = divmod(rest, 1_000_000)
+    return "%s%d hours %s%d minutes %s%d seconds %s%d microseconds" % (
+        sign, hours, sign, minutes, sign, seconds, sign, micro)
+
+
 def _chunks(items, n=5000):
     items = list(items)
     for k in range(0, len(items), n):
@@ -269,7 +316,7 @@ class Database:
     # ----------------------------------------------------------------- locks
     def lock(self, directory_id: int) -> bool:
         """Take the directory's lock for this session; False when another process has it."""
-        got = self.one("SELECT pg_try_advisory_lock(%s::integer, %s::integer)",
+        got = self.one("SELECT pg_catalog.pg_try_advisory_lock(%s::integer, %s::integer)",
                        (LOCK_CLASS, directory_id))[0]
         if got:
             self.locks.add(directory_id)
@@ -277,7 +324,7 @@ class Database:
 
     def unlock(self, directory_id: int) -> None:
         self.locks.discard(directory_id)
-        self.run("SELECT pg_advisory_unlock(%s::integer, %s::integer)", (LOCK_CLASS, directory_id))
+        self.run("SELECT pg_catalog.pg_advisory_unlock(%s::integer, %s::integer)", (LOCK_CLASS, directory_id))
 
     # ------------------------------------------------------------- reference
     def storage_roots(self) -> dict[str, int]:
@@ -290,14 +337,14 @@ class Database:
     def missing_log_privileges(self) -> list[str]:
         """The scan logs the current role may not INSERT into."""
         return [t for t in SCAN_LOGS
-                if not self.one("SELECT has_table_privilege(current_user, %s, 'INSERT')", (t,))[0]]
+                if not self.one("SELECT pg_catalog.has_table_privilege(current_user, %s, 'INSERT')", (t,))[0]]
 
     def login(self) -> str:
         return "%s (session %s)" % self.one("SELECT current_user::text, session_user::text")
 
     def now_us(self) -> int:
         """The database's clock, microseconds since 1970."""
-        return self.one("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")[0]
+        return self.one("SELECT (extract(epoch FROM pg_catalog.clock_timestamp()) * 1000000)::bigint")[0]
 
     # ------------------------------------------------------------ directories
     def due(self) -> list[tuple[int, str]]:
@@ -333,6 +380,24 @@ class Database:
         return self.all("SELECT subject, detail FROM lab.fn_check_integrity() "
                         "WHERE check_name = 'scan_directory_overlap' ORDER BY subject, detail")
 
+    def waiting_for_recordings(self, prefix: str) -> list[tuple]:
+        """Groups that wait for a recording whose directory is not in ``register`` mode.
+
+        (ePsych directory id, recordings directory id, its mode, the number of
+        groups): groups with a pending row whose reason starts with PREFIX (the
+        pairing state ``engine.pairing_token`` records for a paired session).
+        """
+        return self.all(
+            "SELECT e.scan_directory_id, r.scan_directory_id, r.mode, "
+            "       pg_catalog.count(DISTINCT l.group_key) "
+            "FROM lab.scan_directory r "
+            "JOIN lab.scan_directory e ON e.scan_directory_id = r.pair_with "
+            "JOIN lab.scan_file_latest l ON l.storage_root_id = e.storage_root_id "
+            "     AND pg_catalog.starts_with(l.relative_path, e.relative_path || '/') "
+            "WHERE r.mode <> 'register' AND e.mode <> 'off' AND l.status = 'pending' "
+            "  AND pg_catalog.starts_with(l.reason, %s) "
+            "GROUP BY 1, 2, 3 ORDER BY 1, 2", (prefix,))
+
     def window_open(self, directory_id: int) -> bool:
         return bool(self.one("SELECT lab.fn_scan_window_open(%s)", (directory_id,))[0])
 
@@ -344,7 +409,7 @@ class Database:
             "INSERT INTO lab.scan_run (scan_directory_id, command, mode, due_at, tool_version, "
             "host) VALUES (%s, %s, %s, %s::timestamptz, %s, %s) RETURNING scan_run_id, "
             "(extract(epoch FROM started_at) * 1000000)::bigint, "
-            "to_char(started_at AT TIME ZONE 'UTC', 'YYYYMMDD\"T\"HH24MISS\"Z\"')",
+            "pg_catalog.to_char(started_at AT TIME ZONE 'UTC', 'YYYYMMDD\"T\"HH24MISS\"Z\"')",
             (directory_id, command, mode, due_at, tool_version, host))
 
     def insert_result(self, run_id: int, outcome: str, counters: dict, message: str | None,
@@ -373,7 +438,7 @@ class Database:
             "l.reason_code, l.reason, l.artifact_id::text, l.scan_run_id, "
             "(extract(epoch FROM r.started_at) * 1000000)::bigint "
             "FROM lab.scan_file_latest l JOIN lab.scan_run r ON r.scan_run_id = l.scan_run_id "
-            "WHERE l.storage_root_id = %s AND starts_with(l.relative_path, %s)",
+            "WHERE l.storage_root_id = %s AND pg_catalog.starts_with(l.relative_path, %s)",
             (root_id, directory_path + "/"))
         return {r[0]: MemoryRow(*r) for r in rows}
 
@@ -409,9 +474,10 @@ class Database:
         out: dict[str, list[ArtifactFact]] = {}
         for chunk in _chunks(sorted(set(paths))):
             rows = self.all(
-                "SELECT q.p," + _ARTIFACT_COLUMNS + "FROM unnest(%s::text[]) AS q(p) "
+                "SELECT q.p," + _ARTIFACT_COLUMNS + "FROM pg_catalog.unnest(%s::text[]) AS q(p) "
                 "JOIN lab.artifact a ON a.storage_root_id = %s "
-                "AND lower(a.relative_path) = lower(q.p)" + _ARTIFACT_CURRENT,
+                "AND pg_catalog.lower(a.relative_path) = pg_catalog.lower(q.p)"
+                + _ARTIFACT_CURRENT,
                 (chunk, root_id))
             for r in rows:
                 out.setdefault(r[0], []).append(ArtifactFact(*r[1:]))
@@ -421,7 +487,8 @@ class Database:
         """Paths of lab.artifact_present under the directory (compared without case)."""
         return [r[0] for r in self.all(
             "SELECT DISTINCT relative_path FROM lab.artifact_present WHERE storage_root_id = %s "
-            "AND starts_with(lower(relative_path), lower(%s)) ORDER BY 1",
+            "AND pg_catalog.starts_with(pg_catalog.lower(relative_path), pg_catalog.lower(%s)) "
+            "ORDER BY 1",
             (root_id, directory_path + "/"))]
 
     def raw_copies(self, checksums) -> dict[str, list[tuple[str, str, str]]]:
@@ -476,8 +543,8 @@ class Database:
         """
         row = self.one(
             "SELECT (t.at AT TIME ZONE %(z)s) <> t.wall, "
-            "       EXISTS (SELECT 1 FROM generate_series(-12, 12) AS k "
-            "               WHERE k <> 0 AND ((t.at + make_interval(mins => 15 * k)) "
+            "       EXISTS (SELECT 1 FROM pg_catalog.generate_series(-12, 12) AS k "
+            "               WHERE k <> 0 AND ((t.at + pg_catalog.make_interval(mins => 15 * k)) "
             "                                 AT TIME ZONE %(z)s) = t.wall) "
             "FROM (SELECT %(t)s::timestamp AS wall, %(t)s::timestamp AT TIME ZONE %(z)s AS at) t",
             {"t": local, "z": zone})
@@ -491,28 +558,45 @@ class Database:
         return self.one("SELECT subject_id, label, storage_root_id, relative_path "
                         "FROM lab.session WHERE session_id = %s::uuid", (session_id,))
 
+    def session_at(self, root_id: int, path: str) -> tuple | None:
+        """(session_id, subject_id, label, relative_path) of the session at exactly PATH."""
+        return self.one("SELECT session_id::text, subject_id, label, relative_path FROM "
+                        "lab.session WHERE storage_root_id = %s AND relative_path = %s",
+                        (root_id, path))
+
     def session_clashes(self, session_id: str, subject_id: str, label: str, root_id: int,
                         path: str) -> list[tuple]:
-        """Other sessions holding this subject's label or this path (compared without case)."""
+        """Other sessions holding this subject's label or this path (compared without case).
+
+        (session_id, subject_id, label, relative_path, storage root name).
+        """
         return self.all(
-            "SELECT session_id::text, subject_id, label, relative_path FROM lab.session "
-            "WHERE session_id <> %s::uuid AND ((subject_id = %s AND label = %s) "
-            "   OR (storage_root_id = %s AND lower(relative_path) = lower(%s))) ORDER BY 1",
+            "SELECT s.session_id::text, s.subject_id, s.label, s.relative_path, sr.name "
+            "FROM lab.session s JOIN lab.storage_root sr ON sr.root_id = s.storage_root_id "
+            "WHERE s.session_id <> %s::uuid AND ((s.subject_id = %s AND s.label = %s) "
+            "   OR (s.storage_root_id = %s "
+            "       AND pg_catalog.lower(s.relative_path) = pg_catalog.lower(%s))) ORDER BY 1",
             (session_id, subject_id, label, root_id, path))
 
     def insert_session(self, session_id: str, subject_id: str, label: str, root_id: int,
                        path: str, start_local: str | None, zone: str, duration: str | None,
                        rig: str | None) -> None:
-        """A new lab.session row; the times are converted by PostgreSQL."""
+        """A new lab.session row; the times are converted by PostgreSQL.
+
+        ``ended_at`` is ``started_at`` plus DURATION (exact decimal seconds) as
+        whole microseconds (:func:`duration_us`), sent as an interval of whole
+        numbers (:func:`interval_text`): it never passes through a float.
+        """
         self.run(
             "INSERT INTO lab.session (session_id, subject_id, label, storage_root_id, "
             "relative_path, started_at, ended_at, rig, created_by) "
             "SELECT %(id)s::uuid, %(subject)s, %(label)s, %(root)s, %(path)s, t.at, "
-            "       t.at + %(duration)s::numeric * interval '1 second', %(rig)s, "
+            "       t.at + %(duration)s::interval, %(rig)s, "
             "       lab.fn_current_person() "
             "FROM (SELECT %(start)s::timestamp AT TIME ZONE %(zone)s AS at) t",
             {"id": session_id, "subject": subject_id, "label": label, "root": root_id,
-             "path": path, "start": start_local, "zone": zone, "duration": duration, "rig": rig})
+             "path": path, "start": start_local, "zone": zone, "rig": rig,
+             "duration": None if duration is None else interval_text(duration_us(duration))})
 
     def insert_event(self, event_id: str, event_type: str, subject_id: str, session_id: str,
                      occurred_local: str, zone: str, attributes: str, detail: dict) -> None:
@@ -540,7 +624,7 @@ class Database:
         artifact_id = self.one(
             "INSERT INTO lab.artifact (artifact_id, produced_by_event_id, storage_root_id, "
             "relative_path, checksum, checksum_algo, size_bytes, role, format, subject_id, "
-            "session_id, attributes) VALUES (coalesce(%s::uuid, gen_random_uuid()), %s::uuid, "
+            "session_id, attributes) VALUES (coalesce(%s::uuid, pg_catalog.gen_random_uuid()), %s::uuid, "
             "%s, %s, %s, 'sha256', %s, %s, %s, %s, %s::uuid, %s::jsonb) "
             "RETURNING artifact_id::text",
             (artifact_id, event_id, root_id, path, checksum, size, role, file_format, subject_id,
@@ -552,16 +636,17 @@ class Database:
                             verified_us: int | None = None) -> None:
         self.run("INSERT INTO lab.artifact_verification (artifact_id, status, observed_checksum, "
                  "verified_at) VALUES (%s::uuid, 'ok', %s, coalesce(timestamptz 'epoch' + "
-                 "%s::bigint * interval '1 microsecond', now()))",
-                 (artifact_id, checksum, verified_us))
+                 "%s::interval, pg_catalog.now()))",
+                 (artifact_id, checksum, None if verified_us is None
+                  else interval_text(verified_us)))
 
     # ------------------------------------------------- the reviewed path only
     def identity(self) -> dict:
         """What says which database this is: its name, its oid and the cluster's identifier."""
         name, oid, system = self.one(
-            "SELECT current_database()::text, (SELECT oid::bigint FROM pg_database "
-            "WHERE datname = current_database()), (SELECT system_identifier::text "
-            "FROM pg_control_system())")
+            "SELECT pg_catalog.current_database()::text, (SELECT oid::bigint FROM pg_catalog.pg_database "
+            "WHERE datname = pg_catalog.current_database()), (SELECT system_identifier::text "
+            "FROM pg_catalog.pg_control_system())")
         return {"name": name, "oid": int(oid), "system_identifier": system}
 
     def event_text(self, event_id: str, zone: str) -> dict | None:
@@ -571,7 +656,7 @@ class Database:
         """
         row = self.one(
             "SELECT e.event_type, e.subject_id, e.session_id::text, "
-            "to_char(e.occurred_at AT TIME ZONE %s, 'YYYY-MM-DD HH24:MI:SS'), e.attributes "
+            "pg_catalog.to_char(e.occurred_at AT TIME ZONE %s, 'YYYY-MM-DD HH24:MI:SS'), e.attributes "
             "FROM lab.event e WHERE e.event_id = %s::uuid", (zone, event_id))
         if row is None:
             return None
@@ -580,7 +665,7 @@ class Database:
         if row[0] in _DETAIL_CARRY:
             for key, value in self.all(
                     "SELECT j.key, j.value FROM lab.%s_event d CROSS JOIN LATERAL "
-                    "jsonb_each_text(to_jsonb(d)) j WHERE d.event_id = %%s::uuid" % row[0],
+                    "pg_catalog.jsonb_each_text(pg_catalog.to_jsonb(d)) j WHERE d.event_id = %%s::uuid" % row[0],
                     (event_id,)):
                 if key not in ("event_id", "event_type"):
                     out["detail"][key] = value
@@ -673,12 +758,11 @@ class Database:
         """Record the file of ARTIFACT_ID as ``replaced`` by SUCCESSOR_ID."""
         self.run("INSERT INTO lab.artifact_disposition (artifact_id, disposition, "
                  "successor_artifact_id, occurred_at, note, attributes) VALUES (%s::uuid, "
-                 "'replaced', %s::uuid, timestamptz 'epoch' + %s::bigint * interval "
-                 "'1 microsecond', %s, %s::jsonb)",
-                 (artifact_id, successor_id, occurred_us, note, attributes))
+                 "'replaced', %s::uuid, timestamptz 'epoch' + %s::interval, %s, %s::jsonb)",
+                 (artifact_id, successor_id, interval_text(occurred_us), note, attributes))
 
     def session_note(self, session_id: str, note: str, new_path: str | None = None) -> None:
         """Append NOTE to the session's notes; with NEW_PATH also give it that path."""
-        self.run("UPDATE lab.session SET notes = concat_ws(chr(10), notes, %s::text), "
+        self.run("UPDATE lab.session SET notes = pg_catalog.concat_ws(pg_catalog.chr(10), notes, %s::text), "
                  "relative_path = coalesce(%s::text, relative_path) WHERE session_id = %s::uuid",
                  (note, new_path, session_id))
