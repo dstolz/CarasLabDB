@@ -41,7 +41,7 @@ reading an analysis event rather than reverse-engineering a folder.
 | `web/live/` | Live version of the dashboard: same UI, backed by the real database through a small `/api/data` server |
 | `web/forms/` | Browser data entry: build named, reusable form templates and fill them in for one session of one subject, under each member's own login; a CSV file per subject per project is kept up to date |
 | `mcp-server/` | **Read-only** Model Context Protocol server exposing typed `get*` query tools over the `lab` schema to an LLM agent |
-| `tools/` | Python scripts: `backup_lab.py` / `restore_lab.py` (backup and restore of the database and its roles), `verify_artifacts.py` (checks the files on the NAS against their checksums) and `import_nas_files.py` (searches the NAS directories the administrator lists in the database and registers the files it has not seen; holds everything uncertain for a person) |
+| `tools/` | Python scripts: `backup_lab.py` / `restore_lab.py` (backup and restore of the database and its roles), `verify_artifacts.py` (checks the files on the NAS against their checksums) and `import_nas_files.py` (searches the NAS directories the administrator lists in the database and registers the files it has not seen; holds everything uncertain for a person; `scan` and `apply` write what needs a correction, after a person has read a plan) |
 
 ## The data model
 
@@ -91,8 +91,10 @@ The schema is built around an **append-only event log**:
 - **Directory searches** — the list of NAS directories a scheduled tool
   searches for files it has not seen and how often (`scan_directory`), its
   run log (`scan_run`, `scan_run_result`) and its memory of each file
-  (`scan_file`). The list is edited by the administrator; the tool only adds,
-  and holds what it is unsure of. See `design_docs/nas-import.md`.
+  (`scan_file`). The list is edited by the administrator; an unattended run
+  only adds, and holds what it is unsure of. What needs a correction is
+  written only after a person has read a plan. See
+  `design_docs/nas-import.md`.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale.
@@ -282,7 +284,8 @@ members of `lab_rw` and `lab_ro` may do (run as a superuser after
 file verifier, `tests/check_lab_data.py` the live dashboard's export,
 `tests/check_forms_server.py` the forms server and its CSV files,
 `tests/check_nas_import_parsing.py` (no database) and
-`tests/check_import_nas_files.py` the NAS importer, and
+`tests/check_import_nas_files.py` (`run`, `check`, `scan` and `apply` end to
+end) the NAS importer, and
 `mcp-server/tests/` the MCP server. CI runs them on PostgreSQL 14, 15, 16
 and 17 (`.github/workflows/tests.yml`). The MATLAB tests in `tests/matlab/`
 run in CI too, in MATLAB R2024b, R2025a and the latest release on Linux
@@ -359,7 +362,11 @@ directories that are due, reads only files it has not seen, and registers a
 session, an event and an artifact per file when a group of files has been
 seen unchanged long enough; everything uncertain is held and reported.
 `import_nas_files.py check` is its monitor. A new directory starts in
-`report` mode, which registers nothing. See `design_docs/nas-import.md`.
+`report` mode, which registers nothing. Some of what `run` holds (a
+correction, a changed file, part of a copy) is written by hand: `scan` reads
+the directories and writes a plan, a person reads it, and `apply` writes
+exactly that plan (and refuses a group that is no longer as the scan found
+it). See `design_docs/nas-import.md`.
 
 **Query the schema from an LLM agent:** `mcp-server/` is a **read-only** MCP
 server that exposes typed `get*` tools (subjects, sessions, events, artifacts,

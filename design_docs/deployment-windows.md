@@ -65,7 +65,7 @@ whatever you choose consistent.
 | `lab_mcp` | login, `IN ROLE lab_ro` | the MCP server ([mcp-server.md](mcp-server.md)) | those of `lab_ro` |
 | `lab_forms` | login, `IN ROLE lab_ro` | the forms server's CSV rewrites (§3.6); members enter data under their own logins | those of `lab_ro` |
 | `lab_verifier` | login, `IN ROLE lab_rw` | `tools\verify_artifacts.py` | those of `lab_rw` |
-| `lab_scanner` | login, `IN ROLE lab_rw` | the scheduled NAS search, `tools\import_nas_files.py run` (§4.4, [nas-import.md](nas-import.md)) | those of `lab_rw`, plus `INSERT` on `lab.scan_run`, `lab.scan_run_result` and `lab.scan_file`, which `grants.sql` withholds from `lab_rw` |
+| `lab_scanner` | login, `IN ROLE lab_rw` | the scheduled NAS search, `tools\import_nas_files.py run`, and `apply` of a reviewed plan (§4.4, [nas-import.md](nas-import.md)) | those of `lab_rw`, plus `INSERT` on `lab.scan_run`, `lab.scan_run_result` and `lab.scan_file`, which `grants.sql` withholds from `lab_rw` |
 
 Why a separate owner: the owner of the schema can drop the immutability
 triggers, and a subject rename cascades into the append-only tables with the
@@ -787,9 +787,18 @@ holds for a person and how to read its reports are in
   **due** (the database decides, by each directory's own interval and hours),
   so most wakes end in a second;
 - `check` runs once a day and exits 1 when a directory is overdue, when two
-  listed directories overlap, or when a due directory's storage root was not
-  given with `--root`. A root that is not mounted here (missing or empty)
-  ends it with 2.
+  listed directories overlap, when more than one directory that is not `off`
+  names the same directory in `pair_with`, or when a due directory's storage
+  root was not given with `--root`. A root that is not mounted here (missing
+  or empty) ends it with 2.
+
+`scan` and `apply` (what the unattended `run` holds for a person: a
+correction, a changed file, a copy of part of a recording) are run by hand,
+not scheduled, as `lab_scanner` or the owner; `scan` only reads and writes a
+plan to a folder, and `apply` writes exactly that plan
+([nas-import.md](nas-import.md) §10.3). Keep the plan folder where only the
+people who review plans can write: the plan's digest catches an accident, not
+a person who can write the plan.
 
 Before the first run, once, as the owner:
 
@@ -861,16 +870,18 @@ Register-ScheduledTask -TaskName "CarasLabDB NAS search check" -Action $action -
     -User $cred.UserName -Password $cred.GetNetworkCredential().Password -RunLevel Limited
 ```
 
-- The folders of `--log-file` and `--cache-file` must exist
-  (`C:\ProgramData\CarasLabDB` does, from §3.3); `--report-dir` is created.
-  Reports are written only for a run in which something happened.
+- The folder of `--log-file` must exist (`C:\ProgramData\CarasLabDB` does,
+  from §3.3); `--report-dir` is created. A cache file that cannot be written
+  is only a warning in the run's line. Reports are written only for a run in
+  which something happened.
 - If the task is stopped, nothing is half written: each group of files is
   registered in one transaction, and a run with no result row does not move
   the schedule.
 - **Exit codes.** `run`: 0 when every directory searched ended `ok` or
   `partial`; 1 when one ended `failed` or `unreachable` (a folder that could
-  not be listed, a share that is not mounted); 2 on a usage or connection
-  error, including a login that may not write the scan logs. `check`: 0, or
+  not be listed, a share that is not mounted), or a report could not be
+  written; 2 on a usage or connection error, including a login that may not
+  write the scan logs. `check`: 0, or
   1 for a problem, or 2 on a usage or connection error. Have Task Scheduler
   alert on a non-zero **Last Run Result** for both. Files held for a person do
   not fail either task: read them in the dialog, the reports or

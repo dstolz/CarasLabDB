@@ -518,10 +518,13 @@ directory):
 15 8 * * *   PGHOST=dbhost PGDATABASE=lab PGUSER=lab_scanner python3 /srv/CarasLabDB/tools/import_nas_files.py check --root nas-rig3=/mnt/nas-rig3 --log-file /var/log/caraslabdb/nas-check.log || echo "CarasLabDB NAS search needs attention" | mail -s "CarasLabDB NAS search" admin@example.edu
 ```
 
-`run` exits 1 when a directory ended `failed` or `unreachable` and 2 on a
-usage or connection error; alert on both. The folders of `--log-file` and
-`--cache-file` must exist. [deployment-windows.md](deployment-windows.md)
-§4.4 describes the exit codes and the first run.
+`run` exits 1 when a directory ended `failed` or `unreachable`, or a report
+could not be written, and 2 on a usage or connection error; alert on both.
+The folder of `--log-file` must exist; a `--cache-file` that cannot be written
+is only a warning. `scan` and `apply`, which resolve what `run` holds for a
+person, are run by hand, not from cron ([nas-import.md](nas-import.md)
+§10.3). [deployment-windows.md](deployment-windows.md) §4.4 describes the
+exit codes and the first run.
 
 **Schema upgrades** (from launch on) follow [deployment-windows.md](deployment-windows.md) §6:
 back up, stop the clients, apply the migration as `lab_admin` with

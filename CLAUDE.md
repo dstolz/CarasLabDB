@@ -111,12 +111,21 @@ data. It has seven parts:
   `run` is the scheduled, unattended search of the directories that are due
   (`lab.fn_scan_due()`), needs a login inheriting `lab_rw` that also holds
   INSERT on the three scan logs (`lab_scanner`) or the owner, and exits 0 / 1
-  (a directory `failed` or `unreachable`) / 2 (usage, connection, missing
-  privilege); `check` is its monitor and only reads: exit 1 when a directory
-  is overdue, two overlap, or a due directory's root was not given with
-  `--root`; `scan` / `apply` are the reviewed path, a plan file a person
-  reads and then writes exactly). See `design_docs/nas-import.md` and the
-  invariants under "Directory searches" below.
+  (a directory `failed` or `unreachable`, or a report that could not be
+  written) / 2 (usage, connection, missing privilege); `check` is its
+  monitor and only reads: exit 1 when a directory is overdue, two overlap,
+  more than one directory that is not `off` names the same `pair_with`, or a
+  due directory's root was not given with `--root` (it also prints how many
+  groups wait for a recording whose directory is not in `register` mode; that
+  does not change the exit code); `scan` / `apply` are the reviewed path:
+  `scan` writes nothing to the NAS, the database or the cache and leaves a
+  plan file, a CSV and a text report in `--out` (exit 1 when a named
+  directory could not be listed completely), and `apply PLANFILE` writes
+  exactly the plan a person has read, as the same kind of login as `run`
+  (exit 0 / 1 when a group was refused / 2 for a plan that cannot be used --
+  edited, truncated, another format, another database, a root not given --
+  with nothing written)). See `design_docs/nas-import.md` and the invariants
+  under "Directory searches" below.
 
 Read `design_docs/overview.md` first for the conceptual model, then
 `design_docs/database-design.md` for the table-by-table rationale — both are
@@ -279,7 +288,9 @@ records:
   `scan_run_result` and `scan_file` are append-only logs, never a mutable
   "status" column. `scan_file` is the scan memory: a row is appended only
   when what is seen of a file differs from its latest row for that path
-  (`status` `pending` / `registered` / `known` / `held` / `cleared`);
+  (`status` `pending` / `registered` / `known` / `held` / `cleared`; a
+  `pending` row also carries a `reason`: the pairing state of an ePsych
+  session, or, with reason code `changed_during_scan`, what a read found);
   `scan_file_latest` is each path's state and `scan_held` the held ones.
   Like tags it stores no derived id (no subject column: a rename would have
   to follow it); its composite FK `(artifact_id, storage_root_id,
@@ -305,8 +316,9 @@ records:
     records a disposition, never creates a subject, never writes to the NAS
     and never follows a link. Whatever would need one of those is held with a
     reason code (`would_correct`, `content_changed`, `late_recording`,
-    `path_case_conflict`, `registered_but_withdrawn`, ...) and left to
-    `scan` / `apply`. Anything uncertain is held and reported, never guessed.
+    `path_case_conflict`, `registered_but_withdrawn`, `copy_partial`, ...) and
+    left to `scan` / `apply` (which resolve only some of them and hold the
+    rest as well). Anything uncertain is held and reported, never guessed.
   - **The stability rule** (`engine.stability`). A group is registered by a
     run only when every file listed in it has a latest memory row written by
     an earlier run that equals what this run would write (so this run appends
@@ -315,26 +327,62 @@ records:
     the latest run that wrote one of those rows. The first sighting never
     registers (also with `min_age_min = 0`); a file added, changed or gone
     restarts the wait for the whole group. Modification times never decide.
-  - **An incomplete listing fails the run** (`failed`): nothing is
-    registered and nothing is concluded from what is absent.
+    What a row "equals" (`engine.differs`) includes the reason of a `pending`
+    row: for an ePsych session judged with a recordings directory it is the
+    pairing state (`engine.pairing_token`), so one listing without the
+    recording folder does not release the session. A file found changed while
+    it is read gets a `pending` row with reason code `changed_during_scan`,
+    which no listing writes: it never equals the next listing's row, so the
+    wait restarts at the next listing that shows the state, never at the read.
+  - **An incomplete listing fails the run** (`failed`), of the directory or
+    of the directory it is paired with (which is listed and judged whatever
+    its mode): nothing is registered and nothing is concluded from what is
+    absent.
+  - **The copy rule.** A group with no event of its own is added to the one
+    active event of another client that holds every one of its raw files (by
+    SHA-256); a clash with a session of another client does not hold it
+    before the files are read. Some but not all of its data files in other
+    events is `copy_partial` (in an event this tool wrote: `duplicate_content`):
+    `run` never adds part of a recording to another event, and `scan` plans
+    `attach_copy` with the rest only when every matching file is in one event
+    of the same type and subject. A file another client registered with md5 is
+    compared by md5, one registered with blake3 is held `checksum_unsupported`;
+    a group of more than `engine.MAX_GROUP_FILES` files is held
+    `group_too_large` before it is read.
+  - **`apply` re-checks before it writes.** It takes the directory's lock,
+    compares the plan's storage-root name with the database's, lists the
+    directory and its partner again and interprets them again with the
+    overrides the plan carries (headers only), and refuses every group of a
+    directory it cannot list completely. A group is refused, nothing written,
+    unless its `reviewed.group_basis` equals the plan's (files with sizes and
+    mtimes, subject, session, time, detail, pairing), the plan's listing is at
+    least the directory's current `min_age_min` old, and the database is as
+    the scan found it (`expect`). It reads files to their end again only
+    with `--reread`; otherwise every SHA-256 comes from the plan. The plan's
+    digest line is a plain SHA-256 (accident, not tampering), its database
+    identity cannot tell a physical clone, and `reviewed.FORMAT` changes with
+    the plan's shape.
   - **One transaction per group** (session, event, artifacts, `ok`
     verifications, memory rows). Ids are `uuid5` of fixed text under a
     namespace that never changes, the event keeps its digest in
     `attributes.client_digest`; the advisory lock per directory only saves
     work.
-  - **Reason codes are an interface** (`model.REASON_CODES`,
-    `engine.RUN_REASON_CODES`; stored in `scan_file.reason_code`): add,
-    never rename.
+  - **Reason codes are an interface** (all of them in `model.REASON_CODES`,
+    the interpretation's and the "database side" ones; the engine keeps no
+    list of its own; stored in `scan_file.reason_code`): add, never rename.
+    `not_a_subject_folder` is retired and stays listed. The result counters
+    are defined once, in `database.RESULT_COUNTERS`.
   - What interprets a tree is database-free (`walk`, `names`, `content`,
     `mat5`, `rhd`, `layouts/`, `subjects`, `pairing`, `interpret`, `ids`,
     `model`): it reads the tree (and the overrides file), writes nothing and
     keeps no state between calls. `cache.py` is the header cache, a JSON
     file. Every statement the tool sends is in `database.py`;
     the stability rule, the holds against the database and the registration
-    are in `engine.py`; `report.py` writes the CSV and text reports. A layout
-    is one module of `layouts/` plus a `scan_layout` row, inserted by the
-    owner. The header cache is an optimisation only: nothing may depend on it
-    for correctness.
+    are in `engine.py`; `reviewed.py` is `scan`, `apply` and the plan file
+    (and writes their reports); `report.py` writes `run`'s CSV and text
+    reports. A layout is one module of `layouts/` plus a `scan_layout` row,
+    inserted by the owner. The header cache is an optimisation only: nothing
+    may depend on it for correctness.
 - `lab.fn_check_integrity()` has 16 checks (see `database-design.md` §4.2);
   a new invariant that a constraint cannot enforce gets a check there.
 
@@ -650,10 +698,10 @@ applies the schema, runs `tests/schema_test.sql`, applies `grants.sql` twice
 and runs `tests/roles_test.sql` (as members of `lab_rw` / `lab_ro`), runs the
 artifact verifier end to end
 (`tests/check_verify_artifacts.py`), runs the NAS importer's parsing check
-(`tests/check_nas_import_parsing.py`, no database) and its `run` / `check`
-end to end against its own database (`tests/check_import_nas_files.py`, as
-the superuser: it creates throw-away roles and backdates its own run rows),
-runs `lab_data.sql` and checks the JSON
+(`tests/check_nas_import_parsing.py`, no database) and its `run`, `check`,
+`scan` and `apply` end to end against its own database
+(`tests/check_import_nas_files.py`, as the superuser: it creates throw-away
+roles and backdates its own run rows), runs `lab_data.sql` and checks the JSON
 shape, checks that the live dashboard page is up to date with its generator,
 runs the forms server end to end against its own database
 (`tests/check_forms_server.py`, as the superuser: it creates throw-away
@@ -699,15 +747,19 @@ to exercise the code:
   tools/import_nas_files.py run --root <storage_root name>=<mount path>
   [--now] [--dry-run] [--directory ID] [--report-dir DIR] [--cache-file F]
   [--overrides F] [--log-file F]` as `lab_scanner` or the owner (connection
-  from the `PG*` environment), and `check [--root ...]`. `--dry-run` writes
-  nothing; `--now` is a run by hand that never moves the schedule. A new
-  directory starts in `report` mode, which registers nothing. The reviewed
-  path: `scan --root N=P --directory ID --out DIR` writes nothing to the NAS
-  or the database and leaves a plan (`plan_<stamp>.jsonl`, with a digest line
-  `apply` checks, plus a CSV and a text report); `apply PLANFILE --root N=P
-  [--only GROUP_KEY] [--dry-run]` writes exactly that plan, one transaction
-  per group, and refuses a group whose files, listing age or database rows
-  are no longer as the scan found them (`tools/nas_import/reviewed.py`).
+  from the `PG*` environment), and `check [--root ...] [--log-file F]`.
+  `--dry-run` writes nothing; `--now` is a run by hand that never moves the
+  schedule. A new directory starts in `report` mode, which registers nothing.
+  The reviewed path: `scan --root N=P --directory ID --out DIR [--overrides F]
+  [--cache-file F]` writes nothing to the NAS, the database or the cache and
+  leaves a plan (`plan_<stamp>.jsonl`, format `caraslabdb-nas-plan/2`, with a
+  digest line `apply` checks, plus a CSV and a text report); `apply PLANFILE
+  --root N=P [--only GROUP_KEY] [--dry-run] [--reread] [--cache-file F]
+  [--report-dir DIR] [--log-file F]` as `lab_scanner` or the owner writes
+  exactly that plan, one transaction per group, and refuses a group that is no
+  longer as the scan found it: its files, listing age, pairing, subject or
+  detail, or the database rows (`tools/nas_import/reviewed.py`). The files
+  are read to their end again only with `--reread`.
 - **Forms server**: `PGDATABASE=<db> python web/forms/server.py --csv-root
   <dir> --insecure-cookie` (the `lab-forms` launch config), then sign in on
   `http://127.0.0.1:8779/` with a login in `lab_rw`. End to end:

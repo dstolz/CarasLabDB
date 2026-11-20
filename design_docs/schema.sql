@@ -975,8 +975,10 @@ CREATE TABLE lab.observation_event (
 --                      ('pending', 'held' and 'cleared' rows are
 --                      observations, so its report can say which groups have
 --                      been seen unchanged and would be registered) but
---                      registers nothing: no session, event or artifact, and
---                      no 'registered' or 'known' row.
+--                      registers nothing: no session, event or artifact. It
+--                      writes a 'registered' or 'known' row only to follow a
+--                      person's correction of an artifact that was already
+--                      registered: the row then names the current artifact.
 --   mode_changed_at    when mode last changed, or the row was added. Kept by
 --                      trg_scan_directory_policy and never set by a client:
 --                      lab.fn_scan_status uses it so that a directory that
@@ -1047,7 +1049,10 @@ CREATE UNIQUE INDEX uq_scan_directory_path
 -- One row when a run of one directory starts.
 --   command     'run' (the scheduled, unattended search) or 'apply' (a
 --               reviewed plan written by a person).
---   mode        the mode the run was made in; never 'off'.
+--   mode        what the run may do, never 'off': for a 'run', the
+--               directory's mode when it started; for an 'apply', always
+--               'register', since it writes its plan whatever the
+--               directory's mode.
 --   due_at      the scheduled time this run answers, as lab.fn_scan_status
 --               gave it. NULL for a run made by hand: such a run never moves
 --               the schedule. Only a 'run' answers a scheduled time, and a

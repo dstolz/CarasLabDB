@@ -577,14 +577,16 @@ The importer, `tools/import_nas_files.py`, registers the files that are
 already on the NAS: a session, the event that produced them and one artifact
 per file. Its scheduled `run` searches the directories listed in
 `scan_directory`, reads only files it has not seen, and registers what is new
-and unambiguous. The user guide, the tool and the layouts are in
+and unambiguous; what it holds for a person is resolved by `scan` (which
+writes a plan and nothing to the database) and `apply` (which writes exactly
+the plan). The user guide, the tool and the layouts are in
 [nas-import.md](nas-import.md); this is the data model.
 
 | Table | Purpose |
 |---|---|
 | `scan_layout` | `code`, `label`. Seeded `epsych` and `intan`. See §3.1. |
 | `scan_directory` | One directory to search, under a storage root. **Mutable**, recorded in `row_history`. `relative_path`, `layout`, `rig`, `pair_with` (another directory of the same root: a composite foreign key keeps the pair on one root), `time_zone` (a name from `pg_timezone_names`), `scan_interval_min` (1 to 527040), `window_start` / `window_end` (both or neither, whole minutes, wrapping midnight when the start is later), `min_age_min` (default 1440), `mode` (`off`, `report`, `register`; default `report`), `mode_changed_at`, `notes`, `created_at`, `created_by`, `created_login`. |
-| `scan_run` | **Append-only.** One row when a run of one directory starts: `command` (`run` or `apply`), `mode` (`report` or `register`), `due_at` (the scheduled time the run answers, as `fn_scan_status` gave it; NULL for a run made by hand, which never moves the schedule), `started_at` (the database's clock), `tool_version`, `host`, `run_login` (stamped). |
+| `scan_run` | **Append-only.** One row when a run of one directory starts (`scan` makes none): `command` (`run` or `apply`), `mode` (`report` or `register`), `due_at` (the scheduled time the run answers, as `fn_scan_status` gave it; NULL for a run made by hand, which never moves the schedule), `started_at` (the database's clock), `tool_version`, `host`, `run_login` (stamped). |
 | `scan_run_result` | **Append-only.** One row when a run ends: `outcome` (`ok`, `partial`, `failed`, `unreachable`), the counts of files and groups, `bytes_read`, `message` and a `details` object. A run with no result is running or was interrupted. |
 | `scan_file` | **Append-only.** The scan memory: a row is appended only when what the tool sees of a file differs from its latest row. `scan_run_id`, `storage_root_id`, `relative_path` (as spelled on disk), `size_bytes`, `mtime_ns` (`st_mtime_ns`, a whole number: it is compared for equality), `group_key`, `status`, `reason_code`, `reason`, `artifact_id`. |
 
@@ -599,6 +601,13 @@ one at the row's own path: a memory row that named another file's artifact
 would let the tool skip a file that was never registered. There is no
 subject column and no derived id, for the reason `tag_assignment` has no
 `entity_id`: a stored copy of the subject would have to follow a rename.
+
+A `pending` row may carry a `reason` too. For a file of an ePsych session
+judged with a recordings directory it is the pairing state (the recording it
+pairs with, or that it pairs with none), which is compared like the size and
+the modification time. With the `reason_code` `changed_during_scan` it says
+what a read found when the file changed while it was read; no listing writes
+such a row, so the wait starts again at the next listing.
 
 **Mutable list, append-only logs.** The list says what is registered without
 anyone looking, so it is an edited table with a history; the runs and the

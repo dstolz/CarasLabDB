@@ -98,14 +98,14 @@ Python standard library plus psycopg, built like `tools/verify_artifacts.py`: `-
 
 **Two commands** (`plans/nas-auto-scan.md` adds the unattended `run` and `check`)
 1. **`scan --directory <id> ... --out <dir>`** reads the NAS and the database and writes nothing to either. It produces a plan file (JSON lines: every group, file, size, modification time and SHA-256) and a report (CSV and text).
-2. **`apply <plan file>`** writes exactly the reviewed plan. Before each group it checks every file's size and modification time again; a group that changed is refused and reported.
+2. **`apply <plan file>`** writes exactly the reviewed plan. Before each group it checks every file's size and modification time again; a group that changed is refused and reported. *Amended:* `apply` also lists the directory and its partner again and interprets them again (headers only), with the overrides the plan carries, and refuses a group whose files, subject, session, time, detail or pairing differ from the plan's, or whose database rows are no longer as the scan found them; an incomplete listing refuses every group of the directory. The files are read to their end again only with `--reread`; without it every SHA-256 comes from the plan. The plan's last line is a plain SHA-256 over the file: it catches an accident, not a person who can write the plan.
 
 **Stages of a scan**
 1. **Walk** each named directory. Symbolic links are not followed. *Amended:* a folder that cannot be listed fails the scan of its directory, and modification times no longer decide whether a group is complete: `apply` refuses a group whose sighting in the plan file is younger than the directory's `min_age_min`, so a session still being recorded or copied is never registered half-way.
 2. **Interpret** with the layout module: groups, subjects, times, pairing, held items.
 3. **Diff against the database**, so unchanged files are not read again:
    - *Amended:* a file whose latest row in the scan memory (`lab.scan_file`) is `registered` or `known` with the same size and modification time, and whose artifact is active and present, is unchanged;
-   - everything else is hashed (4 MiB chunks, a few worker threads).
+   - everything else is hashed (4 MiB chunks). *Amended:* one file at a time, no worker threads.
 4. **Report** every insert, correction, held item and normalisation.
 
 **What makes a re-run safe** (there is no SQL function for this; the logic of `@CarasLabDB/recordEvent.m` is reproduced)
@@ -122,7 +122,7 @@ Python standard library plus psycopg, built like `tools/verify_artifacts.py`: `-
 | Different bytes at a registered path | A new artifact plus a `replaced` disposition on the old one, flagged in the report: raw data should not change. |
 | Registered file missing | Reported only. Recording a deletion is a person's decision (`addArtifactDisposition`). |
 | A recording appears for a behavior-only session | A correction moves the behavior event into the recording's session. The file-path session stays, with a note, and is reported. |
-| Recording already registered by `ephys_analysis` from a local copy | If every file's checksum is already a `raw` artifact of exactly one event, the NAS files are added to that event. Several events: held. |
+| Recording already registered by `ephys_analysis` from a local copy | If every file's checksum is already a `raw` artifact of exactly one event, the NAS files are added to that event. Several events: held. *Amended:* some but not all of the data files in another client's event is held `copy_partial` by `run`; `scan` adds the rest to that event (`attach_copy`) only when every matching file is in one event of the same type and subject. |
 
 **Verification rows**: each newly registered file gets an `artifact_verification` row with status `ok`, since the tool has just read and hashed it. Otherwise every file would show as `artifact_never_verified`.
 
